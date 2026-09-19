@@ -37,7 +37,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::host::{AgentId, BranchId, ProgramStatus, SessionEvent};
 use crate::tree::depth_after;
 use crate::types::{
-    Address, Author, Call, Disposition, Event, EventId, EventPayload, Message, Outcome,
+    Address, Call, Event, EventId, EventPayload, Outcome,
 };
 
 /// How many lines of a cell's source show while it is collapsed (D13).
@@ -407,7 +407,7 @@ impl ChatState {
                     program: None,
                 });
             }
-            EventPayload::Message(Message::Post { from, origin }) => {
+            EventPayload::Post { from, origin } => {
                 self.push_entry(Entry::Line {
                     branch,
                     id,
@@ -416,25 +416,9 @@ impl ChatState {
                     program: None,
                 });
             }
-            EventPayload::Message(Message::Turn {
-                author,
-                thinking,
-                source,
-                ..
-            }) => {
+            EventPayload::Reply | EventPayload::Restart => {
                 self.streaming.retain(|(b, _)| *b != branch);
                 self.thinking_streaming.retain(|(b, _)| *b != branch);
-                if let Some(thinking) = thinking
-                    && !thinking.is_empty()
-                {
-                    self.push_entry(Entry::Line {
-                        branch,
-                        id,
-                        kind: ChatKind::Thinking,
-                        text: thinking.clone(),
-                        program: None,
-                    });
-                }
                 // Every `Turn` is a program (22_ONE_VOCABULARY's "a turn
                 // is a program") — LLM-authored or a `Turn { author:
                 // User }` restart standing in for one (`e`/`v`, the
@@ -442,7 +426,7 @@ impl ChatState {
                 // no tool-call wrapper to special-case any more, so this
                 // always opens a fresh block, nested under whatever
                 // program is currently deliberating on this branch (`depth`).
-                let by_user = matches!(author, Author::User);
+                let by_user = matches!(event.payload, EventPayload::Restart);
                 let depth = *self.branch_depth.get(&branch).unwrap_or(&0);
                 self.push_entry(Entry::Header {
                     branch,
@@ -450,7 +434,9 @@ impl ChatState {
                     depth,
                     by_user,
                     compacted: None,
-                    source: source.clone(),
+                    // The reply's text arrives as `Part`s; the header
+                    // opens empty and they append to it.
+                    source: String::new(),
                 });
                 self.program_stack.entry(branch).or_default().push(id);
             }
@@ -540,15 +526,12 @@ impl ChatState {
             // `return` always pops one frame; a `Condition` pops only on
             // a `Handover` disposition (a raise that pushes a handler
             // leaves the raising program open, suspended, beneath it —
-            // `Cause::Abandoned`/`Interrupted` are always logged as a
+            // `crate::types::Handback::Abandoned`/`Interrupted` are always logged as a
             // `Handover`, so they fall out of the same check). Exactly
             // `tree::programs_for`'s own `stack` fold, so a chat block's
             // attach point can never disagree with the log projection's.
-            EventPayload::Return { .. } => {
-                self.program_stack.entry(branch).or_default().pop();
-            }
-            EventPayload::Condition { disposition, .. } => {
-                if *disposition == Disposition::Handover {
+            EventPayload::Handback { how, .. } => {
+                if how.is_terminal() {
                     self.program_stack.entry(branch).or_default().pop();
                 }
             }
@@ -591,30 +574,43 @@ impl ChatState {
             // place a reloaded log has it. Live, it arrives as
             // `SessionEvent::Chunk { thinking: true }`; on reload that
             // buffer is gone and this is what is left.
-            EventPayload::Completion { thinking, .. } => {
+            // What the reply cost is accounting, never transcript.
+            EventPayload::ReplyEnd { .. } => {
                 self.thinking_streaming.retain(|(b, _)| *b != branch);
-                if let Some(thinking) = thinking
-                    && !thinking.is_empty()
-                {
-                    self.push_entry(Entry::Line {
-                        branch,
-                        id,
-                        kind: ChatKind::Thinking,
-                        text: thinking.clone(),
-                        program: None,
-                    });
-                }
             }
+            EventPayload::Compaction { .. } => {}
             // A rename is a record: it changes the navigator, never the
             // transcript, and never wakes the branch.
             EventPayload::Rename { .. } => {}
-                    // 28.B–C fill these in: nothing writes them yet, so there
-            // is nothing here to read.
-            EventPayload::Reply
-            | EventPayload::Part { .. }
-            | EventPayload::ReplyEnd { .. }
-            | EventPayload::Restart { .. }
-            | EventPayload::Handback { .. } => {}
+            // The reply's own text, arriving piece by piece: prose and
+            // cells append to the header this reply opened, thinking is
+            // a line of its own and is not part of what it said.
+            EventPayload::Part { part, .. } => {
+                let program = self.program_stack.get(&branch).and_then(|s| s.last()).copied();
+                match part {
+                    crate::types::Part::Thinking(t) if !t.is_empty() => {
+                        self.push_entry(Entry::Line {
+                            branch,
+                            id,
+                            kind: ChatKind::Thinking,
+                            text: t.clone(),
+                            program: None,
+                        });
+                    }
+                    crate::types::Part::Thinking(_) => {}
+                    crate::types::Part::Prose(t) | crate::types::Part::Cell(t) => {
+                        if let Some(p) = program
+                            && let Some(&row) = self.entry_index.get(&p)
+                            && let Some(Entry::Header { source, .. }) = self.entries.get_mut(row)
+                        {
+                            source.push_str(t);
+                            self.classified_line_cache.get_mut()[row] = None;
+                            self.raw_line_cache.get_mut()[row] = None;
+                        }
+                    }
+                }
+            }
+
         }
         self.branch_depth.insert(
             branch,
@@ -1384,12 +1380,7 @@ mod tests {
     fn run_program(id: u64) -> SessionEvent {
         ev(
             id,
-            EventPayload::Message(Message::Turn {
-                author: Author::Agent(EventId::new(1)),
-                source: "noop();".into(),
-                thinking: None,
-                usage: None,
-            }),
+            EventPayload::Restart,
         )
     }
 
@@ -1417,7 +1408,7 @@ mod tests {
     fn post(id: u64, text: &str) -> SessionEvent {
         ev(
             id,
-            EventPayload::Message(Message::Post {
+            EventPayload::Post {
                 from: Author::User,
                 origin: Origin::Direct {
                     text: text.into(),
@@ -1425,7 +1416,7 @@ mod tests {
                     options: Vec::new(),
                     expects_reply: true,
                 },
-            }),
+            },
         )
     }
 
@@ -1472,8 +1463,11 @@ mod tests {
         let before = chat.rows(None, 80).len();
         chat.apply(&ev(
             5,
-            EventPayload::Return {
-                value: serde_json::json!("done"),
+            EventPayload::Handback {
+                reply: EventId::new(1),
+                how: crate::types::Handback::Completed,
+                site: 0,
+                stack: Vec::new(),
             },
         ));
         chat.apply(&ev(
@@ -1825,12 +1819,7 @@ mod tests {
             1,
             3,
             Some(2),
-            EventPayload::Message(Message::Turn {
-                author: Author::Agent(EventId::new(1)),
-                source: "tell(\"user\", \"shared answer\");".into(),
-                thinking: None,
-                usage: None,
-            }),
+            EventPayload::Restart,
         ));
         chat.apply(&ev_on(
             1,
@@ -1863,7 +1852,7 @@ mod tests {
             10,
             11,
             Some(10),
-            EventPayload::Message(Message::Post {
+            EventPayload::Post {
                 from: Author::User,
                 origin: Origin::Direct {
                     text: "fork continues".into(),
@@ -1871,7 +1860,7 @@ mod tests {
                     options: Vec::new(),
                     expects_reply: true,
                 },
-            }),
+            },
         ));
 
         let fork_rows = chat.rows(Some(EventId::new(10)), 80);
@@ -1929,12 +1918,10 @@ mod tests {
         ));
         chat.apply(&ev(
             2,
-            EventPayload::Message(Message::Turn {
-                author: Author::Agent(EventId::new(1)),
-                source: "tell(\"user\", \"42\");".into(),
-                thinking: Some("let me compute 6*7".into()),
-                usage: None,
-            }),
+            EventPayload::Part {
+                reply: EventId::new(1),
+                part: crate::types::Part::Cell("tell(\"user\", \"42\");".into()),
+            },
         ));
         chat.apply(&ev(
             3,
@@ -2005,12 +1992,10 @@ mod tests {
 
         chat.apply(&ev(
             2,
-            EventPayload::Message(Message::Turn {
-                author: Author::Agent(EventId::new(1)),
-                source: "tell(\"user\", \"final answer\");".into(),
-                thinking: Some("done reasoning".into()),
-                usage: None,
-            }),
+            EventPayload::Part {
+                reply: EventId::new(1),
+                part: crate::types::Part::Cell("tell(\"user\", \"final answer\");".into()),
+            },
         ));
         let rows = chat.rows(None, 80);
         assert!(
@@ -2837,16 +2822,20 @@ mod tests {
     // ── notebook cells in the transcript (D13, 25.6) ────────────────
 
     /// A `Turn` whose source is a cell's JavaScript.
-    fn cell(id: u64, source: &str) -> SessionEvent {
-        ev(
-            id,
-            EventPayload::Message(Message::Turn {
-                author: Author::Agent(EventId::new(1)),
-                source: source.into(),
-                thinking: None,
-                usage: None,
-            }),
-        )
+    /// A reply and its one cell: two events, because a reply's text
+    /// arrives as parts (28) and the header they fill in is opened by
+    /// the reply itself.
+    fn cell(id: u64, source: &str) -> [SessionEvent; 2] {
+        [
+            ev(id, EventPayload::Reply),
+            ev(
+                id + 1000,
+                EventPayload::Part {
+                    reply: EventId::new(id),
+                    part: crate::types::Part::Cell(source.to_owned()),
+                },
+            ),
+        ]
     }
 
     fn code_rows(chat: &ChatState) -> Vec<String> {
@@ -2864,7 +2853,9 @@ mod tests {
     fn a_turns_source_is_not_inlined_unless_cells_are_shown() {
         let mut chat = ChatState::new();
         chat.apply(&agent_event());
-        chat.apply(&cell(2, "let a = 1;\nlet b = 2;"));
+        for e in cell(2, "let a = 1;\nlet b = 2;") {
+            chat.apply(&e);
+        }
         assert!(code_rows(&chat).is_empty());
     }
 
@@ -2878,7 +2869,9 @@ mod tests {
             .map(|n| format!("line{n}();"))
             .collect::<Vec<_>>()
             .join("\n");
-        chat.apply(&cell(2, &source));
+        for e in cell(2, &source) {
+            chat.apply(&e);
+        }
 
         let rows = code_rows(&chat);
         assert_eq!(
@@ -2897,7 +2890,9 @@ mod tests {
         let mut chat = ChatState::new();
         chat.apply(&agent_event());
         chat.set_show_cells(true);
-        chat.apply(&cell(2, "tell(\"hi\");\ndone();\n"));
+        for e in cell(2, "tell(\"hi\");\ndone();\n") {
+            chat.apply(&e);
+        }
         assert_eq!(code_rows(&chat), vec!["tell(\"hi\");", "done();"]);
     }
 
@@ -2911,7 +2906,9 @@ mod tests {
             .map(|n| format!("line{n}();"))
             .collect::<Vec<_>>()
             .join("\n");
-        chat.apply(&cell(2, &source));
+        for e in cell(2, &source) {
+            chat.apply(&e);
+        }
         chat.toggle_cell(EventId::new(2));
         assert!(chat.cell_expanded(EventId::new(2)));
         assert_eq!(code_rows(&chat).len(), 8, "every line, no count row");
@@ -2933,8 +2930,12 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("\n")
         };
-        chat.apply(&cell(2, &long("a")));
-        chat.apply(&cell(3, &long("b")));
+        for e in cell(2, &long("a")) {
+            chat.apply(&e);
+        }
+        for e in cell(3, &long("b")) {
+            chat.apply(&e);
+        }
 
         // Both collapsed: five lines and a count each.
         assert_eq!(code_rows(&chat).len(), 2 * (CELL_COLLAPSED_LINES + 1));
@@ -2959,8 +2960,12 @@ mod tests {
         let mut chat = ChatState::new();
         chat.apply(&agent_event());
         chat.set_show_cells(true);
-        chat.apply(&cell(2, "first();"));
-        chat.apply(&cell(3, "second();"));
+        for e in cell(2, "first();") {
+            chat.apply(&e);
+        }
+        for e in cell(3, "second();") {
+            chat.apply(&e);
+        }
         let owners: Vec<(String, RowDetail)> = chat
             .rows(None, 80)
             .into_iter()
@@ -2982,7 +2987,9 @@ mod tests {
         let mut chat = ChatState::new();
         chat.apply(&agent_event());
         chat.set_show_cells(true);
-        chat.apply(&cell(2, "   \n\n"));
+        for e in cell(2, "   \n\n") {
+            chat.apply(&e);
+        }
         assert!(code_rows(&chat).is_empty());
     }
 }

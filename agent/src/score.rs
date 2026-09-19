@@ -47,7 +47,7 @@
 //! program that never calls `tell()` is a no-op the log will otherwise
 //! report as a clean completion.
 
-use crate::types::{Author, Call, Cause, Event, EventPayload, Message, Tree};
+use crate::types::{Call, Event, EventPayload, Tree};
 
 /// One finished log, reduced to the numbers a change is argued from.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -203,52 +203,39 @@ pub fn score(tree: &Tree) -> Score {
     for e in &events {
         let ms = e.timestamp.as_millisecond();
         match &e.payload {
-            EventPayload::Message(Message::Turn {
-                author: Author::Agent(_),
-                source,
-                thinking,
-                usage,
-            }) => {
+            // **One reply, one round trip** (28). It used to be one
+            // per agent-authored `Turn`, filtered to exclude the user's
+            // restarts — a distinction the log now makes by kind, so it
+            // cannot be miscounted by a field being set wrong.
+            EventPayload::Reply => {
                 turns += 1;
-                s.source_bytes += source.len();
-                s.thinking_bytes += thinking.as_ref().map_or(0, |t| t.len());
-                if let Some(u) = usage {
-                    s.prompt_in += u.prompt;
-                    s.cached_in += u.cached;
-                    s.completion_out += u.completion;
-                    s.reasoning_out += u.reasoning;
-                }
-                // The document as it stood when *this* program was
-                // asked for: the spine ending at the event before it.
+                // The document as it stood when *this* reply was asked
+                // for: the spine ending at the event before it.
                 if let Some(parent) = e.parent_id {
                     let spine = tree.spine_at(parent);
                     let doc =
                         crate::document::render(tree, &spine, crate::host::DEFAULT_DOCUMENT_BUDGET);
                     s.prompt_bytes += doc.messages.iter().map(|m| m.content.len()).sum::<usize>();
                 }
-                s.program_lengths.push(interp::count_statements(source));
-                // The gap before a reply's *first* `Turn` is the
-                // completion that produced it. A later cell's `Turn`
-                // charges nothing: it was generated inside that same
-                // wait, which is what D11 bought.
                 if !turn_since_outcome && let Some(prev) = last_outcome_ms {
                     s.provider_ms += ms - prev;
                 }
                 turn_since_outcome = true;
             }
-            EventPayload::Completion {
-                usage, thinking, ..
-            } => {
+            EventPayload::Part { part, .. } => match part {
+                crate::types::Part::Thinking(t) => s.thinking_bytes += t.len(),
+                crate::types::Part::Cell(t) => {
+                    s.source_bytes += t.len();
+                    s.program_lengths.push(interp::count_statements(t));
+                }
+                crate::types::Part::Prose(_) => {}
+            },
+            EventPayload::ReplyEnd { usage, .. } => {
                 completions += 1;
                 s.prompt_in += usage.prompt;
                 s.cached_in += usage.cached;
                 s.completion_out += usage.completion;
                 s.reasoning_out += usage.reasoning;
-                // Counted here as well as off `Message::Turn`, because
-                // under `Transport::Notebook` that is where the
-                // reasoning lives — a reply's `Turn`s are its cells and
-                // are all written before the completion ends.
-                s.thinking_bytes += thinking.as_ref().map_or(0, |t| t.len());
             }
             EventPayload::Call(Call::Invoke { .. }) => s.tool_calls += 1,
             EventPayload::Call(Call::Send {
@@ -276,42 +263,35 @@ pub fn score(tree: &Tree) -> Score {
                 }
             }
             EventPayload::Note { .. } => s.notes += 1,
-            EventPayload::Return { .. } => {
+            EventPayload::Handback { how, .. } => {
                 last_outcome_ms = Some(ms);
                 turn_since_outcome = false;
-                if open_scopes > 0 {
-                    open_scopes -= 1;
+                if how.is_terminal() && open_scopes > 0 {
                     s.resumes += 1;
                 }
-            }
-            EventPayload::Condition {
-                cause, disposition, ..
-            } => {
-                last_outcome_ms = Some(ms);
-                turn_since_outcome = false;
-                match cause {
+                match how {
                     // Every raise is a question the program comes back
                     // from now. `handovers` counted `next_program`,
                     // which `return` replaced in 27.1 and which is gone;
                     // a handover is a `Return` the next program reads,
                     // and `programs` already counts those.
-                    Cause::Raised { .. } => s.raises += 1,
-                    Cause::Trapped { kind, message, .. } => {
+                    crate::types::Handback::Raised { .. } => s.raises += 1,
+                    crate::types::Handback::Trapped { kind, message, .. } => {
                         s.traps += 1;
                         let line = format!("{kind}: {message}");
                         if !s.trap_messages.contains(&line) {
                             s.trap_messages.push(line);
                         }
                     }
-                    Cause::Abandoned => s.abandons += 1,
-                    Cause::CompileFailed { message } => {
+                    crate::types::Handback::Abandoned => s.abandons += 1,
+                    crate::types::Handback::CellFailed { message } => {
                         s.compile_failures.push(message.clone());
                     }
                     _ => {}
                 }
-                if matches!(cause, Cause::Abandoned) {
+                if how.is_terminal() {
                     open_scopes = open_scopes.saturating_sub(1);
-                } else if *disposition == crate::types::Disposition::Pushed {
+                } else {
                     open_scopes += 1;
                 }
             }

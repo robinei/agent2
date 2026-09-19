@@ -75,18 +75,41 @@ pub enum EventPayload {
         usage: crate::host::Usage,
     },
 
+    /// **The conversation is full and a compaction was asked for**
+    /// (28). Parent: the owning agent's spine. Renders to chat: no — the
+    /// directive rides the ephemeral request tail, because an expired
+    /// one left in the history reads as a standing instruction and was
+    /// obeyed twice.
+    ///
+    /// It was `Cause::Compaction`, which made it a *condition*: a
+    /// post-mortem of a program that stopped. Nothing stopped. This is a
+    /// thing the harness did, and counting the attempts — which is all
+    /// anyone reads it for — is not a reason to call it something it is
+    /// not.
+    Compaction { rendered: usize, budget: usize },
+
     /// **A person hands the branch one cell** (28.A) — the `e`, `v` and
     /// answer gestures, `SessionCommand::Restart`. Parent: the owning
     /// agent's spine. Renders to chat: as an assistant message, fenced.
     ///
-    /// Not a `Reply`, because none of the completion vocabulary applies:
-    /// it does not stream, cannot be truncated, has no usage and no
-    /// reasoning. Modelling it as a reply with an author is what let the
-    /// two be confused — and they were, until 2026-09-19.
-    Restart { source: String },
+    /// Not a `Reply`, because none of the completion vocabulary
+    /// applies: it does not stream, cannot be truncated, has no usage
+    /// and no reasoning. Modelling it as a reply with an *author* is
+    /// what let the two be confused — and they were, until 2026-09-19.
+    ///
+    /// It carries no source. What the person handed over arrives as
+    /// `Part`s exactly as a model's reply does, so everything that reads
+    /// a reply reads this the same way; the only thing this variant says
+    /// is who wrote it.
+    Restart,
 
     /// **The reply paused, or ended** (28.A). Parent: the owning agent's
     /// spine. Renders to chat: as the harness's report.
+    ///
+    /// Effects — `Call`, `Result`, `Note`, `Answer`, `Console` — carry no
+    /// reply of their own, because a report is delimited *handback to
+    /// handback*: each shows the rows since the previous one, which puts
+    /// a resumed tail's rows in the right report with nothing stored.
     ///
     /// A reply hands back **N times and ends once**, which
     /// `Cause`'s own doc said and the type contradicted by calling them
@@ -107,80 +130,7 @@ pub enum EventPayload {
     /// its `source` the bare program the model ran; the harness's report
     /// on what that program did comes back as a `Post` from
     /// `Author::Harness`, not as a distinguished reply kind of its own.
-    Message(Message),
-
-    /// **What one completion cost**, as the provider counted it.
-    /// Parent: the owning agent's spine. Renders to chat: no — it is
-    /// accounting, not conversation.
-    ///
-    /// Logged once per completion, when the provider reports the
-    /// figure, and only where [`Message::Turn`]'s own `usage` cannot
-    /// carry it. Under `Transport::Program` it still does, because
-    /// there is one `Turn` per completion and it is written when the
-    /// completion lands.
-    ///
-    /// **Under `Transport::Notebook` it cannot** (`docs/25_NOTEBOOK.md`
-    /// D15). A reply is N `Turn`s, one per cell, and each is logged
-    /// *before its cell runs* — which is while the completion is still
-    /// streaming. By the time the provider says what the completion
-    /// cost, every `Turn` that could have carried it is already on an
-    /// append-only log. So the figure is logged on its own instead, at
-    /// the moment it arrives.
-    ///
-    /// This is the one place D1's "the log schema does not change"
-    /// stopped holding, and it stopped holding because D15 changed when
-    /// a `Turn` is written, not because of anything D1 got wrong.
-    ///
-    /// **Exactly one per completion**, which is what makes it countable:
-    /// `score.rs` reads `programs` off these where they exist, because
-    /// under this transport a `Turn` is a *cell* and counting cells
-    /// would report a three-cell reply as three turns of drift.
-    Completion {
-        usage: crate::host::Usage,
-        /// **The completion verbatim**, exactly as the provider sent it.
-        ///
-        /// This is what the model is shown as its own past turn, and
-        /// that is the whole reason it is stored. A reply under
-        /// `Transport::Notebook` is prose and fenced code together; its
-        /// cells reach the log as `Turn`s holding bare JavaScript, and
-        /// its prose as `Send`s. Rendering a turn *back* from those
-        /// pieces showed the model a series of bare programs — its
-        /// context teaching it the opposite of the card that had just
-        /// told it to write markdown.
-        ///
-        /// D1 said the reply was "recoverable in content and order, but
-        /// not byte-for-byte... Nothing downstream needs them". The last
-        /// clause was false: the model downstream needs them, because
-        /// what it is shown as its own past turn is what it imitates.
-        /// So the bytes are kept, and the renderer replays them rather
-        /// than reassembling anything.
-        ///
-        /// Empty under `Transport::Program`, where `Message::Turn.source`
-        /// already *is* the completion and nothing is lost.
-        #[serde(default, skip_serializing_if = "String::is_empty")]
-        text: String,
-        /// **What the model reasoned before writing the reply**, when the
-        /// provider returns it (`reasoning_content`).
-        ///
-        /// Here for the same reason `usage` is: it belongs to the
-        /// *completion*, and under `Transport::Notebook` there is no
-        /// `Turn` left to carry it. Every cell `Turn` is written before
-        /// its cell runs — while the completion is still streaming — so by
-        /// the time the reasoning has finished arriving they are all on an
-        /// append-only log.
-        ///
-        /// Dropping it was not cosmetic. `score.rs` reads `thinking_bytes`
-        /// off this, and a run that reasoned for 55KB reported 0.0 —
-        /// which reads as "the model did not think" rather than "the
-        /// harness did not keep it", and invalidated a 56-run comparison.
-        ///
-        /// Never sent back to the provider (`host/deepseek.rs`: DeepSeek
-        /// requires `reasoning_content` to be excluded from the next
-        /// turn's context), so this is for the log, the metrics and the
-        /// reader — not for the document.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        thinking: Option<String>,
-    },
+    Post { from: Author, origin: Origin },
 
     /// Chat event. Parent: the previous event on the owning agent's
     /// spine. Renders to chat: yes — as a marker in the branch's own
@@ -302,53 +252,6 @@ pub enum EventPayload {
     /// `Result`. Renders to chat: no.
     Result { call: EventId, outcome: Outcome },
 
-    /// Run event; the program finished, and this is its `return` value.
-    /// Parent: the owning branch's spine. Renders to chat: no — an
-    /// id-addressable artifact like any tool result; the completion
-    /// report is *rendered around* it.
-    ///
-    /// `Return` settles nothing and has no `call`: it is the program's own
-    /// output, flowing **into** its branch's LLM rather than back from a
-    /// call. A program that ends without a `return` still logs
-    /// `Return { value: null }`, so "completed ⇒ `Return`" holds without
-    /// exception — which is what makes recovery decidable from the log
-    /// alone.
-    Return { value: serde_json::Value },
-
-    /// Run event; **everything else** a handback can be — a raise, a
-    /// trapped error, an arriving post, a compile failure, a truncated
-    /// completion, an interruption. Parent: the owning branch's spine.
-    /// Renders to chat: no — its *report* is rendered from it.
-    ///
-    /// Exactly one outcome per handback (not per run): a single program
-    /// may raise, be resumed, trap, be resumed again and finally return,
-    /// and each handback logs its own outcome.
-    ///
-    /// It carries `site` and `stack` because those were the last inputs
-    /// that lived only in the VM, and the VM is never persisted. With them
-    /// logged, **nothing the model ever saw depends on state outside the
-    /// log.**
-    Condition {
-        cause: Cause,
-        /// Where the program stopped: a source byte offset, for the
-        /// line-and-caret diagnostic. `0` when no program ran.
-        site: u32,
-        /// The VM call-stack chain, outermost first.
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        stack: Vec<String>,
-        /// Whether this raise **pushed a handler frame** onto the stack,
-        /// or was a **handover** — the raising frame had nothing left to
-        /// do but forward the decision, so no frame was pushed.
-        ///
-        /// Load-bearing for replay's derived depth counter: a `Pushed`
-        /// condition increments it, a `Handover` does not, and if the log
-        /// doesn't say which happened, every subsequent depth is wrong —
-        /// and with it the document's `depth > 0` filter and the
-        /// decision/completion reading of `Return`.
-        #[serde(default)]
-        disposition: Disposition,
-    },
-
     /// This branch is called this from here on. Parent: the owning
     /// branch's spine. Renders to chat: **no** — a `Rename` is a record,
     /// so renaming a branch never wakes it (the driving rule counts only
@@ -415,83 +318,20 @@ pub enum EventPayload {
     Console { lines: Vec<String> },
 }
 
-/// Why a run handed back. Lisp's word on purpose: there, `condition` is
-/// the supertype and `error` a subtype, so a condition need not be an
-/// error — which is exactly the claim that a raise, a trapped error and a
-/// user interrupt are rows of one table.
-///
-/// **Only handbacks log one.** A condition the program itself handles —
-/// a caught throw, a failed call it recovered from, a fuel slice — never
-/// reaches the LLM and is not one of these.
+/// A message that landed on this branch, with its body materialised.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-pub enum Cause {
-    /// `raise(name, payload)` — the program asked for a decision.
-    Raised {
-        name: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        payload: Option<serde_json::Value>,
-    },
-    /// The rolling document outgrew its budget, so the next completion
-    /// is asked to shrink it before the work goes on.
-    ///
-    /// Harness-raised, like [`Cause::Truncated`]: no program asked for
-    /// this and none is suspended under it in the usual sense — the
-    /// branch was idle and about to be prompted. It is a `Condition`
-    /// rather than a special prompt because the answer is a *program*,
-    /// written by the model, calling `remove_history`/`rewrite_history`
-    /// — which is exactly what a condition is for, and it means
-    /// compaction inherits the one-shot handler rendering, the `Pushed`
-    /// scope, and the resume accounting already built for `raise()`
-    /// rather than needing a second mechanism beside them.
-    ///
-    /// `rendered` and `budget` are the two numbers the handler needs to
-    /// know how much to cut, and they are logged rather than recomputed
-    /// so a report reads the same on replay as it did live.
-    Compaction { rendered: usize, budget: usize },
-    /// A trapped VM error. `resumable` is whether `resume(value)` can
-    /// stand in for the failed operation, which the report must state and
-    /// which only the live error knew.
-    Trapped {
-        kind: String,
-        message: String,
-        resumable: bool,
-    },
-    /// Posts arrived at a running program; it suspended at its next fuel
-    /// slice so the branch could hear them (rule B).
-    Posted { ids: Vec<EventId> },
-    /// The program did not compile. No VM was built, so this run has no
-    /// console and no artifacts — the repair loop.
-    CompileFailed { message: String },
-    /// A completion that hit `max_tokens` mid-program. **Never compile a
-    /// truncated completion** — cut off wherever the token budget ran
-    /// out, it may still parse and run, half-written, on a program the
-    /// model never actually finished emitting, which is strictly worse
-    /// than a clean compile failure the repair loop can see and retry.
-    /// The harness detects this from the completion itself, before
-    /// attempting to compile, and logs it directly rather than letting
-    /// truncated text reach the compiler at all.
-    Truncated,
-    /// The process died mid-program and the VM went with it. Written by
-    /// reconciliation so an interrupted run has an outcome like any other.
-    Interrupted,
-    /// A handler decided `return abandon()`: the suspended run is
-    /// discarded rather than continued. In-flight calls it issued stay
-    /// pending and still land as artifacts; only the VM is dropped.
-    ///
-    /// This exists because **a run must have exactly one log-visible
-    /// terminal, or nothing downstream can be derived from the log
-    /// alone.** `Return`'s doc states the rule for the completing case
-    /// ("a program that ends without a `return` still logs `Return {
-    /// value: null }`"); abandonment is the other way a run ends, and
-    /// before this it logged nothing at all — so a branch that abandoned
-    /// read, forever after, as still suspended.
-    ///
-    /// It settles exactly one frame, the same as `Return`: the frame
-    /// that decided. `depth_after` pops on it for that reason, and must
-    /// pop regardless of the condition's own `disposition` — the
-    /// disposition describes the raise that *opened* a scope, while this
-    /// cause describes a decision that *closes* one.
-    Abandoned,
+pub struct Post {
+    pub from: Author,
+    pub origin: Origin,
+}
+
+impl Post {
+    /// The words themselves, when the body is inline. Empty while it is
+    /// still by-reference (`Origin::Sent`) — resolve it through the
+    /// `Tree` first, which is what `replay_event` does.
+    pub fn text(&self) -> &str {
+        self.origin.direct().map(|(t, _, _)| t).unwrap_or("")
+    }
 }
 
 /// One piece of a reply, exactly as it arrived (28.A).
@@ -567,78 +407,7 @@ impl Handback {
     }
 }
 
-/// Whether a raise pushed a handler frame onto the stack, or handed the
-/// decision to a frame already vacated. See `EventPayload::Condition`.
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Disposition {
-    /// The raising program is still on the stack, suspended, waiting on
-    /// the handler's decision — ordinary deliberation. The handler
-    /// pushes, decides, and pops; the raising program resumes beneath it.
-    Pushed,
-    /// The raising program had nothing left to do but forward the
-    /// decision (a tail raise: `await raise(...)` with nothing done with
-    /// the result, nothing left but the epilogue). Its VM is popped
-    /// *before* the handler's is built, not stacked below it — a real
-    /// tail call, not merely tail-shaped — so no frame is pushed and the
-    /// handler **is** the continuation.
-    Handover,
-}
 
-impl Default for Disposition {
-    /// `Pushed` is the safe default for logs written before this field
-    /// existed: every one of them predates the handover mechanism, so
-    /// every raise in them really was deliberation. Defaulting the other
-    /// way would silently un-count a frame the depth counter is relying
-    /// on, turning an old log's `depth > 0` filter and decision reads
-    /// wrong; defaulting to `Pushed` only ever costs an unnecessary
-    /// nesting level in a render, never a miscounted depth.
-    fn default() -> Self {
-        Disposition::Pushed
-    }
-}
-
-/// The rendered kinds — one per API role, chosen by the **variant**,
-/// never by a flag.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-pub enum Message {
-    /// A message delivered *here* (user role). Parent: the previous event
-    /// on the receiving branch's spine.
-    ///
-    /// **A `Post` is a delivery marker, not a copy.** The new fact it
-    /// records is that this message landed here, at this position in this
-    /// branch's transcript; where its body lives is `origin`.
-    Post { from: Author, origin: Origin },
-
-    /// This context's own output (assistant role). Parent: the previous
-    /// event on the branch's spine. `author` is the LLM, or the user
-    /// taking a turn on this branch — it renders as an assistant message
-    /// either way, because the *branch* acted.
-    ///
-    /// Under code mode the assistant's entire turn **is** a program:
-    /// `source` holds the complete JavaScript text the model emitted —
-    /// there is no separate prose channel and no tool-call wrapper around
-    /// it. A program that wants to speak calls `tell()`/`ask()` from
-    /// inside itself (`Call::Send`); it never returns prose alongside a
-    /// list of calls, because there is no second channel for the prose to
-    /// live in. A user-authored restart is the same shape: `source` is
-    /// either hand-typed text (the `e` gesture) or a synthesized
-    /// `resume(...)`/`answer(...)` call (`v` and the answer gesture) —
-    /// what's shown in the pane is exactly what ran. A compacted program
-    /// still lands here as a comment-only `source`, which is what keeps
-    /// role alternation intact under compaction with no special case.
-    Turn {
-        author: Author,
-        source: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        thinking: Option<String>,
-        /// What this completion cost, as the provider counted it —
-        /// absent on a turn nobody was billed for (a scripted client,
-        /// a user's own turn) and on logs written before it was
-        /// recorded.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        usage: Option<crate::host::Usage>,
-    },
-}
 
 /// Who authored a message. The user is an author, not an agent: they have
 /// no branch of their own and speak *inside* branches.
@@ -703,19 +472,6 @@ impl Origin {
     }
 }
 
-impl Message {
-    /// The message's own text: a `Turn`'s program `source`, or a `Post`
-    /// whose body is inline (`Origin::Direct`). A `Post` whose body is
-    /// still by-reference (`Origin::Sent`) has none — resolve it through
-    /// the `Tree` first, which is what `replay_event` does when building
-    /// a `Context`.
-    pub fn text(&self) -> &str {
-        match self {
-            Message::Turn { source, .. } => source,
-            Message::Post { origin, .. } => origin.direct().map(|(t, _, _)| t).unwrap_or(""),
-        }
-    }
-}
 
 /// What a program's branch waits on. Four **typed** kinds, not one
 /// `Invoke` with a magic `name`: from a program's view they are all
@@ -924,7 +680,12 @@ pub struct Context {
     /// The worked examples snapshotted alongside it — the rest of the
     /// immutable prefix (`EventPayload::Agent.exemplars`).
     pub exemplars: Vec<Exemplar>,
-    pub messages: Vec<Message>,
+    /// Every post that landed on this branch, bodies materialised.
+    ///
+    /// It was `Vec<Message>` when a `Message` could also be a `Turn`.
+    /// Only posts were ever pushed — a turn is the branch's own reply,
+    /// not something said to it — so the element type says so now.
+    pub messages: Vec<Post>,
     /// Posts open on this branch, oldest first: unanswered, expecting a
     /// reply, and at or after this branch's root. **Agents never close** —
     /// a branch that has answered is `Idle`, not done — so this is what
@@ -948,31 +709,25 @@ impl Context {
         let Some(&question) = self.open.first() else {
             return serde_json::Value::Null;
         };
-        let Some(EventPayload::Message(msg)) = tree.events.get(&question).map(|e| &e.payload)
+        let Some(EventPayload::Post { origin, .. }) = tree.events.get(&question).map(|e| &e.payload)
         else {
             return serde_json::Value::Null;
         };
-        match tree.resolve(msg) {
-            Message::Post { origin, .. } => origin
-                .direct()
-                .map(|(_, input, _)| input.clone())
-                .unwrap_or(serde_json::Value::Null),
-            _ => serde_json::Value::Null,
-        }
+        tree.resolve(origin)
+            .direct()
+            .map(|(_, input, _)| input.clone())
+            .unwrap_or(serde_json::Value::Null)
     }
 
     /// The options a still-open post offered, when it came from a
     /// `choose` — empty for every `ask`. What `answer(question, …)` is
     /// held to, and what a recipient reads off the rendered post.
     pub fn options(tree: &Tree, question: EventId) -> Vec<String> {
-        let Some(EventPayload::Message(msg)) = tree.events.get(&question).map(|e| &e.payload)
+        let Some(EventPayload::Post { origin, .. }) = tree.events.get(&question).map(|e| &e.payload)
         else {
             return Vec::new();
         };
-        match tree.resolve(msg) {
-            Message::Post { origin, .. } => origin.options().to_vec(),
-            _ => Vec::new(),
-        }
+        tree.resolve(origin).options().to_vec()
     }
 }
 

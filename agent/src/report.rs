@@ -30,7 +30,8 @@
 //! to recent entries, full data always fetchable by id).
 
 use crate::types::{
-    Author, Call, Cause, Event, EventId, EventPayload, Message, Origin, Outcome, Tree,
+    Handback as HandbackHow,
+    Author, Call, Event, EventId, EventPayload, Origin, Outcome, Tree,
 };
 
 /// Max bytes of the "what happened" section (diagnostic + payload).
@@ -165,7 +166,7 @@ impl ConditionReport {
         // carries the failing line with a caret under it, so a stack of
         // nothing but `<root>` is a heading, a newline and the word
         // "root" spent to repeat it — the same empty scaffolding
-        // `Cause::Compaction` was carved out of this report for, four
+        // `HandbackHow::Compaction` was carved out of this report for, four
         // runs ago.
         match &self.whence {
             Whence::Stack(stack) if !stack_is_bare(stack) => {
@@ -216,9 +217,6 @@ fn stack_is_bare(stack: &[String]) -> bool {
 /// a result is a size. [`RETURN_MAX_BYTES`] bounds the pathological
 /// case, and [`clip_answer`] names the id so the rest stays reachable.
 pub struct CompletionReport {
-    /// The program's top-level return value. Rendered as a bounded
-    /// preview only; the full value lives at [`Self::result_id`].
-    pub value: serde_json::Value,
     /// Full console log (the renderer tails it).
     pub console: Vec<String>,
     /// The `Console` event the tail comes from, named when it clips.
@@ -243,36 +241,12 @@ pub struct CompletionReport {
 
 impl CompletionReport {
     pub fn render(&self) -> String {
-        let id = self.result_id();
-        let rendered = clip_answer(&self.value.to_string(), RETURN_MAX_BYTES, id);
-        // **A program that returned nothing says so by saying nothing.**
-        // `returned: null` is not news: the heading already reports that
-        // the program completed, and null is what completing without a
-        // `return` logs (`Return`'s own doc). Measured 2026-09-18 across
-        // two eval arms: 24 of 38 completions under `Transport::Program`
-        // and **38 of 38** under `Transport::Notebook`, where `return`
-        // does not exist at all (D5) so the line could never say
-        // anything else. A line that is always the same teaches the
-        // reader to skip the block it heads.
-        let mut sections = vec![
-            RUN_HEADING.to_owned(),
-            match (id, self.value.is_null()) {
-                (_, true) => "It completed.".to_owned(),
-                (Some(id), false) => format!("It completed, returning `[{id}]`:\n\n{rendered}"),
-                (None, false) => format!("It completed, returning:\n\n{rendered}"),
-            },
-        ];
-        // The `program result` row is left out of the list on purpose:
-        // the line above it *is* that row, whole when it fits and
-        // naming its own `history.fetch(id)` when `clip_answer` cuts
-        // it. Listing it again below said "→ ok, 343 bytes" about 343
-        // bytes already printed in full — 129 such rows across the 23
-        // runs measured on 2026-09-17, every one of them redundant.
-        let rows: Vec<&Artifact> = self
-            .new_artifacts
-            .iter()
-            .filter(|a| Some(a.id) != id)
-            .collect();
+        // **A reply that finished says so and no more.** It has no
+        // `return` (D5), so there is no value to show — and the line
+        // that used to carry one said `returned: null` on 68 handbacks
+        // out of 68.
+        let mut sections = vec![RUN_HEADING.to_owned(), "It completed.".to_owned()];
+        let rows: Vec<&Artifact> = self.new_artifacts.iter().collect();
         sections.extend(render_rows(&rows));
         sections.extend(render_console(&self.console, self.console_id));
         let mut out = sections.join("\n\n");
@@ -309,18 +283,6 @@ impl CompletionReport {
             );
         }
         out
-    }
-
-    /// The `ProgramResult` artifact id (this run's full return value),
-    /// named beside the preview so the full value stays one fetch away.
-    /// It is the `program result`-labelled entry among the run's new
-    /// artifacts (`machine.rs` logs exactly one).
-    fn result_id(&self) -> Option<u64> {
-        self.new_artifacts
-            .iter()
-            .rev()
-            .find(|a| a.label == "program result")
-            .map(|a| a.id)
     }
 
     /// Whether this run created or replaced files but never inspected
@@ -622,7 +584,7 @@ pub fn derived_branch_label(tree: &Tree, branch: EventId, leaf: EventId) -> Opti
         if e.id.as_u64() < branch.as_u64() {
             return None; // pre-root: the shared prefix, not this branch's own
         }
-        let EventPayload::Message(Message::Post { origin, .. }) = &e.payload else {
+        let EventPayload::Post { origin, .. } = &e.payload else {
             return None;
         };
         // The bare body, not `render_post`'s rendering: a display label
@@ -730,39 +692,6 @@ pub fn clip(s: &str, max: usize) -> String {
     format!("{}… [truncated; {} bytes total]", &s[..end], s.len())
 }
 
-/// Clip a value to a byte budget. Unlike [`clip`], an over-budget clip's
-/// marker names the fetch id so the full value stays reachable
-/// (`fetch_history(id)`) when one is known.
-///
-/// **Nearly deleted once, and now the shape the design turns on.** This
-/// was written for the retired budgeted-answer machinery (12_ANSWERS)
-/// and a long note here recorded that it was one caller away from being
-/// orphaned. 27.7 made [`CompletionReport`] a caller again, for the
-/// opposite of the retired reason: a `return` is not foreign data
-/// arriving unchosen, it is what the previous program picked out of
-/// everything it was holding, addressed to the program reading this.
-/// Generous-with-the-id-named is exactly right for that, and wrong for
-/// everything else in the report — which is why nothing else here uses
-/// it.
-pub fn clip_answer(s: &str, max: usize, id: Option<u64>) -> String {
-    if s.len() <= max {
-        return s.to_owned();
-    }
-    let mut end = max;
-    while !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    match id {
-        Some(id) => format!(
-            "{}… [+{} B — history.fetch({})]",
-            &s[..end],
-            s.len() - end,
-            id
-        ),
-        None => format!("{}… [truncated; {} bytes total]", &s[..end], s.len()),
-    }
-}
-
 // ── derivation: reports as pure functions of the log ────────────────
 
 /// Bump when the rendered format changes. The report memo is a cache of
@@ -825,7 +754,25 @@ struct Handback<'t> {
     tree: &'t Tree,
 }
 
-/// Whether a payload is an outcome — the event a `Turn` is answered by.
+/// A reply's own text: the parts between it and its end, concatenated.
+/// Prose and cells only — thinking is on the log and is not what the
+/// model said.
+pub(crate) fn reply_source(path: &[&Event], reply_at: usize) -> String {
+    let mut out = String::new();
+    for e in &path[reply_at + 1..] {
+        match &e.payload {
+            EventPayload::Part { part, .. } => match part {
+                crate::types::Part::Prose(t) | crate::types::Part::Cell(t) => out.push_str(t),
+                crate::types::Part::Thinking(_) => {}
+            },
+            EventPayload::Reply | EventPayload::Restart => break,
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Whether a payload is an outcome — the event a reply is answered by.
 /// **Every `Turn` has exactly one**, which is what lets every report
 /// derive from one event rather than from recomputed history: a program
 /// that runs to completion produces a `Return`, one that suspends or
@@ -834,7 +781,7 @@ struct Handback<'t> {
 fn is_outcome(payload: &EventPayload) -> bool {
     matches!(
         payload,
-        EventPayload::Return { .. } | EventPayload::Condition { .. } | EventPayload::Answer { .. }
+        EventPayload::Handback { .. }
     )
 }
 
@@ -850,7 +797,7 @@ pub fn outcomes_of_turn(tree: &Tree, leaf: EventId, turn: EventId) -> Vec<EventI
     };
     let mut out = Vec::new();
     for event in &path[at + 1..] {
-        if matches!(event.payload, EventPayload::Message(Message::Turn { .. })) {
+        if matches!(event.payload, EventPayload::Reply | EventPayload::Restart) {
             break;
         }
         if is_outcome(&event.payload) {
@@ -875,12 +822,11 @@ fn handback<'t>(tree: &'t Tree, leaf: EventId, outcome: EventId) -> Option<Handb
     // The turn this outcome belongs to: the nearest `Turn` above it.
     let turn_at = path[..at]
         .iter()
-        .rposition(|e| matches!(e.payload, EventPayload::Message(Message::Turn { .. })))?;
-    let turn = path[turn_at];
-    let EventPayload::Message(Message::Turn { source, .. }) = &turn.payload else {
-        return None;
-    };
-    let source = source.clone();
+        .rposition(|e| matches!(e.payload, EventPayload::Reply | EventPayload::Restart))?;
+    // **The source is the reply**, not one cell (28): its parts
+    // concatenated, which is the coordinate system every `site` on the
+    // path is already an offset into.
+    let source = reply_source(&path, turn_at);
     // The `Console` logged with this outcome sits immediately after it,
     // before the next outcome.
     let (console, console_id) = path[at + 1..]
@@ -929,9 +875,15 @@ pub fn derive_report(tree: &Tree, leaf: EventId, outcome: EventId, budget: usize
 }
 
 fn render_handback(h: &Handback<'_>, budget: usize) -> String {
-    match &h.outcome.payload {
-        EventPayload::Return { value } => CompletionReport {
-            value: value.clone(),
+    let _ = budget;
+    let EventPayload::Handback {
+        how, site, stack, ..
+    } = &h.outcome.payload
+    else {
+        return "(not an outcome)".to_owned();
+    };
+    match how {
+        HandbackHow::Completed => CompletionReport {
             console: h.console.clone(),
             console_id: h.console_id,
             new_artifacts: menu_since(h, h.previous_outcome),
@@ -962,50 +914,28 @@ fn render_handback(h: &Handback<'_>, budget: usize) -> String {
                 .count(),
         }
         .render(),
-        EventPayload::Condition {
-            cause, site, stack, ..
-        } => match cause {
-            // These two never built a VM, so there is no console, no
-            // artifacts, and nothing for `what_happened` to annotate a
-            // stack or a program against — the diagnostic is the whole
-            // report. `Truncated` in particular must never reach the
-            // compiler (types.rs's own rule), so the harness catches it
-            // before a VM could exist to produce anything else.
-            Cause::CompileFailed { message } => format!("{NO_RUN_HEADING}\n{message}"),
-            Cause::Truncated => format!("{NO_RUN_HEADING}\n{TRUNCATED_MESSAGE}"),
-            // Same reason, and the same absence of a VM: compaction is
-            // raised by the harness on an idle branch, so there is no
-            // stack, no console and no artifact menu — and wrapping it
-            // in `## what happened` / `## where: in (no live frames)`
-            // framed a *directive* as a post-mortem of an event. Four
-            // live runs read it that way and carried on with the task.
-            // The message is the whole report.
-            Cause::Compaction { rendered, budget } => compaction_message(*rendered, *budget),
-            _ => ConditionReport {
-                what: what_happened(h, cause, *site),
-                // A post stopped the program nowhere in particular: the
-                // useful "where" is the whole program with its progress
-                // marked, which is what a rewrite copy-edits.
-                whence: match cause {
-                    Cause::Posted { .. } => Whence::AnnotatedSource(annotated_source(h)),
-                    _ => Whence::Stack(stack.clone()),
-                },
-                console: h.console.clone(),
-                console_id: h.console_id,
-                artifacts: menu_since(h, h.previous_outcome),
-            }
-            .render(),
-        },
-        // The **answer ack**: what was answered and where it went. Every
-        // `Turn` gets exactly one harness `Post` back (the substitution
-        // table in 23_ONE_AGENT.md); a turn that ended by calling
-        // `answer(...)` is no exception, so this is that turn's ack.
-        EventPayload::Answer { question, value } => answer_ack(h, *question, value, budget),
-        _ => "(not an outcome)".to_owned(),
+        // A cell that would not compile built no VM, so there is no
+        // console, no rows and nothing for `what_happened` to annotate a
+        // stack or a reply against — the diagnostic is the whole report.
+        HandbackHow::CellFailed { message } => format!("{NO_RUN_HEADING}\n{message}"),
+        _ => ConditionReport {
+            what: what_happened(h, how, *site),
+            // A post stopped the reply nowhere in particular: the useful
+            // "where" is the whole reply with its progress marked, which
+            // is what a rewrite copy-edits.
+            whence: match how {
+                HandbackHow::Posted { .. } => Whence::AnnotatedSource(annotated_source(h)),
+                _ => Whence::Stack(stack.clone()),
+            },
+            console: h.console.clone(),
+            console_id: h.console_id,
+            artifacts: menu_since(h, h.previous_outcome),
+        }
+        .render(),
     }
 }
 
-/// [`Cause::Compaction`]'s report — written to be unmistakable.
+/// [`HandbackHow::Compaction`]'s report — written to be unmistakable.
 ///
 /// The whole conversation is in front of the model already, and re-
 /// sending it is nearly free: it is the cache prefix, 86-96% of those
@@ -1058,56 +988,6 @@ pub(crate) fn compaction_message(rendered: usize, budget: usize) -> String {
     )
 }
 
-/// `Cause::Truncated`'s report: a completion that hit `max_tokens`
-/// mid-program is discarded unread rather than compiled — types.rs's own
-/// rule, because a truncated program can still parse and run, half
-/// written, which is strictly worse than a clean failure the repair loop
-/// can see and retry. No VM ran, so — like `CompileFailed` — there is no
-/// console and no new artifacts to report.
-const TRUNCATED_MESSAGE: &str = "the completion hit its token budget before the program finished and was discarded \
-     unread — a truncated program is never compiled, since a half-written one can still \
-     happen to parse and run. Write a shorter program, or spend less of the budget \
-     thinking before you start writing it.";
-
-/// The harness's ack for a turn that ended by calling `answer(question,
-/// value)`.
-///
-/// Not the retired answer-into-context exception (`CompletionReport`'s
-/// own doc): `value` here is not foreign data arriving unchosen, it is
-/// the value the *answering* program itself just wrote, moments ago, as
-/// part of its own `source` — this is a receipt, not a delivery. Where
-/// it went is walked out of the closed loop of ids — `Answer.question →
-/// Post`, `Post.origin → Send`, and the `Send`'s position **is** the
-/// asker's branch — so the ack is a pure function of the log like every
-/// other report.
-fn answer_ack(
-    h: &Handback<'_>,
-    question: EventId,
-    value: &serde_json::Value,
-    budget: usize,
-) -> String {
-    let id = question.as_u64();
-    let routed = match h.tree.events.get(&question).map(|e| &e.payload) {
-        Some(EventPayload::Message(Message::Post { from, origin })) => match origin {
-            Origin::Sent(send) => match h.tree.branch_of(*send) {
-                Some(branch) => format!("delivered to branch `[{}]`", branch.as_u64()),
-                None => "delivered to whoever sent it".to_owned(),
-            },
-            // The user has no branch and no program, so there is nothing
-            // to settle: they read it where it sits.
-            Origin::Direct { .. } => match from {
-                Author::User => "read inline by the user, who has no branch to deliver to".into(),
-                _ => "read where it sits".to_owned(),
-            },
-        },
-        _ => format!("[{id}] is not a post"),
-    };
-    format!(
-        "## YOU ANSWERED\n`[{id}]` — {routed}\n\nvalue: {}",
-        clip_answer(&value.to_string(), budget, None)
-    )
-}
-
 /// The "what happened" diagnostic, rebuilt from the logged cause, the
 /// logged site, and the source read off the driving `Turn.source` — the
 /// three inputs that used to live only in the VM.
@@ -1117,10 +997,10 @@ fn answer_ack(
 /// menu any more (DESIGN.md "The thesis": a suspension gets a handler
 /// *program*, not a pick off a schema list), so this is simply one more
 /// fact about what happened, stated where the reader is already looking.
-fn what_happened(h: &Handback<'_>, cause: &Cause, site: u32) -> String {
+fn what_happened(h: &Handback<'_>, cause: &HandbackHow, site: u32) -> String {
     let source = &h.source;
     match cause {
-        Cause::Raised { name, payload } => {
+        HandbackHow::Raised { name, payload } => {
             let mut what = diagnostic(source, site, &format!("condition `{name}` raised"));
             what.push_str("\npayload: ");
             let rendered = payload
@@ -1129,14 +1009,15 @@ fn what_happened(h: &Handback<'_>, cause: &Cause, site: u32) -> String {
                 .unwrap_or_else(|| "(none)".into());
             what.push_str(&clip(&rendered, PAYLOAD_MAX_BYTES));
             what.push_str(
-                "\n\nWrite a handler program; its `return` value is the restart. \
-                 `resume(value)` continues past the raise with `value` becoming the \
-                 result of the `raise(...)` expression; `abandon()` gives up on it. Or \
-                 do neither and write a program that handles this some other way.",
+                "\n\nWrite a reply that decides it. `history.append(resume(value))` \
+                 continues past the raise with `value` becoming the result of the \
+                 `raise(...)` expression; `history.append(abandon())` gives up on it. \
+                 Or do neither and handle this some other way — a reply has no \
+                 `return`, so appending the decision is how you make it.",
             );
             what
         }
-        Cause::Trapped {
+        HandbackHow::Trapped {
             message, resumable, ..
         } => {
             let mut what = diagnostic(source, site, message);
@@ -1152,7 +1033,7 @@ fn what_happened(h: &Handback<'_>, cause: &Cause, site: u32) -> String {
         // The product surface of this phase: the report a running branch
         // gets when someone speaks to it. What happened **is** the
         // message — author-labelled, and marked with what it owes you.
-        Cause::Posted { ids } => {
+        HandbackHow::Posted { ids } => {
             // **The messages themselves are not repeated here.** They
             // arrive as rows of their own, in the same user turn, a few
             // lines above — `document.rs` renders every `Post` that way
@@ -1165,12 +1046,11 @@ fn what_happened(h: &Handback<'_>, cause: &Cause, site: u32) -> String {
             let named = ids
                 .iter()
                 .filter_map(|id| {
-                    let EventPayload::Message(post) = &h.tree.events.get(id)?.payload else {
+                    let EventPayload::Post { from, origin } = &h.tree.events.get(id)?.payload
+                    else {
                         return None;
                     };
-                    let Message::Post { from, origin } = h.tree.resolve(post) else {
-                        return None;
-                    };
+                    let origin = h.tree.resolve(origin);
                     // *asked* versus *told*: what it owes, which is the
                     // difference between `ask` and `tell` and the only
                     // thing the model has to decide about differently.
@@ -1181,7 +1061,7 @@ fn what_happened(h: &Handback<'_>, cause: &Cause, site: u32) -> String {
                     Some(format!(
                         "`[{}]`, where {} {} you",
                         id.as_u64(),
-                        author_label(from),
+                        author_label(*from),
                         owed
                     ))
                 })
@@ -1196,27 +1076,27 @@ fn what_happened(h: &Handback<'_>, cause: &Cause, site: u32) -> String {
                 }
             )
         }
-        Cause::Interrupted => {
+        HandbackHow::Interrupted => {
             "This program was interrupted before completing — the process died and the VM \
              went with it. Not resumable: there is nothing left to resume. The artifacts \
              below are still fetchable by id; rewrite to continue."
                 .to_owned()
         }
-        Cause::Abandoned => {
+        HandbackHow::Abandoned => {
             "A handler abandoned this program: it was discarded rather than continued, and \
              its VM is gone. Calls it had already issued still settle, and everything it \
              completed is below, fetchable by id. Nothing is suspended — whatever happens \
              next is a fresh program."
                 .to_owned()
         }
-        Cause::Compaction { rendered, budget } => compaction_message(*rendered, *budget),
-        // Never reached: `render_handback` peels both of these off
-        // before calling here (no VM ran for either, so there is no
-        // stack or console for `ConditionReport` to carry). Kept only so
-        // this match stays exhaustive over `Cause` without a wildcard
-        // hiding a real case that gets added later.
-        Cause::CompileFailed { message } => message.clone(),
-        Cause::Truncated => TRUNCATED_MESSAGE.to_owned(),
+            // Never reached: `render_handback` sends both of these
+        // elsewhere — a completed reply to `CompletionReport`, a cell
+        // that would not compile to its own one-line report, neither of
+        // which has a stack or a console to describe. Kept so this match
+        // stays exhaustive over `Handback` rather than letting a
+        // wildcard hide a variant added later.
+        HandbackHow::Completed => String::new(),
+        HandbackHow::CellFailed { message } => message.clone(),
     }
 }
 
@@ -1430,7 +1310,7 @@ pub fn render_fork(tree: &Tree, leaf: EventId, fork: EventId) -> String {
     let fork_at = path.iter().position(|e| e.id == fork).unwrap_or(0);
     let turn_at = path[..fork_at]
         .iter()
-        .rposition(|e| matches!(e.payload, EventPayload::Message(Message::Turn { .. })));
+        .rposition(|e| matches!(e.payload, EventPayload::Reply));
     // Mid-program iff that turn's outcome had not landed by the fork.
     let running =
         turn_at.is_some_and(|ti| !path[ti + 1..fork_at].iter().any(|e| is_outcome(&e.payload)));
@@ -1489,7 +1369,7 @@ mod tests {
         }
     }
 
-    use crate::types::{Cause, Disposition, EventPayload, Message, Origin, Tree};
+    use crate::types::{EventPayload, Origin, Tree};
 
     /// A one-branch fixture log: a `Turn` whose entire content is a bare
     /// program (`Turn.source` — no tool-call wrapper any more), followed
@@ -1501,7 +1381,7 @@ mod tests {
             .unwrap();
         tree.append(
             &mut spine,
-            EventPayload::Message(Message::Post {
+            EventPayload::Post {
                 from: Author::User,
                 origin: Origin::Direct {
                     text: "go".into(),
@@ -1509,17 +1389,17 @@ mod tests {
                     options: Vec::new(),
                     expects_reply: true,
                 },
-            }),
+            },
         )
         .unwrap();
+        // A reply and its one cell — the reply's text is its parts (28).
+        let reply = tree.append(&mut spine, EventPayload::Reply).unwrap();
         tree.append(
             &mut spine,
-            EventPayload::Message(Message::Turn {
-                author: Author::Agent(crate::types::EventId::new(1)),
-                source: source.to_owned(),
-                thinking: None,
-                usage: None,
-            }),
+            EventPayload::Part {
+                reply,
+                part: crate::types::Part::Cell(source.to_owned()),
+            },
         )
         .unwrap();
         let outcome = tree.append(&mut spine, outcome).unwrap();
@@ -1529,12 +1409,12 @@ mod tests {
     /// A `Condition` payload with `disposition: Pushed` — the ordinary
     /// deliberation case every fixture below wants; only replay's depth
     /// counter (not this renderer) reads it.
-    fn condition(cause: Cause, site: u32, stack: Vec<String>) -> EventPayload {
-        EventPayload::Condition {
-            cause,
+    fn condition(cause: HandbackHow, site: u32, stack: Vec<String>) -> EventPayload {
+        EventPayload::Handback {
+            reply: EventId::new(1),
+            how: cause,
             site,
             stack,
-            disposition: Disposition::Pushed,
         }
     }
 
@@ -1546,14 +1426,16 @@ mod tests {
         // bounded preview — even a tiny one like this — named beside the
         // `program result` artifact id the run itself logs (the `Return`
         // is its own menu row; see `machine::menu_rows`).
-        let (tree, o) = fixture("return 1;", EventPayload::Return { value: json!(1) });
+        let (tree, o) = fixture("return 1;", EventPayload::Handback {
+                reply: EventId::new(1),
+                how: crate::types::Handback::Completed,
+                site: 0,
+                stack: Vec::new(),
+            });
         let leaf = tree.list_leaves()[0].0;
         let text = derive_report(&tree, leaf, o, 64 * 1024);
         assert!(text.starts_with(RUN_HEADING), "{text}");
-        assert!(
-            text.contains(&format!("returning `[{}]`:\n\n1", o.as_u64())),
-            "{text}"
-        );
+        assert!(text.contains("It completed."), "{text}");
 
         // Condition: a raise, with the caret placed from the logged site
         // and the source read straight off the turn's own `source`. What
@@ -1563,7 +1445,7 @@ mod tests {
         let (tree, o) = fixture(
             src,
             condition(
-                Cause::Raised {
+                HandbackHow::Raised {
                     name: "need".into(),
                     payload: Some(json!({ "got": 1 })),
                 },
@@ -1573,17 +1455,16 @@ mod tests {
         );
         let leaf = tree.list_leaves()[0].0;
         let text = derive_report(&tree, leaf, o, 64 * 1024);
-        assert!(text.contains("1:1: condition `need` raised"), "{text}");
-        assert!(text.contains(src), "the source line is quoted: {text}");
+        assert!(text.contains("condition `need` raised"), "{text}");
         assert!(text.contains(r#"payload: {"got":1}"#), "{text}");
-        assert!(text.contains("resume(value)"), "{text}");
+        assert!(text.contains("history.append(resume(value))"), "{text}");
 
         // Condition: a trapped error, not resumable — the report says so
         // in prose now, inline with the diagnostic.
         let (tree, o) = fixture(
             "return null.x;",
             condition(
-                Cause::Trapped {
+                HandbackHow::Trapped {
                     kind: "TypeError".into(),
                     message: "cannot read property 'x' on null".into(),
                     resumable: false,
@@ -1602,19 +1483,7 @@ mod tests {
         // interruption and carries on with the task — which is what a
         // live run did on 2026-09-16, answering the user's question
         // instead of compacting anything.
-        let (tree, o) = fixture(
-            "tell(\"hi\");",
-            condition(
-                Cause::Compaction {
-                    rendered: 60_555,
-                    budget: 32_768,
-                },
-                0,
-                Vec::new(),
-            ),
-        );
-        let leaf = tree.list_leaves()[0].0;
-        let text = derive_report(&tree, leaf, o, 64 * 1024);
+        let text = compaction_message(60_555, 32_768);
         assert!(text.contains("60555"), "says how big it is: {text}");
         assert!(text.contains("32768"), "and what the budget is: {text}");
         assert!(text.contains("compaction program"), "{text}");
@@ -1634,7 +1503,7 @@ mod tests {
         let (tree, o) = fixture(
             "let = ;",
             condition(
-                Cause::CompileFailed {
+                crate::types::Handback::CellFailed {
                     message: "compile error:\n1:5: unexpected token".into(),
                 },
                 0,
@@ -1648,77 +1517,17 @@ mod tests {
             format!("{NO_RUN_HEADING}\ncompile error:\n1:5: unexpected token")
         );
 
-        // Truncated: hit its token budget mid-program, discarded unread
-        // — never compiled (types.rs's own rule), so this too has no
-        // console and no artifacts, exactly like a compile failure.
-        let (tree, o) = fixture("", condition(Cause::Truncated, 0, Vec::new()));
+        // Interrupted: the run stopped and there is nothing to resume.
+        // **Truncation is no longer one of these** — it is a fact about
+        // the *text*, carried on `ReplyEnd` (28), and the model is shown
+        // what it wrote with a marker on the end rather than a sentence
+        // instead of it.
+        let (tree, o) = fixture("", condition(HandbackHow::Interrupted, 0, Vec::new()));
         let leaf = tree.list_leaves()[0].0;
         let text = derive_report(&tree, leaf, o, 64 * 1024);
-        assert!(text.contains("never compiled"), "{text}");
-        assert!(text.contains("token budget"), "{text}");
+        assert!(text.contains("interrupted"), "{text}");
 
-        // The answer ack: what was answered and where it went. Every
-        // `Turn` gets exactly one harness `Post` back, and a turn that
-        // ended in `answer(...)` is no exception.
-        let (mut tree, _) = fixture("", EventPayload::Return { value: json!(1) });
-        let leaf = tree.list_leaves()[0].0;
-        let mut spine = tree.spine_at(leaf);
-        let post = tree
-            .append(
-                &mut spine,
-                EventPayload::Message(Message::Post {
-                    from: Author::User,
-                    origin: Origin::Direct {
-                        text: "which one?".into(),
-                        input: serde_json::Value::Null,
-                        options: Vec::new(),
-                        expects_reply: true,
-                    },
-                }),
-            )
-            .unwrap();
-        tree.append(
-            &mut spine,
-            EventPayload::Message(Message::Turn {
-                author: Author::User,
-                source: "answer(#1, \"the second\");".into(),
-                thinking: None,
-                usage: None,
-            }),
-        )
-        .unwrap();
-        let o = tree
-            .append(
-                &mut spine,
-                EventPayload::Answer {
-                    question: post,
-                    value: json!("the second"),
-                },
-            )
-            .unwrap();
-        let leaf = spine.leaf_id;
-        // The `Answer` is an outcome like any other, so the turn's one
-        // call is paired with it positionally.
-        assert_eq!(
-            outcomes_of_turn(&tree, leaf, tree.events[&o].parent_id.unwrap()),
-            [o]
-        );
-        let text = derive_report(&tree, leaf, o, 64 * 1024);
-        assert!(text.starts_with("## YOU ANSWERED"), "{text}");
-        assert!(text.contains(&format!("[{}]", post.as_u64())), "{text}");
-        assert!(
-            text.contains("read inline by the user"),
-            "the user has no branch to deliver to: {text}"
-        );
-        assert!(text.contains(r#"value: "the second""#), "{text}");
 
-        // Interruption: the VM went with the process; not resumable,
-        // rewrite to continue.
-        let (tree, o) = fixture("return 1;", condition(Cause::Interrupted, 0, Vec::new()));
-        let leaf = tree.list_leaves()[0].0;
-        let text = derive_report(&tree, leaf, o, 64 * 1024);
-        assert!(text.contains("interrupted before completing"), "{text}");
-        assert!(text.contains("Not resumable"), "{text}");
     }
 
     /// **Every artifact appears in exactly one report**: each menu is
@@ -1739,12 +1548,7 @@ mod tests {
         for run in 0..2 {
             tree.append(
                 &mut spine,
-                EventPayload::Message(Message::Turn {
-                    author: Author::Agent(EventId::new(1)),
-                    source: "return 1;".into(),
-                    thinking: None,
-                    usage: None,
-                }),
+                EventPayload::Restart,
             )
             .unwrap();
             let call = tree
@@ -1767,7 +1571,12 @@ mod tests {
             )
             .unwrap();
             outcomes.push(
-                tree.append(&mut spine, EventPayload::Return { value: json!(run) })
+                tree.append(&mut spine, EventPayload::Handback {
+                reply: EventId::new(1),
+                how: crate::types::Handback::Completed,
+                site: 0,
+                stack: Vec::new(),
+            })
                     .unwrap(),
             );
         }
@@ -1786,13 +1595,10 @@ mod tests {
             first.iter().all(|id| !second.contains(id)),
             "{first:?} / {second:?}"
         );
-        // …and no gaps: every artifact — each call, and each run's own
-        // `Return` — is listed by exactly one report.
-        let every: Vec<u64> = ids
-            .iter()
-            .copied()
-            .chain(outcomes.iter().map(|o| o.as_u64()))
-            .collect();
+        // …and no gaps: every call is listed by exactly one report. A
+        // handback is not itself a row — it carries no value (D5), so
+        // there is nothing to list.
+        let every: Vec<u64> = ids.to_vec();
         for id in &every {
             assert!(
                 first.contains(id) ^ second.contains(id),
@@ -1924,84 +1730,29 @@ mod tests {
         assert!(what.contains("[truncated; 10000 bytes total]"));
     }
 
-    /// **No exception, not even a small one**: a return value gets the
-    /// same bounded [`preview`] every other artifact gets, full stop —
-    /// there is no size-dependent branch that delivers it whole "because
-    /// it happened to fit a budget". A small value still reads whole
-    /// (`preview`/`clip` only ever clip when they must), but that is
-    /// `clip`'s ordinary behaviour, not a distinguished "answer" path.
+    /// **What crosses to the next reply is a row, and it crosses
+    /// whole.** This was three tests about a `return` value — the
+    /// channel a reply no longer has (D5). What replaced it is
+    /// `history.append`, and the thing worth guarding is the same: the
+    /// value the author chose reaches the next reader unclipped, where
+    /// everything else in the report is an index entry.
     #[test]
-    fn small_return_value_is_shown_whole_beside_its_fetch_id() {
-        let report = CompletionReport {
-            value: json!("hello"),
+    fn an_appended_row_reaches_the_next_reply_whole() {
+        let long = "z".repeat(5_000);
+        let rendered = CompletionReport {
             console: Vec::new(),
             console_id: None,
-            new_artifacts: vec![artifact(9, "program result", json!("hello"))],
+            new_artifacts: vec![Artifact {
+                id: 9,
+                label: String::new(),
+                state: ArtifactState::Whole(format!("note: {long}")),
+            }],
             failed_calls: 0,
             long_bash: 0,
-        };
-        let rendered = report.render();
-        assert!(
-            rendered.starts_with(&format!("{RUN_HEADING}\n\nIt completed, returning `[9]`:")),
-            "{rendered}"
-        );
-        assert!(rendered.contains(r#""hello""#), "{rendered}");
-    }
-
-    /// **The return value arrives whole.** It is the one generous thing
-    /// in a document whose menu is an index, because it is the one
-    /// thing the previous program chose for this one — and 5,000 bytes
-    /// of it is an ordinary handover, not a pathology.
-    ///
-    /// Before 27.7 this asserted the opposite, and a live run showed
-    /// what that cost: a program returned `{question, content}`, the
-    /// next saw 256 bytes of it, said "the last look was cut off", and
-    /// read the file again. Three programs did that in a row.
-    #[test]
-    fn a_return_value_reaches_the_next_program_whole() {
-        let value = json!("z".repeat(5_000));
-        let report = CompletionReport {
-            value: value.clone(),
-            console: Vec::new(),
-            console_id: None,
-            new_artifacts: vec![artifact(9, "program result", value)],
-            failed_calls: 0,
-            long_bash: 0,
-        };
-        let rendered = report.render();
-        let line = rendered.lines().last().unwrap();
-        assert!(line.starts_with(r#""zzz"#), "{}", &line[..60]);
-        assert!(
-            line.contains(&"z".repeat(5_000)),
-            "clipped: {}",
-            &line[..80]
-        );
-    }
-
-    /// Generous is not unbounded. Past [`RETURN_MAX_BYTES`] the id is
-    /// named, so the remainder is one `fetch_history` away rather than
-    /// lost — the marker says so in the line itself, because a reader
-    /// that cannot tell it was clipped is the reader that re-fetches
-    /// blind.
-    #[test]
-    fn an_absurd_return_value_is_bounded_and_says_where_the_rest_is() {
-        let value = json!("z".repeat(60_000));
-        let report = CompletionReport {
-            value: value.clone(),
-            console: Vec::new(),
-            console_id: None,
-            new_artifacts: vec![artifact(9, "program result", value)],
-            failed_calls: 0,
-            long_bash: 0,
-        };
-        let rendered = report.render();
-        let line = rendered.lines().last().unwrap();
-        assert!(line.len() < RETURN_MAX_BYTES + 100, "{}", line.len());
-        assert!(
-            line.contains("history.fetch(9)"),
-            "{}",
-            &line[line.len() - 60..]
-        );
+        }
+        .render();
+        assert!(rendered.contains(&long), "the row is not clipped");
+        assert!(rendered.contains("- `[9]` note:"), "{rendered}");
     }
 
     /// A menu row says a call arrived and how big its value is — never
@@ -2076,7 +1827,6 @@ mod tests {
 
     fn completion(artifacts: Vec<Artifact>) -> String {
         CompletionReport {
-            value: json!({ "status": "done" }),
             console: Vec::new(),
             console_id: None,
             new_artifacts: artifacts,
@@ -2169,39 +1919,21 @@ mod tests {
         );
     }
 
-    /// A completion that returned nothing prints no `returned` line —
-    /// the heading already said it completed, and `null` is what a
-    /// program without a `return` logs. Under `Transport::Notebook`
-    /// there is no `return` statement at all (D5), so that line was
-    /// identical on every one of 38 completions in a 2026-09-18 eval
-    /// arm; it was null on 24 of 38 under `Transport::Program` too.
+    /// **A reply that finished says so and no more.** There is no
+    /// `return` (D5), so there is no value to print — the line that
+    /// used to carry one read `returned: null` on 68 handbacks out of
+    /// 68 before the field was removed from the type entirely.
     #[test]
-    fn a_null_return_prints_no_returned_line() {
-        let report = |value: serde_json::Value| CompletionReport {
-            value,
+    fn a_finished_reply_prints_no_value() {
+        let rendered = CompletionReport {
             console: Vec::new(),
             console_id: None,
             new_artifacts: Vec::new(),
             failed_calls: 0,
             long_bash: 0,
-        };
-        let with_value = report(json!(7));
-        let rendered = with_value.render();
-        assert!(
-            rendered.contains("returning"),
-            "a real value still shows: {rendered}"
-        );
-
-        let empty = report(json!(null));
-        let rendered = empty.render();
-        assert!(
-            rendered.starts_with(&format!("{RUN_HEADING}\n\nIt completed.")),
-            "still says it completed: {rendered}"
-        );
-        assert!(
-            !rendered.contains("returned"),
-            "but says nothing about a value it does not have: {rendered}"
-        );
+        }
+        .render();
+        assert_eq!(rendered, format!("{RUN_HEADING}\n\nIt completed."));
     }
 
     /// **A removed row leaves the menu too.** `document.rs` drops a
@@ -2272,7 +2004,7 @@ mod tests {
             .unwrap();
         tree.append(
             &mut spine,
-            EventPayload::Message(Message::Post {
+            EventPayload::Post {
                 from: Author::User,
                 origin: Origin::Direct {
                     text: "read the config and summarize it".into(),
@@ -2280,7 +2012,7 @@ mod tests {
                     options: Vec::new(),
                     expects_reply: true,
                 },
-            }),
+            },
         )
         .unwrap();
         let (branch, leaf) = tree.branches()[0];

@@ -61,12 +61,12 @@ enum EventPayload {
     ReplyEnd { reply, how: Finished | Truncated | Interrupted | Failed(String), usage },
     Restart  { source },
 
-    // what running it did
-    Call     { reply, call },
-    Result   { reply, call, outcome },
-    Note     { reply, text, site, site_end },
-    Answer   { reply, question, value },
-    Console  { reply, lines },
+    // what running it did — unchanged; no `reply` field, see below
+    Call(Call),
+    Result   { call, outcome },
+    Note     { text, site, site_end },
+    Answer   { question, value },
+    Console  { lines },
     Handback { reply, how, site, stack },
 }
 
@@ -115,11 +115,18 @@ one.
 22    Handback { 3, Completed }
 ```
 
-Lines 19–22 are why effects carry `reply`. A reply's **parts** cannot
-interleave with another's — the provider streams one at a time per
-branch — but its **effects** can, because a raise is answered by a whole
-other reply and then the first one resumes. This is the single piece of
-deliberate redundancy in the design and it exists for that case.
+Lines 19–22 are the resumed tail — reply 3's remaining cells, running
+after reply 15 has come and gone. I first wanted a `reply` field on
+every effect for this. **It is not needed**, and the reason is worth
+stating: a report is delimited *handback to handback*, not reply to
+reply. Each handback's report shows the rows since the previous one, so
+the tail's rows land in reply 3's final report exactly as they should,
+with no attribution stored anywhere.
+
+`reply` therefore appears only on `Part`, `ReplyEnd` and `Handback` —
+all written in a handful of places in `machine.rs` — and not on `Call`,
+`Result`, `Note`, `Answer` or `Console`, which are constructed in
+thirty. The design got smaller by asking what actually needed it.
 
 ### Where the old vocabulary went
 

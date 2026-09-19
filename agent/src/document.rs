@@ -26,7 +26,7 @@
 //! module calls into it rather than re-deriving effects a second,
 //! incompatible way.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use crate::tree::CompactedView;
 use crate::types::*;
@@ -190,8 +190,19 @@ fn told_literal_cuts(tree: &Tree, agent: EventId, leaf: EventId) -> HashMap<Even
             continue;
         }
         match &ev.payload {
-            EventPayload::Message(Message::Turn { source, .. }) => {
-                turn = Some((ev.id, source.clone()));
+            // **The reply, accumulating.** A `site` is an offset into
+            // the whole reply now (28), so the text a cut indexes is the
+            // parts so far concatenated — not one cell.
+            EventPayload::Reply | EventPayload::Restart => {
+                turn = Some((ev.id, String::new()));
+            }
+            EventPayload::Part { part, .. } => {
+                if let Some((_, src)) = &mut turn {
+                    match part {
+                        Part::Prose(t) | Part::Cell(t) => src.push_str(t),
+                        Part::Thinking(_) => {}
+                    }
+                }
             }
             EventPayload::Note {
                 text,
@@ -218,157 +229,6 @@ fn told_literal_cuts(tree: &Tree, agent: EventId, leaf: EventId) -> HashMap<Even
     out
 }
 
-/// A reply reconstructed for rendering: the completion verbatim, plus the
-/// cuts of all its cells shifted into that text's coordinates.
-struct ReplyRender {
-    text: String,
-    cuts: Vec<Cut>,
-}
-
-/// **Group a notebook run's `Turn`s into the replies they came from**, and
-/// pair each reply with the completion text that produced it.
-///
-/// A reply is N cells and one completion (D7, D15). Its cells reach the log
-/// as `Turn`s holding bare JavaScript and its prose as `Send`s, so rendering
-/// the turn back from those pieces showed the model a series of bare
-/// programs — its own context teaching it the opposite of the card that had
-/// just told it to write markdown. `EventPayload::Completion` carries the
-/// bytes; this puts them back where the reply was.
-///
-/// Returns the render keyed by the reply's **first** `Turn` (where the
-/// assistant message goes) and the set of later `Turn`s it already covers
-/// (which render nothing of their own).
-///
-/// Three cases are deliberately left to the per-`Turn` path instead:
-///
-/// - **A reply with no `Completion`.** Truncated mid-stream, killed, or a
-///   log written before the text was stored. The cells are still there and
-///   still render; nothing is lost, and the fallback is the behaviour this
-///   whole function replaces.
-/// - **A reply any of whose cells is compacted.** Compaction shortens a
-///   `Turn`'s row, and replaying the full reply text over it would undo
-///   exactly what it was for.
-/// - **Cells that ran after their reply's `Completion`** — the tail of a
-///   reply resumed from a `raise`. They arrive in a later group, so they
-///   render as themselves rather than being folded into a reply already
-///   drawn above them.
-#[allow(clippy::type_complexity)]
-fn notebook_replies(
-    tree: &Tree,
-    leaf: EventId,
-    agent: EventId,
-    cuts: &HashMap<EventId, Vec<Cut>>,
-    compacted: &HashMap<EventId, CompactedView>,
-) -> (HashMap<EventId, ReplyRender>, HashSet<EventId>) {
-    let mut replies: HashMap<EventId, ReplyRender> = HashMap::new();
-    let mut covered: HashSet<EventId> = HashSet::new();
-    let mut cur_agent: Option<EventId> = None;
-    // The reply being assembled: its cell `Turn`s in order, and its text
-    // once seen.
-    //
-    // **The two are not in a fixed order.** A streamed reply logs its
-    // cells as their fences close and its `Completion` at the end; a
-    // batched one knows the whole text before a single cell runs and
-    // logs it first. Both are the same reply, so this claims `Turn`s
-    // either side of the text rather than assuming one arrangement.
-    let mut group: Vec<EventId> = Vec::new();
-    let mut group_text: Option<String> = None;
-
-    // A reply is finished when its text and its cells have both been
-    // seen; that is where it is recorded.
-    macro_rules! flush {
-        () => {
-            if let Some(text) = group_text.take() {
-                let turns = std::mem::take(&mut group);
-                record_reply(&mut replies, &mut covered, &turns, &text, cuts, compacted);
-            }
-        };
-    }
-
-    for ev in tree.path_events(leaf) {
-        if let EventPayload::Agent { .. } = ev.payload {
-            cur_agent = Some(ev.id);
-            continue;
-        }
-        if cur_agent != Some(agent) {
-            continue;
-        }
-        match &ev.payload {
-            EventPayload::Message(Message::Turn { .. }) => group.push(ev.id),
-            // The run's terminal ends a reply — but only once its text
-            // has arrived. A `raise` suspends mid-reply and logs its
-            // `Condition` *before* the completion ends, so a group with
-            // no text yet keeps waiting rather than falling back.
-            EventPayload::Return { .. } | EventPayload::Condition { .. } => flush!(),
-            EventPayload::Completion { text, .. } => {
-                if text.is_empty() {
-                    continue;
-                }
-                group_text = Some(text.clone());
-                // Cells already logged: this completion is theirs.
-                // Cells still to come (a batched reply): wait for the
-                // terminal.
-                if !group.is_empty() {
-                    flush!();
-                }
-            }
-            _ => {}
-        }
-    }
-    flush!();
-    (replies, covered)
-}
-
-/// Record one reply: its text keyed by its first cell's `Turn`, and its
-/// later cells marked as already drawn.
-fn record_reply(
-    replies: &mut HashMap<EventId, ReplyRender>,
-    covered: &mut HashSet<EventId>,
-    turns: &[EventId],
-    text: &str,
-    cuts: &HashMap<EventId, Vec<Cut>>,
-    compacted: &HashMap<EventId, CompactedView>,
-) {
-    if turns.is_empty() {
-        return;
-    }
-    if turns.iter().any(|id| compacted.contains_key(id)) {
-        return;
-    }
-    // The cells of this reply, in the same order the driver
-    // fed them — the same splitter, on the same bytes, so
-    // the k-th `Turn` is the k-th cell.
-    let cells = crate::notebook::split_cells(text);
-    let mut shifted: Vec<Cut> = Vec::new();
-    for (k, id) in turns.iter().enumerate() {
-        let Some(cell) = cells.get(k) else { break };
-        // **A `Call::site` is cell-local** (D1): the cell's
-        // offset is subtracted at log time, so a site
-        // indexes its own `Turn.source`. Rendering the whole
-        // reply means those offsets no longer index what is
-        // being shown, and a snip would cut at the wrong
-        // bytes — so the offset is added back here. It is
-        // derived rather than stored: the reply's text is on
-        // the log and the splitter is deterministic, so
-        // where cell k starts is a fact about the bytes.
-        if let Some(cell_cuts) = cuts.get(id) {
-            shifted.extend(cell_cuts.iter().map(|c| Cut {
-                start: c.start + cell.start,
-                end: c.end + cell.start,
-                row: c.row,
-                literal: c.literal,
-            }));
-        }
-    }
-    replies.insert(
-        turns[0],
-        ReplyRender {
-            text: text.to_owned(),
-            cuts: shifted,
-        },
-    );
-    covered.extend(turns.iter().skip(1).copied());
-}
 /// One call's span recorded against the turn that wrote it, if the span
 /// is usable at all. Overlapping spans are dropped: an `ask` nested
 /// inside a `tell` is one call's range inside another's, and editing
@@ -565,11 +425,8 @@ fn pending_line(
         // checksum is gone — an op names an id and nothing else — so
         // the word is free to say what happened instead of what kind of
         // event it was.
-        EventPayload::Message(msg @ Message::Post { from, .. }) => {
-            let resolved = tree.resolve(msg);
-            let Message::Post { origin, .. } = &resolved else {
-                unreachable!("resolve() never changes a Post's variant")
-            };
+        EventPayload::Post { from, origin } => {
+            let origin = tree.resolve(origin);
             let (text, wants_reply) = origin
                 .direct()
                 .map(|(t, _, r)| (t, r))
@@ -752,13 +609,14 @@ pub(crate) fn render_with_lookup(
     messages.extend(worked_examples(&context.exemplars));
     let preamble = messages.len();
     let cuts = told_literal_cuts(tree, agent, leaf);
-    // Under `Transport::Notebook` a reply is N cell `Turn`s and one
-    // completion; this pairs each reply with the bytes the model
-    // actually generated, so the assistant turn replays them rather
-    // than being rebuilt out of its pieces. Empty on every other
-    // transport, where a `Turn` already *is* the completion.
-    let (replies, covered) = notebook_replies(tree, leaf, agent, &cuts, compacted);
     let mut pending: Vec<String> = Vec::new();
+    // **The reply being assembled**: its id, and its parts concatenated
+    // as they arrive. There is no reassembly here and no grouping to
+    // infer — a `Reply` opens it, `Part`s append to it, `ReplyEnd`
+    // closes it (28).
+    let mut reply: Option<(EventId, String)> = None;
+    // Lines that arrived before the open reply — see the `Reply` arm.
+    let mut before: Vec<String> = Vec::new();
     let mut cur_agent: Option<EventId> = None;
     // `Transport::RunProgram` only: the id of the most recent turn's
     // `run_program` call, still unanswered. `flush_pending` consumes it
@@ -784,33 +642,65 @@ pub(crate) fn render_with_lookup(
             continue;
         }
         match &ev.payload {
-            EventPayload::Message(Message::Turn { source, .. }) => {
-                // A later cell of a reply already drawn above: its
-                // JavaScript is inside that reply's text.
-                if covered.contains(&ev.id) {
-                    continue;
+            // A reply, or a person handing the branch one: both open
+            // an assistant turn that its parts fill in.
+            // **Nothing is flushed here.** The lines that led up to this
+            // reply are held aside until its end, because that is where
+            // the assistant message goes — and a reply the model removed
+            // with `history.remove` renders no assistant message at all,
+            // in which case the lines from either side of it have to
+            // merge into one user turn rather than becoming two.
+            EventPayload::Reply | EventPayload::Restart => {
+                ran = false;
+                before = std::mem::take(&mut pending);
+                reply = Some((ev.id, String::new()));
+            }
+            EventPayload::Part { part, .. } => {
+                if let Some((_, text)) = &mut reply {
+                    match part {
+                        // **Thinking is on the log and not in the
+                        // document.** It arrived, so it is recorded; it
+                        // is not what the model said, so it is not
+                        // replayed as what the model said.
+                        Part::Thinking(_) => {}
+                        Part::Prose(t) | Part::Cell(t) => text.push_str(t),
+                    }
                 }
-                let content = match (replies.get(&ev.id), compacted.get(&ev.id)) {
+            }
+            EventPayload::ReplyEnd { how, .. } => {
+                let Some((id, text)) = reply.take() else {
+                    continue;
+                };
+                let content = match compacted.get(&id) {
+                    Some(shadow) => compacted_program_comment(id, shadow),
                     // **The reply, verbatim.** Only the documented
                     // annotate-and-snip pass is applied on top; no
                     // re-fencing, no re-assembly, no normalisation. What
                     // the model is shown as its own turn is what it
                     // wrote, because that is what it imitates.
-                    (Some(reply), _) => Some(annotate_history_calls(
-                        &reply.text,
-                        Some(&reply.cuts).filter(|c| !c.is_empty()),
-                    )),
-                    (None, None) => Some(annotate_history_calls(source, cuts.get(&ev.id))),
-                    (None, Some(shadow)) => compacted_program_comment(ev.id, shadow),
+                    None => {
+                        let mut text = annotate_history_calls(&text, cuts.get(&id));
+                        // **And why it stops, when it stopped early.**
+                        // A reply cut off used to trail away with no
+                        // marker, so the model saw itself break off
+                        // mid-thought for no reason it could see.
+                        if let Some(note) = cut_off_note(how) {
+                            text.push_str(note);
+                        }
+                        Some(text)
+                    }
                 };
-                // A removed program occupies no slot at all. Because a
-                // flush only happens here, the pending lines from either
-                // side of it merge into one user message — no empty
-                // message, and never two assistant turns in a row.
-                if let Some(content) = content {
-                    ran = false;
-                    messages.push(flush_pending(&mut pending));
-                    messages.push(assistant_turn(ev.id, content));
+                match content {
+                    Some(content) => {
+                        push_flush(&mut messages, &mut before);
+                        messages.push(assistant_turn(id, content));
+                    }
+                    // Removed: no slot, and the blocks either side of it
+                    // are one block.
+                    None => {
+                        before.append(&mut pending);
+                        pending = std::mem::take(&mut before);
+                    }
                 }
             }
             // A compaction directive is the one condition that does not
@@ -826,11 +716,8 @@ pub(crate) fn render_with_lookup(
             // nothing had asked for. What survives an episode is its
             // `Compacted` events and the shortened rows they produce,
             // which is the trace worth keeping.
-            EventPayload::Condition {
-                cause: Cause::Compaction { .. },
-                ..
-            } => {}
-            EventPayload::Return { .. } | EventPayload::Condition { .. } => {
+            EventPayload::Compaction { .. } => {}
+            EventPayload::Handback { .. } => {
                 if let Some(line) = report_line(tree, leaf, ev.id, budget, compacted) {
                     pending.push(line);
                     ran = true;
@@ -856,11 +743,26 @@ pub(crate) fn render_with_lookup(
         }
     }
 
-    if !pending.is_empty() {
-        messages.push(flush_pending(&mut pending));
-    }
+    push_flush(&mut messages, &mut before);
+    push_flush(&mut messages, &mut pending);
 
     Document { messages, preamble }
+}
+
+/// **What a reply that stopped early says about itself.**
+///
+/// A completion cut off mid-sentence used to reach the model as a reply
+/// that simply trailed away: it saw itself break off for no reason it
+/// could see, and the only account of why lived in a sentence the
+/// harness sent *instead of* the text. Now the text is there and the
+/// reason is on the end of it.
+fn cut_off_note(how: &ReplyEnd) -> Option<&'static str> {
+    match how {
+        ReplyEnd::Finished => None,
+        ReplyEnd::Truncated => Some("\n\n— cut off here: the reply hit its token budget —"),
+        ReplyEnd::Interrupted => Some("\n\n— cut off here: the block above stopped the run —"),
+        ReplyEnd::Failed(_) => Some("\n\n— nothing arrived: the provider failed —"),
+    }
 }
 
 /// The assistant's own turn, in whichever shape `transport` wants.
@@ -875,6 +777,20 @@ pub(crate) fn render_with_lookup(
 fn assistant_turn(id: EventId, source: String) -> ChatMessage {
     let _ = id;
     ChatMessage::text(ChatRole::Assistant, source)
+}
+
+/// Flush the open block into a `User` message — **unless there is
+/// nothing in it.**
+///
+/// A reply the model removed with `history.remove` occupies no
+/// assistant slot at all, so without this the flush before it and the
+/// flush after it are two adjacent `User` messages with nothing between
+/// them. An empty one is not a turn.
+fn push_flush(messages: &mut Vec<ChatMessage>, pending: &mut Vec<String>) {
+    if pending.is_empty() {
+        return;
+    }
+    messages.push(flush_pending(pending));
 }
 
 /// **The user turn's own heading.** A message in the user role holds
@@ -1021,7 +937,7 @@ mod tests {
             .unwrap();
         tree.append(
             &mut spine,
-            EventPayload::Message(Message::Post {
+            EventPayload::Post {
                 from: Author::User,
                 origin: Origin::Direct {
                     text: "go".into(),
@@ -1029,7 +945,7 @@ mod tests {
                     options: Vec::new(),
                     expects_reply: true,
                 },
-            }),
+            },
         )
         .unwrap();
 
@@ -1049,17 +965,50 @@ mod tests {
         );
     }
 
-    fn turn(source: &str) -> EventPayload {
-        EventPayload::Message(Message::Turn {
-            author: Author::Agent(EventId::new(1)),
-            source: source.to_owned(),
-            thinking: None,
-            usage: None,
-        })
+    /// A cell's text as it goes on the log: with its fences (28), which
+    /// is the coordinate system every `site` is an offset into.
+    fn fenced(src: &str) -> String {
+        format!("```js\n{src}\n```\n")
+    }
+
+    /// A reply and its one cell, plus the end that closes it: three
+    /// events now, where a `Turn` was one. The assistant message is the
+    /// parts, so it does not exist until `ReplyEnd`.
+    fn turn(source: &str) -> [EventPayload; 3] {
+        [
+            EventPayload::Reply,
+            EventPayload::Part {
+                reply: EventId::new(1),
+                part: crate::types::Part::Cell(fenced(source)),
+            },
+            EventPayload::ReplyEnd {
+                reply: EventId::new(1),
+                how: crate::types::ReplyEnd::Finished,
+                usage: Default::default(),
+            },
+        ]
+    }
+
+    /// Append a reply's three events, returning the `Reply`'s id.
+    fn append_turn(tree: &mut Tree, spine: &mut Spine, source: &str) -> EventId {
+        let [reply, cell, end] = turn(source);
+        let id = tree.append(spine, reply).unwrap();
+        let fix = |p: EventPayload| match p {
+            EventPayload::Part { part, .. } => EventPayload::Part { reply: id, part },
+            EventPayload::ReplyEnd { how, usage, .. } => EventPayload::ReplyEnd {
+                reply: id,
+                how,
+                usage,
+            },
+            other => other,
+        };
+        tree.append(spine, fix(cell)).unwrap();
+        tree.append(spine, fix(end)).unwrap();
+        id
     }
 
     fn user_post(text: &str) -> EventPayload {
-        EventPayload::Message(Message::Post {
+        EventPayload::Post {
             from: Author::User,
             origin: Origin::Direct {
                 text: text.to_owned(),
@@ -1067,7 +1016,7 @@ mod tests {
                 options: Vec::new(),
                 expects_reply: true,
             },
-        })
+        }
     }
 
     /// The card, one user post, one completed program: card / user /
@@ -1082,12 +1031,14 @@ mod tests {
             .start_agent(None, None, "root", None, "CARD", Vec::new())
             .unwrap();
         tree.append(&mut spine, user_post("hello")).unwrap();
-        tree.append(&mut spine, turn("tell('hi'); history.append(1);"))
-            .unwrap();
+        append_turn(&mut tree, &mut spine, "tell('hi'); history.append(1);");
         tree.append(
             &mut spine,
-            EventPayload::Return {
-                value: serde_json::json!(1),
+            EventPayload::Handback {
+                reply: EventId::new(1),
+                how: crate::types::Handback::Completed,
+                site: 0,
+                stack: Vec::new(),
             },
         )
         .unwrap();
@@ -1100,7 +1051,7 @@ mod tests {
         assert_eq!(conv[0].role, ChatRole::User);
         assert!(conv[0].content.contains("hello"));
         assert_eq!(conv[1].role, ChatRole::Assistant);
-        assert_eq!(conv[1].content, "tell('hi'); history.append(1);");
+        assert_eq!(conv[1].content, "```js\ntell('hi'); history.append(1);\n```\n");
         assert_eq!(conv[2].role, ChatRole::User);
     }
 
@@ -1121,34 +1072,40 @@ mod tests {
             .start_agent(None, None, "root", None, "CARD", Vec::new())
             .unwrap();
         tree.append(&mut spine, user_post("go")).unwrap();
-        tree.append(&mut spine, turn("raise('x');")).unwrap();
+        append_turn(&mut tree, &mut spine, "raise('x');");
         tree.append(
             &mut spine,
-            EventPayload::Condition {
-                cause: Cause::Raised {
+            EventPayload::Handback {
+                            reply: EventId::new(1),
+                            how: crate::types::Handback::Raised {
                     name: "x".into(),
                     payload: None,
                 },
-                site: 0,
-                stack: Vec::new(),
-                disposition: Disposition::Pushed,
-            },
+                            site: 0,
+                            stack: Vec::new(),
+                        },
         )
         .unwrap();
         // The handler: its own Turn and Return, both at depth 1.
-        tree.append(&mut spine, turn("history.append(resume(1));")).unwrap();
+        append_turn(&mut tree, &mut spine, "history.append(resume(1));");
         tree.append(
             &mut spine,
-            EventPayload::Return {
-                value: serde_json::json!({}),
+            EventPayload::Handback {
+                reply: EventId::new(1),
+                how: crate::types::Handback::Completed,
+                site: 0,
+                stack: Vec::new(),
             },
         )
         .unwrap();
         // Back at depth 0: the raising program resumes and returns.
         tree.append(
             &mut spine,
-            EventPayload::Return {
-                value: serde_json::json!(2),
+            EventPayload::Handback {
+                reply: EventId::new(1),
+                how: crate::types::Handback::Completed,
+                site: 0,
+                stack: Vec::new(),
             },
         )
         .unwrap();
@@ -1159,8 +1116,8 @@ mod tests {
         // which is what the model was prompted with) / assistant(the
         // decision it wrote back) / user(both returns).
         assert_eq!(conv.len(), 5, "{doc:?}");
-        assert_eq!(conv[1].content, "raise('x');");
-        assert_eq!(conv[3].content, "history.append(resume(1));");
+        assert_eq!(conv[1].content, "```js\nraise('x');\n```\n");
+        assert_eq!(conv[3].content, "```js\nhistory.append(resume(1));\n```\n");
         assert!(
             !conv[2].content.is_empty(),
             "a condition that suspended the program renders its report, \
@@ -1188,28 +1145,29 @@ mod tests {
             .start_agent(None, None, "root", None, "CARD", Vec::new())
             .unwrap();
         tree.append(&mut spine, user_post("go")).unwrap();
-        tree.append(&mut spine, turn("Edit.applyEdits(fmt.content, []);"))
-            .unwrap();
+        append_turn(&mut tree, &mut spine, "Edit.applyEdits(fmt.content, []);");
         tree.append(
             &mut spine,
-            EventPayload::Condition {
-                cause: Cause::Trapped {
+            EventPayload::Handback {
+                            reply: EventId::new(1),
+                            how: crate::types::Handback::Trapped {
                     kind: "ReferenceError".into(),
                     message: "fmt is not defined".into(),
                     resumable: true,
                 },
-                site: 0,
-                stack: vec!["<root>".into()],
-                disposition: Disposition::Pushed,
-            },
+                            site: 0,
+                            stack: vec!["<root>".into()],
+                        },
         )
         .unwrap();
-        tree.append(&mut spine, turn("return recompute();"))
-            .unwrap();
+        append_turn(&mut tree, &mut spine, "return recompute();");
         tree.append(
             &mut spine,
-            EventPayload::Return {
-                value: serde_json::json!("the edit"),
+            EventPayload::Handback {
+                reply: EventId::new(1),
+                how: crate::types::Handback::Completed,
+                site: 0,
+                stack: Vec::new(),
             },
         )
         .unwrap();
@@ -1229,8 +1187,8 @@ mod tests {
              turn the next program has to guess from: {doc:?}"
         );
         assert!(
-            doc.messages.iter().any(|m| m.content.contains("the edit")),
-            "the recovery program's own return survives too: {doc:?}"
+            doc.messages.iter().any(|m| m.content.contains("It completed.")),
+            "the recovery reply's own terminal survives too: {doc:?}"
         );
     }
 
@@ -1243,10 +1201,10 @@ mod tests {
     fn a_literal_tell_becomes_a_reference_and_a_computed_one_does_not() {
         const LONG_TELL: &str = "checked every file and the build is green after the rename";
         let src = "tell(\"checked every file and the build is green after the rename\");\ntell(\"x \" + y);\n";
-        let lit = src
+        let lit = fenced(src)
             .find("tell(\"checked every file and the build is green after the rename\")")
             .unwrap();
-        let comp = src.find("tell(\"x \" + y)").unwrap();
+        let comp = fenced(src).find("tell(\"x \" + y)").unwrap();
         let send = |text: &str, a: usize, b: usize| {
             EventPayload::Call(Call::Send {
                 prose: false,
@@ -1265,7 +1223,7 @@ mod tests {
             .start_agent(None, None, "root", None, "CARD", Vec::new())
             .unwrap();
         tree.append(&mut spine, user_post("go")).unwrap();
-        tree.append(&mut spine, turn(src)).unwrap();
+        append_turn(&mut tree, &mut spine, src);
         let a = tree
             .append(
                 &mut spine,
@@ -1317,7 +1275,7 @@ mod tests {
             .start_agent(None, None, "root", None, "CARD", Vec::new())
             .unwrap();
         tree.append(&mut spine, user_post("go")).unwrap();
-        tree.append(&mut spine, turn(src)).unwrap();
+        append_turn(&mut tree, &mut spine, src);
         tree.append(
             &mut spine,
             EventPayload::Call(Call::Send {
@@ -1327,8 +1285,10 @@ mod tests {
                 input: serde_json::Value::Null,
                 options: Vec::new(),
                 expects_reply: false,
-                site: 0,
-                site_end: "tell(\"ok\")".len() as u32,
+                // Reply-absolute (28): the fence is part of the text
+                // the site indexes.
+                site: fenced(src).find("tell(").unwrap() as u32,
+                site_end: (fenced(src).find("tell(").unwrap() + "tell(\"ok\")".len()) as u32,
             }),
         )
         .unwrap();
@@ -1341,7 +1301,7 @@ mod tests {
             .content
             .clone();
         assert!(
-            program.starts_with("tell(\"ok\") /* history["),
+            program.contains("tell(\"ok\") /* history["),
             "text kept, reference added: {program}"
         );
     }
@@ -1360,7 +1320,7 @@ mod tests {
         // Incoming, expecting a reply.
         tree.append(
             &mut spine,
-            EventPayload::Message(Message::Post {
+            EventPayload::Post {
                 from: Author::User,
                 origin: Origin::Direct {
                     text: "which one?".into(),
@@ -1368,10 +1328,10 @@ mod tests {
                     options: Vec::new(),
                     expects_reply: true,
                 },
-            }),
+            },
         )
         .unwrap();
-        tree.append(&mut spine, turn("1;")).unwrap();
+        append_turn(&mut tree, &mut spine, "1;");
         // Outgoing question, and the answer that settles it.
         let q = tree
             .append(
@@ -1400,8 +1360,11 @@ mod tests {
         // run's own list now, not loose lines beside it.
         tree.append(
             &mut spine,
-            EventPayload::Return {
-                value: serde_json::Value::Null,
+            EventPayload::Handback {
+                reply: EventId::new(1),
+                how: crate::types::Handback::Completed,
+                site: 0,
+                stack: Vec::new(),
             },
         )
         .unwrap();
@@ -1422,14 +1385,14 @@ mod tests {
     #[test]
     fn a_literal_ask_is_snipped_and_keeps_its_verb() {
         let src = "const a = await ask(\"user\", \"is 240 still right for request_timeout_seconds, or did we settle on the old 30?\");\n";
-        let at = src.find("ask(").unwrap();
-        let end = src.find(");").unwrap() + 1;
+        let at = fenced(src).find("ask(").unwrap();
+        let end = fenced(src).find(");").unwrap() + 1;
         let mut tree = Tree::new(None);
         let mut spine = tree
             .start_agent(None, None, "root", None, "CARD", Vec::new())
             .unwrap();
         tree.append(&mut spine, user_post("go")).unwrap();
-        tree.append(&mut spine, turn(src)).unwrap();
+        append_turn(&mut tree, &mut spine, src);
         let q = tree
             .append(
                 &mut spine,
@@ -1449,8 +1412,11 @@ mod tests {
         // run's own list now, not loose lines beside it.
         tree.append(
             &mut spine,
-            EventPayload::Return {
-                value: serde_json::Value::Null,
+            EventPayload::Handback {
+                reply: EventId::new(1),
+                how: crate::types::Handback::Completed,
+                site: 0,
+                stack: Vec::new(),
             },
         )
         .unwrap();
@@ -1492,7 +1458,7 @@ mod tests {
                 },
             )
             .unwrap();
-        tree.append(&mut spine, turn("1;")).unwrap();
+        append_turn(&mut tree, &mut spine, "1;");
         let doc = render(&tree, &spine, 64 * 1024);
         let before: String = doc.messages.iter().map(|m| m.content.clone()).collect();
         assert!(
@@ -1534,12 +1500,15 @@ mod tests {
                 .start_agent(None, None, "root", None, "CARD", Vec::new())
                 .unwrap();
             tree.append(&mut spine, user_post("go")).unwrap();
-            let program = tree.append(&mut spine, turn("1 + 1;")).unwrap();
+            let program = append_turn(&mut tree, &mut spine, "1 + 1;");
             tree.append(
                 &mut spine,
-                EventPayload::Return {
-                    value: serde_json::json!(2),
-                },
+                EventPayload::Handback {
+                reply: EventId::new(1),
+                how: crate::types::Handback::Completed,
+                site: 0,
+                stack: Vec::new(),
+            },
             )
             .unwrap();
             tree.append(&mut spine, EventPayload::Compacted { of: program, text })
@@ -1594,12 +1563,14 @@ mod tests {
             .start_agent(None, None, "root", None, "CARD", Vec::new())
             .unwrap();
         tree.append(&mut spine, user_post("hello")).unwrap();
-        tree.append(&mut spine, turn("tell('hi'); history.append(1);"))
-            .unwrap();
+        append_turn(&mut tree, &mut spine, "tell('hi'); history.append(1);");
         tree.append(
             &mut spine,
-            EventPayload::Return {
-                value: serde_json::json!(1),
+            EventPayload::Handback {
+                reply: EventId::new(1),
+                how: crate::types::Handback::Completed,
+                site: 0,
+                stack: Vec::new(),
             },
         )
         .unwrap();
@@ -1617,7 +1588,7 @@ mod tests {
         let doc = sample_document();
         let conv = doc.conversation();
         assert_eq!(conv[1].role, ChatRole::Assistant);
-        assert_eq!(conv[1].content, "tell('hi'); history.append(1);");
+        assert_eq!(conv[1].content, "```js\ntell('hi'); history.append(1);\n```\n");
         assert_eq!(conv[2].role, ChatRole::User, "{conv:?}");
     }
 }

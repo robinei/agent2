@@ -414,7 +414,7 @@ fn run_session_headless(
             if let SessionEvent::Event { event, .. } = &event
                 && matches!(
                     event.payload,
-                    types::EventPayload::Message(types::Message::Turn { .. })
+                    types::EventPayload::Reply
                 )
             {
                 saw_a_program.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -563,7 +563,7 @@ fn print_session_event(event: &SessionEvent) {
                 EventPayload::Answer { question, value } => {
                     println!("{head} answer to #{}: {value}", question.as_u64());
                 }
-                EventPayload::Message(Message::Post { from, origin }) => {
+                EventPayload::Post { from, origin } => {
                     println!(
                         "{head} post: {}",
                         report::render_post(event.id, *from, origin)
@@ -572,8 +572,18 @@ fn print_session_event(event: &SessionEvent) {
                 // The whole turn *is* a program now — no separate prose
                 // channel and no tool-call list beside it (23_ONE_AGENT.md's
                 // substitution table).
-                EventPayload::Message(Message::Turn { source, .. }) => {
-                    println!("{head} turn: {source}");
+                EventPayload::Reply => println!("{head} reply"),
+                EventPayload::Compaction { rendered, budget } => {
+                    println!("{head} compaction: {rendered} of {budget}")
+                }
+                EventPayload::Restart => println!("{head} restart"),
+                EventPayload::Part { part, .. } => match part {
+                    types::Part::Thinking(t) => println!("{head} thinking: {} bytes", t.len()),
+                    types::Part::Prose(t) => println!("{head} prose: {t}"),
+                    types::Part::Cell(t) => println!("{head} cell: {t}"),
+                },
+                EventPayload::ReplyEnd { how, usage, .. } => {
+                    println!("{head} reply end: {how:?}, {} out", usage.completion)
                 }
                 // `wait_until` is exempt: a polling loop calls it repeatedly
                 // for no reason worth printing, and it never has interesting
@@ -594,33 +604,18 @@ fn print_session_event(event: &SessionEvent) {
                         println!("{head} result of #{}: failed: {msg}", call.as_u64())
                     }
                 },
-                EventPayload::Return { value } => {
-                    println!("{head} returned: {value}");
-                }
-                EventPayload::Condition { cause, site, .. } => {
-                    println!("{head} condition at {site}: {cause:?}");
+                EventPayload::Handback { how, site, .. } => {
+                    println!("{head} handback at {site}: {how:?}");
                 }
                 EventPayload::Rename { name } => println!("{head} rename: {name}"),
                 EventPayload::Console { lines } => {
                     println!("{head} console: {} lines", lines.len());
-                }
-                EventPayload::Completion { usage, .. } => {
-                    println!(
-                        "{head} completion: {} in ({} cached), {} out ({} reasoning)",
-                        usage.prompt, usage.cached, usage.completion, usage.reasoning
-                    );
                 }
                 EventPayload::Note { text, .. } => println!("{head} note: {text}"),
                 EventPayload::Compacted { of, text } => match text {
                     Some(t) => println!("{head} compacted #{}: {t}", of.as_u64()),
                     None => println!("{head} compacted #{}: removed", of.as_u64()),
                 },
-                            // 28.B–C fill these in: nothing writes them yet.
-                EventPayload::Reply
-                | EventPayload::Part { .. }
-                | EventPayload::ReplyEnd { .. }
-                | EventPayload::Restart { .. }
-                | EventPayload::Handback { .. } => {}
             }
         }
     }

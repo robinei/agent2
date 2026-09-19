@@ -58,7 +58,7 @@ use crate::document::Document;
 use crate::machine::{LlmTurn, OutCall, Runner, StepInput, StepOutput, ToolResult};
 use crate::tree::Unmatched;
 use crate::types::{
-    Address, Author, Call, Cause, Disposition, EventId, EventPayload, Message, Origin, Outcome,
+    Address, Author, Call, EventId, EventPayload, Origin, Outcome,
     Tree,
 };
 
@@ -455,25 +455,12 @@ impl Session {
                         let state = self.states.get_mut(&branch).expect("opened");
                         self.tree.append(
                             &mut state.spine,
-                            EventPayload::Condition {
-                                cause: Cause::Interrupted,
-                                site: 0,
-                                stack: Vec::new(),
-                                // `Handover`, matching `Runner::abandon`'s
-                                // own precedent for `Cause::Abandoned`:
-                                // this condition closes whatever frame
-                                // was running, it does not open one, so
-                                // it must render at the depth it actually
-                                // happened at rather than staying
-                                // invisible behind `document::render`'s
-                                // `disposition == Handover` check
-                                // (`tree.rs`'s `depth_after` also special-
-                                // cases `Interrupted`'s cause ahead of
-                                // disposition, for the same "settles
-                                // exactly one frame" reason — this value
-                                // is belt-and-braces there too).
-                                disposition: Disposition::Handover,
-                            },
+                            EventPayload::Handback {
+                            reply: EventId::new(1),
+                            how: crate::types::Handback::Interrupted,
+                            site: 0,
+                            stack: Vec::new(),
+                        },
                         )?;
                     }
                 }
@@ -1327,7 +1314,7 @@ impl Session {
     /// **The repair loop** (23_ONE_AGENT A5, ported from the deleted POC's
     /// `take_program` — `codemode/runner.rs`): a completion that fails to
     /// parse as JavaScript is not let through to become a terminal
-    /// `Cause::CompileFailed` — it is re-asked, with the parse diagnostic
+    /// `crate::types::Handback::CellFailed` — it is re-asked, with the parse diagnostic
     /// appended to a fresh render's tail, up to `MAX_REPAIR_ATTEMPTS`
     /// times. This is a *harness* behaviour, the one place the thesis
     /// licenses hard-coding a decision about **when** a mind is invoked
@@ -1777,10 +1764,10 @@ impl Session {
     /// position **is** the asker's branch. Nothing session-local is
     /// consulted, so it survives a reopen as-is.
     fn asking_branch(&self, post: EventId) -> Option<(BranchId, EventId)> {
-        let Some(EventPayload::Message(Message::Post {
+        let Some(EventPayload::Post {
             origin: Origin::Sent(send),
             ..
-        })) = self.tree.events.get(&post).map(|e| &e.payload)
+        }) = self.tree.events.get(&post).map(|e| &e.payload)
         else {
             return None;
         };
@@ -2005,7 +1992,7 @@ fn latest_condition(tree: &Tree, leaf: EventId) -> Option<EventId> {
     tree.path_events(leaf)
         .into_iter()
         .rev()
-        .find(|e| matches!(e.payload, EventPayload::Condition { .. }))
+        .find(|e| matches!(e.payload, EventPayload::Handback { .. }))
         .map(|e| e.id)
 }
 
@@ -2031,21 +2018,21 @@ fn owes_work(tree: &Tree, leaf: EventId) -> bool {
     path[start..]
         .iter()
         .rev()
-        .find(|e| matches!(e.payload, EventPayload::Message(Message::Turn { .. })))
+        .find(|e| matches!(e.payload, EventPayload::Reply))
         .is_some_and(|turn| crate::report::outcomes_of_turn(tree, leaf, turn.id).is_empty())
 }
 
-/// One-word label for a logged condition's cause.
-fn cause_label(cause: &Cause) -> &'static str {
-    match cause {
-        Cause::Raised { .. } => "raised",
-        Cause::Trapped { .. } => "trapped",
-        Cause::Posted { .. } => "posted",
-        Cause::CompileFailed { .. } => "compile failed",
-        Cause::Truncated => "truncated",
-        Cause::Compaction { .. } => "compaction",
-        Cause::Interrupted => "interrupted",
-        Cause::Abandoned => "abandoned",
+/// One-word label for a handback.
+fn cause_label(how: &crate::types::Handback) -> &'static str {
+    use crate::types::Handback as H;
+    match how {
+        H::Raised { .. } => "raised",
+        H::Trapped { .. } => "trapped",
+        H::Posted { .. } => "posted",
+        H::CellFailed { .. } => "cell failed",
+        H::Completed => "completed",
+        H::Interrupted => "interrupted",
+        H::Abandoned => "abandoned",
     }
 }
 
@@ -2063,13 +2050,13 @@ fn leaf_summary(tree: &Tree, leaf: EventId) -> String {
         EventPayload::Answer { question, value } => {
             format!("Answer to #{}: {value}", question.as_u64())
         }
-        EventPayload::Message(Message::Post { from, origin }) => {
+        EventPayload::Post { from, origin } => {
             format!(
                 "Post: {}",
                 crate::report::render_post(event.id, *from, origin)
             )
         }
-        EventPayload::Message(Message::Turn { source, .. }) => format!("Turn: {source}"),
+        EventPayload::Restart => "Restart".to_owned(),
         EventPayload::Call(Call::Invoke { name, .. }) => format!("Invoke: {name}"),
         EventPayload::Call(Call::Send { expects_reply, .. }) => {
             format!("Send: {}", if *expects_reply { "ask" } else { "tell" })
@@ -2084,24 +2071,26 @@ fn leaf_summary(tree: &Tree, leaf: EventId) -> String {
             Outcome::Delivered(v) => format!("Result of #{}: {v}", call.as_u64()),
             Outcome::Failed(msg) => format!("Result of #{}: failed: {msg}", call.as_u64()),
         },
-        EventPayload::Return { value } => format!("Return: {value}"),
-        EventPayload::Condition { cause, .. } => format!("Condition: {}", cause_label(cause)),
+        EventPayload::Handback { how, .. } => format!("Handback: {}", cause_label(how)),
         EventPayload::Rename { name } => format!("Rename: {name}"),
         EventPayload::Console { lines } => format!("Console: {} lines", lines.len()),
-        EventPayload::Completion { usage, .. } => {
-            format!("Completion: {} out", usage.completion)
+        EventPayload::ReplyEnd { how, usage, .. } => {
+            format!("ReplyEnd: {how:?}, {} out", usage.completion)
+        }
+        EventPayload::Reply => "Reply".to_owned(),
+        EventPayload::Part { part, .. } => match part {
+            crate::types::Part::Thinking(t) => format!("Thinking: {} bytes", t.len()),
+            crate::types::Part::Prose(t) => format!("Prose: {} bytes", t.len()),
+            crate::types::Part::Cell(t) => format!("Cell: {} bytes", t.len()),
+        },
+        EventPayload::Compaction { rendered, budget } => {
+            format!("Compaction: {rendered} against {budget}")
         }
         EventPayload::Note { text, .. } => format!("Note: {text}"),
         EventPayload::Compacted { of, text } => match text {
             Some(t) => format!("Compacted #{}: {t}", of.as_u64()),
             None => format!("Compacted #{}: removed", of.as_u64()),
         },
-        // 28.B–C fill these in: nothing writes them yet.
-        EventPayload::Reply
-        | EventPayload::Part { .. }
-        | EventPayload::ReplyEnd { .. }
-        | EventPayload::Restart { .. }
-        | EventPayload::Handback { .. } => String::new(),
     };
     crate::report::clip(&s, crate::report::PREVIEW_MAX_BYTES)
 }
@@ -2237,7 +2226,10 @@ mod tests {
             .events
             .values()
             .filter_map(|e| match &e.payload {
-                EventPayload::Message(Message::Turn { source, .. }) => Some(source.clone()),
+                EventPayload::Part {
+                    part: crate::types::Part::Cell(source),
+                    ..
+                } => Some(source.clone()),
                 _ => None,
             })
             .collect();
@@ -2277,7 +2269,7 @@ mod tests {
             .events
             .values()
             .filter_map(|e| match &e.payload {
-                EventPayload::Completion { thinking, .. } => thinking.clone(),
+                EventPayload::Part { part: crate::types::Part::Thinking(t), .. } => Some(t.clone()),
                 _ => None,
             })
             .collect();
@@ -2297,8 +2289,7 @@ mod tests {
             .filter(|e| {
                 matches!(
                     e.payload,
-                    EventPayload::Return { .. } | EventPayload::Condition { .. }
-                )
+                    EventPayload::Handback { .. }                 )
             })
             .count();
         assert_eq!(terminals, 1, "a reply is one run, however many cells");
@@ -2345,7 +2336,7 @@ mod tests {
         let trapped = tree.events.values().any(|e| {
             matches!(
                 &e.payload,
-                EventPayload::Condition { cause: Cause::Trapped { .. }, .. }
+                EventPayload::Handback { how: crate::types::Handback::Trapped { .. }, .. }
             )
         });
         assert!(trapped, "the cell trapped");
@@ -2405,7 +2396,7 @@ mod tests {
             .iter()
             .rev()
             .find_map(|e| match &e.payload {
-                EventPayload::Return { value } => Some(value.clone()),
+                EventPayload::Handback { how: crate::types::Handback::Completed, .. } => Some(serde_json::Value::Null),
                 _ => None,
             })
             .expect("a Return on this branch")
@@ -2451,22 +2442,19 @@ mod tests {
                 EventPayload::Agent { .. } => "Agent",
                 EventPayload::Fork { .. } => "Fork",
                 EventPayload::Answer { .. } => "Answer",
-                EventPayload::Message(Message::Post { .. }) => "Post",
-                EventPayload::Message(Message::Turn { .. }) => "Turn",
+                EventPayload::Post { .. } => "Post",
+                EventPayload::Reply => "Reply",
+                EventPayload::Restart => "Restart",
+                EventPayload::Part { .. } => "Part",
                 EventPayload::Call(_) => "Call",
                 EventPayload::Result { .. } => "Result",
-                EventPayload::Return { .. } => "Return",
-                EventPayload::Condition { .. } => "Condition",
+                EventPayload::Handback { .. } => "Handback",
                 EventPayload::Console { .. } => "Console",
-                EventPayload::Completion { .. } => "Completion",
+                EventPayload::ReplyEnd { .. } => "ReplyEnd",
+                EventPayload::Compaction { .. } => "Compaction",
                 EventPayload::Rename { .. } => "Rename",
                 EventPayload::Note { .. } => "Note",
                 EventPayload::Compacted { .. } => "Compacted",
-                            EventPayload::Reply
-                | EventPayload::Part { .. }
-                | EventPayload::ReplyEnd { .. }
-                | EventPayload::Restart { .. }
-                | EventPayload::Handback { .. } => Default::default(),
             });
             if matches!(event.payload, EventPayload::Agent { .. }) {
                 break;
@@ -2511,16 +2499,7 @@ mod tests {
     fn derived_with_ids(tree: &Tree, leaf: EventId) -> Vec<(EventId, String)> {
         let mut out = Vec::new();
         for event in tree.path_events(leaf) {
-            if matches!(
-                event.payload,
-                EventPayload::Return { .. } | EventPayload::Condition { .. }
-            ) && !matches!(
-                event.payload,
-                EventPayload::Condition {
-                    cause: Cause::Compaction { .. },
-                    ..
-                }
-            ) {
+            if matches!(event.payload, EventPayload::Handback { .. }) {
                 out.push((
                     event.id,
                     crate::report::derive_report(tree, leaf, event.id, 64 * 1024),
@@ -2905,7 +2884,7 @@ mod tests {
     fn run_program_id(tree: &Tree) -> EventId {
         tree.events
             .values()
-            .filter(|e| matches!(&e.payload, EventPayload::Message(Message::Turn { .. })))
+            .filter(|e| matches!(&e.payload, EventPayload::Reply))
             .min_by_key(|e| e.id.as_u64())
             .map(|e| e.id)
             .expect("a Turn event")
@@ -3339,11 +3318,11 @@ mod tests {
             .events
             .values()
             .find_map(|e| match &e.payload {
-                EventPayload::Condition { cause, .. } => Some(cause.clone()),
+                EventPayload::Handback { how, .. } => Some(how.clone()),
                 _ => None,
             })
             .expect("the off-menu reply raised a condition");
-        let Cause::Trapped {
+        let crate::types::Handback::Trapped {
             message, resumable, ..
         } = condition
         else {
@@ -3403,10 +3382,7 @@ mod tests {
             .events
             .values()
             .find_map(|e| match &e.payload {
-                EventPayload::Condition {
-                    cause: Cause::Trapped { message, .. },
-                    ..
-                } => Some(message.clone()),
+                EventPayload::Handback { how: crate::types::Handback::Trapped { message, .. }, .. } => Some(message.clone()),
                 _ => None,
             })
             .expect("the failed read trapped");
@@ -3447,7 +3423,7 @@ mod tests {
         // either, so it never manufactured one here.
         assert_eq!(
             kinds(tree, root_leaf(&session)),
-            ["Agent", "Post", "Turn", "Call", "Completion", "Return", "Console", "Result"]
+            ["Agent", "Post", "Reply", "Part", "Call", "ReplyEnd", "Handback", "Console", "Result"]
         );
 
         // The one `Post` on this branch is the user's own kickoff.
@@ -3455,7 +3431,7 @@ mod tests {
             .events
             .values()
             .find_map(|e| match &e.payload {
-                EventPayload::Message(Message::Post { from, origin }) if *from == Author::User => {
+                EventPayload::Post { from, origin } if *from == Author::User => {
                     Some((e.id, *from, origin.clone()))
                 }
                 _ => None,
@@ -3502,7 +3478,7 @@ mod tests {
             SessionEvent::Event { event, .. }
                 if matches!(
                     &event.payload,
-                    EventPayload::Message(Message::Turn { source, .. })
+                    EventPayload::Part { part: crate::types::Part::Cell(source), .. }
                         if source.contains("hello back")
                 )
         )));
@@ -3632,7 +3608,7 @@ mod tests {
             .values()
             .find(|e| {
                 matches!(&e.payload,
-                EventPayload::Message(Message::Post { origin, .. })
+                EventPayload::Post { origin, .. }
                 if origin.direct().is_some_and(|(t, _, _)| t == "are you done yet?"))
             })
             .expect("the post is logged on arrival")
@@ -3641,10 +3617,7 @@ mod tests {
             .events
             .values()
             .find_map(|e| match &e.payload {
-                EventPayload::Condition {
-                    cause: Cause::Posted { ids },
-                    ..
-                } => Some(ids.clone()),
+                EventPayload::Handback { how: crate::types::Handback::Posted { ids }, .. } => Some(ids.clone()),
                 _ => None,
             })
             .expect("the run suspended into Condition::Posted");
@@ -3656,7 +3629,7 @@ mod tests {
     // --- M4: fork / label / resume / list-leaves ---
 
     fn user(text: &str) -> EventPayload {
-        EventPayload::Message(Message::Post {
+        EventPayload::Post {
             from: Author::User,
             origin: Origin::Direct {
                 text: text.into(),
@@ -3664,7 +3637,7 @@ mod tests {
                 options: Vec::new(),
                 expects_reply: true,
             },
-        })
+        }
     }
 
     /// An assistant turn: under code mode `source` is the whole program,
@@ -3672,12 +3645,7 @@ mod tests {
     /// (23_ONE_AGENT.md's substitution table) — mirrors `tree.rs`'s own
     /// `assistant_msg` test helper.
     fn assistant(source: &str) -> EventPayload {
-        EventPayload::Message(Message::Turn {
-            author: Author::Agent(EventId::new(1)),
-            source: source.into(),
-            thinking: None,
-            usage: None,
-        })
+        EventPayload::Reply
     }
 
     /// An incomplete root agent: Agent(1), User(2 "q"),
@@ -3885,7 +3853,7 @@ mod tests {
         let kinds = kinds(session.tree(), root_leaf(&session));
         assert_eq!(
             kinds,
-            ["Agent", "Post", "Turn", "Answer", "Rename"],
+            ["Agent", "Post", "Reply", "Answer", "Handback", "Rename"],
             "{kinds:?}"
         );
     }
@@ -4164,7 +4132,7 @@ mod tests {
             .unwrap();
         tree.append(
             &mut spine,
-            EventPayload::Message(Message::Post {
+            EventPayload::Post {
                 from: Author::User,
                 origin: Origin::Direct {
                     text: "do something".into(),
@@ -4172,17 +4140,12 @@ mod tests {
                     options: Vec::new(),
                     expects_reply: true,
                 },
-            }),
+            },
         )
         .unwrap();
         tree.append(
             &mut spine,
-            EventPayload::Message(Message::Turn {
-                author: Author::Agent(EventId::new(1)),
-                source: "return 42;".into(),
-                thinking: None,
-                usage: None,
-            }),
+            EventPayload::Restart,
         )
         .unwrap();
         // No outcome at all — the VM was lost with the process.
@@ -4204,10 +4167,7 @@ mod tests {
         assert!(
             session.tree().events.values().any(|e| matches!(
                 &e.payload,
-                EventPayload::Condition {
-                    cause: Cause::Interrupted,
-                    ..
-                }
+                EventPayload::Handback { how: crate::types::Handback::Interrupted, .. }
             )),
             "the interrupted run was given an outcome"
         );
@@ -4362,12 +4322,12 @@ mod tests {
             .values()
             .find(|e| {
                 matches!(&e.payload,
-                    EventPayload::Message(Message::Post { origin: Origin::Sent(s), .. })
+                    EventPayload::Post { origin: Origin::Sent(s), .. }
                     if *s == send)
             })
             .map(|e| e.id)
             .expect("the Post naming that Send");
-        let EventPayload::Message(Message::Post { from, .. }) = &tree.events[&post].payload else {
+        let EventPayload::Post { from, .. } = &tree.events[&post].payload else {
             unreachable!()
         };
         assert_eq!(*from, Author::Agent(session.conversation_branch()));
@@ -4462,7 +4422,7 @@ mod tests {
         // surprise.
         assert_eq!(
             kinds(tree, worker_leaf),
-            ["Agent", "Post", "Turn", "Call", "Completion", "Return", "Console", "Result"]
+            ["Agent", "Post", "Reply", "Part", "Call", "ReplyEnd", "Handback", "Console", "Result"]
         );
         assert!(
             tree.spine_at(worker_leaf).context().open.is_empty(),
@@ -4492,10 +4452,10 @@ mod tests {
             .find(|e| {
                 matches!(
                     e.payload,
-                    EventPayload::Message(Message::Post {
+                    EventPayload::Post {
                         origin: Origin::Sent(_),
                         ..
-                    })
+                    }
                 )
             })
             .map(|e| e.id)
@@ -5013,7 +4973,7 @@ mod tests {
             let leaf = session.state(agent).unwrap().spine.leaf_id;
             assert_eq!(
                 kinds(tree, leaf),
-                ["Agent", "Post", "Turn", "Answer", "Completion", "Return", "Console"]
+                ["Agent", "Post", "Reply", "Part", "Answer", "ReplyEnd", "Handback", "Console"]
             );
         }
     }
@@ -5075,10 +5035,10 @@ mod tests {
         assert!(
             !tree.events.values().any(|e| matches!(
                 &e.payload,
-                EventPayload::Message(Message::Post {
+                EventPayload::Post {
                     origin: Origin::Sent(_),
                     ..
-                })
+                }
             )),
             "a question to the human posts nowhere"
         );
@@ -5131,7 +5091,7 @@ mod tests {
         assert!(
             parent_path.iter().any(|e| matches!(
                 &e.payload,
-                EventPayload::Message(Message::Post { from: Author::Agent(a), .. })
+                EventPayload::Post { from: Author::Agent(a), .. }
                 if tree.enclosing_agent(*a) != Some(session.conversation_branch())
             )),
             "the worker's question is on the parent's branch: {:?}",
@@ -5140,10 +5100,7 @@ mod tests {
         assert!(
             parent_path.iter().any(|e| matches!(
                 &e.payload,
-                EventPayload::Condition {
-                    cause: Cause::Posted { .. },
-                    ..
-                }
+                EventPayload::Handback { how: crate::types::Handback::Posted { .. }, .. }
             )),
             "and the running parent suspended on it"
         );
@@ -5282,12 +5239,9 @@ mod tests {
 
         // The question the worker read carried the options with it.
         let rendered = match &tree.events[&EventId::new(question)].payload {
-            EventPayload::Message(msg) => match tree.resolve(msg) {
-                Message::Post { origin, from } => {
-                    crate::report::render_post(EventId::new(question), from, &origin)
-                }
-                _ => panic!("not a post"),
-            },
+            EventPayload::Post { from, origin } => {
+                crate::report::render_post(EventId::new(question), *from, &tree.resolve(origin))
+            }
             other => panic!("not a message: {other:?}"),
         };
         assert!(
@@ -5362,10 +5316,10 @@ mod tests {
         assert!(
             matches!(
                 &tree.events[&EventId::new(question)].payload,
-                EventPayload::Message(Message::Post {
+                EventPayload::Post {
                     origin: Origin::Sent(_),
                     ..
-                })
+                }
             ),
             "#{question} must be the delivered question"
         );
@@ -5383,7 +5337,7 @@ mod tests {
         // pointless completion.
         assert_eq!(
             kinds(tree, worker_leaf),
-            ["Agent", "Post", "Turn", "Answer", "Completion", "Return", "Console"]
+            ["Agent", "Post", "Reply", "Part", "Answer", "ReplyEnd", "Handback", "Console"]
         );
         assert!(tree.spine_at(worker_leaf).context().open.is_empty());
     }
@@ -5501,10 +5455,10 @@ mod tests {
             assert!(
                 matches!(
                     &tree.events[&EventId::new(id)].payload,
-                    EventPayload::Message(Message::Post {
+                    EventPayload::Post {
                         origin: Origin::Sent(_),
                         ..
-                    })
+                    }
                 ),
                 "#{id} must be a delivered question"
             );
@@ -5514,7 +5468,7 @@ mod tests {
         assert!(
             tree.events.values().any(|e| matches!(
                 &e.payload,
-                EventPayload::Condition { cause: Cause::Posted { ids }, .. }
+                EventPayload::Handback { how: crate::types::Handback::Posted { ids }, .. }
                 if ids.contains(&EventId::new(upward_question))
             )),
             "the running parent suspended on the child's question"
@@ -5804,7 +5758,7 @@ mod tests {
         let kinds = kinds(session.tree(), root_leaf(&session));
         assert_eq!(
             kinds,
-            ["Agent", "Post", "Post", "Turn", "Call", "Completion", "Return", "Console", "Result"],
+            ["Agent", "Post", "Post", "Reply", "Part", "Call", "ReplyEnd", "Handback", "Console", "Result"],
             "one turn, a bare reply — it answers neither open post (18_TARGETING), but under \
              code mode that reply is still a real tell() call, not call-free prose; (C0b) its \
              own unawaited settlement is never a rule-C surprise, so nothing trails it: \
@@ -5824,7 +5778,7 @@ mod tests {
             SessionEvent::Event { event, .. }
                 if matches!(
                     &event.payload,
-                    EventPayload::Message(Message::Turn { source, .. })
+                    EventPayload::Part { part: crate::types::Part::Cell(source), .. }
                         if source.contains("second thoughts")
                 )
         )));
@@ -5867,14 +5821,14 @@ mod tests {
             .into_iter()
             .find(|e| {
                 matches!(&e.payload,
-                    EventPayload::Message(Message::Post { from: Author::Harness, origin })
+                    EventPayload::Post { from: Author::Harness, origin }
                     if origin.direct().is_some_and(|(t, _, r)| t.contains("interrupted") && !r))
             })
             .expect("the interrupt is a logged harness post");
         // …and it is what the program suspended on, at its next slice.
         assert!(tree.path_events(leaf).iter().any(|e| matches!(
             &e.payload,
-            EventPayload::Condition { cause: Cause::Posted { ids }, .. } if ids.contains(&notice.id)
+            EventPayload::Handback { how: crate::types::Handback::Posted { ids }, .. } if ids.contains(&notice.id)
         )));
         assert!(
             !session.state(branch).unwrap().open().contains(&notice.id),
@@ -5936,10 +5890,7 @@ mod tests {
             .filter(|e| {
                 matches!(
                     &e.payload,
-                    EventPayload::Message(Message::Turn {
-                        author: Author::User,
-                        ..
-                    })
+                    EventPayload::Reply
                 )
             })
             .collect();
@@ -6161,16 +6112,16 @@ mod tests {
         // the only one on the branch.
         assert_eq!(
             kinds(tree, leaf),
-            ["Agent", "Post", "Turn", "Note", "Call", "Completion", "Return", "Console", "Result"]
+            ["Agent", "Post", "Reply", "Part", "Note", "Call", "ReplyEnd", "Handback", "Console", "Result"]
         );
         assert_eq!(appended(tree, leaf), json!(1));
         assert!(
             !tree.path_events(leaf).iter().any(|e| matches!(
                 &e.payload,
-                EventPayload::Message(Message::Post {
+                EventPayload::Post {
                     from: Author::Harness,
                     ..
-                })
+                }
             )),
             "a fire-and-forget tell must not cost a harness post"
         );
@@ -6268,11 +6219,11 @@ mod tests {
             .iter()
             .find(|e| {
                 matches!(&e.payload,
-                    EventPayload::Message(Message::Post { from: Author::Harness, origin })
+                    EventPayload::Post { from: Author::Harness, origin }
                     if origin.direct().is_some_and(|(t, _, r)| t.contains("no program awaiting it") && !r))
             })
             .expect("an unawaited result is surfaced as a harness post");
-        let EventPayload::Message(Message::Post { origin, .. }) = &notice.payload else {
+        let EventPayload::Post { origin, .. } = &notice.payload else {
             unreachable!()
         };
         let (text, _, _) = origin.direct().unwrap();
@@ -6320,7 +6271,7 @@ mod tests {
             .iter()
             .filter(|e| {
                 matches!(&e.payload,
-                    EventPayload::Message(Message::Post { from: Author::Harness, origin })
+                    EventPayload::Post { from: Author::Harness, origin }
                     if origin.direct().is_some_and(|(t, _, r)| t.contains("no program awaiting it") && !r))
             })
             .count();
@@ -6356,12 +6307,7 @@ mod tests {
         }
         tree.append(
             &mut root,
-            EventPayload::Message(Message::Turn {
-                author: Author::Agent(EventId::new(1)),
-                source: "history.append(await ask(w, \"q\"));".into(),
-                thinking: None,
-                usage: None,
-            }),
+            EventPayload::Restart,
         )
         .unwrap();
         if !step(&mut tree, 4) {
@@ -6423,10 +6369,10 @@ mod tests {
         }
         tree.append(
             &mut worker,
-            EventPayload::Message(Message::Post {
+            EventPayload::Post {
                 from: Author::Agent(EventId::new(1)),
                 origin: Origin::Sent(EventId::new(7)),
-            }),
+            },
         )
         .unwrap();
         if !step(&mut tree, 9) {
@@ -6526,7 +6472,7 @@ mod tests {
         // return value ever synthesized.
         assert_eq!(
             kinds(session.tree(), worker.spine.leaf_id),
-            ["Agent", "Post", "Turn", "Answer", "Completion", "Return", "Console"],
+            ["Agent", "Post", "Reply", "Part", "Answer", "ReplyEnd", "Handback", "Console"],
             "the lost post was appended, and the worker answered it"
         );
         assert_eq!(
@@ -6632,15 +6578,15 @@ mod tests {
         tree.append(&mut root, user("go")).unwrap();
         tree.append(
             &mut root,
-            EventPayload::Message(Message::Turn {
-                author: Author::Agent(EventId::new(1)),
-                source: "return 7;".into(),
-                thinking: None,
-                usage: None,
-            }),
+            EventPayload::Restart,
         )
         .unwrap();
-        tree.append(&mut root, EventPayload::Return { value: json!(7) })
+        tree.append(&mut root, EventPayload::Handback {
+                reply: EventId::new(1),
+                how: crate::types::Handback::Completed,
+                site: 0,
+                stack: Vec::new(),
+            })
             .unwrap();
 
         // Nothing to repair: the `Return` says the program finished.
@@ -6698,13 +6644,11 @@ mod tests {
         tree.append(&mut root, user("go")).unwrap();
         tree.append(
             &mut root,
-            EventPayload::Message(Message::Turn {
-                author: Author::Agent(EventId::new(1)),
-                source: "await tools.send_email(); history.append(await ask(\"user\", \"which one?\"));"
-                    .into(),
-                thinking: None,
-                usage: None,
-            }),
+            EventPayload::Part {
+                reply: EventId::new(1),
+                part: crate::types::Part::Cell("await tools.send_email(); history.append(await ask(\"user\", \"which one?\"));"
+                    .into()),
+            },
         )
         .unwrap();
         let invoke = tree
@@ -6786,7 +6730,7 @@ mod tests {
         let mut worker = tree.spine_at(EventId::new(5));
         tree.append(
             &mut worker,
-            EventPayload::Message(Message::Post {
+            EventPayload::Post {
                 from: Author::Agent(EventId::new(1)),
                 origin: Origin::Direct {
                     text: "do the thing".into(),
@@ -6794,17 +6738,12 @@ mod tests {
                     options: Vec::new(),
                     expects_reply: true,
                 },
-            }),
+            },
         )
         .unwrap();
         tree.append(
             &mut worker,
-            EventPayload::Message(Message::Turn {
-                author: Author::Agent(EventId::new(5)),
-                source: "history.append(await ask(null, \"which one?\"));".into(),
-                thinking: None,
-                usage: None,
-            }),
+            EventPayload::Restart,
         )
         .unwrap();
         let send = tree
@@ -6884,7 +6823,7 @@ mod tests {
             .values()
             .filter(|e| {
                 matches!(&e.payload,
-                EventPayload::Message(Message::Post { origin: Origin::Sent(s), .. }) if *s == send)
+                EventPayload::Post { origin: Origin::Sent(s), .. } if *s == send)
             })
             .count();
         assert_eq!(

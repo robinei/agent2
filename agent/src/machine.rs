@@ -365,7 +365,7 @@ enum Phase {
     /// There is still only ever **one** parked run in this variant —
     /// `Phase` itself never represents nesting. What changed in C0a
     /// (23_ONE_AGENT.md) is where a *new* program starting on top of
-    /// this one goes: not straight into `Cause::Abandoned`, but onto
+    /// this one goes: not straight into `crate::types::Handback::Abandoned`, but onto
     /// [`Runner::beneath`], a stack of exactly these frozen `(Run,
     /// ResumeWith)` pairs. That stack, not another dimension on this
     /// enum, is "the handler stack is a host-side structure of
@@ -509,11 +509,15 @@ pub struct Runner {
     /// stripped — the bug this field exists to stop, on a quarter of
     /// replies.
     streaming_reply: String,
-    /// Who wrote the reply now being assembled. Every cell's `Turn`
-    /// carries it, so a hand-typed turn stays the person's: the notebook
-    /// path stamped `Author::Agent` on all of them, and the log lost the
-    /// one distinction `Message::Turn.author` exists to keep.
-    reply_author: Author,
+    /// The `Reply` (or `Restart`) whose parts and handbacks are being
+    /// written (28). Allocated before a byte arrives, so everything in
+    /// the reply can name it — and so a generation that produces nothing
+    /// still leaves the record that it was attempted.
+    reply_id: EventId,
+    /// How the reply being assembled stopped arriving, when it was
+    /// anything but `Finished`. Set by whoever cut it off; read once by
+    /// `finish_notebook_generation`.
+    reply_ended: Option<ReplyEnd>,
     /// A `resume(...)`/`abandon()` handed to `history.append`, waiting
     /// for this reply's run to end. See the `TOOL_APPEND_HISTORY` arm.
     pending_decision: Option<serde_json::Value>,
@@ -592,7 +596,7 @@ pub struct Runner {
     /// own completion says what to do: a `{__decision: "resume"|
     /// "abandon", ..}` tag routes to [`Runner::resume`]/
     /// [`Runner::abandon`]; anything else is a genuine rewrite, and the
-    /// frame is discarded (`Cause::Abandoned`) instead.
+    /// frame is discarded (`crate::types::Handback::Abandoned`) instead.
     beneath: Vec<(Run, ResumeWith, u64)>,
 }
 
@@ -611,7 +615,7 @@ enum SuspendCause {
     /// have already run — their calls made, their rows appended. So this
     /// suspends the run that is under way rather than refusing a turn that
     /// never started, and the effects that happened stay in the log. The
-    /// cause is still `Cause::CompileFailed`: what went wrong is that the
+    /// cause is still `crate::types::Handback::CellFailed`: what went wrong is that the
     /// model wrote a cell that does not compile, and that is what the repair
     /// loop needs to see.
     CellCompileFailed(String),
@@ -702,7 +706,8 @@ impl Runner {
             streaming_epoch: None,
             streaming_reply: String::new(),
             pending_decision: None,
-            reply_author: Author::Harness,
+            reply_id: EventId::new(1),
+            reply_ended: None,
             attached: false,
             // A branch handed to a fresh `Runner` has said nothing to
             // *this* session's LLM and is owed no prompt for its
@@ -829,7 +834,7 @@ impl Runner {
         self.agent_segment(tree)
             .iter()
             .filter(|e| e.id.as_u64() > self.shown)
-            .filter(|e| matches!(e.payload, EventPayload::Message(Message::Post { .. })))
+            .filter(|e| matches!(e.payload, EventPayload::Post { .. }))
             .map(|e| e.id)
             .collect()
     }
@@ -845,14 +850,13 @@ impl Runner {
         let segment = self.agent_segment(tree);
         let at = segment
             .iter()
-            .rposition(|e| matches!(e.payload, EventPayload::Message(Message::Turn { .. })))?;
+            .rposition(|e| matches!(e.payload, EventPayload::Reply))?;
         segment[at + 1..]
             .iter()
             .any(|e| {
                 matches!(
                     e.payload,
-                    EventPayload::Return { .. } | EventPayload::Condition { .. }
-                )
+                    EventPayload::Handback { .. }                 )
             })
             .then_some(segment[at].id)
     }
@@ -911,13 +915,12 @@ impl Runner {
             return None; // on this branch; not the fork case
         }
         // Unanswered anywhere on this path, and expecting a reply.
-        let expects_reply = matches!(
-            tree.resolve(match &path[at].payload {
-                EventPayload::Message(m) => m,
-                _ => return None,
-            }),
-            Message::Post { origin, .. } if matches!(origin.direct(), Some((_, _, true)))
-        );
+        let expects_reply = match &path[at].payload {
+            EventPayload::Post { origin, .. } => {
+                matches!(tree.resolve(origin).direct(), Some((_, _, true)))
+            }
+            _ => return None,
+        };
         let answered = path.iter().any(
             |e| matches!(&e.payload, EventPayload::Answer { question: q, .. } if *q == question),
         );
@@ -1007,7 +1010,7 @@ impl Runner {
     ) -> io::Result<(EventId, Vec<StepOutput>)> {
         let post = tree.append(
             &mut self.spine,
-            EventPayload::Message(Message::Post { from, origin }),
+            EventPayload::Post { from, origin },
         )?;
         // Logged on arrival either way — visible and crash-safe before
         // anything decides what to do about it. Whether it starts a turn
@@ -1206,7 +1209,7 @@ impl Runner {
     /// dropped. Like [`Runner::resume`], this is a direct host call, not
     /// something the LLM names.
     ///
-    /// It logs `Cause::Abandoned`, and must: a run needs exactly one
+    /// It logs `crate::types::Handback::Abandoned`, and must: a run needs exactly one
     /// log-visible terminal or nothing downstream can be derived from the
     /// log alone. `Return` is the completing case; this is the other one.
     /// Logging nothing — which is what this did before — left the branch
@@ -1225,12 +1228,12 @@ impl Runner {
         // belt-and-braces rather than load-bearing.
         tree.append(
             &mut self.spine,
-            EventPayload::Condition {
-                cause: Cause::Abandoned,
-                site: 0,
-                stack: Vec::new(),
-                disposition: Disposition::Handover,
-            },
+            EventPayload::Handback {
+                    reply: self.reply_id,
+                    how: Handback::Abandoned,
+                    site: 0,
+                    stack: Vec::new(),
+                },
         )?;
         self.last_vm = Some(run.vm);
         self.prompt_if_needed(tree)
@@ -2264,7 +2267,9 @@ impl Runner {
                     None => Err(format!("call #{id} has no result yet")),
                 },
             },
-            EventPayload::Return { value } => Ok(value.clone()),
+            // A handback carries no value — a reply has no `return`
+            // (D5) — so fetching one reads as the fact that it happened.
+            EventPayload::Handback { how, .. } => Ok(serde_json::json!(format!("{how:?}"))),
             // Not a menu row — it is named at the point it is
             // truncated, because it is context for one place rather than
             // work to be reused. Fetchable all the same.
@@ -2280,16 +2285,23 @@ impl Runner {
             // `origin`) — the same `resolve` the renderer calls, so a
             // fetch and a render can never disagree about what a post
             // said.
-            EventPayload::Message(msg @ Message::Post { .. }) => match tree.resolve(msg) {
-                Message::Post { origin, .. } => Ok(serde_json::Value::String(
-                    origin.direct().map(|(t, _, _)| t).unwrap_or("").to_owned(),
-                )),
-                _ => unreachable!("resolve() never changes a Post's variant"),
-            },
-            // A program's own source, so a compacted turn can be read
-            // back by the turn that needs to know what it did.
-            EventPayload::Message(Message::Turn { source, .. }) => {
-                Ok(serde_json::Value::String(source.clone()))
+            EventPayload::Post { origin, .. } => Ok(serde_json::Value::String(
+                tree.resolve(origin)
+                    .direct()
+                    .map(|(t, _, _)| t)
+                    .unwrap_or("")
+                    .to_owned(),
+            )),
+            // A reply's own text, so a compacted one can be read back
+            // by the reply that needs to know what it did (28: its parts
+            // concatenated, which is what it is).
+            EventPayload::Reply | EventPayload::Restart => {
+                let path = tree.path_events(self.spine.leaf_id);
+                let at = path.iter().position(|e| e.id.as_u64() == id);
+                Ok(serde_json::Value::String(match at {
+                    Some(at) => crate::report::reply_source(&path, at),
+                    None => String::new(),
+                }))
             }
             EventPayload::Note { text, .. } => Ok(serde_json::Value::String(text.clone())),
             // Genuinely not a row: the agent's own root, a `Compacted`
@@ -2422,7 +2434,7 @@ impl Runner {
                 // that issued it is very much still the one running.
                 // `abandon` deliberately skips this: its whole point is
                 // that in-flight calls settle as artifacts nobody
-                // receives (`Cause::Abandoned`'s own doc), which is
+                // receives (`crate::types::Handback::Abandoned`'s own doc), which is
                 // exactly what leaving their generation stale achieves.
                 for pending in self.pending.values_mut() {
                     if pending.generation == home_generation {
@@ -2437,7 +2449,7 @@ impl Runner {
             // clause (`last_turn_outcome(tree) > self.shown`) would
             // otherwise see *this* handler's own `Turn`, still ahead of
             // a `shown` last advanced at the original suspend, followed
-            // by the fresh `Cause::Abandoned` `abandon()` is about to
+            // by the fresh `crate::types::Handback::Abandoned` `abandon()` is about to
             // log — indistinguishable from a genuinely new, unshown
             // completion — and fire a spurious prompt for an exchange
             // the branch has already fully seen.
@@ -2473,22 +2485,26 @@ impl Runner {
             self.last_vm = Some(old_run.vm);
             tree.append(
                 &mut self.spine,
-                EventPayload::Condition {
-                    cause: Cause::Abandoned,
+                EventPayload::Handback {
+                    reply: self.reply_id,
+                    how: Handback::Abandoned,
                     site: 0,
                     stack: Vec::new(),
-                    disposition: Disposition::Handover,
                 },
             )?;
         }
 
-        // "Completed ⇒ `Return`" holds without exception — a program that
-        // ends without a `return` still logs `Return { value: null }` —
-        // which is what makes recovery decidable from the log alone.
+        // "Completed ⇒ a terminal `Handback`" holds without exception,
+        // which is what makes recovery decidable from the log alone. It
+        // carries no value: a reply has no `return` (D5), and the field
+        // was null 68 times out of 68 before it was removed.
         let outcome = tree.append(
             &mut self.spine,
-            EventPayload::Return {
-                value: value_json.clone(),
+            EventPayload::Handback {
+                reply: self.reply_id,
+                how: Handback::Completed,
+                site: 0,
+                stack: Vec::new(),
             },
         )?;
         // The console is a diagnostic stream, capped with an explicit
@@ -2571,70 +2587,45 @@ impl Runner {
         // the *live* VM needs to resume. A `VMError` is not serialisable
         // and only a live VM can consume one, so the two cannot be the
         // same value.
-        let (cause, site, suspension, disposition) = match cause {
+        let (cause, site, suspension) = match cause {
             SuspendCause::Raise { condition, payload } => {
                 let payload = payload.map(|v| value_json(&run.vm, &v));
                 // `step()` advanced `ip` past the `Raise`, so the raise
                 // site is the previous slot.
                 let site = span_at(&run.vm, (run.vm.ip as usize).saturating_sub(1));
                 (
-                    Cause::Raised {
+                    Handback::Raised {
                         name: condition,
                         payload,
                     },
                     site,
                     ResumeWith::Raise,
-                    // FLAGGED (23_ONE_AGENT.md A4 — "record Disposition
-                    // on every Condition you log"): whether this raise
-                    // was a tail call (`Handover` — the raising frame
-                    // already popped, nothing left but the epilogue) or
-                    // ordinary deliberation (`Pushed`) is not derivable
-                    // from anything `StepResult::Raise`/`VM::frames()`
-                    // exposes here. `Pushed` is `Disposition`'s own safe
-                    // default: it only ever costs an unnecessary nesting
-                    // level on replay, never a miscounted depth. Detecting
-                    // a real tail-call handover (comparing frame depth
-                    // before/after, or a VM-side marker) is left for
-                    // whoever next touches replay depth counting.
-                    Disposition::Pushed,
                 )
             }
             SuspendCause::Trapped(e) => {
                 let site = span_at(&run.vm, e.ip as usize);
-                let cause = Cause::Trapped {
+                let cause = Handback::Trapped {
                     kind: format!("{:?}", e.kind),
                     message: e.message.clone(),
                     resumable: matches!(e.resume, ResumeMode::PushValueThenContinue),
                 };
-                // Same flag as above: a trap has no tail-call shape to
-                // even ask the question of (it isn't a `raise`), so
-                // `Pushed` here is not a default standing in for an
-                // unknown answer — it is simply correct. Noted anyway so
-                // the two cases aren't confused when this is read later.
-                (cause, site, ResumeWith::Trapped(e), Disposition::Pushed)
+                (cause, site, ResumeWith::Trapped(e))
             }
-            SuspendCause::Truncated => (
-                Cause::Truncated,
-                0,
-                // Nothing to resume into: the rest of the reply was never
-                // written. The next completion continues with the results
-                // of the cells that did run already in hand.
-                ResumeWith::Continue,
-                Disposition::Pushed,
-            ),
+            // **Truncation is a fact about the text, not the program**
+            // (28): it goes on `ReplyEnd`, and the run simply stops
+            // where the reply did.
+            SuspendCause::Truncated => {
+                self.reply_ended = Some(ReplyEnd::Truncated);
+                (Handback::Interrupted, 0, ResumeWith::Continue)
+            }
             SuspendCause::CellCompileFailed(report) => {
                 // `ip` is parked on the failed cell's append position, which
                 // has no instruction yet — so there is no span to point at,
                 // and a zero-width site is the convention for exactly that.
                 (
-                    Cause::CompileFailed { message: report },
+                    Handback::CellFailed { message: report },
                     0,
-                    // Nothing to resume *into*: the cell that would have
-                    // continued the run does not exist. The next completion
-                    // starts a fresh reply, as it does for any other
-                    // compile failure.
                     ResumeWith::Continue,
-                    Disposition::Pushed,
                 )
             }
             SuspendCause::Posted(ids) => {
@@ -2643,12 +2634,7 @@ impl Runner {
                 // "handler" in the raise/resume sense here, just the
                 // running program parking until its next fuel slice
                 // (rule B). `Pushed` is simply correct.
-                (
-                    Cause::Posted { ids },
-                    site,
-                    ResumeWith::Continue,
-                    Disposition::Pushed,
-                )
+                (Handback::Posted { ids }, site, ResumeWith::Continue)
             }
         };
 
@@ -2669,9 +2655,9 @@ impl Runner {
         // `prompt_suspended`'s one-shot handler prompt, which would
         // re-state a report the rolling document now already carries);
         // and no run is left for `apply_turn` to discard, so no
-        // `Cause::Abandoned` is logged for a program that finished on
+        // `crate::types::Handback::Abandoned` is logged for a program that finished on
         // purpose.
-        let handed_over = disposition == Disposition::Handover;
+        let handed_over = cause.is_terminal();
         if handed_over {
             self.last_vm = Some(run.vm);
             self.phase = Phase::Idle;
@@ -2685,11 +2671,11 @@ impl Runner {
         // persisted.
         let outcome = tree.append(
             &mut self.spine,
-            EventPayload::Condition {
-                cause,
+            EventPayload::Handback {
+                reply: self.reply_id,
+                how: cause,
                 site,
                 stack,
-                disposition,
             },
         )?;
         tree.append(
@@ -2793,10 +2779,7 @@ impl Runner {
         let mut attempts = 0;
         for ev in tree.path_events(self.spine.leaf_id) {
             match &ev.payload {
-                EventPayload::Condition {
-                    cause: Cause::Compaction { .. },
-                    ..
-                } => attempts += 1,
+                EventPayload::Compaction { .. } => attempts += 1,
                 EventPayload::Compacted { .. } => attempts = 0,
                 _ => {}
             }
@@ -2826,22 +2809,7 @@ impl Runner {
         }
         tree.append(
             &mut self.spine,
-            EventPayload::Condition {
-                cause: Cause::Compaction { rendered, budget },
-                site: 0,
-                stack: Vec::new(),
-                // `Handover`, not `Pushed`: `document::render` inserts a
-                // report for a `Handover` and *hides* a `Pushed` one,
-                // because a pushed condition means a nested handler is
-                // about to run and nothing chat-visible has happened
-                // yet. Logged as `Pushed`, the request to compact went
-                // into the rolling document nowhere at all — two live
-                // runs on 2026-09-16 saw an ordinary conversation with
-                // an unanswered task, and did the task. Nothing opens a
-                // scope here: the compaction program is this branch's
-                // next turn, not a deliberation beneath it.
-                disposition: Disposition::Handover,
-            },
+            EventPayload::Compaction { rendered, budget },
         )?;
         self.compaction_requested = true;
         self.phase = Phase::AwaitingLlm;
@@ -2903,10 +2871,9 @@ impl Runner {
             .iter()
             .rev()
             .find_map(|e| match &e.payload {
-                EventPayload::Condition {
-                    cause: Cause::Compaction { rendered, budget },
-                    ..
-                } => Some(crate::report::compaction_message(*rendered, *budget)),
+                EventPayload::Compaction { rendered, budget } => {
+                    Some(crate::report::compaction_message(*rendered, *budget))
+                }
                 _ => None,
             })
     }
@@ -2987,7 +2954,7 @@ impl Runner {
             .filter(|e| {
                 matches!(
                     e.payload,
-                    EventPayload::Call(_) | EventPayload::Return { .. }
+                    EventPayload::Call(_) | EventPayload::Handback { .. }
                 )
             })
             .map(|e| e.id.as_u64())
@@ -3407,10 +3374,19 @@ pub(crate) fn menu_rows(
                         },
                     },
                 }),
-                EventPayload::Return { value } => Some(Artifact {
+                // **An `answer` is a row again.** It stopped being an
+                // outcome in 28 — a reply can answer and keep going, and
+                // one exemplar does — so the ack that used to stand in
+                // for it is gone and the act itself is what the log
+                // shows.
+                EventPayload::Answer { question, value } => Some(Artifact {
                     id,
-                    label: "program result".into(),
-                    state: ArtifactState::Delivered(value.clone()),
+                    label: String::new(),
+                    state: ArtifactState::Whole(format!(
+                        "you answered [{}]: {}",
+                        question.as_u64(),
+                        crate::document::escape_untrusted(&value.to_string())
+                    )),
                 }),
                 // A `history.append` — the one channel that crosses
                 // between replies by design, so it belongs in the list
@@ -3531,7 +3507,14 @@ impl Runner {
         let Some(notebook) = run.notebook.as_mut() else {
             return Ok(Vec::new());
         };
-        notebook.push_text(text);
+        let pieces = notebook.push_text(text);
+        self.log_parts(tree, &pieces)?;
+        let Phase::Running(run) = &mut self.phase else {
+            return Ok(Vec::new());
+        };
+        let Some(notebook) = run.notebook.as_mut() else {
+            return Ok(Vec::new());
+        };
         // **From the notebook, not from the chunk.** `push_text` may drop a
         // span it has just been handed — a provider leaking its reasoning
         // into the reply channel (`Notebook::drop_leaked_reasoning`) — and
@@ -3570,9 +3553,11 @@ impl Runner {
         // guard that makes the arm unreachable.
         if self.streaming_epoch.is_none() {
             if let Phase::Suspended(run, _) = &mut self.phase {
-                if let Some(notebook) = run.notebook.as_mut() {
-                    notebook.end_truncated(truncated);
-                }
+                let tail = match run.notebook.as_mut() {
+                    Some(notebook) => notebook.end_truncated(truncated),
+                    None => Vec::new(),
+                };
+                self.log_parts(tree, &tail)?;
             }
             return Ok(None);
         }
@@ -3581,7 +3566,6 @@ impl Runner {
         // written before its cell ran, which is while this completion was
         // still streaming (D15) — and the log is append-only, so there is
         // no `Turn` left to hang the figures on.
-        self.finish_notebook_generation(tree, usage, thinking)?;
         // **Mark the reply ended wherever its run is**, suspended
         // included. A raise or a trap in an early cell parks the run, and
         // this used to return before marking it — so the notebook stayed
@@ -3589,14 +3573,21 @@ impl Runner {
         // for a fence that was never coming. The reply is over either
         // way; whether its run can proceed is a separate question,
         // answered below.
-        match &mut self.phase {
+        let tail = match &mut self.phase {
             Phase::Running(run) | Phase::Suspended(run, _) => {
-                if let Some(notebook) = run.notebook.as_mut() {
-                    notebook.end_truncated(truncated);
+                match run.notebook.as_mut() {
+                    Some(notebook) => notebook.end_truncated(truncated),
+                    None => Vec::new(),
                 }
             }
             _ => return Ok(Some(Vec::new())),
-        }
+        };
+        self.log_parts(tree, &tail)?;
+        // **The end is logged last.** Trailing prose only becomes a
+        // piece when the reply ends, so draining it first is what keeps
+        // a reply's parts *before* its `ReplyEnd` — and the parts
+        // concatenating back to the reply is the whole design (28).
+        self.finish_notebook_generation(tree, usage, thinking)?;
         if !matches!(self.phase, Phase::Running(_)) {
             // Parked. The cells that are left run when a handler decides.
             return Ok(Some(Vec::new()));
@@ -3694,13 +3685,23 @@ impl Runner {
             self.beneath.push((old, resume_with, self.generation));
         }
         self.generation += 1;
+        // **The reply is logged before a byte of it arrives** (28).
+        // Everything the reply produces names this id, and a generation
+        // that dies before saying anything still leaves the record that
+        // it was attempted — a provider error used to leave none.
+        self.reply_id = match author {
+            Author::User => tree.append(
+                &mut self.spine,
+                EventPayload::Restart,
+            )?,
+            _ => tree.append(&mut self.spine, EventPayload::Reply)?,
+        };
         self.phase = Phase::Running(Run {
-            program_id: self.spine.leaf_id,
+            program_id: self.reply_id,
             vm,
             notebook: Some(notebook),
         });
         self.streaming_epoch = epoch.or(Some(u64::MAX));
-        self.reply_author = author;
         Ok(true)
     }
 
@@ -3730,14 +3731,51 @@ impl Runner {
         // be the same state: that is what made a third of the arm's
         // completions invisible, and every per-reply metric was divided
         // by the wrong number.
+        let _ = text;
+        if let Some(thinking) = thinking.filter(|t| !t.is_empty()) {
+            tree.append(
+                &mut self.spine,
+                EventPayload::Part {
+                    reply: self.reply_id,
+                    part: Part::Thinking(thinking),
+                },
+            )?;
+        }
         tree.append(
             &mut self.spine,
-            EventPayload::Completion {
+            EventPayload::ReplyEnd {
+                reply: self.reply_id,
+                how: self.reply_ended.take().unwrap_or(ReplyEnd::Finished),
                 usage: usage.unwrap_or_default(),
-                text,
-                thinking,
             },
         )?;
+        Ok(())
+    }
+
+    /// **Log the reply's parts as they arrive**, which is what makes
+    /// them concatenate back to it (28). They used to be logged as they
+    /// were *consumed* — at execution — so a reply that arrived whole
+    /// logged its `ReplyEnd` before any of its own text.
+    fn log_parts(&mut self, tree: &mut Tree, pieces: &[crate::notebook::Piece]) -> io::Result<()> {
+        let reply = self.reply_id;
+        let outer: Vec<Part> = {
+            let Phase::Running(run) = &self.phase else {
+                return Ok(());
+            };
+            let Some(nb) = run.notebook.as_ref() else {
+                return Ok(());
+            };
+            pieces
+                .iter()
+                .map(|piece| match piece {
+                    crate::notebook::Piece::Prose(t) => Part::Prose(t.clone()),
+                    crate::notebook::Piece::Cell(i) => Part::Cell(nb.cell_outer(*i)),
+                })
+                .collect()
+        };
+        for part in outer {
+            tree.append(&mut self.spine, EventPayload::Part { reply, part })?;
+        }
         Ok(())
     }
 
@@ -3820,15 +3858,17 @@ impl Runner {
                 unreachable!("advance_notebook with no notebook");
             };
             match notebook.take_piece() {
-                Some(piece @ crate::notebook::Piece::Prose(_)) => {
+                Some(crate::notebook::Piece::Prose(verbatim)) => {
                     // **Verbatim on the log, trimmed to the person.** The
-                    // piece carries every byte so the reply can be put
+                    // part carries every byte so the reply can be put
                     // back together exactly (28); what someone reads is
                     // the same text without the blank lines that
                     // separated it from the fences.
-                    let Some(text) = piece.visible().map(str::to_owned) else {
+                    let trimmed = verbatim.trim();
+                    if trimmed.is_empty() {
                         continue;
-                    };
+                    }
+                    let text = trimmed.to_owned();
                     let send = tree.append(
                         &mut self.spine,
                         EventPayload::Call(Call::Send {
@@ -3849,22 +3889,20 @@ impl Runner {
                     out.push(StepOutput::Sends(vec![send]));
                 }
                 Some(crate::notebook::Piece::Cell(i)) => {
-                    // The `Turn` goes in **before** the cell is compiled,
+                    // The part goes in **before** the cell is compiled,
                     // not merely before it runs. A cell that does not
-                    // compile has to leave its source in the log too, or the
-                    // repair loop is handed a diagnostic with nothing to
-                    // read it against — and the report, which anchors on the
-                    // newest `Turn`, would have nothing to anchor to.
-                    let source = notebook.cell_source(i);
-                    let turn = tree.append(
-                        &mut self.spine,
-                        EventPayload::Message(Message::Turn {
-                            author: self.reply_author,
-                            source,
-                            thinking: None,
-                            usage: None,
-                        }),
-                    )?;
+                    // compile has to leave its source in the log too, or
+                    // the repair loop is handed a diagnostic with nothing
+                    // to read it against.
+                    //
+                    // It carries the cell's fences (28): that is what
+                    // keeps the parts concatenating back to the reply,
+                    // and what makes a cell's offset the sum of the
+                    // lengths before it.
+                    // The part is already on the log — it was written
+                    // when it arrived (28). What identifies the run is
+                    // the reply itself.
+                    let turn = self.reply_id;
                     let Phase::Running(run) = &mut self.phase else {
                         unreachable!()
                     };
@@ -3899,7 +3937,7 @@ fn span_at(vm: &VM, ip: usize) -> u32 {
 /// Who authored the post `question` — the author an answer is owed to.
 fn asker_of(tree: &Tree, question: EventId) -> Option<Author> {
     match &tree.events.get(&question)?.payload {
-        EventPayload::Message(Message::Post { from, .. }) => Some(*from),
+        EventPayload::Post { from, .. } => Some(*from),
         _ => None,
     }
 }
@@ -4135,8 +4173,7 @@ mod tests {
             .find(|e| {
                 matches!(
                     e.payload,
-                    EventPayload::Return { .. } | EventPayload::Condition { .. }
-                )
+                    EventPayload::Handback { .. }                 )
             })
             .map(|e| e.id)
             .expect("an outcome to render");
@@ -4151,19 +4188,19 @@ mod tests {
                 EventPayload::Agent { .. } => "Agent",
                 EventPayload::Fork { .. } => "Fork",
                 EventPayload::Answer { .. } => "Answer",
-                EventPayload::Message(Message::Post { .. }) => "Post",
-                EventPayload::Message(Message::Turn { .. }) => "Turn",
+                EventPayload::Post { .. } => "Post",
                 EventPayload::Reply => "Reply",
+                EventPayload::Compaction { .. } => "Compaction",
                 EventPayload::Part { .. } => "Part",
                 EventPayload::ReplyEnd { .. } => "ReplyEnd",
-                EventPayload::Restart { .. } => "Restart",
+                EventPayload::Restart => "Restart",
                 EventPayload::Handback { .. } => "Handback",
                 EventPayload::Call(_) => "Call",
                 EventPayload::Result { .. } => "Result",
-                EventPayload::Return { .. } => "Return",
-                EventPayload::Condition { .. } => "Condition",
+                EventPayload::Handback { .. } => "Return",
+                EventPayload::Handback { .. } => "Condition",
                 EventPayload::Console { .. } => "Console",
-                EventPayload::Completion { .. } => "Completion",
+                EventPayload::ReplyEnd { .. } => "Completion",
                 EventPayload::Rename { .. } => "Rename",
                 EventPayload::Note { .. } => "Note",
                 EventPayload::Compacted { .. } => "Compacted",
@@ -4349,7 +4386,7 @@ mod tests {
         assert!(report.contains("hi there"), "{report}");
         assert_eq!(
             payload_kinds(&state, &tree),
-            ["Agent", "Post", "Turn", "Note", "Completion", "Return", "Console"]
+            ["Agent", "Post", "Reply", "Part", "Note", "ReplyEnd", "Handback", "Console"]
         );
     }
 
@@ -4452,7 +4489,7 @@ mod tests {
 
         // No `Working` output at all: an empty `source` must never
         // reach `start_program`/`interp::compile` and manufacture a
-        // spurious `Cause::CompileFailed`.
+        // spurious `crate::types::Handback::CellFailed`.
         assert!(
             !out.iter().any(|o| matches!(o, StepOutput::Working)),
             "an empty source must not start a program: {out:?}"
@@ -4485,7 +4522,7 @@ mod tests {
         assert!(report.contains("DID NOT RUN"), "{report}");
         assert_eq!(
             payload_kinds(&state, &tree),
-            ["Agent", "Turn", "Condition", "Console", "Completion"]
+            ["Agent", "Reply", "Part", "Handback", "Console", "ReplyEnd"]
         );
         // A cell that will not compile *suspends* the reply rather than
         // ending it: the condition is handed back and the next reply
@@ -4511,15 +4548,17 @@ mod tests {
         drain(&mut state, &mut tree, out);
         assert_eq!(state.status(), "suspended");
 
-        let disposition = state
+        // A raise *pauses*: the handback is non-terminal, which is
+        // where `Disposition::Pushed` used to be stored separately.
+        let how = state
             .agent_segment(&tree)
             .iter()
             .find_map(|e| match &e.payload {
-                EventPayload::Condition { disposition, .. } => Some(*disposition),
+                EventPayload::Handback { how, .. } => Some(how.clone()),
                 _ => None,
             })
-            .expect("a logged Condition");
-        assert_eq!(disposition, Disposition::Pushed);
+            .expect("a logged handback");
+        assert!(!how.is_terminal(), "{how:?}");
 
         // The host, not the LLM, drives the continuation directly.
         let out = state.resume(&mut tree, json!(41)).unwrap();
@@ -4667,24 +4706,23 @@ mod tests {
             .unwrap();
         drain(&mut state, &mut tree, out);
         assert_eq!(state.status(), "idle");
-        // The abandoned raise is a logged `Cause::Abandoned`, not a
+        // The abandoned raise is a logged `crate::types::Handback::Abandoned`, not a
         // `Return` of the raw decision object anywhere on the branch.
         assert!(
             state.agent_segment(&tree).iter().any(|e| matches!(
                 &e.payload,
-                EventPayload::Condition {
-                    cause: Cause::Abandoned,
-                    ..
-                }
+                EventPayload::Handback { how: crate::types::Handback::Abandoned, .. }
             )),
             "the abandon is a logged Condition"
         );
+        // A decision is not a row: appending one records the verdict,
+        // it does not write a note about it.
         assert!(
             !state.agent_segment(&tree).iter().any(|e| matches!(
                 &e.payload,
-                EventPayload::Return { value } if value.get("__decision").is_some()
+                EventPayload::Note { text, .. } if text.contains("__decision")
             )),
-            "no decision object ever lands as a program's own Return"
+            "no decision object ever lands as a row"
         );
     }
 
@@ -4716,10 +4754,10 @@ mod tests {
             .iter()
             .rev()
             .find_map(|e| match &e.payload {
-                EventPayload::Message(Message::Post {
+                EventPayload::Post {
                     from: Author::Harness,
                     origin,
-                }) => origin.direct().map(|(t, _, _)| t.to_owned()),
+                } => origin.direct().map(|(t, _, _)| t.to_owned()),
                 _ => None,
             });
         assert_eq!(posted.as_deref(), Some(INTERRUPT_NOTICE));
@@ -4903,7 +4941,7 @@ mod tests {
             .agent_segment(&tree)
             .iter()
             .rev()
-            .find(|e| matches!(e.payload, EventPayload::Message(Message::Post { .. })))
+            .find(|e| matches!(e.payload, EventPayload::Post { .. }))
             .unwrap()
             .id;
 
@@ -4954,7 +4992,7 @@ mod tests {
         // menu be an index rather than a replay.
         assert_eq!(
             &payload_kinds(&state, &tree)[before..],
-            ["Turn", "Note", "Completion", "Return", "Console"],
+            ["Reply", "Part", "Note", "ReplyEnd", "Handback", "Console"],
             "the fetch logged something of its own"
         );
     }
@@ -4979,7 +5017,7 @@ mod tests {
             .id;
         let turn = segment
             .iter()
-            .find(|e| matches!(e.payload, EventPayload::Message(Message::Turn { .. })))
+            .find(|e| matches!(e.payload, EventPayload::Reply))
             .unwrap()
             .id;
 
@@ -5337,10 +5375,10 @@ mod tests {
         for _ in 0..20 {
             tree.append(
                 &mut state.spine,
-                EventPayload::Message(Message::Post {
+                EventPayload::Post {
                     from: Author::User,
                     origin: direct(&"filler ".repeat(40), false),
-                }),
+                },
             )
             .unwrap();
         }
@@ -5366,7 +5404,7 @@ mod tests {
             !tree
                 .events
                 .values()
-                .any(|e| matches!(e.payload, EventPayload::Condition { .. }))
+                .any(|e| matches!(e.payload, EventPayload::Handback { .. }))
         );
     }
 
@@ -5379,21 +5417,17 @@ mod tests {
         assert!(matches!(fired, Some(StepOutput::LlmRequest(_))));
         assert!(state.compaction_requested, "a compaction was asked for");
 
+        // A compaction request is its own event now — not a condition,
+        // because nothing stopped.
         let logged = tree
             .events
             .values()
             .find_map(|e| match &e.payload {
-                EventPayload::Condition { cause, .. } => Some(cause.clone()),
+                EventPayload::Compaction { rendered, budget } => Some((*rendered, *budget)),
                 _ => None,
             })
-            .expect("a condition");
-        let Cause::Compaction {
-            rendered,
-            budget: b,
-        } = logged
-        else {
-            panic!("wrong cause: {logged:?}");
-        };
+            .expect("a compaction request");
+        let (rendered, b) = logged;
         assert_eq!(b, budget);
         assert!(rendered > budget, "{rendered} should exceed {budget}");
     }
@@ -5566,7 +5600,7 @@ mod tests {
         let target = tree
             .events
             .values()
-            .filter(|e| matches!(e.payload, EventPayload::Message(Message::Post { .. })))
+            .filter(|e| matches!(e.payload, EventPayload::Post { .. }))
             .map(|e| e.id.as_u64())
             .min()
             .map(EventId::new)
@@ -5616,7 +5650,7 @@ mod tests {
         let post = tree
             .events
             .values()
-            .filter(|e| matches!(e.payload, EventPayload::Message(Message::Post { .. })))
+            .filter(|e| matches!(e.payload, EventPayload::Post { .. }))
             .map(|e| e.id)
             .min()
             .expect("a post to remove");
@@ -5729,7 +5763,7 @@ mod tests {
             .agent_segment(&tree)
             .iter()
             .filter_map(|e| match &e.payload {
-                EventPayload::Message(Message::Turn { source, .. }) => Some(source.as_str()),
+                EventPayload::Part { part: crate::types::Part::Cell(source), .. } => Some(source.as_str()),
                 _ => None,
             })
             .collect();
@@ -5915,8 +5949,7 @@ mod tests {
             .filter(|e| {
                 matches!(
                     e.payload,
-                    EventPayload::Return { .. } | EventPayload::Condition { .. }
-                )
+                    EventPayload::Handback { .. }                 )
             })
             .count();
         assert_eq!(outcomes, 1, "one report, not one per cell");
@@ -5989,7 +6022,10 @@ mod tests {
         let mut checked = 0;
         for event in state.agent_segment(&tree) {
             match &event.payload {
-                EventPayload::Message(Message::Turn { source, .. }) => {
+                EventPayload::Part {
+                    part: crate::types::Part::Cell(source),
+                    ..
+                } => {
                     current = Some(source.clone());
                 }
                 EventPayload::Call(Call::Send { site, site_end, .. }) => {
@@ -6010,11 +6046,6 @@ mod tests {
                     checked += 1;
                 }
                 _ => {}
-                            EventPayload::Reply
-                | EventPayload::Part { .. }
-                | EventPayload::ReplyEnd { .. }
-                | EventPayload::Restart { .. }
-                | EventPayload::Handback { .. } => Default::default(),
             }
         }
         assert_eq!(checked, 2, "two tells, two sites resolved");
@@ -6119,7 +6150,7 @@ mod tests {
             "cell 0's effect stands: {kinds:?}"
         );
         assert!(
-            kinds.contains(&"Condition"),
+            kinds.contains(&"Handback"),
             "and the run has an outcome: {kinds:?}"
         );
         // The effects stand in the *log* — that is what "partial
@@ -6186,7 +6217,7 @@ mod tests {
         drain(&mut state, &mut tree, out);
         assert_eq!(
             payload_kinds(&state, &tree),
-            ["Agent", "Post", "Turn", "Completion", "Return", "Console"]
+            ["Agent", "Post", "Reply", "Part", "ReplyEnd", "Handback", "Console"]
         );
     }
 
@@ -6236,11 +6267,11 @@ mod tests {
         let kinds = payload_kinds(&state, &tree);
         assert_eq!(
             kinds,
-            ["Agent", "Post", "Call", "Turn", "Call"],
+            ["Agent", "Post", "Reply", "Part", "Call", "Part", "Call"],
             "cell 0 ran while the reply was still open"
         );
         assert!(
-            !kinds.contains(&"Return"),
+            !kinds.contains(&"Handback"),
             "but the run has not ended: {kinds:?}"
         );
         assert!(matches!(state.phase, Phase::Running(_)));
@@ -6284,7 +6315,7 @@ mod tests {
         );
         assert_eq!(
             payload_kinds(&state, &tree),
-            ["Agent", "Post", "Call", "Turn", "Call"],
+            ["Agent", "Post", "Reply", "Part", "Call", "Part", "Call"],
             "the paragraph is delivered, then the cell runs and speaks"
         );
     }
@@ -6343,14 +6374,19 @@ mod tests {
             .notebook_stream_end(&mut tree, false, None, None)
             .unwrap();
 
-        let text = tree
-            .events
-            .values()
-            .find_map(|e| match &e.payload {
-                EventPayload::Completion { text, .. } => Some(text.clone()),
+        let text = state
+            .agent_segment(&tree)
+            .iter()
+            .filter_map(|e| match &e.payload {
+                EventPayload::Part { part, .. } => match part {
+                    crate::types::Part::Prose(t) | crate::types::Part::Cell(t) => Some(t.clone()),
+                    crate::types::Part::Thinking(_) => None,
+                },
                 _ => None,
             })
-            .expect("the completion was logged");
+            .collect::<String>();
+        // **The invariant, end to end**: the reply's parts on the log
+        // concatenate back to the completion that produced them (28).
         assert_eq!(text, reply, "verbatim, prose and fences included");
     }
 
@@ -6439,11 +6475,11 @@ mod tests {
                 if text == "cell 0 ran")
         });
         assert!(said, "cell 0's effects stand");
-        let causes: Vec<&Cause> = state
+        let causes: Vec<&crate::types::Handback> = state
             .agent_segment(&tree)
             .iter()
             .filter_map(|e| match &e.payload {
-                EventPayload::Condition { cause, .. } => Some(cause),
+                EventPayload::Handback { how, .. } => Some(how),
                 _ => None,
             })
             .collect();
@@ -6452,9 +6488,21 @@ mod tests {
             1,
             "one run, one terminal, even truncated: {causes:?}"
         );
+        // Truncation is a fact about the *text* (28): the handback says
+        // the run stopped, `ReplyEnd` says why the reply did.
         assert!(
-            matches!(causes[0], Cause::Truncated),
+            matches!(causes[0], crate::types::Handback::Interrupted),
             "reported as partial, not completed: {causes:?}"
+        );
+        assert!(
+            tree.events.values().any(|e| matches!(
+                &e.payload,
+                EventPayload::ReplyEnd {
+                    how: crate::types::ReplyEnd::Truncated,
+                    ..
+                }
+            )),
+            "and the reply says it was cut off"
         );
     }
 
@@ -6528,7 +6576,7 @@ mod tests {
             .agent_segment(&tree)
             .iter()
             .filter_map(|e| match &e.payload {
-                EventPayload::Completion { usage, .. } => Some(usage.completion),
+                EventPayload::ReplyEnd { usage, .. } => Some(usage.completion),
                 _ => None,
             })
             .collect();
@@ -6537,7 +6585,7 @@ mod tests {
         let turns = state
             .agent_segment(&tree)
             .iter()
-            .filter(|e| matches!(e.payload, EventPayload::Message(Message::Turn { .. })))
+            .filter(|e| matches!(e.payload, EventPayload::Reply))
             .count();
         assert_eq!(turns, 3, "three cells, three Turns — and still one cost");
     }
@@ -6572,7 +6620,7 @@ mod tests {
             .agent_segment(&tree)
             .iter()
             .filter_map(|e| match &e.payload {
-                EventPayload::Completion { usage, .. } => Some(usage.completion),
+                EventPayload::ReplyEnd { usage, .. } => Some(usage.completion),
                 _ => None,
             })
             .collect();
@@ -6820,8 +6868,8 @@ mod tests {
             .agent_segment(tree)
             .iter()
             .filter_map(|e| match &e.payload {
-                EventPayload::Completion { thinking, .. } => thinking.clone(),
-                EventPayload::Message(Message::Turn { thinking, .. }) => thinking.clone(),
+                EventPayload::Part { part: crate::types::Part::Thinking(t), .. } => Some(t.clone()),
+                EventPayload::Part { part: crate::types::Part::Thinking(t), .. } => Some(t.clone()),
                 _ => None,
             })
             .collect()
@@ -6956,7 +7004,7 @@ mod tests {
     /// *previous* reply declared — which is what a leaked VM looks like.
     fn leaked_binding(state: &Runner, tree: &Tree) -> bool {
         state.agent_segment(tree).iter().any(|e| {
-            matches!(&e.payload, EventPayload::Condition { cause, .. }
+            matches!(&e.payload, EventPayload::Handback { how: cause, .. }
                 if format!("{cause:?}").contains("already declared"))
         })
     }
@@ -6990,7 +7038,7 @@ mod tests {
         assert!(!leaked_binding(&state, &tree), "reply 2 got a fresh VM");
         assert!(
             state.agent_segment(&tree).iter().any(|e| {
-                matches!(&e.payload, EventPayload::Message(Message::Turn { source, .. })
+                matches!(&e.payload, EventPayload::Part { part: crate::types::Part::Cell(source), .. }
                     if source.contains("second reply ran"))
             }),
             "and its chunks were not dropped"
@@ -7049,7 +7097,7 @@ mod tests {
         let completions = state
             .agent_segment(&tree)
             .iter()
-            .filter(|e| matches!(e.payload, EventPayload::Completion { .. }))
+            .filter(|e| matches!(e.payload, EventPayload::ReplyEnd { .. }))
             .count();
         assert_eq!(completions, 3, "three replies, three completions");
         assert_eq!(
@@ -7111,7 +7159,7 @@ mod tests {
 
         assert!(
             state.agent_segment(&tree).iter().any(|e| {
-                matches!(&e.payload, EventPayload::Message(Message::Turn { source, .. })
+                matches!(&e.payload, EventPayload::Part { part: crate::types::Part::Cell(source), .. }
                     if source.contains("handler ran"))
             }),
             "the handler's cell was compiled and logged, not dropped"

@@ -233,7 +233,7 @@ pub struct LeafInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Author, Event, EventPayload, Message, Origin};
+    use crate::types::{Author, Event, EventPayload, Origin};
     use jiff::Timestamp;
 
     fn roundtrip_cmd(cmd: SessionCommand) {
@@ -323,7 +323,7 @@ mod tests {
                 id,
                 parent_id: Some(EventId::new(1)),
                 timestamp: Timestamp::UNIX_EPOCH,
-                payload: EventPayload::Message(Message::Post {
+                payload: EventPayload::Post {
                     from: Author::User,
                     origin: Origin::Direct {
                         text: "x".into(),
@@ -331,7 +331,7 @@ mod tests {
                         options: Vec::new(),
                         expects_reply: true,
                     },
-                }),
+                },
             },
         });
     }

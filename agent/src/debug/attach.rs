@@ -40,7 +40,7 @@ use super::ui;
 use crate::host::{BranchId, BranchInfo, Session, SessionCommand, SessionEvent};
 use crate::report::derived_branch_label;
 use crate::tree::ProgramView;
-use crate::types::{Call, Cause, EventId, EventPayload, Message, Outcome};
+use crate::types::{Call, EventId, EventPayload, Outcome};
 
 /// Cap for one step-line key, so a hot loop on one source line cannot
 /// wedge the UI (mirrors the standalone runner).
@@ -335,7 +335,7 @@ impl AttachedApp {
     pub fn apply(&mut self, event: &SessionEvent) {
         if let SessionEvent::Event { branch, event, .. } = event
             && Some(*branch) == self.selected
-            && matches!(&event.payload, EventPayload::Message(Message::Turn { .. }))
+            && matches!(&event.payload, EventPayload::Reply)
         {
             // Follow the live program: every `Turn` is one now
             // (22_ONE_VOCABULARY's "a turn is a program"), so a fresh one
@@ -1173,10 +1173,10 @@ fn timeline_rows(session: &Session) -> Vec<(EventId, BranchId, String)> {
         .events
         .values()
         .filter_map(|e| {
-            let EventPayload::Message(Message::Post {
+            let EventPayload::Post {
                 from: crate::types::Author::User,
                 origin,
-            }) = &e.payload
+            } = &e.payload
             else {
                 return None;
             };
@@ -2585,23 +2585,17 @@ fn render_placeholder(frame: &mut Frame, pane: Pane, area: Rect) {
 }
 
 /// One-line summary of a logged condition for the console footer.
-fn condition_line(cause: &Cause) -> String {
+fn condition_line(cause: &crate::types::Handback) -> String {
     match cause {
-        Cause::Raised { name, .. } => format!("raised `{name}`"),
-        Cause::Trapped { message, .. } => message.clone(),
-        Cause::Posted { .. } => "a message arrived".to_owned(),
-        Cause::CompileFailed { .. } => "compile error".to_owned(),
-        // Never compiled at all (`Cause::Truncated`'s own doc in
-        // `types.rs`): cut off mid-program, it may still parse and run
-        // half-written, which is strictly worse than a clean failure.
-        Cause::Truncated => "truncated (hit the token limit)".to_owned(),
-        Cause::Compaction { rendered, budget } => {
-            format!("compaction ({rendered} of {budget} bytes)")
-        }
-        Cause::Interrupted => "interrupted".to_owned(),
+        crate::types::Handback::Raised { name, .. } => format!("raised `{name}`"),
+        crate::types::Handback::Trapped { message, .. } => message.clone(),
+        crate::types::Handback::Posted { .. } => "a message arrived".to_owned(),
+        crate::types::Handback::CellFailed { .. } => "compile error".to_owned(),
+        crate::types::Handback::Completed => "completed".to_owned(),
+        crate::types::Handback::Interrupted => "interrupted".to_owned(),
         // A handler decided `return abandon()`: the suspended run was
         // discarded, not continued.
-        Cause::Abandoned => "abandoned".to_owned(),
+        crate::types::Handback::Abandoned => "abandoned".to_owned(),
     }
 }
 

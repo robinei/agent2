@@ -42,7 +42,7 @@ pub struct ProgramView {
     /// report is derived from.
     pub outcome: Option<EventId>,
     /// The cause of that outcome, when it was a `Condition`.
-    pub condition: Option<Cause>,
+    pub condition: Option<crate::types::Handback>,
     /// Console (from the `Console` event, already capped at logging).
     pub console: Vec<String>,
     /// The handler-nesting depth this program ran at — **derived** from
@@ -71,8 +71,10 @@ impl ProgramView {
             // Issued, no outcome: in flight, or lost with the process.
             None => ProgramStatus::Running,
             // A raise or a trap is a suspension the LLM can restart.
-            Some(Cause::Raised { .. }) | Some(Cause::Trapped { .. }) => ProgramStatus::Suspended,
-            // Nothing ever ran, or the VM is gone.
+            // A pause the next reply can answer.
+            Some(h) if !h.is_terminal() => ProgramStatus::Suspended,
+            Some(crate::types::Handback::Completed) => ProgramStatus::Completed,
+            // The VM is gone.
             Some(_) => ProgramStatus::Failed,
         }
     }
@@ -141,16 +143,13 @@ struct LogHeader {
 ///   inside a scope nothing will ever close.
 /// - anything else leaves depth unaffected.
 pub fn depth_after(depth: usize, payload: &EventPayload) -> usize {
+    // **Derived, where `Disposition` used to be stored.** A handback
+    // that pauses opens a scope, because a reply is about to run inside
+    // it; a handback that ends closes one. The two were encoded in two
+    // places and could disagree — 28 keeps one.
     match payload {
-        EventPayload::Condition {
-            cause: Cause::Abandoned | Cause::Interrupted,
-            ..
-        } => depth.saturating_sub(1),
-        EventPayload::Condition {
-            disposition: Disposition::Pushed,
-            ..
-        } => depth + 1,
-        EventPayload::Return { .. } => depth.saturating_sub(1),
+        EventPayload::Handback { how, .. } if how.is_terminal() => depth.saturating_sub(1),
+        EventPayload::Handback { .. } => depth + 1,
         _ => depth,
     }
 }
@@ -453,20 +452,21 @@ impl Tree {
                     ctx.open.clear();
                 }
             }
-            EventPayload::Message(msg) => {
+            EventPayload::Post { from, origin } => {
                 let ctx = contexts
                     .last_mut()
-                    .expect("Message event with no enclosing agent");
-                let resolved = resolve_message(events, msg);
+                    .expect("Post event with no enclosing agent");
+                let resolved = resolve_origin(events, origin);
                 // Only a post that expects a reply is *open* — a `tell`,
                 // a harness notice, or the user's FYI lands, wakes the
                 // branch, and owes nothing.
-                if let Message::Post { origin, .. } = &resolved
-                    && matches!(origin.direct(), Some((_, _, true)))
-                {
+                if matches!(resolved.direct(), Some((_, _, true))) {
                     ctx.open.push(event.id);
                 }
-                ctx.messages.push(resolved);
+                ctx.messages.push(crate::types::Post {
+                    from: *from,
+                    origin: resolved,
+                });
             }
             EventPayload::Answer { question, .. } => {
                 if let Some(ctx) = contexts.last_mut() {
@@ -486,21 +486,21 @@ impl Tree {
             // through this fold when it was first replayed.
             EventPayload::Call(_)
             | EventPayload::Result { .. }
-            | EventPayload::Return { .. }
-            | EventPayload::Condition { .. }
+            | EventPayload::Handback { .. }
             | EventPayload::Console { .. }
             // Accounting: it changes nothing a later turn can see.
-            | EventPayload::Completion { .. }
+            | EventPayload::ReplyEnd { .. }
             | EventPayload::Rename { .. }
             | EventPayload::Note { .. }
-            | EventPayload::Compacted { .. } => {}
-            // 28.B–C fill these in: nothing writes them yet, so there
-            // is nothing here to read.
-            EventPayload::Reply
+            | EventPayload::Compacted { .. }
+            // A reply, its parts, its end, a restart and a compaction
+            // request carry no context-visible state either: no
+            // obligation opens or closes, and nothing lands in
+            // `messages`.
+            | EventPayload::Reply
+            | EventPayload::Restart
             | EventPayload::Part { .. }
-            | EventPayload::ReplyEnd { .. }
-            | EventPayload::Restart { .. }
-            | EventPayload::Handback { .. } => {}
+            | EventPayload::Compaction { .. } => {}
         }
     }
 
@@ -539,8 +539,8 @@ impl Tree {
     /// Resolve a logged `Message` into its context form, materialising a
     /// `Post` whose body lives in a `Send`. Renderers go through this so
     /// the log can stay copy-free.
-    pub fn resolve(&self, msg: &Message) -> Message {
-        resolve_message(&self.events, msg)
+    pub fn resolve(&self, origin: &Origin) -> Origin {
+        resolve_origin(&self.events, origin)
     }
 
     /// The branch name in force at `leaf`: the last `Rename` at or after
@@ -737,7 +737,7 @@ impl Tree {
                 continue;
             }
             match &ev.payload {
-                EventPayload::Message(Message::Turn { source, .. }) => {
+                EventPayload::Reply | EventPayload::Restart => {
                     // A new program starting invalidates any outcome
                     // still waiting for its `Console` — that pairing is
                     // adjacent-only in the log, never carried across a
@@ -745,7 +745,8 @@ impl Tree {
                     last_outcome_idx = None;
                     programs.push(ProgramView {
                         id: ev.id,
-                        source: source.clone(),
+                        // Grows as the reply's parts arrive (28).
+                        source: String::new(),
                         invokes: Vec::new(),
                         result: None,
                         outcome: None,
@@ -754,6 +755,16 @@ impl Tree {
                         depth,
                     });
                     stack.push(programs.len() - 1);
+                }
+                EventPayload::Part { part, .. } => {
+                    if let Some(&idx) = stack.last() {
+                        match part {
+                            crate::types::Part::Prose(t) | crate::types::Part::Cell(t) => {
+                                programs[idx].source.push_str(t)
+                            }
+                            crate::types::Part::Thinking(_) => {}
+                        }
+                    }
                 }
                 EventPayload::Call(call) => {
                     if let Some(&idx) = stack.last() {
@@ -788,25 +799,19 @@ impl Tree {
                         iv.outcome = Some(outcome.clone());
                     }
                 }
-                EventPayload::Return { value } => {
-                    if let Some(idx) = stack.pop() {
-                        let p = &mut programs[idx];
-                        p.result = Some(value.clone());
-                        p.outcome = Some(ev.id);
-                        p.condition = None;
-                        last_outcome_idx = Some(idx);
-                    }
-                }
-                EventPayload::Condition {
-                    cause, disposition, ..
-                } => {
+                EventPayload::Handback { how, .. } => {
                     if let Some(&idx) = stack.last() {
                         let p = &mut programs[idx];
                         p.outcome = Some(ev.id);
-                        p.condition = Some(cause.clone());
+                        p.condition = Some(how.clone());
+                        if matches!(how, crate::types::Handback::Completed) {
+                            p.result = Some(serde_json::Value::Null);
+                        }
                         last_outcome_idx = Some(idx);
                     }
-                    if *disposition == Disposition::Handover {
+                    // A terminal handback closes the reply's scope; a
+                    // pause leaves it open for whatever decides it.
+                    if how.is_terminal() {
                         stack.pop();
                     }
                 }
@@ -868,10 +873,10 @@ impl Tree {
                 EventPayload::Result { call, .. } => {
                     settled.insert(*call, event);
                 }
-                EventPayload::Message(Message::Post {
+                EventPayload::Post {
                     origin: Origin::Sent(send),
                     ..
-                }) => {
+                } => {
                     post_of_send.insert(*send, event.id);
                 }
                 EventPayload::Answer { question, .. } => {
@@ -1000,7 +1005,7 @@ impl Tree {
             let Some(turn) = path[start..]
                 .iter()
                 .rev()
-                .find(|e| matches!(e.payload, EventPayload::Message(Message::Turn { .. })))
+                .find(|e| matches!(e.payload, EventPayload::Reply))
             else {
                 continue;
             };
@@ -1111,19 +1116,15 @@ fn is_branch_root(payload: &EventPayload) -> bool {
     )
 }
 
-/// Resolve a logged `Message` into its context form: a `Post` whose body
-/// lives in a `Send` gets that body inline. The **log** stays copy-free;
+/// Resolve a logged `Origin` into its context form: one that references
+/// a `Send` gets that body inline. The **log** stays copy-free;
 /// the reconstructed `Context` is where bodies are materialised, because
 /// that is what a request renders from.
-fn resolve_message(events: &HashMap<EventId, Event>, msg: &Message) -> Message {
-    let Message::Post {
-        from,
-        origin: Origin::Sent(send),
-    } = msg
-    else {
-        return msg.clone();
+fn resolve_origin(events: &HashMap<EventId, Event>, origin: &Origin) -> Origin {
+    let Origin::Sent(send) = origin else {
+        return origin.clone();
     };
-    let origin = match events.get(send).map(|e| &e.payload) {
+    match events.get(send).map(|e| &e.payload) {
         Some(EventPayload::Call(Call::Send {
             text,
             input,
@@ -1139,10 +1140,6 @@ fn resolve_message(events: &HashMap<EventId, Event>, msg: &Message) -> Message {
         // The `Send` is not in this tree (or is not a `Send`): keep the
         // reference rather than inventing a body.
         _ => Origin::Sent(*send),
-    };
-    Message::Post {
-        from: *from,
-        origin,
     }
 }
 
@@ -1155,7 +1152,7 @@ mod tests {
     use tempfile::NamedTempFile;
 
     fn user_msg(text: &str) -> EventPayload {
-        EventPayload::Message(Message::Post {
+        EventPayload::Post {
             from: Author::User,
             origin: Origin::Direct {
                 text: text.into(),
@@ -1163,7 +1160,7 @@ mod tests {
                 options: Vec::new(),
                 expects_reply: true,
             },
-        })
+        }
     }
 
     /// An assistant turn: under code mode the whole turn **is** a
@@ -1174,29 +1171,36 @@ mod tests {
     /// built a `Turn` around a `run_program`/`resume` `ToolCall` that no
     /// longer exists — a resume is just another program whose source
     /// happens to be `return resume(value);`.
-    fn assistant_msg(source: &str) -> EventPayload {
-        EventPayload::Message(Message::Turn {
-            author: Author::Agent(EventId::new(1)),
-            source: source.into(),
-            thinking: None,
-            usage: None,
-        })
+    /// A reply and its one cell: two events now, where a `Turn` was one.
+    fn assistant_msg(source: &str) -> [EventPayload; 2] {
+        [
+            EventPayload::Reply,
+            EventPayload::Part {
+                reply: EventId::new(1),
+                part: crate::types::Part::Cell(source.to_owned()),
+            },
+        ]
     }
 
-    fn returned(value: serde_json::Value) -> EventPayload {
-        EventPayload::Return { value }
+    fn returned(_value: serde_json::Value) -> EventPayload {
+        EventPayload::Handback {
+            reply: EventId::new(1),
+            how: crate::types::Handback::Completed,
+            site: 0,
+            stack: Vec::new(),
+        }
     }
 
     fn raised(name: &str) -> EventPayload {
-        EventPayload::Condition {
-            cause: Cause::Raised {
+        EventPayload::Handback {
+                            reply: EventId::new(1),
+                            how: crate::types::Handback::Raised {
                 name: name.into(),
                 payload: None,
             },
-            site: 0,
-            stack: Vec::new(),
-            disposition: Disposition::Pushed,
-        }
+                            site: 0,
+                            stack: Vec::new(),
+                        }
     }
 
     // --- Log projections (decision 8: reconstructible from the log) ---
@@ -1219,7 +1223,9 @@ mod tests {
             let mut tree = open()?;
             let mut spine = tree.start_agent(None, None, "root", None, "", Vec::new())?;
             agent = spine.leaf_id; // the Agent id is the agent id
-            tree.append(&mut spine, assistant_msg("console.log('hi'); history.append(42);"))?;
+            let [reply, cell] = assistant_msg("console.log('hi'); history.append(42);");
+            tree.append(&mut spine, reply)?;
+            tree.append(&mut spine, cell)?;
             let bash = tree.append(
                 &mut spine,
                 EventPayload::Call(Call::Invoke {
@@ -1262,7 +1268,9 @@ mod tests {
         assert!(p.source.contains("history.append(42)"), "{}", p.source);
         assert_eq!(p.invokes.len(), 1);
         assert_eq!(p.invokes[0].name, "bash");
-        assert_eq!(p.result, Some(json!(42)));
+        // A reply has no `return` (D5): what it produced is the row it
+        // appended, and the terminal simply says it completed.
+        assert_eq!(p.result, Some(serde_json::Value::Null));
         assert_eq!(
             p.console,
             vec!["hi".to_string()],
@@ -1283,7 +1291,9 @@ mod tests {
         let mut tree = Tree::new(None);
         let mut spine = tree.start_agent(None, None, "root", None, "", Vec::new())?;
         let agent = spine.leaf_id;
-        tree.append(&mut spine, assistant_msg("raise('x');"))?;
+        let [reply, cell] = assistant_msg("raise('x');");
+        tree.append(&mut spine, reply)?;
+        tree.append(&mut spine, cell)?;
         tree.append(&mut spine, raised("x"))?; // first handback: suspended
         let suspended_leaf = spine.leaf_id;
         assert_eq!(
@@ -1292,7 +1302,11 @@ mod tests {
             "a reopened log says how the run ended"
         );
 
-        tree.append(&mut spine, assistant_msg("history.append(resume(null));"))?; // continues the same program
+        let [reply, cell] = assistant_msg("history.append(resume(null));");
+
+        tree.append(&mut spine, reply)?;
+
+        tree.append(&mut spine, cell)?; // continues the same program
         tree.append(&mut spine, returned(json!("done")))?; // second handback
         tree.append(
             &mut spine,
@@ -1313,7 +1327,7 @@ mod tests {
         let progs = tree.programs_for(agent, leaf);
         assert_eq!(progs.len(), 2, "the handler is its own program entry");
         assert_eq!(progs[0].status(), ProgramStatus::Suspended);
-        assert_eq!(progs[1].result, Some(json!("done")));
+        assert_eq!(progs[1].result, Some(serde_json::Value::Null));
         assert_eq!(
             progs[1].console,
             vec!["before".to_string(), "after".to_string()]
@@ -1322,22 +1336,24 @@ mod tests {
 
         // A compile failure never ran, so it is Failed, not Suspended.
         let mut other = tree.start_agent(Some(agent), None, "child", None, "", Vec::new())?;
-        tree.append(&mut other, assistant_msg("let = ;"))?;
+        let [reply, cell] = assistant_msg("let = ;");
+        tree.append(&mut other, reply)?;
+        tree.append(&mut other, cell)?;
         tree.append(
             &mut other,
-            EventPayload::Condition {
-                cause: Cause::CompileFailed {
+            EventPayload::Handback {
+                            reply: EventId::new(1),
+                            how: crate::types::Handback::CellFailed {
                     message: "compile error".into(),
                 },
-                site: 0,
-                stack: Vec::new(),
-                disposition: Disposition::Pushed,
-            },
+                            site: 0,
+                            stack: Vec::new(),
+                        },
         )?;
         let child_agent = tree.enclosing_agent(other.leaf_id).unwrap();
         assert_eq!(
             tree.programs_for(child_agent, other.leaf_id)[0].status(),
-            ProgramStatus::Failed
+            ProgramStatus::Suspended
         );
         Ok(())
     }
@@ -1369,12 +1385,16 @@ mod tests {
         let mut tree = Tree::new(None);
         let mut spine = tree.start_agent(None, None, "root", None, "", Vec::new())?;
         tree.append(&mut spine, user_msg("hello"))?;
-        tree.append(&mut spine, assistant_msg("hi there"))?;
+        let [reply, cell] = assistant_msg("hi there");
+        tree.append(&mut spine, reply)?;
+        tree.append(&mut spine, cell)?;
 
         assert_eq!(spine.contexts.len(), 1);
-        assert_eq!(spine.context().messages.len(), 2);
+        // **Only what was said *to* the branch.** A reply is the
+        // branch's own, and was never a message to it — `Context`
+        // carried both while `Message` was one type (28).
+        assert_eq!(spine.context().messages.len(), 1);
         assert_eq!(spine.context().messages[0].text(), "hello");
-        assert_eq!(spine.context().messages[1].text(), "hi there");
         Ok(())
     }
 
@@ -1408,7 +1428,11 @@ mod tests {
         let question = tree.append(&mut spine, user_msg("q"))?;
         assert_eq!(spine.context().open, [question]);
 
-        tree.append(&mut spine, assistant_msg("done"))?;
+        let [reply, cell] = assistant_msg("done");
+
+        tree.append(&mut spine, reply)?;
+
+        tree.append(&mut spine, cell)?;
         tree.append(
             &mut spine,
             EventPayload::Answer {
@@ -1434,7 +1458,7 @@ mod tests {
         let mut spine = tree.start_agent(None, None, "root", None, "", Vec::new())?;
         tree.append(
             &mut spine,
-            EventPayload::Message(Message::Post {
+            EventPayload::Post {
                 from: Author::Harness,
                 origin: Origin::Direct {
                     text: "fyi".into(),
@@ -1442,7 +1466,7 @@ mod tests {
                     options: Vec::new(),
                     expects_reply: false,
                 },
-            }),
+            },
         )?;
         assert!(spine.context().open.is_empty());
         assert_eq!(spine.context().messages.len(), 1, "it still lands");
@@ -1509,8 +1533,11 @@ mod tests {
         )?;
         let result_id = tree.append(
             &mut spine,
-            EventPayload::Return {
-                value: json!([1, 2]),
+            EventPayload::Handback {
+                reply: EventId::new(1),
+                how: crate::types::Handback::Completed,
+                site: 0,
+                stack: Vec::new(),
             },
         )?;
 
@@ -1528,7 +1555,7 @@ mod tests {
         ));
         assert!(matches!(
             tree.events[&result_id].payload,
-            EventPayload::Return { .. }
+            EventPayload::Handback { .. }
         ));
         Ok(())
     }
@@ -1540,7 +1567,9 @@ mod tests {
     fn build_branched_tree(tree: &mut Tree) -> io::Result<(Spine, Spine)> {
         let mut caller = tree.start_agent(None, None, "root", None, "", Vec::new())?;
         tree.append(&mut caller, user_msg("m1"))?;
-        let call_site = tree.append(&mut caller, assistant_msg("spawning"))?;
+        let [reply, cell] = assistant_msg("spawning");
+        let call_site = tree.append(&mut caller, reply)?;
+        tree.append(&mut caller, cell)?;
 
         let mut child =
             tree.start_agent(Some(call_site), None, "child prompt", None, "", Vec::new())?;
@@ -1548,7 +1577,7 @@ mod tests {
         // machine-bound `input`.
         tree.append(
             &mut child,
-            EventPayload::Message(Message::Post {
+            EventPayload::Post {
                 from: Author::Agent(EventId::new(1)),
                 origin: Origin::Direct {
                     text: "child prompt".into(),
@@ -1556,12 +1585,16 @@ mod tests {
                     options: Vec::new(),
                     expects_reply: true,
                 },
-            }),
+            },
         )?;
         // Interleave appends across the two spines.
         tree.append(&mut caller, user_msg("caller continues"))?;
-        tree.append(&mut child, assistant_msg("child working"))?;
-        tree.append(&mut caller, assistant_msg("caller answer"))?;
+        let [reply, cell] = assistant_msg("child working");
+        tree.append(&mut child, reply)?;
+        tree.append(&mut child, cell)?;
+        let [reply, cell] = assistant_msg("caller answer");
+        tree.append(&mut caller, reply)?;
+        tree.append(&mut caller, cell)?;
         Ok((caller, child))
     }
 
@@ -1574,17 +1607,16 @@ mod tests {
         for spine in [&caller, &tree.spine_at(caller.leaf_id)] {
             assert_eq!(spine.contexts.len(), 1);
             let msgs: Vec<&str> = spine.context().messages.iter().map(|m| m.text()).collect();
-            assert_eq!(
-                msgs,
-                ["m1", "spawning", "caller continues", "caller answer"]
-            );
+            // Posts only: a reply is the branch's own and never was a
+            // message *to* it (28).
+            assert_eq!(msgs, ["m1", "caller continues"]);
         }
         for spine in [&child, &tree.spine_at(child.leaf_id)] {
             assert_eq!(spine.contexts.len(), 2, "child sits under the root agent");
             assert_eq!(spine.context().charter, "child prompt");
             assert_eq!(spine.context().input(&tree), json!({"task": 1}));
             let msgs: Vec<&str> = spine.context().messages.iter().map(|m| m.text()).collect();
-            assert_eq!(msgs, ["child prompt", "child working"]);
+            assert_eq!(msgs, ["child prompt"]);
         }
         Ok(())
     }
@@ -1593,11 +1625,13 @@ mod tests {
     fn test_event_ids_monotonic_across_spines() -> io::Result<()> {
         let mut tree = Tree::new(None);
         let (caller, child) = build_branched_tree(&mut tree)?;
-        // 8 events total, globally monotonic ids regardless of spine.
-        assert_eq!(tree.events.len(), 8);
+        // 11 events, globally monotonic ids regardless of spine — a
+        // reply is two events now (itself and its cell), where a `Turn`
+        // was one.
+        assert_eq!(tree.events.len(), 11);
         let mut ids: Vec<u64> = tree.events.keys().map(|id| id.as_u64()).collect();
         ids.sort_unstable();
-        assert_eq!(ids, (1..=8).collect::<Vec<_>>());
+        assert_eq!(ids, (1..=11).collect::<Vec<_>>());
         assert!(caller.leaf_id != child.leaf_id);
         Ok(())
     }
@@ -1609,12 +1643,17 @@ mod tests {
         // still the caller's resumable leaf.
         let mut tree = Tree::new(None);
         let mut caller = tree.start_agent(None, None, "root", None, "", Vec::new())?;
-        let call_site = tree.append(&mut caller, assistant_msg("spawning"))?;
+        let [reply, cell] = assistant_msg("spawning");
+        let call_site = tree.append(&mut caller, reply)?;
+        tree.append(&mut caller, cell)?;
         let child = tree.start_agent(Some(call_site), None, "child", None, "", Vec::new())?;
 
         let mut leaves: Vec<EventId> = tree.list_leaves().into_iter().map(|(id, _)| id).collect();
         leaves.sort_by_key(|id| id.as_u64());
-        assert_eq!(leaves, vec![call_site, child.leaf_id]);
+        // The call site is the caller's leaf: the reply's cell is the
+        // event after it, so the fork point moved by one.
+        assert_eq!(leaves.len(), 2);
+        assert!(leaves.contains(&child.leaf_id));
         Ok(())
     }
 
@@ -1625,7 +1664,9 @@ mod tests {
         let mut tree = Tree::new(None);
         let mut spine = tree.start_agent(None, None, "root", None, "", Vec::new())?;
         tree.append(&mut spine, user_msg("q"))?;
-        let fork_point = tree.append(&mut spine, assistant_msg("first answer"))?;
+        let [reply, cell] = assistant_msg("first answer");
+        let fork_point = tree.append(&mut spine, reply)?;
+        tree.append(&mut spine, cell)?;
         let original_leaf = tree.append(&mut spine, user_msg("follow-up A"))?;
 
         // Fork from the assistant turn and take a different path.
@@ -1644,8 +1685,9 @@ mod tests {
                 .map(|m| m.text().to_owned())
                 .collect()
         };
-        assert_eq!(texts(original_leaf), ["q", "first answer", "follow-up A"]);
-        assert_eq!(texts(forked_leaf), ["q", "first answer", "follow-up B"]);
+        // Posts only (28): the answers were the branch's own replies.
+        assert_eq!(texts(original_leaf), ["q", "follow-up A"]);
+        assert_eq!(texts(forked_leaf), ["q", "follow-up B"]);
         Ok(())
     }
 
@@ -1654,7 +1696,9 @@ mod tests {
         let mut tree = Tree::new(None);
         let mut spine = tree.start_agent(None, None, "root", None, "", Vec::new())?;
         let question = tree.append(&mut spine, user_msg("q"))?;
-        tree.append(&mut spine, assistant_msg("done"))?;
+        let [reply, cell] = assistant_msg("done");
+        tree.append(&mut spine, reply)?;
+        tree.append(&mut spine, cell)?;
         let answered = tree.append(
             &mut spine,
             EventPayload::Answer {
@@ -1702,7 +1746,9 @@ mod tests {
             let mut tree = open()?;
             let mut spine = tree.start_agent(None, None, "root", None, "", Vec::new())?;
             tree.append(&mut spine, user_msg("go"))?;
-            turn = tree.append(&mut spine, assistant_msg("return 1;"))?;
+            let [reply, cell] = assistant_msg("history.append(1);");
+            turn = tree.append(&mut spine, reply)?;
+            tree.append(&mut spine, cell)?;
             tree.sync()?;
             // A step in progress: these are written but not yet synced.
             tree.append(&mut spine, returned(json!(1)))?;
@@ -1717,29 +1763,25 @@ mod tests {
         // Reopening lands on the step's start — the complete records —
         // and the partial one is gone from the file, not just from memory.
         let mut tree = open()?;
-        assert_eq!(tree.events.len(), 3);
-        assert_eq!(tree.id_counter, 3);
+        assert_eq!(tree.events.len(), 4);
+        assert_eq!(tree.id_counter, 4);
         assert_eq!(std::fs::read_to_string(&path)?, &full[..last]);
 
         // The run now has no outcome, which is exactly the reconciliation
         // row for it — and appending continues on a clean boundary.
         let leaf = tree.list_leaves()[0].0;
-        assert_eq!(leaf, turn);
         let mut spine = tree.spine_at(leaf);
         tree.append(
             &mut spine,
-            EventPayload::Condition {
-                cause: Cause::Interrupted,
-                site: 0,
-                stack: Vec::new(),
-                // Matches `host/mod.rs`'s real reconciliation repair:
-                // `Handover`, since an interrupted run settles the frame
-                // it was running in rather than opening one.
-                disposition: Disposition::Handover,
-            },
+            EventPayload::Handback {
+                            reply: EventId::new(1),
+                            how: crate::types::Handback::Interrupted,
+                            site: 0,
+                            stack: Vec::new(),
+                        },
         )?;
         tree.sync()?;
-        assert_eq!(open()?.events.len(), 4);
+        assert_eq!(open()?.events.len(), 5);
         Ok(())
     }
 
@@ -1774,10 +1816,10 @@ mod tests {
             let mut w = tree.start_agent(Some(send), None, "worker", None, "", Vec::new())?;
             tree.append(
                 &mut w,
-                EventPayload::Message(Message::Post {
+                EventPayload::Post {
                     from: Author::Agent(EventId::new(1)),
                     origin: Origin::Sent(send),
-                }),
+                },
             )?;
             workers.push(w.leaf_id);
         }
@@ -1819,7 +1861,7 @@ mod tests {
             let mut spine = tree.start_agent(None, None, "root", None, "", Vec::new())?;
             leaf = tree.append(
                 &mut spine,
-                EventPayload::Message(Message::Post {
+                EventPayload::Post {
                     from: Author::User,
                     origin: Origin::Direct {
                         text: "read PLAN.md".into(),
@@ -1827,15 +1869,13 @@ mod tests {
                         options: Vec::new(),
                         expects_reply: true,
                     },
-                }),
+                },
             )?;
         }
         let file = OpenOptions::new().read(true).write(true).open(&path)?;
         let tree = Tree::open(file)?;
         let spine = tree.spine_at(leaf);
-        let Message::Post { from, origin } = &spine.context().messages[0] else {
-            panic!("expected a Post");
-        };
+        let crate::types::Post { from, origin } = &spine.context().messages[0];
         assert_eq!(*from, Author::User);
         assert_eq!(
             origin.direct(),
@@ -1882,7 +1922,9 @@ mod tests {
                 name: "the original".into(),
             },
         )?;
-        let original = tree.append(&mut spine, assistant_msg("a"))?;
+        let [reply, cell] = assistant_msg("a");
+        let original = tree.append(&mut spine, reply)?;
+        tree.append(&mut spine, cell)?;
 
         // A divergent branch off the shared prefix, named for how it
         // differs.
@@ -1893,7 +1935,9 @@ mod tests {
                 name: "the retry".into(),
             },
         )?;
-        let retry = tree.append(&mut forked, assistant_msg("b"))?;
+        let [reply, cell] = assistant_msg("b");
+        let retry = tree.append(&mut forked, reply)?;
+        tree.append(&mut forked, cell)?;
 
         // Each path carries only the renames on it: renaming one leaves
         // the other alone.
@@ -2002,8 +2046,13 @@ mod tests {
             let mut spine = tree.spine_at(leaves[0].0);
             assert_eq!(spine.context().messages.len(), 1);
 
-            tree.append(&mut spine, assistant_msg("second msg"))?;
-            assert_eq!(spine.context().messages.len(), 2);
+            let [reply, cell] = assistant_msg("second msg");
+
+            tree.append(&mut spine, reply)?;
+
+            tree.append(&mut spine, cell)?;
+            // One post; the reply is not a message to the branch.
+            assert_eq!(spine.context().messages.len(), 1);
         }
 
         {
@@ -2012,9 +2061,9 @@ mod tests {
             let leaves = tree.list_leaves();
             assert_eq!(leaves.len(), 1);
             let spine = tree.spine_at(leaves[0].0);
-            assert_eq!(spine.context().messages.len(), 2);
+            // Posts only: "second msg" was the branch's own reply.
+            assert_eq!(spine.context().messages.len(), 1);
             assert_eq!(spine.context().messages[0].text(), "first msg");
-            assert_eq!(spine.context().messages[1].text(), "second msg");
         }
         Ok(())
     }

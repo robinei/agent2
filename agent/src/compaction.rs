@@ -179,9 +179,9 @@ pub fn compact(tree: &Tree, spine: &Spine, ops: &[CompactionOp]) -> Vec<EventPay
 fn renders_a_line(payload: &EventPayload) -> bool {
     matches!(
         payload,
-        EventPayload::Message(_)
+        EventPayload::Post { .. }
             | EventPayload::Note { .. }
-            | EventPayload::Return { .. }
+            | EventPayload::Handback { .. }
             | EventPayload::Call(_)
             | EventPayload::Fork { .. }
     )
@@ -239,7 +239,7 @@ mod tests {
         let agent = spine.leaf_id;
         tree.append(
             &mut spine,
-            EventPayload::Message(Message::Post {
+            EventPayload::Post {
                 from: Author::User,
                 origin: Origin::Direct {
                     text: "go".into(),
@@ -247,24 +247,22 @@ mod tests {
                     options: Vec::new(),
                     expects_reply: true,
                 },
-            }),
+            },
         )
         .unwrap();
         let program = tree
             .append(
                 &mut spine,
-                EventPayload::Message(Message::Turn {
-                    author: Author::Agent(agent),
-                    source: "1;".into(),
-                    thinking: None,
-                    usage: None,
-                }),
+                EventPayload::Restart,
             )
             .unwrap();
         tree.append(
             &mut spine,
-            EventPayload::Return {
-                value: serde_json::json!(1),
+            EventPayload::Handback {
+                reply: EventId::new(1),
+                how: crate::types::Handback::Completed,
+                site: 0,
+                stack: Vec::new(),
             },
         )
         .unwrap();
@@ -292,7 +290,7 @@ mod tests {
         let agent = spine.leaf_id;
         tree.append(
             &mut spine,
-            EventPayload::Message(Message::Post {
+            EventPayload::Post {
                 from: Author::User,
                 origin: Origin::Direct {
                     text: "go".into(),
@@ -300,17 +298,12 @@ mod tests {
                     options: Vec::new(),
                     expects_reply: true,
                 },
-            }),
+            },
         )
         .unwrap();
         tree.append(
             &mut spine,
-            EventPayload::Message(Message::Turn {
-                author: Author::Agent(agent),
-                source: "await tools.bash('cargo check');".into(),
-                thinking: None,
-                usage: None,
-            }),
+            EventPayload::Restart,
         )
         .unwrap();
         let call = tree
@@ -337,9 +330,12 @@ mod tests {
         let ret = tree
             .append(
                 &mut spine,
-                EventPayload::Return {
-                    value: serde_json::json!("checked"),
-                },
+                EventPayload::Handback {
+                reply: EventId::new(1),
+                how: crate::types::Handback::Completed,
+                site: 0,
+                stack: Vec::new(),
+            },
             )
             .unwrap();
         (tree, spine, ret)

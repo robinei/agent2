@@ -192,28 +192,32 @@ impl Notebook {
     }
 
     /// The source of cell `i` — what its `Turn` records (D15).
+    /// Cell `i` **with its fences** — the bytes that go on the log as a
+    /// `Part::Cell`, so that the parts of a reply concatenate back to it
+    /// (28).
+    pub fn cell_outer(&self, i: usize) -> String {
+        let c = self.stream.cells()[i];
+        self.reply[c.outer_start..c.outer_end].to_owned()
+    }
+
     pub fn cell_source(&self, i: usize) -> String {
         self.stream.cells()[i].slice(&self.reply).to_string()
     }
 
-    /// Rebase a raw instruction span into the cell that contains it, so a
-    /// logged `site` is an offset into that cell's own `Turn.source` (D1).
+    /// A raw VM span, as an offset into the **reply** (28).
     ///
-    /// The lookup is by *containment* rather than by "whichever cell was fed
-    /// last", because an await can leave an earlier cell still executing while
-    /// a later one has already been compiled. A span in the prelude or outside
-    /// every cell has no call site of its own and gets the zero-width
-    /// convention.
+    /// It used to return a *cell-local* offset, and everything that
+    /// rendered a site then had to put the cell's own start back — a
+    /// `Cut` shift on every call, in `document.rs`, computed by
+    /// re-splitting the reply. A site is an offset into the reply now,
+    /// which is the text a diagnostic quotes and the text a snip cuts,
+    /// so there is nothing left to rebase between.
+    ///
+    /// The one subtraction that survives is the prelude's: the VM's
+    /// buffer is the prelude and then the reply, and only the reply is
+    /// anything the model wrote.
     pub fn rebase_site(&self, raw: u32) -> u32 {
-        let Some(offset) = (raw as usize).checked_sub(self.base) else {
-            return 0;
-        };
-        self.stream
-            .cells()
-            .iter()
-            .find(|c| (c.start..c.end).contains(&offset))
-            .map(|c| (offset - c.start) as u32)
-            .unwrap_or(0)
+        (raw as usize).saturating_sub(self.base) as u32
     }
 
     /// Compile cell `i` into `vm`.

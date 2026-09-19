@@ -29,7 +29,7 @@ use std::path::Path;
 
 use crate::host;
 use crate::types::{
-    Address, Author, Call, Cause, Disposition, EventId, EventPayload, Message,
+    Address, Author, Call, EventId, EventPayload,
     Outcome as CallOutcome, Tree,
 };
 
@@ -456,11 +456,6 @@ fn pending_ask(events: &[host::SessionEvent]) -> Option<(host::BranchId, EventId
                 pending = None;
             }
             _ => {}
-                        EventPayload::Reply
-                | EventPayload::Part { .. }
-                | EventPayload::ReplyEnd { .. }
-                | EventPayload::Restart { .. }
-                | EventPayload::Handback { .. } => Default::default(),
             }
     }
     pending
@@ -498,13 +493,11 @@ fn fold(session: host::Session, errors: Vec<String>) -> Outcome {
             }) => {
                 open_asks.insert(e.id, text.clone());
             }
-            EventPayload::Condition {
-                cause, disposition, ..
-            } => {
+            EventPayload::Handback { how: cause, .. } => {
                 match cause {
-                    Cause::Raised { .. } => raise_count += 1,
-                    Cause::Trapped { .. } => trap_count += 1,
-                    Cause::Abandoned => abandon_count += 1,
+                    crate::types::Handback::Raised { .. } => raise_count += 1,
+                    crate::types::Handback::Trapped { .. } => trap_count += 1,
+                    crate::types::Handback::Abandoned => abandon_count += 1,
                     _ => {}
                 }
                 // An open scope, tracked as a stack rather than a
@@ -512,9 +505,9 @@ fn fold(session: host::Session, errors: Vec<String>) -> Outcome {
                 // `Return` (below) closes one by continuing. What is
                 // still on this stack when the log ends was never
                 // settled either way, and must not be read as a resume.
-                if matches!(cause, Cause::Abandoned) {
+                if cause.is_terminal() {
                     open_scopes.pop();
-                } else if *disposition == Disposition::Pushed {
+                } else {
                     open_scopes.push(e.id);
                 }
             }
@@ -530,7 +523,7 @@ fn fold(session: host::Session, errors: Vec<String>) -> Outcome {
                     });
                 }
             }
-            EventPayload::Return { .. } => {
+            EventPayload::Handback { .. } => {
                 // The suspended program ran to completion, so whatever
                 // scope it was under was closed by continuing — that is
                 // a resume, whether or not anything was logged for it.
@@ -539,10 +532,10 @@ fn fold(session: host::Session, errors: Vec<String>) -> Outcome {
                 }
             }
             EventPayload::Note { text, .. } => appended.push(text.clone()),
-            EventPayload::Message(Message::Turn {
-                author: Author::Agent(_),
-                ..
-            }) => {
+            // **One reply, one round trip.** A `Restart` is a person
+            // handing the branch a cell, not a completion, so it is a
+            // different event and cannot be counted as one.
+            EventPayload::Reply => {
                 round_trips += 1;
             }
             EventPayload::Call(Call::Send {
@@ -1251,10 +1244,7 @@ fn multi_turn_continuity_check(outcome: &Outcome, _dir: &Path) -> Result<(), Str
         .filter(|e| {
             matches!(
                 &e.payload,
-                EventPayload::Message(Message::Turn {
-                    author: Author::Agent(_),
-                    ..
-                })
+                EventPayload::Reply
             )
         })
         .collect();
@@ -2068,7 +2058,7 @@ pub(crate) mod tests {
             .find(|e| {
                 matches!(
                     &e.payload,
-                    EventPayload::Message(Message::Post { from: Author::Harness, origin })
+                    EventPayload::Post { from: Author::Harness, origin }
                         if origin
                             .direct()
                             .is_some_and(|(t, _, r)| t.to_lowercase().contains("interrupt") && !r)
@@ -2078,7 +2068,7 @@ pub(crate) mod tests {
         assert!(
             tree.events.values().any(|e| matches!(
                 &e.payload,
-                EventPayload::Condition { cause: Cause::Posted { ids }, .. }
+                EventPayload::Handback { how: crate::types::Handback::Posted { ids }, .. }
                     if ids.contains(&notice.id)
             )),
             "the interrupt notice has no Condition{{Posted}} naming it as the wake's cause"
