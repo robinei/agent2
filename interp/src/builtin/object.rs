@@ -33,13 +33,27 @@ pub fn object_ctor(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 
 /// `Object.keys(obj)` → array of own enumerable string keys. Step 2e: reads
 /// the unified own-prop snapshot, so it also enumerates a **function's** user
+/// **What it was handed, because it is nearly always `undefined`.**
+/// `Object.entries(r.items)` on a result with no `items` used to say
+/// `in \`entries\`: type error`, which names neither the value nor the
+/// expression — the same silence `Array.from` was fixed of, and the
+/// same cause: a field that is not there.
+fn object_needs_an_object(vm: &mut VM, verb: &str, got: &Value) -> VMError {
+    let what = vm.describe_operand(got);
+    vm.fail(
+        ErrorKind::TypeError,
+        format!("Object.{verb} needs an object; got {what}").as_str(),
+    )
+}
+
 /// props (excluding the virtual `name`/`length`/`prototype` rungs), not just
 /// plain objects.
 pub fn obj_keys(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let recv = args.get(vm, 0).clone();
-    let props = vm
-        .own_enumerable_props(&recv)
-        .ok_or_else(|| vm.fail(ErrorKind::TypeError, "type error"))?;
+    let props = match vm.own_enumerable_props(&recv) {
+        Some(p) => p,
+        None => return Err(object_needs_an_object(vm, "keys", &recv)),
+    };
     let arr: ThinVec<Value> = props.into_iter().map(|(k, _)| Value::String(k)).collect();
     Ok(vm.alloc_array(arr))
 }
@@ -48,9 +62,10 @@ pub fn obj_keys(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 /// function's `props` bag — see [`obj_keys`]).
 pub fn obj_values(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let recv = args.get(vm, 0).clone();
-    let props = vm
-        .own_enumerable_props(&recv)
-        .ok_or_else(|| vm.fail(ErrorKind::TypeError, "type error"))?;
+    let props = match vm.own_enumerable_props(&recv) {
+        Some(p) => p,
+        None => return Err(object_needs_an_object(vm, "values", &recv)),
+    };
     let vals: ThinVec<Value> = props.into_iter().map(|(_, v)| v).collect();
     Ok(vm.alloc_array(vals))
 }
@@ -59,9 +74,10 @@ pub fn obj_values(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 /// function's `props` bag — see [`obj_keys`]).
 pub fn obj_entries(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let recv = args.get(vm, 0).clone();
-    let pairs = vm
-        .own_enumerable_props(&recv)
-        .ok_or_else(|| vm.fail(ErrorKind::TypeError, "type error"))?;
+    let pairs = match vm.own_enumerable_props(&recv) {
+        Some(p) => p,
+        None => return Err(object_needs_an_object(vm, "entries", &recv)),
+    };
     let mut result: ThinVec<Value> = ThinVec::with_capacity(pairs.len());
     for (k, v) in pairs {
         let pair: ThinVec<Value> = vec![Value::String(k), v].into();
@@ -74,7 +90,10 @@ pub fn obj_entries(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 pub fn obj_from_entries(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let arr_ptr = match args.get(vm, 0) {
         Value::Array(p) => *p,
-        _ => return Err(vm.fail(ErrorKind::TypeError, "type error")),
+        other => {
+            let other = other.clone();
+            return Err(object_needs_an_object(vm, "fromEntries", &other));
+        }
     };
     let entries = vm
         .arrays
@@ -367,6 +386,26 @@ pub fn obj_is_extensible(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 
 #[cfg(test)]
 mod tests {
+    /// **What it was handed, because it is nearly always `undefined`.**
+    /// `Object.entries(r.items)` on a result with no `items` said
+    /// `in `entries`: type error`, naming neither the value nor the
+    /// wanted shape — the same silence `Array.from` was fixed of, and
+    /// the same cause: a field that is not there.
+    #[test]
+    fn object_verbs_name_what_they_were_handed() {
+        for (src, want) in [
+            ("Object.keys(null)", "got null"),
+            ("Object.values(undefined)", "got undefined"),
+            ("Object.entries(3)", "got a number (3)"),
+            ("Object.fromEntries(5)", "got a number (5)"),
+        ] {
+            let err = crate::testutil::run_runtime_err(&format!("{src};"));
+            assert_eq!(err.kind, crate::ErrorKind::TypeError, "{src}");
+            assert!(err.message.contains("needs an object"), "{src}: {}", err.message);
+            assert!(err.message.contains(want), "{src}: {}", err.message);
+        }
+    }
+
     use crate::{
         Value,
         builtin::Builtin,

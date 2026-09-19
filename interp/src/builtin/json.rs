@@ -5,7 +5,19 @@ use crate::vm::{ErrorKind, RcStr, VM, VMError, Value};
 
 /// `JSON.parse(s)` → any.
 pub fn json_parse(vm: &mut VM, args: Args) -> Result<Value, VMError> {
-    let s = vm.string_from(args.get(vm, 0))?;
+    // **A non-string is nearly always a field that is not there.**
+    // `JSON.parse(r.body)` on a result with no `body` said `in
+    // \`parse\`: type error`, naming neither the value nor that a
+    // string was wanted.
+    let arg = args.get(vm, 0).clone();
+    if !matches!(arg, Value::String(_)) {
+        let what = vm.describe_operand(&arg);
+        return Err(vm.fail(
+            ErrorKind::ValueError,
+            format!("JSON.parse needs a string; got {what}").as_str(),
+        ));
+    }
+    let s = vm.string_from(&arg)?;
     // **serde already said what was wrong; this used to throw it away.**
     // `in `parse`: value error` names neither the reason nor the place,
     // and both are in hand: serde's message carries "expected value at
@@ -146,6 +158,15 @@ mod tests {
     /// names neither the reason nor the place, while both were in the
     /// error being discarded. The commonest cause is parsing something
     /// that was never JSON, so the head of the input goes too.
+    /// A non-string is nearly always a field that is not there, and
+    /// saying which is the difference between one turn and two.
+    #[test]
+    fn json_parse_names_a_non_string_argument() {
+        let err = crate::testutil::run_runtime_err("JSON.parse(undefined);");
+        assert!(err.message.contains("needs a string"), "{}", err.message);
+        assert!(err.message.contains("undefined"), "{}", err.message);
+    }
+
     #[test]
     fn json_parse_says_why_and_shows_what_it_was_given() {
         let err = crate::testutil::run_runtime_err("JSON.parse('not json at all');");
