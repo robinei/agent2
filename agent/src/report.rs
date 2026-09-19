@@ -207,7 +207,18 @@ fn stack_is_bare(stack: &[String]) -> bool {
 
 #[cfg(test)]
 mod bare_stack_tests {
-    use super::stack_is_bare;
+    use super::{fenced, stack_is_bare};
+
+    /// A console entry is one `console.log` call's output, not one
+    /// line, and most end with a newline — which used to print a blank
+    /// line under almost every `### it printed`.
+    #[test]
+    fn a_fenced_block_has_no_blank_line_before_its_closing_fence() {
+        assert_eq!(fenced("a\nb\n", "text"), "```text\na\nb\n```");
+        assert_eq!(fenced("a\nb", "text"), "```text\na\nb\n```");
+        // Blank lines *inside* are the program's own output and stay.
+        assert_eq!(fenced("a\n\nb", "text"), "```text\na\n\nb\n```");
+    }
 
     /// Both synthetic top frames are bare — `<root>` for a whole
     /// program, `<unknown>` for a notebook cell, whose frame carries no
@@ -392,6 +403,12 @@ pub const NO_RUN_HEADING: &str = "## YOUR PROGRAM DID NOT RUN";
 /// CommonMark requires and what keeps a printed markdown file from
 /// closing the block early.
 fn fenced(body: &str, tag: &str) -> String {
+    // **No blank line before the closing fence.** A console entry is
+    // one `console.log` call's output, not one line, and most end with
+    // a newline of their own — so adding the fence's newline printed a
+    // stray blank line under almost every `### it printed` in the
+    // system. Display only: the bytes are on the log untouched.
+    let body = body.trim_end_matches('\n');
     let longest = body
         .as_bytes()
         .split(|b| *b != b'`')
