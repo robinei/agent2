@@ -13,19 +13,19 @@ to one commit, so no run straddles a build.
 
 | | baseline | after |
 |---|---|---|
-| passed | 17/18 (94%) | **17/17 (100%)** |
-| prompt bytes | 1,052 KB | **699 KB (−34%)** |
-| programs per run | 4.8 | **3.0 (−37%)** |
+| passed | 17/18 (94%) | **20/21 (95%)** |
+| prompt bytes | 1,052 KB | **655 KB (−38%)** |
+| programs per run | 4.8 | **3.3 (−31%)** |
 
-Per task, programs and prompt both fell on every one of the seven:
-`sweep-200` 11 → 6, `skipped-tests` 5.5 → 2, `dead-code-sweep` 7 → 5.5,
-`sweep-40` 4 → 3, `sweep-8` 4 → 3.5, `ambiguous-config` 2.5 → 2,
-`plain-question` 1 → 1.
+Per task: `sweep-200` 11 → 5 programs and 395 → 146 KB, `sweep-8` 4 → 2
+and 107 → 53 KB, `skipped-tests` 5.5 → 3 and 146 → 82 KB,
+`dead-code-sweep` 7 → 6, `ambiguous-config` 2.5 → 2, `sweep-40` and
+`plain-question` unchanged.
 
-(A run the provider never answered is excluded by the driver rather
-than failed, which is why the denominators differ. Three such were lost
-to an upstream 530 in one batch, and the retry budget has since been
-raised to outlast it.)
+The denominators are the other result. A run the provider never
+answered is excluded rather than failed, and the baseline lost three
+that way; this one lost none, because the retry budget now outlasts the
+530 that took them.
 
 A third off both, with the pass rate holding — and rather more than a
 third on the tasks with room to move: `skipped-tests` and `sweep-200`
