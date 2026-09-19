@@ -217,7 +217,7 @@ pub fn edit_replace_once(vm: &mut VM, args: Args) -> Result<Value, VMError> {
         if let Some(why) = doubles_indentation(text, pos, replacement.as_str()) {
             return Err(vm.fail(
                 ErrorKind::ValueError,
-                &format!("replaceOnce: {why}"),
+                format!("replaceOnce: {why}").as_str(),
             ));
         }
         let mut out = String::with_capacity(text.len());
@@ -699,7 +699,7 @@ pub fn edit_apply_edits(vm: &mut VM, args: Args) -> Result<Value, VMError> {
         if let Some(why) = doubles_indentation(text, matches[0], new_s.as_str()) {
             return Err(vm.fail(
                 ErrorKind::ValueError,
-                &format!("applyEdits edit[{i}]: {why}"),
+                format!("applyEdits edit[{i}]: {why}").as_str(),
             ));
         }
         spans.push((i, matches[0], matches[0] + old.len(), new_s));

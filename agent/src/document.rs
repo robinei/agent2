@@ -1084,8 +1084,7 @@ fn flush_pending(pending: &mut Vec<String>) -> ChatMessage {
 fn worked_examples(exemplars: &[Exemplar]) -> Vec<ChatMessage> {
     exemplars
         .iter()
-        .enumerate()
-        .flat_map(|(_i, ex)| {
+        .flat_map(|ex| {
             // **Shaped like a real one.** An example's request sits
             // immediately before the conversation's own first user
             // turn, and a user turn is `# NEW EVENTS` with the person's

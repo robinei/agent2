@@ -429,7 +429,8 @@ mod tests {
     /// Atomicity used to mean the good one died too, twenty at a time.
     #[test]
     fn a_bad_op_is_skipped_and_never_takes_a_good_one_with_it() {
-        let cases: Vec<(&str, fn() -> CompactionOp)> = vec![
+        type Case = (&'static str, fn() -> CompactionOp);
+        let cases: Vec<Case> = vec![
             ("an id that is not on this path", || CompactionOp::Remove {
                 from: EventId::new(9999),
                 to: EventId::new(9999),

@@ -853,12 +853,6 @@ impl Runner {
         self.dialect_card = card;
     }
 
-    /// Point this branch at a wire container. The session sets it from
-    /// `document::configured_transport()` when it opens a branch; tests
-    /// name one directly.
-
-    /// The wire container this branch's turns use.
-
     /// This branch's agent — the innermost `Agent` root on its path.
     pub fn agent_id(&self) -> EventId {
         self.agent
@@ -1207,7 +1201,7 @@ impl Runner {
                 if let Some(out) = self.notebook_stream_end(
                     tree,
                     turn.truncated,
-                    turn.usage.clone(),
+                    turn.usage,
                     turn.thinking.clone(),
                 )? {
                     return Ok(out);
@@ -3964,11 +3958,6 @@ fn outcome_json(outcome: &Outcome) -> Result<serde_json::Value, String> {
         Outcome::Failed(msg) => Err(msg.clone()),
     }
 }
-
-/// The source byte offset of instruction `ip` — what a `Condition`
-/// records so its report can point a caret without a live VM. `spans[ip]`
-/// is a `(start, end)` range; `Condition::site` is a single point (a caret,
-/// not an underline), so only `start` survives here.
 
 impl Runner {
     /// **Feed streamed completion text to a notebook turn** (D11, 25.5).

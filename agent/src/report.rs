@@ -2516,7 +2516,7 @@ mod tests {
                 }),
             )
         };
-        let owned = vec![
+        let owned = [
             call(5, "outline"),
             call(6, "read_file"),
             call(7, "grep"),
