@@ -9,9 +9,10 @@ use crate::vm::{VM, VMError, Value};
 /// entry per `console.log` *call*, so this capped calls: a single
 /// `console.log(file)` counted as one against 256 and a real
 /// `sweep-200` entry held 323 newlines in 4,094 bytes. Every bound
-/// downstream inherited the lie — the report's "last 20 lines" could
-/// be thousands. Now one line is one entry, so the cap here, the
-/// report's tail, and `history.fetch`'s array all mean lines.
+/// downstream inherited the lie — the report's line count could be off
+/// by a factor of a hundred. Now one line is one entry, so the cap
+/// here, the report's tail, and `history.fetch`'s array all mean
+/// lines.
 ///
 /// Raised with the split, because a file dump that used one slot now
 /// uses hundreds and must not evict the run's own earlier output.
