@@ -418,6 +418,10 @@ builtins! {
     ArrayJoin,    BuiltinKind::Method, "join",        1, 2,      array_join,    true,  false, false, false, false, false, false, false, false, false;
     ArrayReverse, BuiltinKind::Method, "reverse",     1, 1,      array_reverse, true,  false, false, false, false, false, false, false, false, false;
     ArrayFlat,    BuiltinKind::Method, "flat",        1, 2,      array_flat,    true,  false, false, false, false, false, false, false, false, false;
+    ArrayKeys,    BuiltinKind::Method, "keys",        1, 1,      array_keys,    true,  false, false, false, false, false, false, false, false, false;
+    ArrayValues,  BuiltinKind::Method, "values",      1, 1,      array_values,  true,  false, false, false, false, false, false, false, false, false;
+    ArrayEntries, BuiltinKind::Method, "entries",     1, 1,      array_entries, true,  false, false, false, false, false, false, false, false, false;
+    ArrayToReversed, BuiltinKind::Method, "toReversed", 1, 1,    array_to_reversed, true, false, false, false, false, false, false, false, false, false;
     ArrayFill,    BuiltinKind::Method, "fill",        2, VARARG, array_fill,    true,  false, false, false, false, false, false, false, false, false;
     ArraySplice,  BuiltinKind::Method, "splice",      1, VARARG, array_splice,  true,  false, false, false, false, false, false, false, false, false;
 
@@ -910,3 +914,4 @@ mod tests {
         assert_eq!(out, serde_json::json!(42));
     }
 }
+

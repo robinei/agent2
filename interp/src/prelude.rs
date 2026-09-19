@@ -84,6 +84,21 @@ const HOFS: &[Hof] = &[
         source: "function __findLastIndex(a, f) {\n  for (let i = a.length - 1; i >= 0; i--) { if (f(a[i], i, a)) { return i; } }\n  return -1;\n}",
     },
     Hof {
+        // `Array.from(x, f)`: convert with the one-argument builtin,
+        // then map. Not a method on `x` at all — the compiler passes
+        // the source as the receiver so this can lower like the rest.
+        method: "from",
+        source: "function __arrayFrom(a, f) {\n  const s = Array.from(a);\n  const r = [];\n  for (let i = 0; i < s.length; i++) { r.push(f(s[i], i)); }\n  return r;\n}",
+    },
+    Hof {
+        // `toSorted` is `sort` on a copy — the non-mutating spelling.
+        // `const sorted = xs.sort()` has also sorted `xs`, which is
+        // rarely what it meant, and is the reason the copying forms
+        // were added to the language.
+        method: "toSorted",
+        source: "function __toSorted(a, f) {\n  const b = a.slice();\n  for (let i = 1; i < b.length; i++) {\n    const key = b[i];\n    let j = i - 1;\n    while (j >= 0 && f(b[j], key) > 0) { b[j + 1] = b[j]; j--; }\n    b[j + 1] = key;\n  }\n  return b;\n}\nfunction __toSortedDefault(a) {\n  const b = a.slice();\n  for (let i = 1; i < b.length; i++) {\n    const key = b[i];\n    let j = i - 1;\n    while (j >= 0 && String(b[j]) > String(key)) { b[j + 1] = b[j]; j--; }\n    b[j + 1] = key;\n  }\n  return b;\n}",
+    },
+    Hof {
         method: "sort",
         source: "function __sort(a, f) {\n  for (let i = 1; i < a.length; i++) {\n    const key = a[i];\n    let j = i - 1;\n    while (j >= 0 && f(a[j], key) > 0) { a[j + 1] = a[j]; j--; }\n    a[j + 1] = key;\n  }\n  return a;\n}\nfunction __sortDefault(a) {\n  for (let i = 1; i < a.length; i++) {\n    const key = a[i];\n    let j = i - 1;\n    while (j >= 0 && String(a[j]) > String(key)) { a[j + 1] = a[j]; j--; }\n    a[j + 1] = key;\n  }\n  return a;\n}",
     },

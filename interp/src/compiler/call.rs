@@ -81,6 +81,32 @@ impl super::Compiler {
                 // A leading identifier matching a reserved namespace is a static
                 // intrinsic; otherwise it is a method on the receiver value.
                 if let ast::Expression::Identifier(obj) = &m.object {
+                    // **`Array.from(x, f)` is a higher-order call
+                    // wearing a namespace's clothes.** The builtin
+                    // behind the one-argument form cannot invoke a
+                    // closure, so the two-argument form accepted `f`
+                    // and silently dropped it:
+                    // `Array.from({length: 3}, (_, i) => i)` — the
+                    // standard way to write a range — returned
+                    // `[null, null, null]` and the program carried on
+                    // with it. A wrong answer nobody is told about is
+                    // worse than the gap it papers over.
+                    //
+                    // Lowered like any other HOF, with the source as
+                    // the receiver: `__arrayFrom(x, f)`, whose body
+                    // calls the one-argument builtin to convert and
+                    // then maps. Checked here rather than in
+                    // `compile_method_call`, because the namespace arm
+                    // below claims the call first.
+                    if obj.name.as_str() == "Array" && method == "from" && argv.len() == 2 {
+                        return self.emit_prelude_call(
+                            "__arrayFrom",
+                            argv[0],
+                            &argv[1..],
+                            span,
+                            false,
+                        );
+                    }
                     match obj.name.as_str() {
                         "Math" | "Object" | "JSON" | "Number" | "Array" | "String" | "Map"
                         | "Set" | "console" | "Edit" | "ArrayBuffer" | "Date" => {
@@ -831,6 +857,13 @@ impl super::Compiler {
                 return self.compile_hof(recv, argv, span, optional, "__findLastIndex", 1);
             }
             "sort" => return self.compile_sort(recv, argv, span, optional),
+            "toSorted" => {
+                return match argv.len() {
+                    1 => self.emit_prelude_call("__toSorted", recv, argv, span, optional),
+                    0 => self.emit_prelude_call("__toSortedDefault", recv, argv, span, optional),
+                    n => self.error(span, format!("`toSorted` expects 0 or 1 argument(s), got {n}")),
+                };
+            }
             // The promise combinators. `await` inside `try`/`catch` is
             // what the card teaches and what composes best here, but
             // reaching for `.catch` is ordinary JavaScript and trapping

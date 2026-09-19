@@ -70,8 +70,34 @@ pub fn array_from(vm: &mut VM, args: Args) -> Result<Value, VMError> {
             }
             Ok(vm.alloc_array(out))
         }
+        // **Everything `for … of` iterates, `Array.from` converts.**
+        // It used to take an array or a `{length}` object and throw
+        // "type error" at everything else, so the commonest use of all
+        // — `Array.from(new Set(xs))` to dedupe — failed, while the
+        // spread that means the same thing, `[...new Set(xs)]`,
+        // worked. Two spellings of one operation disagreeing is a
+        // dialect gap a reader can only find by falling into it.
+        Value::Set(_) => super::set_values(vm, args),
+        Value::Map(_) => super::map_entries(vm, args),
+        Value::String(s) => {
+            let chars: ThinVec<Value> = s
+                .as_str()
+                .chars()
+                .map(|c| Value::String(crate::rc_str::RcStr::from(c.to_string())))
+                .collect();
+            Ok(vm.alloc_array(chars))
+        }
         Value::Undefined | Value::Null => Ok(vm.alloc_array(ThinVec::new())),
-        _ => Err(vm.fail(ErrorKind::TypeError, "type error")),
+        other => {
+            let what = vm.describe_operand(&other.clone());
+            Err(vm.fail(
+                ErrorKind::TypeError,
+                &format!(
+                    "Array.from needs something to iterate — an array, a string, a Set, a \
+                     Map, or an object with a `length`. Got {what}."
+                ),
+            ))
+        }
     }
 }
 
@@ -173,6 +199,66 @@ pub fn array_reverse(vm: &mut VM, args: Args) -> Result<Value, VMError> {
         .ok_or_else(|| VMError::fail_at(ip, ErrorKind::TypeError, "bad array pointer"))?;
     arr.reverse();
     Ok(Value::Array(arr_ptr))
+}
+
+/// `arr.keys()` / `arr.values()` / `arr.entries()` — the index view, the
+/// element view, and the pairs.
+///
+/// **Arrays are the reason `[...Array(n).keys()]` exists**, which is one
+/// of the two idioms for "the numbers 0 to n". The other,
+/// `Array.from({length: n}, (_, i) => i)`, is above. `Map` and `Set`
+/// have had these three since they were added; an array not having them
+/// meant the range idiom a model reached for first threw, and the one it
+/// fell back to returned nulls.
+///
+/// Eager arrays rather than lazy iterators, like the `Map`/`Set` ones
+/// beside them: this dialect has no iterator protocol, and `for … of`
+/// and spread both take an array.
+pub fn array_keys(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    let arr_ptr = args.array_receiver(vm)?;
+    let n = vm.arrays.get(arr_ptr as usize).map_or(0, |a| a.len());
+    let keys: ThinVec<Value> = (0..n).map(|i| Value::PosInt(i as u64)).collect();
+    Ok(vm.alloc_array(keys))
+}
+
+pub fn array_values(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    let arr_ptr = args.array_receiver(vm)?;
+    let copy = vm
+        .arrays
+        .get(arr_ptr as usize)
+        .cloned()
+        .unwrap_or_default();
+    Ok(vm.alloc_array(copy))
+}
+
+pub fn array_entries(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    let arr_ptr = args.array_receiver(vm)?;
+    let items = vm
+        .arrays
+        .get(arr_ptr as usize)
+        .cloned()
+        .unwrap_or_default();
+    let mut out: ThinVec<Value> = ThinVec::with_capacity(items.len());
+    for (i, v) in items.into_iter().enumerate() {
+        let pair: ThinVec<Value> = vec![Value::PosInt(i as u64), v].into();
+        out.push(vm.alloc_array(pair));
+    }
+    Ok(vm.alloc_array(out))
+}
+
+/// `arr.toReversed()` — `reverse()` on a copy, leaving the receiver
+/// alone. The in-place pair are the older spelling and the trap: a
+/// program that writes `const sorted = xs.reverse()` has also reversed
+/// `xs`, which is rarely what it meant.
+pub fn array_to_reversed(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    let arr_ptr = args.array_receiver(vm)?;
+    let mut copy = vm
+        .arrays
+        .get(arr_ptr as usize)
+        .cloned()
+        .unwrap_or_default();
+    copy.reverse();
+    Ok(vm.alloc_array(copy))
 }
 
 /// `arr.flat([depth])` → flattens nested arrays to the given depth (default 1).
@@ -643,6 +729,94 @@ mod tests {
         assert_eq!(
             testutil::run_ret("return [1,2].concat(3, [4]);"),
             serde_json::json!([1, 2, 3, 4])
+        );
+    }
+
+    #[test]
+    /// **The two spellings of one operation have to agree.**
+    /// `[...new Set(xs)]` worked and `Array.from(new Set(xs))` threw
+    /// "type error", so the commonest dedupe in the language failed
+    /// depending on how it was written.
+    #[test]
+    fn array_from_converts_what_for_of_iterates() {
+        assert_eq!(
+            testutil::run_ret("return Array.from(new Set([1, 1, 2]));"),
+            serde_json::json!([1, 2])
+        );
+        assert_eq!(
+            testutil::run_ret("return Array.from('ab');"),
+            serde_json::json!(["a", "b"])
+        );
+        assert_eq!(
+            testutil::run_ret("return Array.from(new Map([['a', 1]]));"),
+            serde_json::json!([["a", 1]])
+        );
+        assert_eq!(
+            testutil::run_ret("return Array.from(null);"),
+            serde_json::json!([])
+        );
+    }
+
+    /// **The mapper used to be accepted and dropped.**
+    /// `Array.from({length: n}, (_, i) => i)` is how a range is written,
+    /// and it returned `[null, null, null]` — a wrong answer the program
+    /// was never told about.
+    #[test]
+    fn array_from_applies_its_map_function() {
+        assert_eq!(
+            testutil::run_ret("return Array.from({length: 3}, (_, i) => i);"),
+            serde_json::json!([0, 1, 2])
+        );
+        assert_eq!(
+            testutil::run_ret("return Array.from(new Set(['a']), (s) => s + '!');"),
+            serde_json::json!(["a!"])
+        );
+    }
+
+    /// What it cannot convert, it says so about — `describe_operand`
+    /// names the value rather than the old bare "type error".
+    #[test]
+    fn array_from_names_what_it_cannot_convert() {
+        let err = testutil::run_runtime_err("Array.from(42);");
+        assert_eq!(err.kind, crate::ErrorKind::TypeError);
+        assert!(err.message.contains("Array.from needs"), "{}", err.message);
+        assert!(err.message.contains("42"), "names the value: {}", err.message);
+    }
+
+    /// `[...Array(n).keys()]` is the other way to write a range, and
+    /// arrays had none of the three views `Map` and `Set` have had all
+    /// along.
+    #[test]
+    fn arrays_have_keys_values_and_entries() {
+        assert_eq!(
+            testutil::run_ret("return [...Array(3).keys()];"),
+            serde_json::json!([0, 1, 2])
+        );
+        assert_eq!(
+            testutil::run_ret("return ['a', 'b'].values();"),
+            serde_json::json!(["a", "b"])
+        );
+        assert_eq!(
+            testutil::run_ret("return [...['a'].entries()];"),
+            serde_json::json!([[0, "a"]])
+        );
+    }
+
+    /// The copying forms exist because `const s = xs.sort()` also sorts
+    /// `xs`, which is rarely what it meant.
+    #[test]
+    fn to_sorted_and_to_reversed_leave_the_receiver_alone() {
+        let out = testutil::run_ret(
+            "const xs = [3, 1, 2]; const a = xs.toSorted((p, q) => p - q);              const b = xs.toReversed(); return [a, b, xs];",
+        );
+        assert_eq!(
+            out,
+            serde_json::json!([[1, 2, 3], [2, 1, 3], [3, 1, 2]]),
+            "both copy; the original is untouched"
+        );
+        assert_eq!(
+            testutil::run_ret("return ['b', 'a'].toSorted();"),
+            serde_json::json!(["a", "b"])
         );
     }
 
