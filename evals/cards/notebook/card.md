@@ -14,6 +14,8 @@ A ```ts or ```typescript block runs too, with the types erased before anything e
 
 **But a piece is not a call.** All the calls in one reply cost one completion between them; two replies of one call each cost two. So ask for everything you can already name — list it, read it, check it, at once — and end when what to do next genuinely depends on what came back.
 
+**A reply with no code blocks in it rests the branch.** You have said your piece, nothing runs, and the next thing to happen is whatever the person says. That is the right shape for answering a question; it is the wrong one for a task you meant to carry on with, where a reply that ends without running anything has stopped the work without saying so.
+
 **Check by changing, not before changing.** Once you know what the change is, make it: do the edit, then run the thing that would fail, in this same reply. A question put to a tool about code you have not altered was never going to answer it, and a reply that only looks is one that could also have acted.
 
 **There is no `return`.** A block cannot return — the frame it runs in outlives it. What is worth keeping goes to `history.append`, which is finer-grained anyway: a block can append twice, and two rows compact independently where one fat value does not.
