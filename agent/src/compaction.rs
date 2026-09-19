@@ -177,11 +177,17 @@ pub fn compact(tree: &Tree, spine: &Spine, ops: &[CompactionOp]) -> Vec<EventPay
 /// `Result` and a `Console` render inside something else or not at all,
 /// so naming one is a no-op rather than an error.
 ///
-/// **A reply is named by its `Reply`** (or its `Restart`), not by any
-/// of the parts it is made of (28). The parts are pieces of one
-/// message; the document keys that message on the id the reply opened
-/// with, so that is the id an op has to be allowed to say. Naming a
-/// `Part` or a `ReplyEnd` would ask to compact half a sentence.
+/// **A reply is named by its `Reply`, and a block of one by its
+/// `Part`.** Both, because they are different units and both are whole:
+/// the `Reply` is the message, and a `Part` is one block of it — a
+/// paragraph, or a fenced cell — carrying its own event id and its own
+/// `↓ history[N]` marker in the document. Dropping the cell and keeping
+/// the prose that explains it is a thing a handler should be able to
+/// ask for.
+///
+/// A `ReplyEnd` still is not a row, and neither is a `Part::Thinking`:
+/// thinking is on the log and not in the document, so it carries no
+/// marker, nothing can name it, and compacting it would shrink nothing.
 fn renders_a_line(payload: &EventPayload) -> bool {
     matches!(
         payload,
@@ -192,6 +198,10 @@ fn renders_a_line(payload: &EventPayload) -> bool {
             | EventPayload::Handback { .. }
             | EventPayload::Call(_)
             | EventPayload::Fork { .. }
+            | EventPayload::Part {
+                part: crate::types::Part::Prose(_) | crate::types::Part::Cell(_),
+                ..
+            }
     )
 }
 
@@ -585,6 +595,142 @@ mod tests {
         assert!(
             tree.events.contains_key(&note),
             "but the log still has it, so fetch still answers"
+        );
+    }
+
+    /// A reply whose blocks are named one at a time: prose, cell,
+    /// prose. Returns the ids of all three.
+    fn branch_with_three_blocks() -> (Tree, Spine, [EventId; 3]) {
+        let mut tree = Tree::new(None);
+        let mut spine = tree
+            .start_agent(None, None, "root", None, "CARD", Vec::new())
+            .unwrap();
+        tree.append(
+            &mut spine,
+            EventPayload::Post {
+                from: Author::User,
+                origin: Origin::Direct {
+                    text: "go".into(),
+                    input: serde_json::Value::Null,
+                    options: Vec::new(),
+                    expects_reply: true,
+                },
+            },
+        )
+        .unwrap();
+        let reply = tree.append(&mut spine, EventPayload::Restart).unwrap();
+        let mut ids = Vec::new();
+        for part in [
+            crate::types::Part::Prose("Reading it first.\n\n".into()),
+            crate::types::Part::Cell("```js\nconst n = 1;\n```\n".into()),
+            crate::types::Part::Prose("\nThat is the count.\n".into()),
+        ] {
+            ids.push(
+                tree.append(&mut spine, EventPayload::Part { reply, part })
+                    .unwrap(),
+            );
+        }
+        tree.append(
+            &mut spine,
+            EventPayload::ReplyEnd {
+                reply,
+                how: crate::types::ReplyEnd::Finished,
+                usage: Default::default(),
+            },
+        )
+        .unwrap();
+        (tree, spine, [ids[0], ids[1], ids[2]])
+    }
+
+    fn rendered(tree: &Tree, spine: &Spine) -> String {
+        render(tree, spine, 64 * 1024)
+            .messages
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect()
+    }
+
+    /// **A block is a target of its own.** The cell goes and the prose
+    /// that explains it stays — which is the whole reason a `Part` is
+    /// nameable separately from the `Reply` it belongs to.
+    #[test]
+    fn compacting_one_block_leaves_the_others_standing() {
+        let (mut tree, mut spine, [first, cell, last]) = branch_with_three_blocks();
+        let before = rendered(&tree, &spine);
+        assert!(before.contains("const n = 1"), "{before}");
+        assert!(
+            before.contains(&format!("↓ history[{}]", cell.as_u64())),
+            "every block is marked: {before}"
+        );
+
+        let ops = [CompactionOp::Remove {
+            from: cell,
+            to: cell,
+        }];
+        let payloads = compact(&tree, &spine, &ops);
+        assert_eq!(payloads.len(), 1, "a block is nameable");
+        for payload in payloads {
+            tree.append(&mut spine, payload).unwrap();
+        }
+
+        let after = rendered(&tree, &spine);
+        assert!(!after.contains("const n = 1"), "the cell is gone: {after}");
+        assert!(
+            !after.contains(&format!("↓ history[{}]", cell.as_u64())),
+            "and so is its marker: {after}"
+        );
+        assert!(after.contains("Reading it first."), "{after}");
+        assert!(after.contains("That is the count."), "{after}");
+        assert!(
+            after.contains(&format!("↓ history[{}]", first.as_u64()))
+                && after.contains(&format!("↓ history[{}]", last.as_u64())),
+            "the surviving blocks keep their own markers: {after}"
+        );
+    }
+
+    /// A replaced block **is** its marker: the line that named it now
+    /// says what it stood for, with the `…` every replacement carries.
+    #[test]
+    fn a_replaced_block_renders_as_its_marker() {
+        let (mut tree, mut spine, [_, cell, _]) = branch_with_three_blocks();
+        let ops = [CompactionOp::Replace {
+            id: cell,
+            text: "counted the defs".into(),
+        }];
+        for payload in compact(&tree, &spine, &ops) {
+            tree.append(&mut spine, payload).unwrap();
+        }
+        let after = rendered(&tree, &spine);
+        assert!(
+            after.contains(&format!("↓ history[{}] … counted the defs", cell.as_u64())),
+            "{after}"
+        );
+        assert!(!after.contains("const n = 1"), "{after}");
+    }
+
+    /// **Compacted to nothing is a removal, not an empty reply.** Both
+    /// render as no text, and they mean opposite things: one is news
+    /// the model needs ("your completion went entirely to reasoning"),
+    /// the other is something it asked for.
+    #[test]
+    fn a_reply_whose_every_block_went_leaves_no_turn_at_all() {
+        let (mut tree, mut spine, ids) = branch_with_three_blocks();
+        let ops = [CompactionOp::Remove {
+            from: ids[0],
+            to: ids[2],
+        }];
+        for payload in compact(&tree, &spine, &ops) {
+            tree.append(&mut spine, payload).unwrap();
+        }
+        let doc = render(&tree, &spine, 64 * 1024);
+        let after: String = doc.messages.iter().map(|m| m.content.as_str()).collect();
+        assert!(!after.contains("arrived empty"), "not that news: {after}");
+        assert!(!after.contains("↓ history["), "{after}");
+        assert!(
+            !doc.conversation()
+                .iter()
+                .any(|m| m.role == crate::document::ChatRole::Assistant),
+            "no assistant slot for a reply compacted away: {doc:?}"
         );
     }
 

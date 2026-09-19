@@ -740,6 +740,11 @@ pub(crate) fn render_with_lookup(
     // reply that was pure prose tells the model it ran something it
     // did not write.
     let mut ran_a_cell = false;
+    // Whether the reply now open wrote any block at all. It separates
+    // "arrived empty" from "compacted to nothing", which render the
+    // same way — no text — and mean opposite things: the first is news
+    // the model needs, the second is a removal it asked for.
+    let mut had_blocks = false;
 
     for ev in tree.path_events(leaf) {
         if let EventPayload::Agent { .. } = ev.payload {
@@ -761,6 +766,7 @@ pub(crate) fn render_with_lookup(
             EventPayload::Reply | EventPayload::Restart => {
                 ran = false;
                 ran_a_cell = false;
+                had_blocks = false;
                 before = std::mem::take(&mut pending);
                 reply = Some((ev.id, String::new()));
                 blocks.clear();
@@ -777,8 +783,29 @@ pub(crate) fn render_with_lookup(
                         // replayed as what the model said.
                         Part::Thinking(_) => {}
                         Part::Prose(t) | Part::Cell(t) => {
-                            blocks.push((text.len(), ev.id.as_u64()));
-                            text.push_str(t);
+                            had_blocks = true;
+                            // **A compacted block is its marker and
+                            // nothing else.** The marker already names
+                            // the row and already sits on its own line,
+                            // so a shadow has somewhere to go that no
+                            // other row's does: `↓ history[12] … what
+                            // it did`. A removed one takes its marker
+                            // with it and leaves the blocks either side
+                            // adjacent, which is what removal means.
+                            match compacted.get(&ev.id) {
+                                Some(shadow) => {
+                                    if let Some(t) = shadow.text.as_deref() {
+                                        text.push_str(&format!(
+                                            "{BLOCK_ARROW} history[{}] … {t}\n",
+                                            ev.id.as_u64()
+                                        ));
+                                    }
+                                }
+                                None => {
+                                    blocks.push((text.len(), ev.id.as_u64()));
+                                    text.push_str(t);
+                                }
+                            }
                         }
                     }
                 }
@@ -803,6 +830,11 @@ pub(crate) fn render_with_lookup(
                     // is a zero-byte assistant message: malformed on
                     // the wire, and silent about the one thing the
                     // model needs to know about its own last turn.
+                    // Compacted to nothing is a removal, not an empty
+                    // reply: no assistant slot, and the user turns
+                    // either side merge — exactly what a wholly
+                    // compacted `Reply` does one arm up.
+                    None if text.is_empty() && had_blocks => None,
                     None if text.is_empty() => Some(EMPTY_REPLY_NOTE.to_owned()),
                     None => {
                         let mut text =

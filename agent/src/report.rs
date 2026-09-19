@@ -1037,9 +1037,13 @@ pub(crate) fn compaction_message(
          `history.remove(id)` shows nothing for that entry from here on, and \
          `history.remove(from, to)` does the same for every entry in an inclusive range. \
          `history.replace(id, text)` shows `text` in its place instead. Everything carrying \
-         an `[id]` above can be named — a program, a report, a note, a post, or any single \
-         line of a report's menu. Anything else you name is simply skipped, and everything \
-         you name that does exist still applies.\n\n\
+         an id above can be named — a report, a note, a post, any single line of a \
+         report's menu, and **any block of any reply you have written**, which is what the \
+         `↓ history[12]` line above a block is for. Anything else you name is simply \
+         skipped, and everything you name that does exist still applies.\n\n\
+         Your own blocks are usually the cheapest thing to drop: a program that has \
+         already run sits directly above the report saying what it did, and the report is \
+         the part worth keeping.\n\n\
          This card and the worked examples before the conversation carry no id, so they \
          cannot be named and are not yours to shrink.\n\n\
          An entry shown as `[id] … text` is already standing in for something longer. \
