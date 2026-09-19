@@ -348,6 +348,32 @@ Worth keeping: **a bound on attempts is not a bound on a loop whose
 every round reports success.** The question a guard has to answer is
 whether the work can help, not how many times it has been tried.
 
+## The local model
+
+`Qwen3.8-27B` over the LAN, 64k context, as a second opinion on
+everything above. It works with the harness and it is far too slow for
+the suite: roughly 450 seconds a program, and a `skipped-tests` run hit
+a 3,600-second cap after two.
+
+It is still the best evidence for block compaction, because it reached
+for the feature on its first exposure to it. Its compaction program:
+
+```js
+history.remove(4);
+history.remove(5);
+history.remove(9, 12);
+history.append("Findings so far: …");
+```
+
+`4` and `5` are the prose and the cell of its own previous reply, named
+off the `↓ history[N]` markers that had existed for an hour. A second
+run compacted four rows and every one was a `Part` — its own blocks
+again.
+
+It also produced the loop that led to the floor guard, and the
+repeat-yourself behaviour that led to a spent compaction program
+removing itself. A model slow enough to watch is worth having.
+
 ## Where the bytes are
 
 Measured over 20 rendered documents:
