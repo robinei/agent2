@@ -27,8 +27,10 @@ than failed, which is why the denominators differ. Three such were lost
 to an upstream 530 in one batch, and the retry budget has since been
 raised to outlast it.)
 
-Half the completions and half the bytes, with the pass rate holding.
-Most of the cost came off one change — telling the model what is in
+A third off both, with the pass rate holding — and rather more than a
+third on the tasks with room to move: `skipped-tests` and `sweep-200`
+each lost roughly two thirds of their prompt. Most of the cost came off
+one change — telling the model what is in
 the working directory, so it stops spending its first program finding
 out — and the shape of the win is that a model which can see the tree
 plans the whole job in one program instead of discovering it three
