@@ -299,15 +299,47 @@ struct Cut {
 /// here — a scan would have to get string literals right and would get
 /// them wrong on the first `tell(")")`. Rows written before those
 /// fields existed carry zero and are left exactly as they were.
-fn annotate_history_calls(source: &str, cuts: Option<&Vec<Cut>>) -> String {
-    let Some(cuts) = cuts else {
+fn annotate_history_calls(source: &str, cuts: Option<&Vec<Cut>>, blocks: &[(usize, u64)]) -> String {
+    // **One pass, because there is one source.** A block marker is
+    // computed against the reply as the model wrote it and so is a
+    // call annotation, and either kind changes the length of what
+    // follows it. Applying both from the end means every offset still
+    // points where it pointed when it was taken — which is the whole
+    // reason the cuts below could ever be computed separately from the
+    // text they edit.
+    enum Edit {
+        Call(Cut),
+        Block(u64),
+    }
+    let mut edits: Vec<(usize, Edit)> = blocks
+        .iter()
+        .map(|(at, row)| (*at, Edit::Block(*row)))
+        .collect();
+    if let Some(cuts) = cuts {
+        edits.extend(cuts.iter().cloned().map(|c| (c.start, Edit::Call(c))));
+    }
+    if edits.is_empty() {
         return source.to_owned();
-    };
-    let mut cuts = cuts.clone();
+    }
     // Right to left, so no earlier offset goes stale.
-    cuts.sort_by_key(|c| std::cmp::Reverse(c.start));
+    edits.sort_by_key(|(at, _)| std::cmp::Reverse(*at));
     let mut out = source.to_owned();
-    for c in cuts {
+    for (at, edit) in edits {
+        let c = match edit {
+            Edit::Block(row) => {
+                // On its own line, always: a marker sharing a line with
+                // the prose above it reads as part of what the model
+                // wrote, which is the one thing it must not do.
+                let lead = if at > 0 && !out[..at].ends_with('\n') {
+                    "\n"
+                } else {
+                    ""
+                };
+                out.insert_str(at, &format!("{lead}{BLOCK_ARROW} history[{row}]\n"));
+                continue;
+            }
+            Edit::Call(c) => c,
+        };
         let snipped = format!("/*{ARROW} snipped - history[{}] */", c.row);
         let marked = format!(" /*{ARROW} history[{}] */", c.row);
         if c.literal && snipped.len() < c.end - c.start {
@@ -342,6 +374,17 @@ fn annotate_history_calls(source: &str, cuts: Option<&Vec<Cut>>) -> String {
     }
     out
 }
+
+/// The arrow a **block** carries, on the line above it, pointing down
+/// at the block it names — the prose paragraph or the fenced cell that
+/// follows. Its sibling [`ARROW`] points left at the call on its own
+/// line, and the pair says the same thing twice: an arrow names a row
+/// of the history and points at what it names.
+///
+/// A glyph the model does not reach for on its own is doing the work
+/// here, the same work `ARROW` does one line down; `card.md` says in
+/// words that neither was written by the model.
+const BLOCK_ARROW: &str = "↓";
 
 /// The arrow every annotation carries, so it reads as something
 /// pointing *out* of the code at a row rather than as a comment
@@ -669,6 +712,11 @@ pub(crate) fn render_with_lookup(
     // infer — a `Reply` opens it, `Part`s append to it, `ReplyEnd`
     // closes it (28).
     let mut reply: Option<(EventId, String)> = None;
+    // Where each block of the open reply starts, and which row it is.
+    // Collected while the parts concatenate, because that is the only
+    // moment the offsets are known; spent in `annotate_history_calls`,
+    // which is where every offset edit to a reply happens.
+    let mut blocks: Vec<(usize, u64)> = Vec::new();
     // Lines that arrived before the open reply — see the `Reply` arm.
     let mut before: Vec<String> = Vec::new();
     let mut cur_agent: Option<EventId> = None;
@@ -715,6 +763,7 @@ pub(crate) fn render_with_lookup(
                 ran_a_cell = false;
                 before = std::mem::take(&mut pending);
                 reply = Some((ev.id, String::new()));
+                blocks.clear();
             }
             EventPayload::Part { part, .. } => {
                 if let Part::Cell(_) = part {
@@ -727,7 +776,10 @@ pub(crate) fn render_with_lookup(
                         // is not what the model said, so it is not
                         // replayed as what the model said.
                         Part::Thinking(_) => {}
-                        Part::Prose(t) | Part::Cell(t) => text.push_str(t),
+                        Part::Prose(t) | Part::Cell(t) => {
+                            blocks.push((text.len(), ev.id.as_u64()));
+                            text.push_str(t);
+                        }
                     }
                 }
             }
@@ -753,7 +805,8 @@ pub(crate) fn render_with_lookup(
                     // model needs to know about its own last turn.
                     None if text.is_empty() => Some(EMPTY_REPLY_NOTE.to_owned()),
                     None => {
-                        let mut text = annotate_history_calls(&text, cuts.get(&id));
+                        let mut text =
+                            annotate_history_calls(&text, cuts.get(&id), &std::mem::take(&mut blocks));
                         // **And why it stops, when it stopped early.**
                         // A reply cut off used to trail away with no
                         // marker, so the model saw itself break off
@@ -1147,8 +1200,8 @@ mod tests {
                 .map(|m| m.content.clone())
                 .expect("the reply renders");
             assert!(
-                assistant.starts_with("Looking at the first of the two"),
-                "verbatim first: {assistant}"
+                assistant.starts_with("↓ history[4]\nLooking at the first of the two"),
+                "verbatim under its marker first: {assistant}"
             );
             assert!(
                 assistant.contains(want),
@@ -1189,7 +1242,10 @@ mod tests {
         assert_eq!(conv[0].role, ChatRole::User);
         assert!(conv[0].content.contains("hello"));
         assert_eq!(conv[1].role, ChatRole::Assistant);
-        assert_eq!(conv[1].content, "```js\ntell('hi'); history.append(1);\n```\n");
+        assert_eq!(
+            conv[1].content,
+            "↓ history[4]\n```js\ntell('hi'); history.append(1);\n```\n"
+        );
         assert_eq!(conv[2].role, ChatRole::User);
     }
 
@@ -1254,8 +1310,11 @@ mod tests {
         // which is what the model was prompted with) / assistant(the
         // decision it wrote back) / user(both returns).
         assert_eq!(conv.len(), 5, "{doc:?}");
-        assert_eq!(conv[1].content, "```js\nraise('x');\n```\n");
-        assert_eq!(conv[3].content, "```js\nhistory.append(resume(1));\n```\n");
+        assert_eq!(conv[1].content, "↓ history[4]\n```js\nraise('x');\n```\n");
+        assert_eq!(
+            conv[3].content,
+            "↓ history[8]\n```js\nhistory.append(resume(1));\n```\n"
+        );
         assert!(
             !conv[2].content.is_empty(),
             "a condition that suspended the program renders its report, \
@@ -1422,13 +1481,13 @@ mod tests {
         }];
         // The model's own guess, in our shape and with the wrong id.
         let source = "history.append(arg); /* history[13] */\n";
-        let out = annotate_history_calls(source, Some(&cuts));
+        let out = annotate_history_calls(source, Some(&cuts), &[]);
         assert_eq!(out, "history.append(arg) /* ← history[30] */;\n");
         assert!(!out.contains("13"), "the invented id is gone: {out}");
 
         // And the same once it has imitated the arrow too.
         let source = "history.append(arg); /* ← history[13] */\n";
-        let out = annotate_history_calls(source, Some(&cuts));
+        let out = annotate_history_calls(source, Some(&cuts), &[]);
         assert_eq!(out, "history.append(arg) /* ← history[30] */;\n");
     }
 
@@ -1443,7 +1502,7 @@ mod tests {
             literal: false,
         }];
         let source = "history.append(arg); /* see history[9] for the listing */\n";
-        let out = annotate_history_calls(source, Some(&cuts));
+        let out = annotate_history_calls(source, Some(&cuts), &[]);
         assert!(out.contains("see history[9] for the listing"), "{out}");
         assert!(out.contains("/* ← history[30] */"), "{out}");
     }
@@ -1770,7 +1829,10 @@ mod tests {
         let doc = sample_document();
         let conv = doc.conversation();
         assert_eq!(conv[1].role, ChatRole::Assistant);
-        assert_eq!(conv[1].content, "```js\ntell('hi'); history.append(1);\n```\n");
+        assert_eq!(
+            conv[1].content,
+            "↓ history[4]\n```js\ntell('hi'); history.append(1);\n```\n"
+        );
         assert_eq!(conv[2].role, ChatRole::User, "{conv:?}");
     }
 }

@@ -2579,6 +2579,21 @@ impl Runner {
                     None => String::new(),
                 }))
             }
+            // **One block of a reply, as it was written.** The
+            // document marks every block with `↓ history[N]`, and an
+            // id the model can see has to be an id it can read:
+            // without this arm the marker would name a row `fetch`
+            // says does not exist, which is the papercut the
+            // `append`/`fetch` round-trip was.
+            //
+            // Thinking carries no marker — it is on the log and not in
+            // the document — so nothing can name it, and it falls
+            // through to the refusal below with everything else that
+            // is not a row.
+            EventPayload::Part { part, .. } => match part {
+                Part::Prose(t) | Part::Cell(t) => Ok(serde_json::Value::String(t.clone())),
+                Part::Thinking(_) => Err(format!("#{id} is not a row of this conversation")),
+            },
             // **Whole, as the card promises.** What was appended
             // comes back as it went in — not as its JSON text, which is
             // what a program had to know to `JSON.parse` before 28.
@@ -7876,6 +7891,52 @@ mod tests {
             .collect()
     }
 
+    /// **A marker names a row, so the row has to answer.** Every block
+    /// of a reply carries `↓ history[N]` above it; an id the model can
+    /// see and cannot read back is the papercut the `append`/`fetch`
+    /// round-trip was, and this is the arm that keeps the marker
+    /// honest.
+    #[test]
+    fn a_block_of_a_reply_fetches_back_as_its_own_text() {
+        let (mut tree, mut state) = setup_under();
+        user_post(&mut state, &mut tree, "go");
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::LlmResponse(llm_program(
+                    "Reading it first.\n\n```js\nlet n = 1;\n```\n",
+                )),
+            )
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+
+        let blocks: Vec<(u64, Part)> = state
+            .agent_segment(&tree)
+            .iter()
+            .filter_map(|e| match &e.payload {
+                EventPayload::Part { part, .. } => Some((e.id.as_u64(), part.clone())),
+                _ => None,
+            })
+            .collect();
+        let fetched: Vec<serde_json::Value> = blocks
+            .iter()
+            .filter(|(_, p)| !matches!(p, Part::Thinking(_)))
+            .map(|(id, _)| {
+                state
+                    .fetch_history(&tree, &[interp::Value::PosInt(*id)])
+                    .expect("a block the document marks is a block that fetches")
+            })
+            .collect();
+        assert_eq!(
+            fetched,
+            vec![
+                json!("Reading it first.\n\n"),
+                json!("```js\nlet n = 1;\n```\n"),
+            ],
+            "each block comes back as itself, fences and all"
+        );
+    }
+
     /// **The model's own past turn is what it generated.** Not rebuilt
     /// from pieces, not re-fenced, not reassembled — the completion
     /// verbatim, with only the documented annotate-and-snip pass on top.
@@ -7902,9 +7963,23 @@ mod tests {
             .collect();
 
         assert_eq!(assistant.len(), 1, "one message per reply, not per cell");
+        // **The markers are the only difference.** Each block carries a
+        // `↓ history[N]` line above it so the model can name it; lift
+        // those and what is left is the completion, byte for byte — no
+        // re-fencing, no reassembly, no normalisation.
+        let stripped: String = assistant[0]
+            .split_inclusive('\n')
+            .filter(|l| !l.starts_with("↓ history["))
+            .collect();
         assert_eq!(
-            assistant[0], reply,
-            "byte-identical to what the model generated"
+            stripped, reply,
+            "byte-identical to what the model generated, once the markers are lifted"
+        );
+        assert_eq!(
+            assistant[0].matches("↓ history[").count(),
+            5,
+            "one marker per block — three prose, two cells: {}",
+            assistant[0]
         );
     }
 
