@@ -6570,6 +6570,26 @@ mod tests {
             )),
             "and the edit landed when the program finished"
         );
+        // **And it does not compact itself.** That rule is for the
+        // reply the harness *asked* for, which is work in a document it
+        // asked to be made smaller. An ordinary program that happens to
+        // use the same verb is the conversation, and stays in it.
+        let own_blocks: Vec<EventId> = tree
+            .events
+            .values()
+            .filter(|e| matches!(&e.payload, EventPayload::Part { reply, .. } if *reply == state.reply_id))
+            .map(|e| e.id)
+            .collect();
+        for b in own_blocks {
+            assert!(
+                !tree.events.values().any(|e| matches!(
+                    &e.payload,
+                    EventPayload::Compacted { of, .. } if *of == b
+                )),
+                "an ordinary program's own block #{} was compacted",
+                b.as_u64()
+            );
+        }
     }
 
     /// A label indexes a call; it does not replay its arguments. The
