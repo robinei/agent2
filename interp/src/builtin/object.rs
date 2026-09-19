@@ -88,7 +88,18 @@ pub fn obj_entries(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 
 /// `Object.fromEntries(entries)` → object from [key, value] pairs.
 pub fn obj_from_entries(vm: &mut VM, args: Args) -> Result<Value, VMError> {
-    let arr_ptr = match args.get(vm, 0) {
+    // **A `Map` is a list of entries, which is the whole point of it.**
+    // `Object.fromEntries(m)` is the standard way to turn one back into
+    // an object and this refused it. Found by the message written an
+    // hour earlier: `Object.fromEntries needs an object; got a map` is
+    // what a `sweep-40` run was told on 2026-09-20, and naming the
+    // value is what made the gap visible — the old "type error" would
+    // have hidden it again.
+    let entries_value = match args.get(vm, 0) {
+        Value::Map(_) => super::map_entries(vm, args)?,
+        other => other.clone(),
+    };
+    let arr_ptr = match &entries_value {
         Value::Array(p) => *p,
         other => {
             let other = other.clone();
@@ -386,6 +397,29 @@ pub fn obj_is_extensible(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 
 #[cfg(test)]
 mod tests {
+    /// **A `Map` is a list of entries.** `Object.fromEntries(m)` is the
+    /// standard way to turn one back into an object, and this refused
+    /// it — found because the message written an hour earlier named the
+    /// value: `Object.fromEntries needs an object; got a map`, on a
+    /// live `sweep-40` run. The old "type error" would have hidden it
+    /// again.
+    #[test]
+    fn from_entries_takes_a_map() {
+        assert_eq!(
+            crate::testutil::run_ret(
+                "const m = new Map([['a', 1], ['b', 2]]); return Object.fromEntries(m);"
+            ),
+            serde_json::json!({"a": 1, "b": 2})
+        );
+        // And the round trip both ways.
+        assert_eq!(
+            crate::testutil::run_ret(
+                "return Object.fromEntries(new Map(Object.entries({x: 7})));"
+            ),
+            serde_json::json!({"x": 7})
+        );
+    }
+
     /// **What it was handed, because it is nearly always `undefined`.**
     /// `Object.entries(r.items)` on a result with no `items` said
     /// `in `entries`: type error`, naming neither the value nor the
