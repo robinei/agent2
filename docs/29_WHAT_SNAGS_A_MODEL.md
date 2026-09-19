@@ -1,0 +1,145 @@
+# 29 — What snags a model
+
+A night spent reading 96 kept eval runs for places the harness trips
+the model it is trying to help. Not a design phase: an audit, and the
+fixes that fell out of it. The method is worth more than any one
+finding, so it is first.
+
+## The method
+
+**Compare the model-facing surface against what the code does.** Every
+claim the harness makes — a tool's `returns`, an `@example`, a card
+sentence, an error message — is a promise a model will act on. Two of
+them were false, and the measurements say those two cost more than
+every dialect gap put together.
+
+**Read the runs, not the aggregates.** Every real finding below came
+from opening a log. The one thing built from an aggregate alone was
+withdrawn a commit later, because reading the runs it fired on showed
+it was wrong five times out of six.
+
+**Where an example and a rule disagree, the example wins.** Twice, with
+receipts.
+
+## What was actually wrong
+
+### `outline` returned something other than what it declared
+
+Its `returns` said `{ items: Array<{ name, kind, line }> }` and its
+`@example` said `const { items } = await tools.outline(path)`. It
+returned a bare array, whose entries carry `start_line`/`end_line` and
+not `line`.
+
+| | |
+|---|---|
+| `outline` calls across 96 runs | 21 |
+| traps caused | **11** |
+| share of all traps recorded | 11 of 30 |
+| share of all `.length of undefined` traps | all of them |
+
+It was also the only tool in the set returning a bare array; the other
+six return objects, 858 calls between them. The declaration was right
+about what the model wanted, so the value moved.
+
+### `replace_file` returned a diff nobody was told about
+
+Declared `{ version }`, returns `{ version, diff }` on 84 of 86
+observed calls, and its guideline read *"You will not see the result,
+so verify in this same program: read it back."* Which is false, and
+paid for: **39% of writes were followed by a `read_file` of the same
+path**, and not one cell in 96 runs mentioned `.diff`. The menu row had
+been printing `→ ok, {version, diff}` the whole time, so the
+declaration was contradicting the document around it.
+
+### `bash`'s description was cut mid-word
+
+`DESCRIPTION_MAX_BYTES` is 400 and the doc beside it claimed "every
+shipped tool fits comfortably inside this". `bash` was 408. What fell
+off the end was `"s timeout, 4MB per stream"` — so the model was never
+told a command has 30 seconds or that output stops at 4MB. The limits
+now lead the sentence, because a clip takes the tail, and a test holds
+the claim.
+
+### The worked examples broke the card's own rules
+
+`history.append`'s doc says in bold **"Not the bytes of something you
+read"**. The fifth exemplar did exactly that, with prose defending it.
+Measured: **72% of all appended bytes echo a result already on the
+log** — 79 KB carried twice across 19 runs.
+
+The fourth wrote every file in a loop and then told the person how
+many, with nothing run in between — the exact shape
+`wrote_without_verifying` nudges about, demonstrated in the card the
+nudge quotes.
+
+### A reply cannot read what it printed
+
+`sweep-8`, 2026-09-19. The run deleted six helpers, ran `test.py`,
+printed the output, and in the next block of the same reply told the
+person *"Syntax check and tests pass"* while the console held
+`AttributeError` and `TEST_EXIT:1`. Its prose between the blocks read
+*"Check what came back, then report."*
+
+There is no way to do that. `console.log` reaches the model in the
+*next* reply, and the card said output lands there "too: the cheap one,
+for looking rather than keeping, and for findings **as you go**" —
+where "as you go" is the false promise.
+
+## The dialect
+
+81 constructs a model might write, probed against what `interp`
+implements. Two silent wrong answers, which are worse than gaps because
+the program carries on:
+
+- `Array.from({length: 3}, (_, i) => i)` — the standard range idiom —
+  returned `[null, null, null]`. The builtin cannot invoke a closure, so
+  the mapper was accepted and dropped.
+- `[...Array(3).keys()]`, the other range idiom, threw. Both ways to
+  write a range failed, one loudly and one silently.
+
+And `Array.from(new Set(xs))` threw while `[...new Set(xs)]` worked —
+two spellings of one operation disagreeing, which a reader can only
+find by falling into it.
+
+**What was left undone, and why.** Object getters, labelled
+break/continue, generators, `String.raw`, `structuredClone`, `BigInt`,
+`Object.groupBy`: **zero uses across 96 runs**. Closing them would be
+speculation.
+
+## Errors that sent the reader to the wrong place
+
+| was | is |
+|---|---|
+| `` `f` is already declared `` | …and this code shares one scope with what ran before it. The check only fires across fragments, so the other declaration is never in the fragment being read. Six runs died here |
+| `replaceOnce expected 1 match, found 4 of X — widen it` | …*at lines 3, 11, 19, 27*, or name the line with `Edit.replaceLines`. The offsets were in hand at the moment of the error |
+| `f is not defined` | …and `f` was bound in the reply at `[12]`; nothing crosses between replies. Said only when the declaration is findable, so there are no false positives |
+| `history.append` returned `null` | …returns the row's id. Two live programs invented an identifier for it rather than do without, and died on it |
+
+## What was rejected
+
+**A nudge for "spoke to the person after a failing command".** Built
+from an aggregate, withdrawn after reading the runs. It fired on 9 of
+96; 46 of its 58 firings were `grep` exiting 1 with no matches, which
+is an answer. Teaching it that exit 1 with nothing written is a search
+that found nothing cut it to 7 — and those were mostly a model running
+an un-skipped trial suite *expecting* failures and correctly saying so.
+It also never caught the case that motivated it, because that run wrote
+`; echo TEST_EXIT:$?` and exited 0.
+
+A report section that is wrong most of the time it appears is how a
+reader learns to skip that section.
+
+## Where the bytes are
+
+Measured over 20 rendered documents:
+
+| | |
+|---|---|
+| card + worked examples | **66.8%** |
+| assistant turns | 16.8% |
+| `### it printed` | 6.9% |
+| `### rows it added` | 6.1% |
+| everything else in a user turn | 3.5% |
+
+Compaction operates on the third of the document that is not the card.
+Worth knowing before optimising any of it.
