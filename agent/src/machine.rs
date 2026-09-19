@@ -6513,6 +6513,21 @@ mod tests {
             tree.events.contains_key(&target),
             "the original row is shadowed, never removed"
         );
+
+        // **And the document still alternates.** Every block of the
+        // compaction program is shadowed, so its assistant slot is
+        // empty — which is the case `render` handles by emitting no
+        // turn and merging the user blocks either side, rather than
+        // leaving two assistant messages next to each other for a
+        // provider to reject.
+        let doc = crate::document::render(&tree, &state.spine, 64 * 1024);
+        let roles: Vec<_> = doc.conversation().iter().map(|m| m.role).collect();
+        for pair in roles.windows(2) {
+            assert_ne!(
+                pair[0], pair[1],
+                "two turns in the same role after a self-compaction: {roles:?}"
+            );
+        }
     }
 
     /// The history verbs work in any program, not only a compaction
