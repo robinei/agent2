@@ -21,7 +21,7 @@ pub fn json_parse(vm: &mut VM, args: Args) -> Result<Value, VMError> {
         let more = if s.chars().nth(60).is_some() { "…" } else { "" };
         vm.fail(
             ErrorKind::ValueError,
-            &format!("JSON.parse: {e} — the text begins {head:?}{more}"),
+            format!("JSON.parse: {e} — the text begins {head:?}{more}").as_str(),
         )
     })?;
     vm.json_to_stack_value(&json, 0)
