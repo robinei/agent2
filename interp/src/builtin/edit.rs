@@ -18,7 +18,7 @@ use crate::vm::{ErrorKind, RcStr, VM, VMError, Value};
 /// that was not the error, which is the least useful thing a message
 /// can do.
 fn edit_text(vm: &mut VM, args: &Args, who: &str) -> Result<RcStr, VMError> {
-    let v = args.get(vm, 0);
+    let v = args.get(vm, 0).clone();
     if matches!(v, Value::Undefined) {
         let msg = format!(
             "{who}(text, …): `text` is undefined. `replaceOnce` and `applyEdits` return the \
@@ -27,7 +27,30 @@ fn edit_text(vm: &mut VM, args: &Args, who: &str) -> Result<RcStr, VMError> {
         );
         return Err(vm.fail(ErrorKind::TypeError, msg));
     }
-    vm.string_from(v)
+    // **And the same mistake the other way up.** The message above
+    // catches a `.result` taken off a function that does not have one;
+    // this catches the `.result` that was never taken. Live on
+    // 2026-09-20, a run wrote
+    //
+    //   const withSkips = Edit.replaceCount(text, old, "");
+    //   Edit.replaceOnce(withSkips, …);
+    //
+    // and got `in `replaceOnce`: type error` — the whole message —
+    // while the object it was handed was sitting there announcing what
+    // it was. That cost the run its task.
+    if let Value::Object(p) = &v
+        && vm
+            .objects
+            .get(*p as usize)
+            .is_some_and(|o| o.map.contains_key("result"))
+    {
+        let msg = format!(
+            "{who}(text, …): `text` is the `{{ result, count }}` object `replaceCount` \
+             returns, not a string. Pass its `.result`."
+        );
+        return Err(vm.fail(ErrorKind::TypeError, msg));
+    }
+    vm.string_from(&v)
 }
 
 /// `Edit.replaceOnce(text, old, new)` → string.
@@ -795,6 +818,38 @@ mod match_count_tests {
         let text = "aa\nbb\ncc\n";
         assert_eq!(lines_of(text, [0usize, 3, 6].into_iter()), vec![1, 2, 3]);
         assert_eq!(lines_of(text, [1usize].into_iter()), vec![1]);
+    }
+
+    /// **Both halves of the `replaceCount` confusion.** One function
+    /// returns the string, the other returns `{ result, count }`, and
+    /// a program can get it wrong in either direction. Live on
+    /// 2026-09-20 a run passed the object straight in and was told
+    /// only "type error"; the task failed.
+    #[test]
+    fn passing_the_wrong_half_of_replace_count_says_which_half() {
+        let forgot = crate::testutil::run_runtime_err(
+            "const r = Edit.replaceCount('aa', 'a', 'b'); Edit.replaceOnce(r, 'b', 'c');",
+        );
+        assert_eq!(forgot.kind, crate::ErrorKind::TypeError);
+        assert!(
+            forgot.message.contains("`{ result, count }` object"),
+            "names what it was handed: {}",
+            forgot.message
+        );
+        assert!(
+            forgot.message.contains("Pass its `.result`"),
+            "and what to write: {}",
+            forgot.message
+        );
+
+        let too_far = crate::testutil::run_runtime_err(
+            "const s = Edit.replaceOnce('ab', 'a', 'x'); Edit.replaceOnce(s.result, 'x', 'y');",
+        );
+        assert!(
+            too_far.message.contains("is undefined"),
+            "the mirror image still says its own thing: {}",
+            too_far.message
+        );
     }
 
     /// Long needles are clipped so one trap cannot dominate a report.
