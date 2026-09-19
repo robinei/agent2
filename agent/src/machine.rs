@@ -1953,8 +1953,24 @@ impl Runner {
             }
             TOOL_ANSWER => {
                 let args = self.call_args_json(&call.args);
+                // **The middle argument was never read.** `[question,
+                // _label, value]` is what this arm always matched: the
+                // label was bound and dropped, while the card asked for
+                // it in the signature — so every `answer` call computed
+                // a string, paid tokens for it, and handed it to
+                // nothing. Two arguments is the documented form now;
+                // three is still accepted so a program written against
+                // the old card is not punished for it.
+                let args: Vec<serde_json::Value> = match args.as_slice() {
+                    [question, value] => vec![question.clone(), value.clone()],
+                    [question, _label, value] => vec![question.clone(), value.clone()],
+                    _ => {
+                        self.settle_err("answer(question, value) takes the question's id and the value");
+                        return Ok(true);
+                    }
+                };
                 match args.as_slice() {
-                    [question, _label, value] => {
+                    [question, value] => {
                         match question.as_u64().filter(|n| *n > 0).map(EventId::new) {
                             Some(question) if self.open().contains(&question) => {
                                 // A `choose` promised its asker one of
@@ -2035,12 +2051,7 @@ impl Runner {
                             }
                         }
                     }
-                    _ => {
-                        self.settle_err(
-                            "answer(question, label, value) takes exactly three arguments",
-                        );
-                        Ok(true)
-                    }
+                    _ => unreachable!("normalised to two arguments above"),
                 }
             }
             TOOL_APPEND_HISTORY => {

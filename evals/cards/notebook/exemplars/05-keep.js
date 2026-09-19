@@ -9,8 +9,8 @@ history.append({ readme: readme.content });
 history.append({ design: design.content });
 ```
 
-Now the failure itself.
+Now the failure itself — printed rather than kept, because what is worth a row is what I conclude from it.
 
 ```js
-history.append({ check: (await tools.bash("CHECK 2>&1")).stdout });
+console.log((await tools.bash("CHECK 2>&1")).stdout);
 ```

@@ -5,7 +5,7 @@ const hits = (await tools.bash("grep -rl OLD .")).stdout.split("\n").filter(Bool
 const fs = await Promise.all(hits.map((p) => tools.read_file(p)));
 ```
 
-`hits` and `fs` are still bound below — the blocks of one reply share a scope — so the edits go in the next one.
+`hits` and `fs` are still bound in the block below — the blocks of one reply share a scope.
 
 ```js
 for (let i = 0; i < hits.length; i++) {

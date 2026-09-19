@@ -69,7 +69,7 @@ declare function ask(who: "user" | Agent, text: string): Promise<string>;
 declare function choose(who: "user" | Agent, text: string, options: string[]): Promise<string>;
 
 /** Discharge an `ask()` or `choose()` another program is blocked on, by its id. A `choose` takes one of the options it offered and nothing else. */
-declare function answer(question: number, label: string, value: unknown): void;
+declare function answer(question: number, value: unknown): void;
 
 /** A new agent with a clean context. Creating is not messaging — it is idle until you `tell` or `ask` the handle. */
 declare function spawn(charter: string): Agent;

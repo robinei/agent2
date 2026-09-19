@@ -1,4 +1,4 @@
-The config still names the old host, so I will change it and then run the check — a change I have not checked is not a change I have made.
+Changing it, then running the check in the same reply — a change I have not checked is not a change I have made.
 
 ```js
 const f = await tools.read_file("PATH");
