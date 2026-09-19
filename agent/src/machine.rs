@@ -2806,6 +2806,25 @@ impl Runner {
             }
         };
 
+        // **A handback's site is an offset into the reply**, exactly
+        // as a `Call`'s is (28, "Sites"). The spans above come off the
+        // VM, so they are offsets into the *parse buffer* — the prelude
+        // and then the reply — and the prelude has to come off them
+        // here, where `run` still holds the notebook that knows how
+        // long it is.
+        //
+        // Left un-rebased until 2026-09-19, when a live `glm-5.3` run
+        // trapped on a `ReferenceError` and the report read
+        // `12:1: test is not defined` over a **blank line and a bare
+        // caret**: line 12 of the parse buffer is inside the prelude,
+        // and the report renders against the reply, which is ten lines
+        // long. Every trap, raise and post report has been pointing
+        // into the prelude — the one diagnostic phase 28 exists to make
+        // nameable.
+        let site = run
+            .notebook
+            .as_ref()
+            .map_or(site, |nb| nb.rebase_site(site));
         self.pause_falsifies_the_rest = matches!(
             cause,
             Handback::Trapped { .. } | Handback::CellFailed { .. }
@@ -6480,6 +6499,49 @@ mod tests {
             .content
             .clone();
         assert_eq!(assistant, crate::document::EMPTY_REPLY_NOTE);
+    }
+
+    /// **A handback's site points into the reply, not the prelude.**
+    /// Same coordinate system as a `Call`'s (28, "Sites") — and it was
+    /// not, until a live run made it visible: a trap report read
+    /// `12:1: test is not defined` over a blank line and a bare caret,
+    /// because line 12 of the parse buffer is prelude and the report
+    /// renders against the ten-line reply.
+    #[test]
+    fn a_traps_site_is_an_offset_into_the_reply() {
+        let (mut tree, mut state) = setup_under();
+        user_post(&mut state, &mut tree, "go");
+        let reply =
+            "Using what the last reply read.\n\n```js\nconst prev = null;\nconsole.log(prev.content);\n```\n";
+        let out = state
+            .step(&mut tree, StepInput::LlmResponse(llm_program(reply)))
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+
+        let (site, message) = state
+            .agent_segment(&tree)
+            .iter()
+            .find_map(|e| match &e.payload {
+                EventPayload::Handback {
+                    how: crate::types::Handback::Trapped { message, .. },
+                    site,
+                    ..
+                } => Some((*site as usize, message.clone())),
+                _ => None,
+            })
+            .expect("the trap");
+        assert!(message.contains("cannot read property"), "{message}");
+        assert!(
+            site < reply.len(),
+            "site {site} is past the end of a {}-byte reply — it is still \
+             a parse-buffer offset",
+            reply.len()
+        );
+        assert_eq!(
+            &reply[site..site + 7],
+            "content",
+            "and it names the offending expression"
+        );
     }
 
     /// **A tool call in another harness's syntax is an action that
