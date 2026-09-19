@@ -1,15 +1,15 @@
-Both documents are what I will keep thinking with, so each gets a row of its own — a later compaction can drop one and leave the other exact.
+Each gets a row of its own, so a later compaction can drop the one I am done with and leave the other exact. A row holds what I took from a file, never the file — those bytes are on the record already, and `history.fetch` returns them for nothing.
 
 ```js
 const [readme, design] = await Promise.all([
   tools.read_file("README.md"),
   tools.read_file("DESIGN.md"),
 ]);
-history.append({ readme: readme.content });
-history.append({ design: design.content });
+history.append({ documented_check: readme.content.match(/^\s*\$ (.+)$/m)?.[1] });
+history.append({ rules: design.content.match(/^- .*/gm) ?? [] });
 ```
 
-Now the failure itself — printed rather than kept, because what is worth a row is what I conclude from it.
+Now the failure itself — printed, not kept: what earns a row is what I conclude from it.
 
 ```js
 console.log((await tools.bash("CHECK 2>&1")).stdout);
