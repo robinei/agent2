@@ -2185,7 +2185,7 @@ impl Runner {
                     Some(value) => {
                         let (site, site_end) =
                             (self.rebase_site(call.site), self.rebase_site(call.site_end));
-                        tree.append(
+                        let row = tree.append(
                             &mut self.spine,
                             EventPayload::Note {
                                 value: value.clone(),
@@ -2193,7 +2193,20 @@ impl Runner {
                                 site_end,
                             },
                         )?;
-                        self.settle(Ok(serde_json::Value::Null));
+                        // **The id, because the program asked for it.**
+                        // It used to settle `null` and throw the id
+                        // away, so a program that wanted to refer to
+                        // the row it had just written had nothing to
+                        // hold: the document shows `/* ← history[40] */`
+                        // only on the way *back*, a turn later. Two
+                        // live programs invented an identifier for it
+                        // rather than do without —
+                        // `history_append_id_placeholder` and
+                        // `history_rows_at_this_point` — and died with
+                        // `is not defined`. A value the caller reaches
+                        // for by making up a name for it is one the
+                        // call should be handing over.
+                        self.settle(Ok(serde_json::json!(row.as_u64())));
                     }
                     None => self.settle_err("append_history(value) needs one argument"),
                 }
@@ -7889,6 +7902,46 @@ mod tests {
             .iter()
             .map(|m| (m.role, m.content.clone()))
             .collect()
+    }
+
+    /// **`history.append` hands back the row's id.** A program that
+    /// wants to name what it just wrote should not have to wait a turn
+    /// to read the annotation off its own source — two live programs
+    /// invented an identifier rather than do without, and died on it.
+    #[test]
+    fn appending_to_history_returns_the_row_it_made() {
+        let (mut tree, mut state) = setup_under();
+        user_post(&mut state, &mut tree, "go");
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::LlmResponse(llm_program(
+                    "```js\nconst id = history.append({ a: 1 });\nconsole.log(typeof id, id);\n```\n",
+                )),
+            )
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+        let note = state
+            .agent_segment(&tree)
+            .iter()
+            .find(|e| matches!(e.payload, EventPayload::Note { .. }))
+            .expect("the note landed")
+            .id
+            .as_u64();
+        let printed: Vec<String> = state
+            .agent_segment(&tree)
+            .iter()
+            .filter_map(|e| match &e.payload {
+                EventPayload::Console { lines } => Some(lines.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert_eq!(
+            printed,
+            vec![format!("number {note}")],
+            "the id of the row it just wrote, as a number it can pass to fetch"
+        );
     }
 
     /// **A marker names a row, so the row has to answer.** Every block

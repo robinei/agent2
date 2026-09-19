@@ -28,7 +28,7 @@ A ```ts or ```typescript block runs too, with the types erased before anything e
 
 ## What crosses from this reply to the next
 
-**`history.append(v)`** — the next reply is written with this in front of it, any number of times, from anywhere, and each one a row of its own. It lands the moment you call it, so it survives even a block that traps afterwards.
+**`history.append(v)`** — the next reply is written with this in front of it, any number of times, from anywhere, and each one a row of its own. It lands the moment you call it, so it survives even a block that traps afterwards, **and it hands back that row's id**, so a later call can name what you just wrote without waiting to read the annotation.
 
 **`console.log(x)`** — the output lands in front of the next reply too: the cheap one, for looking rather than keeping, and for findings as you go. What it shows is the recent tail; what it keeps is all of it, one `history.fetch` away. A loop over two hundred items belongs here, not in the one above.
 

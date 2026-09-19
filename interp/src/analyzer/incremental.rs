@@ -205,7 +205,26 @@ impl IncrementalAnalyzer {
             };
             out.push(Diagnostic {
                 span: Span::point(span),
-                message: format!("`{name}` is already declared"),
+                // **Say which scope, because that is the surprise.**
+                // This check only ever fires across fragments — a
+                // collision inside one parse is caught as a syntax
+                // error before it gets here — so the name being
+                // redeclared is always one that something *earlier*
+                // bound, in a scope the new code did not open and
+                // cannot see the top of. A bare "already declared"
+                // sends a reader looking for the other declaration in
+                // the fragment in front of them, where it is not.
+                //
+                // Live, across 96 kept runs of the agent that embeds
+                // this crate, six programs died here — on `f`, `r`,
+                // `refs`, `files`, `names` and `t`, all of them the
+                // second `const` of a name a previous fragment had
+                // already taken.
+                message: format!(
+                    "`{name}` is already declared — this code shares one scope with what \
+                     ran before it, so that name is taken. Use a different one, or assign \
+                     to it without `const`/`let`."
+                ),
                 kind: crate::diag::DiagKind::Semantic,
             });
         }
