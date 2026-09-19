@@ -288,6 +288,29 @@ loud error for a silent one, which is the trade this codebase keeps
 refusing, and it is a language decision rather than a repair. It wants
 a person awake.
 
+## Compaction, forced
+
+None of the suite's documents get near a 64 KB budget any more, so
+compaction had to be provoked: `sweep-200` at 34,000 bytes, against a
+card-and-examples floor of 25,792 that no handler can touch.
+
+It fired **thirteen times in one run**, removed 49 rows, and the
+document was never once below the floor. `COMPACTION_ATTEMPTS` is
+supposed to bound exactly this and cannot — it counts fires since the
+last *success*, and at the floor every round succeeds at removing rows
+while shrinking nothing. Block compaction, added the same night, made
+it worse by giving the model more rows it could always find something
+among.
+
+The guard that does not depend on counting is the floor itself: render
+the document with every nameable row shadowed at once, and if that is
+still over the threshold, no handler can get under it. Asking is a
+completion spent on nothing.
+
+Worth keeping: **a bound on attempts is not a bound on a loop whose
+every round reports success.** The question a guard has to answer is
+whether the work can help, not how many times it has been tried.
+
 ## Where the bytes are
 
 Measured over 20 rendered documents:
