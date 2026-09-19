@@ -58,7 +58,7 @@ pub fn outline_def() -> ToolDef {
         // its top-level definitions") was accurate and said nothing
         // about what is absent, which is what a reader needs in order to
         // pick a different tool.
-        description: "Top-level definitions of a source file, language inferred from the extension. Read-only."
+        description: "Top-level definitions of a source file, language inferred from the extension — Rust, JavaScript, TypeScript or Python. Read-only."
             .into(),
         input_schema: json!({
             "type": "array",
@@ -69,9 +69,9 @@ pub fn outline_def() -> ToolDef {
             "maxItems": 1
         }),
         guidelines: vec![
-            "The `line` is an edit anchor, not just a fact: `Edit.replaceLines(text, line, line, …)` names one place exactly, where a string that looks distinctive often is not. `#[allow(dead_code)]` appears seven times in a small file; `label` appears once, and outline says which line it is on.".into(),
+            "The `line` is an edit anchor, not just a fact: `Edit.replaceLines(text, line, line, …)` names one place exactly, where a string that looks distinctive often is not. A marker like `TODO(perf)` appears seven times in a small file; `parse_header` appears once, and outline says which line it is on.".into(),
         ],
-        example: Some("const { items } = await tools.outline(\"src/lib.rs\");".into()),
+        example: Some("const { items } = await tools.outline(path);".into()),
         returns: Some("{ items: Array<{ name: string; kind: string; line: number }> }".into()),
         handler: Box::new(|args| {
             let path = args
@@ -317,7 +317,7 @@ fn signature_first_line(
 pub fn parse_errors_def() -> ToolDef {
     ToolDef {
         name: "parse_errors".into(),
-        description: "Check syntax. With a path, reads and checks that file; with `source` and `lang` instead, checks content you computed **before writing it**."
+        description: "Check syntax. With a path, reads and checks that file; with `source` and `lang` instead (`\"rust\"`, `\"javascript\"`, `\"typescript\"`, `\"python\"`), checks content you computed **before writing it**."
             .into(),
         input_schema: json!({
             "type": "array",
@@ -337,7 +337,7 @@ pub fn parse_errors_def() -> ToolDef {
         guidelines: vec![
             "Check content *before* writing it: pass `source` and `lang` with no path, and nothing touches disk.".into(),
         ],
-        example: Some("const { ok } = await tools.parse_errors(null, candidate, \"rust\");".into()),
+        example: Some("const { ok } = await tools.parse_errors(null, candidate, lang);".into()),
         returns: Some("{ ok: boolean; errors: Array<{ line: number; message: string }> }".into()),
         handler: Box::new(|args| {
             let first = args.get(0);

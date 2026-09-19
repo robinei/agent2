@@ -198,7 +198,7 @@ fn read_file_def() -> ToolDef {
                 .into(),
             "Hold onto `version` and hand it to `replace_file`, so a write fails rather than clobbering a file that moved.".into(),
         ],
-        example: Some("const f = await tools.read_file(\"src/lib.rs\");".into()),
+        example: Some("const f = await tools.read_file(\"README.md\");".into()),
         returns: Some("{ content: string; version: string; truncated?: boolean }".into()),
         handler: Box::new(|args| {
             let path = args
@@ -398,7 +398,7 @@ fn bash_def() -> ToolDef {
             "Ask once for everything it will answer at once: change all the candidates, run it once, and read which ones it names back. A per-item loop is the fallback.".into(),
             "Prefer looping in the program rather than in the command: the values stay in variables you can use in the next call and return at the end, and a mistake stops at a line instead of somewhere inside a heredoc. When a script really is the right tool — a parser, something with no JS equivalent — write the script.".into(),
         ],
-        example: Some("const r = await tools.bash(\"cargo check --all-targets 2>&1\");".into()),
+        example: Some("const r = await tools.bash(\"make check 2>&1\");".into()),
         returns: Some(
             "{ status: number; stdout: string; stderr: string; truncated?: boolean }".into(),
         ),
