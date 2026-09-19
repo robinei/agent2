@@ -630,6 +630,13 @@ def aggregate(runs: list) -> dict:
             # `reasoning 0.0KB` from the *text* bytes and never showed
             # the provider's own count, so one symptom read as two.
             "reasoning_out": med([s.get("reasoning_out", 0) for s in scores]),
+            # `agent score` estimates this from the reasoning text when
+            # the provider reports zero and the log plainly holds some
+            # (opencode.ai/zen folds it into completion_tokens). Say so
+            # in the line, so an estimate is never read as a count.
+            "reasoning_estimated": any(
+                s.get("reasoning_estimated") for s in scores
+            ),
             "cached_in": med([s.get("cached_in", 0) for s in scores]),
             "completion_out": med([s.get("completion_out", 0) for s in scores]),
             "provider_s": med([s["provider_ms"] / 1000 for s in scores]),
@@ -710,7 +717,9 @@ def print_summary(summary: dict):
         )
         print(
             f"  tokens: {s['prompt_in']} in ({s['cached_in']} cached)"
-            f"   {s['completion_out']} out ({s['reasoning_out']} reasoning)"
+            f"   {s['completion_out']} out"
+            f" ({s['reasoning_out']} reasoning"
+            f"{', est' if s['reasoning_estimated'] else ''})"
         )
         for trap, n in s["traps"].items():
             print(f"  trap [{classify_trap(trap)}] x{n}: {trap}")
@@ -859,6 +868,7 @@ def compare(before: Path, after: Path):
             "credit", "calls_per_program", "programs", "exec_s",
             "prompt_kb", "source_kb", "thinking_kb",
             "prompt_in", "cached_in", "completion_out", "reasoning_out",
+            "reasoning_estimated",
         ):
             # A summary written before a metric existed simply lacks it;
             # say so rather than dropping the row or, worse, raising

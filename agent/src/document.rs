@@ -688,6 +688,16 @@ pub(crate) fn render_with_lookup(
                     // re-fencing, no re-assembly, no normalisation. What
                     // the model is shown as its own turn is what it
                     // wrote, because that is what it imitates.
+                    // **A reply that said nothing still gets a turn**,
+                    // and the turn says what happened. The provider can
+                    // return a completion whose whole budget went to
+                    // `reasoning_content`, leaving `content` empty —
+                    // seen live on 2026-09-19 at 17.6 KB of reasoning
+                    // and not one byte of reply. Rendered verbatim that
+                    // is a zero-byte assistant message: malformed on
+                    // the wire, and silent about the one thing the
+                    // model needs to know about its own last turn.
+                    None if text.is_empty() => Some(EMPTY_REPLY_NOTE.to_owned()),
                     None => {
                         let mut text = annotate_history_calls(&text, cuts.get(&id));
                         // **And why it stops, when it stopped early.**
@@ -769,6 +779,15 @@ pub(crate) fn render_with_lookup(
 /// could see, and the only account of why lived in a sentence the
 /// harness sent *instead of* the text. Now the text is there and the
 /// reason is on the end of it.
+/// What stands in for a reply that arrived with no text at all.
+///
+/// Addressed to the model about its own turn, because that is whose
+/// turn it is: it spent the completion and wrote nothing, and the only
+/// way it can see that is if we say so here.
+pub const EMPTY_REPLY_NOTE: &str =
+    "— this reply arrived empty: the whole completion went to reasoning and \
+     nothing was written, so nothing ran —";
+
 fn cut_off_note(how: &ReplyEnd) -> Option<&'static str> {
     match how {
         ReplyEnd::Finished => None,

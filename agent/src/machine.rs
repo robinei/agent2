@@ -627,6 +627,18 @@ enum SuspendCause {
     CellCompileFailed(String),
 }
 
+/// What one reply produced — see [`Runner::replies`].
+struct ReplyShape {
+    id: EventId,
+    /// Wrote at least one cell, so there was a program.
+    ran: bool,
+    /// Put something in front of the person: a cell (which can `tell`),
+    /// or prose, which reaches them as it is written.
+    spoke: bool,
+    /// Its run has logged a terminal or a pause.
+    handed_back: bool,
+}
+
 impl Runner {
     /// Root agent of a tree. `charter` is what the agent is for; the
     /// system prompt is assembled from it and the card and snapshotted on
@@ -819,6 +831,12 @@ impl Runner {
         if !self.unseen_posts(tree).is_empty() {
             return true;
         }
+        // **A reply that said nothing is not a rest.** Ask once more;
+        // `empty_reply_deserves_another_ask` is what keeps that from
+        // becoming a loop.
+        if self.empty_reply_deserves_another_ask(tree) {
+            return true;
+        }
         // The crash-recovery clause, `shown`-guarded like everything
         // else this rule checks: a genuinely new (unseen) outcome on the
         // most recent `Turn` is a cause even with no `Post` to find.
@@ -838,6 +856,61 @@ impl Runner {
             .collect()
     }
 
+    /// What each reply on this branch produced, oldest first — the one
+    /// fold the resting rule is decided from.
+    ///
+    /// Three outcomes, and they are not the same question asked twice:
+    ///
+    /// - **ran a cell** — there is a program, and its `Handback` is a
+    ///   cause for the next request.
+    /// - **spoke only** — prose reached the person and no cell ran.
+    ///   That is D4's implicit `done()`: the model said its piece and
+    ///   the next thing to happen is whatever the person says.
+    /// - **said nothing** — no prose, no cell, no `tell`. Not an
+    ///   answer, and not a rest: nobody was told anything, so a branch
+    ///   that rests here has abandoned the task in silence.
+    ///
+    /// The third used to be folded into the second, because "no cells"
+    /// was the whole test. It cost a live run on 2026-09-19: the
+    /// provider spent the entire completion on `reasoning_content` and
+    /// returned empty `content`, the branch rested, and the harness
+    /// exited 0 with the task untouched.
+    fn replies(&self, tree: &Tree) -> Vec<ReplyShape> {
+        let segment = self.agent_segment(tree);
+        let mut out: Vec<ReplyShape> = Vec::new();
+        for event in &segment {
+            match &event.payload {
+                EventPayload::Reply | EventPayload::Restart => out.push(ReplyShape {
+                    id: event.id,
+                    ran: false,
+                    spoke: false,
+                    handed_back: false,
+                }),
+                EventPayload::Part { part, .. } => {
+                    if let Some(last) = out.last_mut() {
+                        match part {
+                            crate::types::Part::Cell(_) => {
+                                last.ran = true;
+                                last.spoke = true;
+                            }
+                            crate::types::Part::Prose(t) if !t.trim().is_empty() => {
+                                last.spoke = true
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                EventPayload::Handback { .. } => {
+                    if let Some(last) = out.last_mut() {
+                        last.handed_back = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
     /// The most recent reply on this path **that ran something** and
     /// has since logged a `Handback` — regardless of `shown`. The two
     /// callers differ only in whether they apply that guard themselves:
@@ -845,33 +918,29 @@ impl Runner {
     /// cause), `unrendered_cause` deliberately does not (reconciliation
     /// needs the fact independent of a `shown` a crash may have left
     /// pointing past it).
-    ///
-    /// **"That ran something" is what makes D4 work.** A reply with no
-    /// cells is an implicit `done()`: the model spoke and stopped, and
-    /// the branch rests. That used to fall out for free, because a
-    /// `Turn` was logged per *cell* and a cell-less reply logged none.
-    /// A `Reply` is logged unconditionally now, so the condition has to
-    /// be said out loud — and saying it is an improvement: the rule was
-    /// never "no Turn event", it was always "nothing ran".
     fn last_turn_outcome(&self, tree: &Tree) -> Option<EventId> {
-        let segment = self.agent_segment(tree);
-        let at = segment
+        let replies = self.replies(tree);
+        let last = replies.last()?;
+        (last.ran && last.handed_back).then_some(last.id)
+    }
+
+    /// Whether the branch should be asked again because its last reply
+    /// **said nothing at all** — and how many times in a row that has
+    /// now happened, so the answer can stop being yes.
+    ///
+    /// **Bounded at one retry.** An empty completion is usually a
+    /// provider hiccup and a second ask gets a real reply; two in a row
+    /// is a branch that cannot speak, and asking a third time is a loop
+    /// that bills for itself. After that the branch rests with the
+    /// empty turns on the log, where a person can see them.
+    fn empty_reply_deserves_another_ask(&self, tree: &Tree) -> bool {
+        let replies = self.replies(tree);
+        let trailing_empty = replies
             .iter()
-            .rposition(|e| matches!(e.payload, EventPayload::Reply))?;
-        let tail = &segment[at + 1..];
-        let ran = tail.iter().any(|e| {
-            matches!(
-                e.payload,
-                EventPayload::Part {
-                    part: crate::types::Part::Cell(_),
-                    ..
-                }
-            )
-        });
-        (ran && tail
-            .iter()
-            .any(|e| matches!(e.payload, EventPayload::Handback { .. })))
-        .then_some(segment[at].id)
+            .rev()
+            .take_while(|r| !r.spoke && r.handed_back)
+            .count();
+        trailing_empty == 1
     }
 
     /// **Reconciliation's half of the trigger rule**: forget having shown
@@ -6214,6 +6283,95 @@ mod tests {
             })
             .expect("the person hears it");
         assert!(said.contains("already lives in `retry.rs`"), "{said}");
+    }
+
+    /// **A prose-only reply still rests.** This is the `plain-question`
+    /// shape — a question with no work in it, answered in a sentence —
+    /// and D4 is what makes it possible at all. The empty-reply rule
+    /// below must not touch it: *spoke* is the test, not *ran*.
+    #[test]
+    fn a_prose_only_reply_rests_the_branch_and_is_not_asked_again() {
+        let (mut tree, mut state) = setup_under();
+        user_post(&mut state, &mut tree, "what is a mutex?");
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::LlmResponse(crate::host::scripted_markdown(
+                    "A mutex has one holder; a semaphore has a count.\n",
+                )),
+            )
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+
+        assert!(state.is_idle());
+        assert!(
+            !state.needs_prompt(&tree),
+            "the model answered; the next thing to happen is whatever the person says"
+        );
+    }
+
+    /// **A reply that said nothing at all is asked again — once.**
+    ///
+    /// Not the same case as the one above, and folding the two together
+    /// cost a live run on 2026-09-19: the provider spent the whole
+    /// completion on `reasoning_content` and returned empty `content`,
+    /// so the reply had no prose and no cell, the branch rested, and
+    /// the harness exited 0 with the task untouched. Nobody was told
+    /// anything — that is not an answer.
+    #[test]
+    fn a_reply_that_said_nothing_is_asked_again_once() {
+        let (mut tree, mut state) = setup_under();
+        user_post(&mut state, &mut tree, "go");
+        let empty = || {
+            StepInput::LlmResponse(crate::host::scripted_markdown(""))
+        };
+
+        let asked = |outs: &[StepOutput]| {
+            outs.iter().any(|o| matches!(o, StepOutput::LlmRequest(_)))
+        };
+
+        let out = state.step(&mut tree, empty()).unwrap();
+        let settled = drain(&mut state, &mut tree, out);
+        assert!(
+            asked(&settled),
+            "an empty completion is usually a hiccup: ask again — {settled:?}"
+        );
+
+        // Twice in a row is a branch that cannot speak, and a third ask
+        // is a loop that bills for itself.
+        let out = state.step(&mut tree, empty()).unwrap();
+        let settled = drain(&mut state, &mut tree, out);
+        assert!(
+            !asked(&settled),
+            "two empty replies rest, with both turns on the log to be seen"
+        );
+        assert!(state.is_idle());
+    }
+
+    /// And the model is *told* its reply was empty, in the one place it
+    /// reads its own turns back. A zero-byte assistant message says
+    /// nothing and is malformed on the wire besides.
+    #[test]
+    fn an_empty_reply_renders_as_a_marker_not_as_nothing() {
+        let (mut tree, mut state) = setup_under();
+        user_post(&mut state, &mut tree, "go");
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::LlmResponse(crate::host::scripted_markdown("")),
+            )
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+
+        let doc = crate::document::render(&tree, &state.spine, 64 * 1024);
+        let assistant = doc
+            .conversation()
+            .iter()
+            .find(|m| m.role == crate::document::ChatRole::Assistant)
+            .expect("the empty reply still gets a turn")
+            .content
+            .clone();
+        assert_eq!(assistant, crate::document::EMPTY_REPLY_NOTE);
     }
 
     /// A cell that does not compile stops the run — but the cells

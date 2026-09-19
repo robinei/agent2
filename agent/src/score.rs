@@ -138,11 +138,29 @@ pub struct Score {
     /// program instead of twenty-three round trips" overstates the
     /// saving, because most of a re-sent context is cache.
     /// `reasoning_out` is the part of `completion_out` spent thinking.
+    ///
+    /// **`reasoning_out` is estimated when the provider will not say.**
+    /// `opencode.ai/zen` folds reasoning into `completion_tokens` and
+    /// reports `reasoning_tokens: 0`, so a run that wrote 300 bytes of
+    /// program and 17.6 KB of reasoning read as `4909 out (0
+    /// reasoning)` — indistinguishable from 4,909 tokens of program,
+    /// which is the opposite of what happened. Where the log holds
+    /// reasoning text and the provider claimed none, the bytes are
+    /// divided by [`BYTES_PER_TOKEN`] instead. An estimate labelled as
+    /// one beats a zero that reads as a measurement.
     pub prompt_in: u64,
     pub cached_in: u64,
     pub completion_out: u64,
     pub reasoning_out: u64,
+    /// Whether `reasoning_out` was estimated from `thinking_bytes`
+    /// rather than reported.
+    pub reasoning_estimated: bool,
 }
+
+/// Bytes per token, for the one figure that has to be estimated. A
+/// round number on purpose: it is an order-of-magnitude stand-in, not
+/// a tokenizer, and there is none in this crate.
+pub const BYTES_PER_TOKEN: usize = 4;
 
 /// Fold a tree into a [`Score`]. One pass, in event-id order, which is
 /// dispatch order.
@@ -177,6 +195,7 @@ pub fn score(tree: &Tree) -> Score {
         cached_in: 0,
         completion_out: 0,
         reasoning_out: 0,
+        reasoning_estimated: false,
     };
 
     // The same stack `scripted::fold` keeps, and for the same reason:
@@ -301,6 +320,12 @@ pub fn score(tree: &Tree) -> Score {
 
     if let (Some(first), Some(last)) = (events.first(), events.last()) {
         s.span_ms = last.timestamp.as_millisecond() - first.timestamp.as_millisecond();
+    }
+    // **The provider counted no reasoning and the log holds some.**
+    // See `Score::reasoning_out`.
+    if s.reasoning_out == 0 && s.thinking_bytes > 0 {
+        s.reasoning_out = (s.thinking_bytes / BYTES_PER_TOKEN) as u64;
+        s.reasoning_estimated = true;
     }
     // See `Score::programs`: a log that records completions is counted
     // by them, because a `Turn` there may be one cell of several.
