@@ -149,18 +149,19 @@ pub fn compact(tree: &Tree, spine: &Spine, ops: &[CompactionOp]) -> Vec<EventPay
     // and #12, the second named #9 and #12 again and was allowed to,
     // and two more fired after that. The model was reading its own
     // earlier compaction program out of the history and copying it.
-    let done: std::collections::HashSet<EventId> = tree
-        .path_events(spine.leaf_id)
-        .iter()
-        .filter_map(|e| match &e.payload {
-            EventPayload::Compacted { of, .. } => Some(*of),
-            _ => None,
-        })
-        .collect();
+    // **Gone means gone; shortened does not.** `compacted_lookup` is
+    // last-write-wins precisely because a row may be compacted more
+    // than once, and the directive tells a handler to do it — an entry
+    // showing as `[id] … text` can be fetched and rewritten from the
+    // original. So a row that still renders *something* is still a
+    // target. Only one that renders nothing is out, because naming it
+    // again changes nothing.
+    let shadows = tree.compacted_lookup(spine.leaf_id);
+    let gone = |id: &EventId| matches!(shadows.get(id), Some(v) if v.text.is_none());
     let present: Vec<EventId> = tree
         .path_events(spine.leaf_id)
         .iter()
-        .filter(|e| renders_a_line(&e.payload) && !done.contains(&e.id))
+        .filter(|e| renders_a_line(&e.payload) && !gone(&e.id))
         .map(|e| e.id)
         .collect();
 
@@ -690,6 +691,46 @@ mod tests {
         assert!(
             compact(&tree, &spine, &ops).is_empty(),
             "and nothing the second time — there is nothing left to remove"
+        );
+    }
+
+    /// **A shortened row can be shortened again; a gone one cannot.**
+    /// `compacted_lookup` is last-write-wins because a row may be
+    /// compacted more than once, and the directive tells a handler to
+    /// do exactly that — fetch the original and rewrite from it, rather
+    /// than summarise the summary. Excluding every compacted row from
+    /// `present` took that away along with the no-op it was aimed at.
+    #[test]
+    fn a_replaced_row_can_be_replaced_again_but_a_removed_one_is_done() {
+        let (mut tree, mut spine, [first, cell, _]) = branch_with_three_blocks();
+        for payload in compact(&tree, &spine, &[CompactionOp::Replace {
+            id: cell,
+            text: "counted the defs".into(),
+        }]) {
+            tree.append(&mut spine, payload).unwrap();
+        }
+        let again = compact(&tree, &spine, &[CompactionOp::Replace {
+            id: cell,
+            text: "counted 200 defs, 107 dead".into(),
+        }]);
+        assert_eq!(again.len(), 1, "a row that still renders is still a target");
+        for payload in again {
+            tree.append(&mut spine, payload).unwrap();
+        }
+        let after = rendered(&tree, &spine);
+        assert!(after.contains("counted 200 defs, 107 dead"), "{after}");
+        assert!(!after.contains("counted the defs"), "the older stand-in is gone: {after}");
+
+        // Removed is the end of it.
+        for payload in compact(&tree, &spine, &[CompactionOp::Remove {
+            from: first,
+            to: first,
+        }]) {
+            tree.append(&mut spine, payload).unwrap();
+        }
+        assert!(
+            compact(&tree, &spine, &[CompactionOp::Remove { from: first, to: first }]).is_empty(),
+            "naming a row that renders nothing changes nothing"
         );
     }
 
