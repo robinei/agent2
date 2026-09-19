@@ -127,6 +127,57 @@ pub fn active() -> &'static Card {
 /// fits comfortably inside this.
 const DESCRIPTION_MAX_BYTES: usize = 400;
 
+/// The shipped manifest, as the model reads it — the two facts that
+/// were wrong in it, held.
+#[test]
+fn the_shipped_manifest_tells_the_truth_about_itself() {
+    let manifest = tool_manifest(&crate::host::tools::real_registry(), true);
+    assert!(
+        !manifest.contains("[truncated;"),
+        "a clipped tool description drops its tail where the model reads it:\n{manifest}"
+    );
+    assert!(
+        manifest.contains("30s timeout, 4MB per stream"),
+        "`bash`'s hard limits are the part that must survive a clip: {manifest}"
+    );
+    assert!(
+        manifest.contains("parse_errors(path: string | null"),
+        "the parameter its own @example passes `null` to says so: {manifest}"
+    );
+    assert!(
+        manifest.contains("diff?: string"),
+        "`replace_file` returns a diff, and saying so is what stops the re-read: {manifest}"
+    );
+    assert!(
+        manifest.contains("start_line: number"),
+        "`outline`'s entries carry start_line/end_line, not `line`: {manifest}"
+    );
+}
+
+/// Every shipped tool's description fits inside the clip above.
+///
+/// The doc there says they all "fit comfortably", and `bash` did not:
+/// at 408 bytes it was cut mid-word, and what fell off the end was
+/// `"s timeout, 4MB per stream"` — so the one hard operational fact in
+/// it, that a command has 30 seconds and 4MB, was the part the model
+/// never read. A claim about the shipped set is worth exactly as much
+/// as the test that holds it, so here is the test.
+///
+/// The limits now lead the sentence as well. A clip takes the tail, so
+/// what must survive one belongs at the front.
+#[test]
+fn every_tool_description_fits_the_clip() {
+    for def in crate::host::tools::real_registry().iter() {
+        let n = def.description.len();
+        assert!(
+            n <= DESCRIPTION_MAX_BYTES,
+            "`{}`'s description is {n} bytes against a {DESCRIPTION_MAX_BYTES}-byte clip — \
+             the tail would be cut off where the model reads it",
+            def.name
+        );
+    }
+}
+
 /// This session's tools, as TypeScript declarations.
 ///
 /// **The same format as everything else the model is told.** It used to
@@ -142,6 +193,19 @@ const DESCRIPTION_MAX_BYTES: usize = 400;
 /// `argN: unknown` and `Promise<unknown>` — because a manifest that
 /// omits a live tool is worse than one that describes it thinly.
 fn ts_type(schema: &serde_json::Value) -> &'static str {
+    // **A parameter that takes `null` says so.** `parse_errors`'s own
+    // `@example` passes `null` for its path — that is the documented
+    // way to check unwritten content — while the signature above it
+    // said `path: string`. A declaration contradicted by the example
+    // printed under it teaches nothing about which to believe.
+    if schema.get("nullable").and_then(|n| n.as_bool()) == Some(true) {
+        return match schema.get("type").and_then(|t| t.as_str()) {
+            Some("string") => "string | null",
+            Some("integer") | Some("number") => "number | null",
+            Some("boolean") => "boolean | null",
+            _ => "unknown",
+        };
+    }
     match schema.get("type").and_then(|t| t.as_str()) {
         Some("string") => "string",
         Some("integer") | Some("number") => "number",

@@ -340,6 +340,7 @@ pub fn parse_errors_def() -> ToolDef {
                 {
                     "name": "path",
                     "type": "string",
+                    "nullable": true,
                     "description": "path, or null to check `source` instead"
                 },
                 { "name": "source", "type": "string", "description": "content to check, unwritten" },

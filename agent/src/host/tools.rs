@@ -384,7 +384,7 @@ fn replace_file_def() -> ToolDef {
 fn bash_def() -> ToolDef {
     ToolDef {
         name: "bash".into(),
-        description: "A shell command. A single pipeline is what it is best at, and loops or multi-step logic usually read better in the JS program — but a script here is allowed when it is the right tool. Runs with `pipefail`, so the status is the failing stage's, and a `| head` that truncates is still a success. A command that could not be run at all rejects. Non-zero is a result, not an error. 30s timeout, 4MB per stream."
+        description: "A shell command. 30s timeout, 4MB per stream. A single pipeline is what it does best; multi-step logic usually reads better in the JS program, though a script here is allowed when it is the right tool. Runs with `pipefail`, so the status is the failing stage's, and a `| head` that truncates still succeeds. Non-zero is a result, not an error; a command that could not run at all rejects."
             .into(),
         input_schema: json!({
             "type": "array",
