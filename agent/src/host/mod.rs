@@ -3843,14 +3843,13 @@ mod tests {
 
         let leaves = last_leaves(&rx.try_iter().collect::<Vec<_>>());
         assert_eq!(leaves.len(), 1);
-        // #3's `Turn` never logged an outcome (`tree_with_open_root`
-        // builds it as a bare, un-run event) — reconciliation repairs
-        // that on open exactly like a crash would, appending
-        // `Condition{Interrupted}` as #4, which is the leaf that lands.
-        assert_eq!(leaves[0].leaf, EventId::new(4));
+        // The fixture's reply is complete — Reply(3), Part(4),
+        // ReplyEnd(5), Handback(6) — so nothing is repaired on open and
+        // its own last event is the leaf.
+        assert_eq!(leaves[0].leaf, EventId::new(6));
         assert_eq!(leaves[0].agent, EventId::new(1));
         assert_eq!(leaves[0].open, 1);
-        assert_eq!(leaves[0].summary, "Handback: interrupted");
+        assert_eq!(leaves[0].summary, "Handback: completed");
     }
 
     #[test]
@@ -3898,7 +3897,7 @@ mod tests {
         let kinds = kinds(session.tree(), root_leaf(&session));
         assert_eq!(
             kinds,
-            ["Agent", "Post", "Reply", "Answer", "Handback", "Rename"],
+            ["Agent", "Post", "Reply", "Part", "ReplyEnd", "Handback", "Answer", "Rename"],
             "{kinds:?}"
         );
     }
@@ -3915,13 +3914,13 @@ mod tests {
         );
         let h = session.handle();
         // Fork off the user message (#2), dropping the original a1
-        // reply (#3) and its `Answer` (#4). The `Fork` is the next event
-        // logged, so its id — the new branch's id — is #5.
+        // reply (#3–#6) and its `Answer` (#7). The `Fork` is the next
+        // event logged, so its id — the new branch's id — is #8.
         h.send(SessionCommand::Fork {
             from: EventId::new(2),
             name: Some("retry".into()),
         });
-        let fork = EventId::new(5);
+        let fork = EventId::new(8);
         h.send(SessionCommand::UserTurn {
             branch: fork,
             text: "forked follow-up".into(),
@@ -3936,14 +3935,14 @@ mod tests {
         for (leaf, _) in &leaves {
             assert_eq!(agent_root_of(tree, *leaf), EventId::new(1));
         }
-        // The original's leaf (#4) survived untouched.
-        assert!(leaves.iter().any(|(id, _)| *id == EventId::new(4)));
+        // The original's leaf (#7) survived untouched.
+        assert!(leaves.iter().any(|(id, _)| *id == EventId::new(7)));
         // The forked branch diverged off #2 (never saw "a1") and is a
         // branch of its own, rooted at the `Fork`.
         let forked_leaf = leaves
             .iter()
             .map(|(id, _)| *id)
-            .find(|id| *id != EventId::new(4))
+            .find(|id| *id != EventId::new(7))
             .unwrap();
         assert_eq!(tree.branch_of(forked_leaf), Some(fork));
         let forked = tree.spine_at(forked_leaf);
@@ -3965,19 +3964,11 @@ mod tests {
         // settlement is specifically exempted (nothing was ever owed a
         // reply for it to begin with), so nothing follows the program's
         // own turn here.
+        // `Context::messages` is the branch's **posts** (28): the
+        // reply is not one of them — it is a `Reply` and its parts,
+        // read back from the log.
         let msgs: Vec<&str> = forked.context().messages.iter().map(|m| m.text()).collect();
-        assert_eq!(
-            msgs,
-            [
-                "q",
-                "forked follow-up",
-                // `scripted_text` now bakes in `done()` (`machine.rs`'s
-                // `finish_program`: completing no longer rests by
-                // default, so the helper for "say it and stop" has to
-                // say so) — the literal source is what renders here.
-                "tell(\"user\", \"forked done\"); done();\n"
-            ]
-        );
+        assert_eq!(msgs, ["q", "forked follow-up"]);
         // The fork's id was announced, and both branches are live.
         let events: Vec<SessionEvent> = rx.try_iter().collect();
         assert_eq!(opened(&events), [fork]);
@@ -4036,7 +4027,7 @@ mod tests {
 
         let (session, rx) = open(tree, vec![]);
         let h = session.handle();
-        h.send(SessionCommand::Resume(EventId::new(4)));
+        h.send(SessionCommand::Resume(EventId::new(7)));
         h.send(SessionCommand::Resume(answered_leaf)); // answered — still fine
         h.send(SessionCommand::Resume(EventId::new(99))); // unknown — rejected
         h.send(SessionCommand::Shutdown);
@@ -4047,7 +4038,7 @@ mod tests {
         assert_eq!(errs.len(), 1, "{errs:?}");
         assert!(errs[0].contains("not in the log"));
         // Each accepted resume announced the branch that leaf sits on —
-        // the root's own for #4, the fork's for the answered leaf.
+        // the root's own for #7, the fork's for the answered leaf.
         assert_eq!(opened(&events), [EventId::new(1), fork]);
         // …and the fork is live now, with its own leaf. The original
         // branch was never moved.
@@ -4062,7 +4053,7 @@ mod tests {
                 .unwrap()
                 .spine
                 .leaf_id,
-            EventId::new(4),
+            EventId::new(7),
         );
     }
 
@@ -4134,17 +4125,16 @@ mod tests {
             tx,
         )
         .unwrap();
-        // `new` would auto-pick #3; `open_at` honours the chosen leaf —
-        // modulo reconciliation, which repairs `other_leaf`'s own bare,
-        // un-run `Turn` (`tree_with_open_root`/`assistant` build one with
-        // no logged outcome) the same way a crash would, appending
-        // `Condition{Interrupted}` right after it.
+        // `new` would auto-pick the root's own leaf; `open_at` honours
+        // the chosen one. Nothing is repaired on open — `assistant`
+        // builds a complete reply, handback and all — so the leaf is
+        // exactly the one asked for.
         let anchored = session
             .state(session.conversation_branch())
             .unwrap()
             .spine
             .leaf_id;
-        assert_eq!(anchored.as_u64(), other_leaf.as_u64() + 1);
+        assert_eq!(anchored, other_leaf);
         assert_eq!(
             session.tree().branch_of(anchored),
             session.tree().branch_of(other_leaf),
@@ -5594,7 +5584,7 @@ mod tests {
         );
         let h = session.handle();
         // Two forks off the same point (#2). Their ids are the next two
-        // events logged: #5 and #6.
+        // events logged: #8 and #9.
         h.send(SessionCommand::Fork {
             from: EventId::new(2),
             name: Some("A".into()),
@@ -5603,7 +5593,7 @@ mod tests {
             from: EventId::new(2),
             name: Some("B".into()),
         });
-        let (a, b) = (EventId::new(5), EventId::new(6));
+        let (a, b) = (EventId::new(8), EventId::new(9));
         h.send(SessionCommand::UserTurn {
             branch: a,
             text: "to A".into(),
@@ -5630,9 +5620,9 @@ mod tests {
             [EventId::new(1), a, b]
         );
         // Each fork grew its own transcript from the shared prefix, and
-        // the original's leaf (#3) never moved.
+        // the original's leaf (#7) never moved.
         let leaf_of = |branch| session.state(branch).unwrap().spine.leaf_id;
-        assert_eq!(leaf_of(EventId::new(1)), EventId::new(4));
+        assert_eq!(leaf_of(EventId::new(1)), EventId::new(7));
         let texts = |branch| -> Vec<String> {
             tree.spine_at(leaf_of(branch))
                 .context()
@@ -5641,24 +5631,11 @@ mod tests {
                 .map(|m| m.text().to_owned())
                 .collect()
         };
-        // As in `fork_then_user_turn_diverges_in_the_same_agent`: each
-        // reply is an unawaited `tell()` (`scripted_text`'s shape) — the
-        // Turn's own text is the whole program, not just the string it
-        // told. It used to settle with no VM left to receive it and fire
-        // a rule-C notice naming the artifact; since C0b (23_ONE_AGENT.md)
-        // a `tell`'s own settlement is never a rule-C surprise, so there
-        // is nothing after it.
-        // `scripted_text` now bakes in `done()` (`machine.rs`'s
-        // `finish_program`: completing no longer rests by default), so
-        // the literal source carries it too.
-        assert_eq!(
-            texts(a),
-            ["q", "to A", "tell(\"user\", \"A answers\"); done();\n"]
-        );
-        assert_eq!(
-            texts(b),
-            ["q", "to B", "tell(\"user\", \"B answers\"); done();\n"]
-        );
+        // As in `fork_then_user_turn_diverges_in_the_same_agent`, the
+        // context is the branch's **posts** (28) — the replies are on
+        // the log as `Reply`s and their parts, not here.
+        assert_eq!(texts(a), ["q", "to A"]);
+        assert_eq!(texts(b), ["q", "to B"]);
 
         let events: Vec<SessionEvent> = rx.try_iter().collect();
         assert_eq!(opened(&events), [a, b]);
@@ -5717,13 +5694,13 @@ mod tests {
     fn fork_line_renders() {
         let (session, _rx) = open(tree_with_answered_root(), vec![]);
         session.handle().send(SessionCommand::Fork {
-            from: EventId::new(4),
+            from: EventId::new(7),
             name: None,
         });
         session.handle().send(SessionCommand::Shutdown);
         let session = drain(session);
 
-        let state = session.state(EventId::new(5)).unwrap();
+        let state = session.state(EventId::new(8)).unwrap();
         let doc = crate::document::render(
             session.tree(),
             &state.spine,
@@ -5740,7 +5717,7 @@ mod tests {
                     // An `answer` needs no row of its own: it is the
                     // answering turn's outcome, and `## YOU ANSWERED`
                     // above already says what went where.
-                    "# NEW EVENTS\n\n[harness] fork of branch #1 at #4 — questions before \
+                    "# NEW EVENTS\n\n[harness] fork of branch #1 at #7 — questions before \
                  this line are being handled there; do not redo its work unless asked."
                         .to_owned(),
             }),

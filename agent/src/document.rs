@@ -632,6 +632,12 @@ pub(crate) fn render_with_lookup(
     // after it gets a heading rather than trailing off the run's last
     // section. Cleared by that heading and by every flush.
     let mut ran = false;
+    // Whether the reply now open wrote a cell. A reply with none rests
+    // the branch (D4) — it spoke and stopped — and its handback has
+    // nothing to report: "RAN YOUR PROGRAM / It completed." over a
+    // reply that was pure prose tells the model it ran something it
+    // did not write.
+    let mut ran_a_cell = false;
 
     for ev in tree.path_events(leaf) {
         if let EventPayload::Agent { .. } = ev.payload {
@@ -652,10 +658,14 @@ pub(crate) fn render_with_lookup(
             // merge into one user turn rather than becoming two.
             EventPayload::Reply | EventPayload::Restart => {
                 ran = false;
+                ran_a_cell = false;
                 before = std::mem::take(&mut pending);
                 reply = Some((ev.id, String::new()));
             }
             EventPayload::Part { part, .. } => {
+                if let Part::Cell(_) = part {
+                    ran_a_cell = true;
+                }
                 if let Some((_, text)) = &mut reply {
                     match part {
                         // **Thinking is on the log and not in the
@@ -718,6 +728,9 @@ pub(crate) fn render_with_lookup(
             // which is the trace worth keeping.
             EventPayload::Compaction { .. } => {}
             EventPayload::Handback { .. } => {
+                if !ran_a_cell {
+                    continue;
+                }
                 if let Some(line) = report_line(tree, leaf, ev.id, budget, compacted) {
                     pending.push(line);
                     ran = true;
