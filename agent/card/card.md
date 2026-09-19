@@ -85,9 +85,9 @@ declare function list_agents(opts?: { under?: number; deep?: boolean }):
 declare namespace history {
   /** Put something on the record as a row of *its own*.
 
-  Worth a row: a conclusion you reached, and the material you will keep thinking *with*. The four paths that matter out of the two hundred you listed, never the two hundred — that is what `console.log` is for. The README, the design notes, the one file the task turns on. Reading a file costs nothing and never fills this up, but what you read is only in front of you if it is on the record, and you write the next reply out of what is in front of you.
+  Worth a row: **a conclusion you reached**. You write the next reply out of what is in front of you, so a row holds what you want to still be looking at then — the four paths that matter out of the two hundred you listed, never the two hundred. Every row is paid for again on every turn, until something compacts it.
 
-  Not a copy of a result. A result is already kept: its row is in the conversation and `history.fetch(id)` returns it whole, for nothing. Keep an id, or a conclusion, not the bytes. */
+  **Not the bytes of something you read.** A result is already kept: its row names the call, and `history.fetch(id)` hands the content back whole, from the log, for nothing — so a program that needs those bytes fetches them. Copy them into a note instead and they sit in the record twice, charged on every turn, for nothing you could not have had free. To *look* at something once, `console.log` it. To keep what you made of it, append that. Keep an id, or a conclusion, never a copy. */
   function append(value: unknown): void;
   /** Read any entry back, whole, by its id. Entries that no longer show in the conversation too: `remove` takes them out of what you are shown, never off the log. */
   function fetch(id: number): unknown;
