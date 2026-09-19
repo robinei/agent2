@@ -343,7 +343,8 @@ pub enum EventPayload {
         /// `sweep-200` entry carried 323 newlines in 4,094 bytes — so
         /// every bound over it counted calls while calling them lines:
         /// a 256-"line" ring that a file dump spent one slot on, and a
-        /// report tail of "the last 20 lines" that could be thousands.
+        /// report tail whose stated line count could be off by a
+        /// hundredfold.
         /// The split happens where the entry is formed
         /// (`interp`'s `console_write`), so the VM buffer, this event,
         /// the report's tail and `history.fetch`'s array all count the
