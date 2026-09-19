@@ -177,7 +177,15 @@ else will notice when it moves.**
 | `` `f` is already declared `` | …and this code shares one scope with what ran before it. The check only fires across fragments, so the other declaration is never in the fragment being read. Six runs died here |
 | `replaceOnce expected 1 match, found 4 of X — widen it` | …*at lines 3, 11, 19, 27*, or name the line with `Edit.replaceLines`. The offsets were in hand at the moment of the error |
 | `f is not defined` | …and `f` was bound in the reply at `[12]`; nothing crosses between replies. Said only when the declaration is findable, so there are no false positives |
+| `assignment to undeclared variable` | …there is no implicit global here; declare it with `let`. Accurate before, and silent about both things a reader needs |
+| `in \`replaceOnce\`: type error` | …`text` is the `{ result, count }` object `replaceCount` returns. The mirror mistake had a message; this one did not, and it cost a run its task |
 | `history.append` returned `null` | …returns the row's id. Two live programs invented an identifier for it rather than do without, and died on it |
+| *(nothing)* | …an edit that would leave a line indented twice over is refused, naming the column and the fix. Two runs wrote a broken file and reported success |
+
+Of 50 traps and compile failures across the kept runs, four were
+repeated immediately — the same message on the next handback. All four
+are in this table. **That ratio is the most direct score there is for
+whether a message works**, and it is worth watching.
 
 ## What was rejected
 
