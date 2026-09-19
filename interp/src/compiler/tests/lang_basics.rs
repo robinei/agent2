@@ -50,6 +50,13 @@ fn arithmetic_and_operators() {
 /// wrote `history.fetch(46).slice(0, 2000)` against a `{ content,
 /// version }` result and was told, in full, `in \`slice\`: type error`.
 /// It guessed `.content` and paid a round trip for the guess.
+///
+/// **And the keys, so there is nothing left to guess.** Naming the
+/// count said the shape was wrong; naming `content, version` says
+/// which `.` to write. A `sweep-200` run on 2026-09-20 fetched a row
+/// it had appended as `{ app: … }`, called `matchAll` on it, and was
+/// told it had "an object with 1 property" — the one word that would
+/// have ended it being the one word missing.
 #[test]
 fn a_method_on_the_wrong_receiver_says_what_it_got() {
     let err = testutil::run_runtime_err(
@@ -59,7 +66,7 @@ fn a_method_on_the_wrong_receiver_says_what_it_got() {
     assert_eq!(
         err.message,
         "in `slice`: expected a string, an array or an ArrayBuffer, \
-         got an object with 2 properties"
+         got an object with 2 properties (content, version)"
     );
 }
 

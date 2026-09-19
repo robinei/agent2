@@ -68,11 +68,28 @@ impl VM {
                 Some(a) => format!("an array of {}", a.len()),
                 None => "an array".to_string(),
             },
+            // **The keys, because the next move is one of them.** An
+            // object reaching a string method is nearly always a
+            // wrapper the caller forgot to open — a `{ content,
+            // version }` from `read_file`, a `{ result, count }` from
+            // `replaceCount`, a note fetched back whole. "An object
+            // with 1 property" says it is the wrong shape; naming the
+            // property says which `.` to write. Live on 2026-09-20 a
+            // `sweep-200` run fetched a row it had appended as
+            // `{ app: … }` and called `matchAll` on it, and the message
+            // it got named the count and not the key.
             Value::Object(p) => match self.objects.get(*p as usize) {
                 Some(o) => {
                     let n = o.map.len();
+                    let shown: Vec<&str> = o.map.keys().take(4).map(|k| k.as_str()).collect();
+                    let more = if n > shown.len() { ", …" } else { "" };
+                    let keys = if shown.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" ({}{more})", shown.join(", "))
+                    };
                     format!(
-                        "an object with {n} propert{}",
+                        "an object with {n} propert{}{keys}",
                         if n == 1 { "y" } else { "ies" }
                     )
                 }
