@@ -127,6 +127,20 @@ break/continue, generators, `String.raw`, `structuredClone`, `BigInt`,
 `Object.groupBy`: **zero uses across 96 runs**. Closing them would be
 speculation.
 
+### The forgery guard checked a shape nothing emits
+
+`escape_untrusted` exists so untrusted content cannot render looking
+like a row the harness wrote. It matched `^\[\d+\]`; rows have been
+`` `[2]` user told you: … `` since ids were backticked. It escaped the
+dead shape and passed the live one, and had no test in either
+direction.
+
+That is the same failure as `RETURN_MAX_BYTES` and the console line
+cap, in a place where being out of date is a hole rather than a
+wart: **a constant or a pattern that encodes another part of the
+system's format has to be checked against that format, because nothing
+else will notice when it moves.**
+
 ## Errors that sent the reader to the wrong place
 
 | was | is |
