@@ -2533,9 +2533,11 @@ mod tests {
         assert_eq!(
             kinds(session.tree(), root_leaf(&session)),
             [
-                "Agent", "Post", "Turn",
-                // Calls are logged at dispatch, their results at landing.
-                "Call", "Call", "Completion", "Result", "Result", "Note", "Return", "Console",
+                "Agent", "Post", "Reply", "Part",
+                // Calls are logged at dispatch, their results at
+                // landing; the reply ends where the text stopped, which
+                // here is after its one cell had already dispatched.
+                "Call", "Call", "ReplyEnd", "Result", "Result", "Note", "Handback", "Console",
             ]
         );
         // Both fan-out results landed (order is completion order).
@@ -3647,14 +3649,54 @@ mod tests {
     /// no separate prose channel and no tool-call wrapper
     /// (23_ONE_AGENT.md's substitution table) — mirrors `tree.rs`'s own
     /// `assistant_msg` test helper.
-    fn assistant(source: &str) -> EventPayload {
-        EventPayload::Reply
+    /// A reply the branch already made, appended whole: four events,
+    /// because a reply is recorded rather than reassembled (28) — it
+    /// opens, its text lands as a part, it ends, and the run it started
+    /// hands back. Returns the new leaf.
+    ///
+    /// **Prose, not a cell.** These fixtures are settled conversations:
+    /// the model said its piece and stopped, which is D4's cell-less
+    /// reply — an implicit `done()`. Give it a cell and re-opening the
+    /// log reads the reply as a program whose outcome was never turned
+    /// into a request, and wakes the branch.
+    fn assistant(tree: &mut Tree, spine: &mut crate::types::Spine, text: &str) -> EventId {
+        let reply = tree.append(spine, EventPayload::Reply).unwrap();
+        tree.append(
+            spine,
+            EventPayload::Part {
+                reply,
+                part: crate::types::Part::Prose(format!("{text}\n")),
+            },
+        )
+        .unwrap();
+        tree.append(
+            spine,
+            EventPayload::ReplyEnd {
+                reply,
+                how: crate::types::ReplyEnd::Finished,
+                usage: Default::default(),
+            },
+        )
+        .unwrap();
+        // And the run it started is over. Without this the reply reads
+        // as one a crash caught mid-flight, and re-opening the log
+        // closes it out as `Interrupted` before anything else happens.
+        tree.append(
+            spine,
+            EventPayload::Handback {
+                reply,
+                how: crate::types::Handback::Completed,
+                site: 0,
+                stack: Vec::new(),
+            },
+        )
+        .unwrap()
     }
 
-    /// An incomplete root agent: Agent(1), User(2 "q"),
-    /// Assistant(3 "a1"). Leaf = #3 — open, so resumable and forkable.
-    /// Agent #1, the user's question #2, the reply #3 — and **no
-    /// `Answer`**, so #2 is still open. Reconciliation reads that as row
+    /// An incomplete root agent: Agent(1), User(2 "q"), then the reply
+    /// "a1" as its four events — Reply(3), Part(4), ReplyEnd(5),
+    /// Handback(6). Leaf = #6 — open, so resumable and forkable. And
+    /// **no `Answer`**, so #2 is still open. Reconciliation reads that as row
     /// one of its table and brings the branch back live owing a reply,
     /// which is what the tests about owing want.
     fn tree_with_open_root() -> Tree {
@@ -3663,17 +3705,17 @@ mod tests {
             .start_agent(None, None, "root", None, "", Vec::new())
             .unwrap();
         tree.append(&mut spine, user("q")).unwrap();
-        tree.append(&mut spine, assistant("a1")).unwrap();
+        assistant(&mut tree, &mut spine, "a1");
         tree
     }
 
-    /// The same, finished: the reply logs its `Answer` (#4), so nothing
+    /// The same, finished: the reply logs its `Answer` (#7), so nothing
     /// is open and re-opening the log wakes nobody. This is the honest
     /// shape of a settled conversation, and the fixture for every test
     /// where owing an answer is beside the point.
     fn tree_with_answered_root() -> Tree {
         let mut tree = tree_with_open_root();
-        let mut spine = tree.spine_at(EventId::new(3));
+        let mut spine = tree.spine_at(EventId::new(6));
         tree.append(
             &mut spine,
             EventPayload::Answer {
@@ -4081,7 +4123,7 @@ mod tests {
         // Two open leaves: #3 (auto-pick) and a second forked branch.
         let mut tree = tree_with_open_root();
         let mut branch = tree.fork(EventId::new(2)).unwrap();
-        let other_leaf = tree.append(&mut branch, assistant("branch2")).unwrap();
+        let other_leaf = assistant(&mut tree, &mut branch, "branch2");
 
         let (tx, _rx) = channel();
         let session = Session::open_at(
@@ -4229,7 +4271,7 @@ mod tests {
             .start_agent(None, None, "root", None, "", Vec::new())
             .unwrap();
         let question = tree.append(&mut spine, user("q")).unwrap();
-        tree.append(&mut spine, assistant("done")).unwrap();
+        assistant(&mut tree, &mut spine, "done");
         tree.append(
             &mut spine,
             EventPayload::Answer {
@@ -4976,7 +5018,7 @@ mod tests {
             let leaf = session.state(agent).unwrap().spine.leaf_id;
             assert_eq!(
                 kinds(tree, leaf),
-                ["Agent", "Post", "Reply", "Part", "Answer", "ReplyEnd", "Handback", "Console"]
+                ["Agent", "Post", "Reply", "Part", "ReplyEnd", "Answer", "Handback", "Console"]
             );
         }
     }
@@ -5639,10 +5681,10 @@ mod tests {
         });
         h.send(SessionCommand::Shutdown);
         let mut session = drain(session);
-        let fork = EventId::new(5);
+        let fork = EventId::new(8);
 
         // Nothing but the `Fork` was logged, and the fork is idle.
-        assert_eq!(session.tree().id_counter, 5);
+        assert_eq!(session.tree().id_counter, 8);
         assert_eq!(session.state(fork).unwrap().status(), "idle");
         assert!(errors(&rx.try_iter().collect::<Vec<_>>()).is_empty());
 
@@ -5657,7 +5699,10 @@ mod tests {
         let kinds = kinds(session.tree(), session.state(fork).unwrap().spine.leaf_id);
         assert_eq!(
             kinds,
-            ["Agent", "Post", "Fork", "Post", "Turn", "Call", "Completion", "Return", "Console", "Result"],
+            [
+                "Agent", "Post", "Fork", "Post", "Reply", "Part", "Call", "ReplyEnd", "Handback",
+                "Console", "Result",
+            ],
             "the fork diverged at #2, before the original's reply — the reply itself is a real \
              tell() call under code mode, not call-free prose, but (C0b) an unawaited tell's own \
              settlement is never a rule-C surprise, so nothing trails it: {kinds:?}"
@@ -6260,13 +6305,13 @@ mod tests {
         // recognized on both `unawaited` paths in `on_tool_results`), so
         // this second `tell` settles quietly: an artifact (`Call`,
         // `Result`) with no harness post and no further wake. The tail is
-        // `Return, Console, Result` — the program's own ordinary
+        // `Handback, Console, Result` — the program's own ordinary
         // completion, then the `tell`'s delivery receipt landing
         // separately (dispatched from `finish_program`'s `unstarted`
         // handling, settled by a later `on_tool_results`) — not a second
         // `Post`.
         assert!(
-            kinds(session.tree(), leaf).ends_with(&["Return", "Console", "Result"]),
+            kinds(session.tree(), leaf).ends_with(&["Handback", "Console", "Result"]),
             "{:?}",
             kinds(session.tree(), leaf)
         );
@@ -6381,7 +6426,7 @@ mod tests {
         if !step(&mut tree, 9) {
             return tree;
         }
-        tree.append(&mut worker, assistant("answered")).unwrap();
+        assistant(&mut tree, &mut worker, "answered");
         if !step(&mut tree, 10) {
             return tree;
         }
