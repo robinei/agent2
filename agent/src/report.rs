@@ -80,8 +80,14 @@ pub const CONSOLE_MAX_BYTES: usize = 256 * 1024;
 /// back at all — and re-read the same files next program. Half the
 /// return value's budget, spent from the newest line backwards, so the
 /// most recent output survives whole and an older chatty loop is what
-/// gets dropped.
-pub const CONSOLE_SECTION_MAX_BYTES: usize = RETURN_MAX_BYTES / 2;
+/// gets dropped. Spent from the newest line backwards.
+///
+/// 4 KB, and it used to be written as half of a `RETURN_MAX_BYTES`
+/// that no longer described anything: a reply has no `return` (D5),
+/// and what a program hands on it hands on through `history.append`.
+/// A number standing on a deleted idea reads as though it were derived
+/// from something.
+pub const CONSOLE_SECTION_MAX_BYTES: usize = 4096;
 /// Artifact-menu entries shown (most recent kept; older ids stay valid).
 pub const MENU_MAX_ENTRIES: usize = 20;
 /// Max bytes of the annotated program source in a post-condition report.
@@ -90,17 +96,6 @@ pub const ANNOTATED_SOURCE_MAX_BYTES: usize = 4096;
 pub const ANNOTATIONS_PER_LINE: usize = 6;
 /// Per-entry preview bytes in the artifact menu.
 pub const PREVIEW_MAX_BYTES: usize = 256;
-
-/// What a `return` value may occupy in the completion report that
-/// carries it to the next program — the document's one generous
-/// channel, and generous on purpose (see [`CompletionReport`]).
-///
-/// Large enough for the things a program actually hands on — a file, a
-/// list of sites, a set of findings — and small enough that a program
-/// returning something absurd costs one turn's worth of document rather
-/// than the conversation. Past it, [`clip_answer`] names the id, so the
-/// remainder is one `fetch_history` away instead of lost.
-pub const RETURN_MAX_BYTES: usize = 8192;
 
 /// One artifact-menu entry: a `Call` (settled or still pending) or a
 /// `ProgramResult`, named by its event id and fetchable via
@@ -286,8 +281,8 @@ mod bare_stack_tests {
 /// everything else it was holding. That is the definition of chosen.
 /// The document now has exactly one generous channel and it is that
 /// one — the menu is an index (27.2), a call's arguments are clipped,
-/// a result is a size. [`RETURN_MAX_BYTES`] bounds the pathological
-/// case, and [`clip_answer`] names the id so the rest stays reachable.
+/// a result is a size, and what a program hands on it hands on through
+/// `history.append` — which is a row of its own and compacts like one.
 pub struct CompletionReport {
     /// Full console log (the renderer tails it).
     pub console: Vec<String>,
