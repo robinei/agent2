@@ -5,6 +5,28 @@ the model it is trying to help. Not a design phase: an audit, and the
 fixes that fell out of it. The method is worth more than any one
 finding, so it is first.
 
+## What it came to
+
+Same four tasks, `deepseek-v4-flash`, before and after. Each arm from a
+worktree pinned to one commit, so no run straddles a build.
+
+| | baseline | after |
+|---|---|---|
+| passed | 10/11 (91%) | **17/18 (94%)** |
+| prompt bytes | 573 KB | **305 KB (−47%)** |
+| programs per run | 5.1 | **2.7 (−47%)** |
+
+Half the completions and half the bytes, with the pass rate holding.
+Most of the cost came off one change — telling the model what is in
+the working directory, so it stops spending its first program finding
+out — and the shape of the win is that a model which can see the tree
+plans the whole job in one program instead of discovering it three
+files at a time.
+
+The pass rate moved on one change too: refusing an edit that would
+double a line's indentation took `skipped-tests` from 2/4 to 6/6, and
+the guard fired once in those six runs with the run recovering from it.
+
 ## The method
 
 **Compare the model-facing surface against what the code does.** Every
