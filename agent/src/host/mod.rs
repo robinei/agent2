@@ -6397,8 +6397,11 @@ mod tests {
         if !step(&mut tree, 9) {
             return tree;
         }
+        // Four events, not one: a reply is recorded rather than
+        // reassembled (28), so this step spans #9–#12 and the two after
+        // it are #13 and #14.
         assistant(&mut tree, &mut worker, "answered");
-        if !step(&mut tree, 10) {
+        if !step(&mut tree, 13) {
             return tree;
         }
         tree.append(
@@ -6409,7 +6412,7 @@ mod tests {
             },
         )
         .unwrap();
-        if !step(&mut tree, 11) {
+        if !step(&mut tree, 14) {
             return tree;
         }
         tree.append(
@@ -6528,7 +6531,7 @@ mod tests {
 
         // Cut after the `Answer`, before its `Result`: delivery lost.
         // The value is in the log; the repair carries it home.
-        let tree = exchange_log(10);
+        let tree = exchange_log(13);
         assert!(tree.unmatched().contains(&Unmatched::LostDelivery {
             branch: EventId::new(1),
             send: EventId::new(7),
@@ -6542,7 +6545,7 @@ mod tests {
         );
 
         // The whole exchange: nothing about it is unmatched any more.
-        let tree = exchange_log(11);
+        let tree = exchange_log(14);
         assert!(
             !tree.unmatched().iter().any(|r| matches!(
                 r,
@@ -6558,7 +6561,7 @@ mod tests {
         // one repair left: the VM went with the process.
         assert!(tree.unmatched().contains(&Unmatched::InterruptedRun {
             branch: EventId::new(1),
-            leaf: EventId::new(11),
+            leaf: EventId::new(14),
             turn: EventId::new(3),
         }));
     }
@@ -6595,20 +6598,27 @@ mod tests {
             .start_agent(None, None, "root", None, "root", Vec::new())
             .unwrap();
         tree.append(&mut root, user("go")).unwrap();
+        let reply = tree.append(&mut root, EventPayload::Restart).unwrap();
         tree.append(
             &mut root,
-            EventPayload::Restart,
+            EventPayload::Part {
+                reply,
+                part: crate::types::Part::Cell("```js\nhistory.append(7);\n```\n".into()),
+            },
         )
         .unwrap();
-        tree.append(&mut root, EventPayload::Handback {
-                reply: EventId::new(1),
+        tree.append(
+            &mut root,
+            EventPayload::Handback {
+                reply,
                 how: crate::types::Handback::Completed,
                 site: 0,
                 stack: Vec::new(),
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
-        // Nothing to repair: the `Return` says the program finished.
+        // Nothing to repair: the handback says the program finished.
         assert!(
             !tree
                 .unmatched()
@@ -6635,10 +6645,13 @@ mod tests {
         let tree = session.tree();
         let leaf = root_leaf(&session);
         let reports = derived_reports(tree, leaf);
+        // A reply has no `return` (D5), so a completion report says so
+        // and lists the rows the run added — here the live round trip's
+        // own `tell`.
         assert!(
             reports
                 .iter()
-                .any(|t| t.contains("It completed, returning `[4]`:\n\n7")),
+                .any(|t| t.contains("It completed.") && t.contains("it returned 7")),
             "{reports:?}"
         );
         assert_eq!(
