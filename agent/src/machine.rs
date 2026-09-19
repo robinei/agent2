@@ -2452,9 +2452,32 @@ impl Runner {
                     None => Err(format!("call #{id} has no result yet")),
                 },
             },
-            // A handback carries no value — a reply has no `return`
-            // (D5) — so fetching one reads as the fact that it happened.
-            EventPayload::Handback { how, .. } => Ok(serde_json::json!(format!("{how:?}"))),
+            // A handback carries no *return* value — a reply has no
+            // `return` (D5) — but it is not empty: `Trapped` holds
+            // `{kind, message, resumable}` and `Raised` holds
+            // `{name, payload}`, which is exactly what a handler wants.
+            //
+            // **Serde, not `Debug`.** This used to hand back
+            // `format!("{how:?}")` — Rust syntax in a JSON string, which
+            // a program can only substring-match:
+            //
+            // ```text
+            // Trapped { kind: "TypeError", message: "…", resumable: true }
+            // ```
+            //
+            // The log already stores the same thing properly, so the
+            // rendering was the only lossy step. `value_json` in this
+            // file has a whole paragraph on why a Rust debug rendering
+            // must not reach a program — a live run wrote a file whose
+            // first line was the word `Undefined` — and this was the
+            // same mistake one function over, model-facing.
+            //
+            // The terminal variants serialise to a bare string
+            // (`"Completed"`), which is still "reads as the fact that it
+            // happened"; the rich ones become an object a program can
+            // index.
+            EventPayload::Handback { how, .. } => serde_json::to_value(how)
+                .map_err(|e| format!("handback #{id} has no JSON form: {e}")),
             // Not a menu row — it is named at the point it is
             // truncated, because it is context for one place rather than
             // work to be reused. Fetchable all the same.
@@ -5387,6 +5410,14 @@ mod tests {
                 "history.append(\"a conclusion\");",
                 r#"appended: "a conclusion""#,
             ),
+            // **The guess this exists to remove.** An object and a
+            // string that happens to contain JSON rendered identically
+            // while a string was shown bare — same row, different
+            // things in the hand, and nothing to tell them apart.
+            (
+                "history.append(JSON.stringify({ a: 1 }));",
+                r#"appended: "{\"a\":1}""#,
+            ),
         ] {
             let (mut tree, mut state) = setup();
             state.kickoff(&mut tree).unwrap();
@@ -5397,10 +5428,87 @@ mod tests {
             let doc = crate::document::render(&tree, &state.spine, 64 * 1024);
             let text: String = doc.messages.iter().map(|m| m.content.as_str()).collect();
             assert!(text.contains(row), "wanted {row:?} in:\n{text}");
-            // No escaped quotes: the value is stored as a value now, so
-            // there is no JSON-inside-JSON to escape.
-            assert!(!text.contains(r#"\""#), "double-escaped:\n{text}");
         }
+    }
+
+    /// And the two are not the same row. This is the whole point: the
+    /// rendering is the model's only evidence of what `fetch` returns,
+    /// so an object and its serialisation must not look alike.
+    #[test]
+    fn an_object_and_its_serialisation_render_differently() {
+        let row = |program: &str| {
+            let (mut tree, mut state) = setup();
+            state.kickoff(&mut tree).unwrap();
+            let out = state
+                .step(&mut tree, StepInput::LlmResponse(llm_program(program)))
+                .unwrap();
+            drain(&mut state, &mut tree, out);
+            let doc = crate::document::render(&tree, &state.spine, 64 * 1024);
+            let text: String = doc.messages.iter().map(|m| m.content.as_str()).collect();
+            let at = text.find("appended: ").expect("a note row");
+            text[at..].lines().next().unwrap().to_owned()
+        };
+        let object = row("history.append({ a: 1 });");
+        let string = row("history.append(JSON.stringify({ a: 1 }));");
+        assert_ne!(object, string, "the guess is back");
+        assert_eq!(object, r#"appended: {"a":1}"#);
+        assert_eq!(string, r#"appended: "{\"a\":1}""#);
+    }
+
+    /// **A handback fetches as structure, not as Rust.** It used to
+    /// come back `format!("{how:?}")` — `Trapped { kind: "TypeError",
+    /// … }`, which a program can only substring-match — while the log
+    /// stored the same thing as proper JSON all along. `value_json` in
+    /// this file has a paragraph on why a debug rendering must never
+    /// reach a program; this was the same mistake one function over.
+    #[test]
+    fn a_handback_fetches_as_structure_not_as_rust() {
+        let (mut tree, mut state) = setup();
+        state.kickoff(&mut tree).unwrap();
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::LlmResponse(llm_program("const v = null; v.x;")),
+            )
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+        let handback = state
+            .agent_segment(&tree)
+            .iter()
+            .find(|e| matches!(e.payload, EventPayload::Handback { .. }))
+            .expect("the trap")
+            .id;
+
+        let fetched = state.fetch_history(&tree, &[Value::PosInt(handback.as_u64())]).unwrap();
+        // Indexable: a handler can branch on `resumable` without
+        // parsing a sentence.
+        assert_eq!(fetched["Trapped"]["kind"], json!("TypeError"));
+        assert_eq!(fetched["Trapped"]["resumable"], json!(true));
+        assert!(
+            fetched["Trapped"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("cannot read property")),
+            "{fetched}"
+        );
+    }
+
+    /// And a terminal one is still just the fact that it happened.
+    #[test]
+    fn a_completed_handback_fetches_as_a_bare_name() {
+        let (mut tree, mut state) = setup();
+        state.kickoff(&mut tree).unwrap();
+        let out = state
+            .step(&mut tree, StepInput::LlmResponse(llm_program("done();")))
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+        let handback = state
+            .agent_segment(&tree)
+            .iter()
+            .find(|e| matches!(e.payload, EventPayload::Handback { .. }))
+            .expect("the handback")
+            .id;
+        let fetched = state.fetch_history(&tree, &[Value::PosInt(handback.as_u64())]).unwrap();
+        assert_eq!(fetched, json!("Completed"));
     }
 
     /// A `Note` and a program's own source come back too — the three
