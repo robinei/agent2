@@ -69,6 +69,50 @@ fn ambiguous(n: usize, needle: &str, lines: &[usize]) -> String {
     match_count_error("replaceOnce", n, needle, lines)
 }
 
+/// Whether an edit would leave a line indented twice over.
+///
+/// **The shape, exactly:** the match starts partway into its line,
+/// everything before it on that line is whitespace, and the
+/// replacement begins with that same whitespace. Applying it writes
+/// `pre + pre + …`, so a four-space line becomes an eight-space one and
+/// the file stops parsing.
+///
+/// Live twice on 2026-09-20, both on `skipped-tests`, both deleting a
+/// decorator:
+///
+/// ```text
+/// old: '@unittest.skip("…")\n    def test_base_rate(self):'
+/// new: '    def test_base_rate(self):'
+/// ```
+///
+/// The `@` is four spaces into its line and `old` does not include
+/// them, so the edit takes the decorator and leaves its indentation
+/// sitting in front of a `def` that brought its own. One run reported
+/// the mistake itself — "my earlier edit removed the decorator without
+/// its leading indentation" — a whole reply after the fact.
+///
+/// Refusing rather than warning, because the card promises these verbs
+/// "throw rather than landing somewhere you did not mean", and because
+/// a program that *wants* doubled indentation writes it in `new`
+/// against an `old` that starts at the line's beginning.
+fn doubles_indentation(text: &str, start: usize, new: &str) -> Option<String> {
+    let line_start = text[..start].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let pre = &text[line_start..start];
+    if pre.is_empty() || !pre.chars().all(|c| c == ' ' || c == '\t') {
+        return None;
+    }
+    if !new.starts_with(pre) {
+        return None;
+    }
+    Some(format!(
+        "the match starts {} column(s) into its line, after indentation that `old` does not \
+         include, and `new` begins with that same indentation — applying it would leave the \
+         line indented twice over. Put the leading whitespace in `old` as well, or take it \
+         off the front of `new`.",
+        pre.len()
+    ))
+}
+
 /// The 1-based line each byte offset falls on.
 ///
 /// **Where the matches are is the half the advice was missing.**
@@ -170,6 +214,12 @@ pub fn edit_replace_once(vm: &mut VM, args: Args) -> Result<Value, VMError> {
             return Err(vm.fail(ErrorKind::ValueError, ambiguous(n, old, &lines)));
         }
         let (pos, _) = indices[0];
+        if let Some(why) = doubles_indentation(text, pos, replacement.as_str()) {
+            return Err(vm.fail(
+                ErrorKind::ValueError,
+                &format!("replaceOnce: {why}"),
+            ));
+        }
         let mut out = String::with_capacity(text.len());
         out.push_str(&text[..pos]);
         out.push_str(replacement.as_str());
@@ -646,6 +696,12 @@ pub fn edit_apply_edits(vm: &mut VM, args: Args) -> Result<Value, VMError> {
                 ),
             ));
         }
+        if let Some(why) = doubles_indentation(text, matches[0], new_s.as_str()) {
+            return Err(vm.fail(
+                ErrorKind::ValueError,
+                &format!("applyEdits edit[{i}]: {why}"),
+            ));
+        }
         spans.push((i, matches[0], matches[0] + old.len(), new_s));
     }
 
@@ -850,6 +906,45 @@ mod match_count_tests {
             "the mirror image still says its own thing: {}",
             too_far.message
         );
+    }
+
+    /// **The indentation the needle left behind.** Live twice on
+    /// 2026-09-20, both deleting a decorator whose leading spaces the
+    /// needle did not include, both producing an `IndentationError`
+    /// the run then reported as a success.
+    #[test]
+    fn an_edit_that_would_double_an_indent_is_refused() {
+        let src = "class T:\n    @skip(\"x\")\n    def t(self):\n        pass\n";
+        let err = crate::testutil::run_runtime_err(&format!(
+            "Edit.replaceOnce({src:?}, '@skip(\"x\")\\n    def t(self):', '    def t(self):');"
+        ));
+        assert_eq!(err.kind, crate::ErrorKind::ValueError);
+        assert!(
+            err.message.contains("indented twice over"),
+            "says what would happen: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("Put the leading whitespace in `old`"),
+            "and what to write: {}",
+            err.message
+        );
+
+        // Including the indentation in `old` is the fix, and works.
+        let out = crate::testutil::run_ret(&format!(
+            "return Edit.replaceOnce({src:?}, '    @skip(\"x\")\\n    def t(self):', '    def t(self):');"
+        ));
+        assert_eq!(
+            out,
+            serde_json::json!("class T:\n    def t(self):\n        pass\n")
+        );
+
+        // And an ordinary mid-line replacement is untouched: what
+        // precedes the match is not whitespace, so nothing doubles.
+        let out = crate::testutil::run_ret(
+            "return Edit.replaceOnce('let a = b;', 'b', '  c');",
+        );
+        assert_eq!(out, serde_json::json!("let a =   c;"));
     }
 
     /// Long needles are clipped so one trap cannot dominate a report.
