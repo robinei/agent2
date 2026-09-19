@@ -8031,6 +8031,32 @@ mod tests {
         );
     }
 
+    /// **A marker the model wrote is replaced, not doubled.** It reads
+    /// these in its own turns and writes them back — that is what
+    /// `imitated_annotation` exists for on the `←` side, after a live
+    /// run emitted four invented ids and the pass added the four real
+    /// ones beside them. A `↓` it wrote is just as wrong, and a
+    /// doubled marker is the example it imitates next turn.
+    #[test]
+    fn a_block_marker_the_model_wrote_is_replaced() {
+        let rows = notebook_conversation(
+            "↓ history[999]\nReading it first.\n\n```js\nlet n = 1;\n```\n",
+        );
+        let assistant: Vec<&String> = rows
+            .iter()
+            .filter(|(r, _)| *r == crate::document::ChatRole::Assistant)
+            .map(|(_, c)| c)
+            .collect();
+        let text = assistant[0];
+        assert!(!text.contains("999"), "the invented id is gone: {text}");
+        assert_eq!(
+            text.matches("↓ history[").count(),
+            2,
+            "one marker per block, not one per block plus a forgery: {text}"
+        );
+        assert!(text.contains("Reading it first."), "{text}");
+    }
+
     /// **A marker names a row, so the row has to answer.** Every block
     /// of a reply carries `↓ history[N]` above it; an id the model can
     /// see and cannot read back is the papercut the `append`/`fetch`

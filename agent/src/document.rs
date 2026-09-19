@@ -347,7 +347,15 @@ fn annotate_history_calls(source: &str, cuts: Option<&Vec<Cut>>, blocks: &[(usiz
                 } else {
                     ""
                 };
-                out.insert_str(at, &format!("{lead}{BLOCK_ARROW} history[{row}]\n"));
+                // **Replace an imitated one, never sit beside it** —
+                // the rule `imitated_annotation` already applies to
+                // `←`, for a reason it learned the hard way: the model
+                // reads these in its own turns and writes them back,
+                // with invented ids, and a doubled marker is then the
+                // example it imitates next turn. A `↓` it wrote is
+                // just as wrong and just as copyable.
+                let end = imitated_block_marker(&out, at).unwrap_or(at);
+                out.replace_range(at..end, &format!("{lead}{BLOCK_ARROW} history[{row}]\n"));
                 continue;
             }
             Edit::Call(c) => c,
@@ -407,6 +415,32 @@ pub(crate) const BLOCK_ARROW: &str = "↓";
 /// the confusion happens, which prose in a system prompt 16 KB earlier
 /// evidently does not.
 pub(crate) const ARROW: &str = " ←";
+
+/// The end of a `↓ history[N]` line the model wrote itself at the head
+/// of a block, so the marker pass can replace it rather than add a
+/// second one below it.
+///
+/// Only our exact shape, and only at the head of the block — a `↓`
+/// somewhere in a sentence is something the model meant.
+fn imitated_block_marker(text: &str, at: usize) -> Option<usize> {
+    let rest = text.get(at..)?;
+    let lead = rest.len() - rest.trim_start_matches(['\n', ' ', '\t']).len();
+    let body = &rest[lead..];
+    let digits = body
+        .strip_prefix(BLOCK_ARROW)?
+        .strip_prefix(" history[")?;
+    let close = digits.find(']')?;
+    if close == 0 || !digits[..close].bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let after = &digits[close + 1..];
+    let line_end = after.find('\n').map(|i| i + 1).unwrap_or(after.len());
+    // Anything else on that line means it was not a bare marker.
+    if !after[..line_end].trim().is_empty() {
+        return None;
+    }
+    Some(at + lead + BLOCK_ARROW.len() + " history[".len() + close + 1 + line_end)
+}
 
 /// The span of an annotation the model wrote itself, immediately after
 /// `at` — so this pass can replace it rather than append beside it.
