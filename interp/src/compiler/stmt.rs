@@ -197,7 +197,7 @@ impl super::Compiler {
             // that instead of stopping at "not supported".
             ast::Statement::LabeledStatement(s) => self.error(
                 s.span.into(),
-                "a labelled statement is not supported, and so neither is `break`/`continue` \
+                "a labeled statement is not supported, and so neither is `break`/`continue` \
                  to a label. Lift the inner loop into a function and `return` from it, or \
                  set a flag the outer loop tests.",
             ),
