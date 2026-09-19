@@ -205,10 +205,11 @@ fn told_literal_cuts(tree: &Tree, agent: EventId, leaf: EventId) -> HashMap<Even
                 }
             }
             EventPayload::Note {
-                text,
+                value,
                 site,
                 site_end,
             } => {
+                let text = &crate::machine::note_text(value);
                 let Some((id, src)) = &turn else { continue };
                 push_cut(&mut out, *id, src, *site, *site_end, text, ev.id.as_u64());
             }
@@ -1633,7 +1634,7 @@ mod tests {
             .append(
                 &mut spine,
                 EventPayload::Note {
-                    text: "a long finding worth several lines".into(),
+                    value: "a long finding worth several lines".into(),
                     site: 0,
                     site_end: 0,
                 },

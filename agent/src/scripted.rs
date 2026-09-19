@@ -532,7 +532,7 @@ fn fold(session: host::Session, errors: Vec<String>) -> Outcome {
                     });
                 }
             }
-            EventPayload::Note { text, .. } => appended.push(text.clone()),
+            EventPayload::Note { value, .. } => appended.push(crate::machine::note_text(value)),
             // **One reply, one round trip.** A `Restart` is a person
             // handing the branch a cell, not a completion, so it is a
             // different event and cannot be counted as one.

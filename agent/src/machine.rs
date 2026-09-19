@@ -2120,7 +2120,7 @@ impl Runner {
                         tree.append(
                             &mut self.spine,
                             EventPayload::Note {
-                                text: note_text(value),
+                                value: value.clone(),
                                 site,
                                 site_end,
                             },
@@ -2488,7 +2488,10 @@ impl Runner {
                     None => String::new(),
                 }))
             }
-            EventPayload::Note { text, .. } => Ok(serde_json::Value::String(text.clone())),
+            // **Whole, as the card promises.** What was appended
+            // comes back as it went in — not as its JSON text, which is
+            // what a program had to know to `JSON.parse` before 28.
+            EventPayload::Note { value, .. } => Ok(value.clone()),
             // Genuinely not a row: the agent's own root, a `Compacted`
             // event at its own position, structure. `document::label_of`
             // has no name for these either, and `compaction.rs` refuses
@@ -3385,7 +3388,7 @@ pub(crate) fn off_menu(who: &str, reply: &str, options: &[String]) -> String {
 /// stores rendered text: a JSON string is used verbatim, anything else is
 /// serialized. The card's own guidance is to append a short projection
 /// (a summary), not a raw result, so the common case is already a string.
-fn note_text(value: &serde_json::Value) -> String {
+pub(crate) fn note_text(value: &serde_json::Value) -> String {
     match value {
         serde_json::Value::String(s) => s.clone(),
         other => other.to_string(),
@@ -3627,12 +3630,12 @@ pub(crate) fn menu_rows(
                 // and the model-facing direction is the one that
                 // matters. `EventPayload::Note` keeps its name; nobody
                 // outside this file sees it.
-                EventPayload::Note { text, .. } => Some(Artifact {
+                EventPayload::Note { value, .. } => Some(Artifact {
                     id,
                     label: String::new(),
                     state: ArtifactState::Whole(format!(
                         "appended: {}",
-                        crate::document::escape_untrusted(text)
+                        crate::document::escape_untrusted(&note_text(value))
                     )),
                 }),
                 _ => None,
@@ -5026,7 +5029,7 @@ mod tests {
         assert!(
             !state.agent_segment(&tree).iter().any(|e| matches!(
                 &e.payload,
-                EventPayload::Note { text, .. } if text.contains("__decision")
+                EventPayload::Note { value, .. } if note_text(value).contains("__decision")
             )),
             "no decision object ever lands as a row"
         );
@@ -5180,7 +5183,7 @@ mod tests {
             .agent_segment(&tree)
             .iter()
             .find_map(|e| match &e.payload {
-                EventPayload::Note { text, .. } => Some(text.clone()),
+                EventPayload::Note { value, .. } => Some(note_text(value)),
                 _ => None,
             });
         assert_eq!(note.as_deref(), Some("figured out the bug is in parsing"));
@@ -5283,10 +5286,7 @@ mod tests {
             .find_map(|e| match &e.payload {
                 // A reply has no `return`: what it handed forward is its
                 // last `history.append`.
-                EventPayload::Note { text, .. } => Some(
-                    serde_json::from_str::<serde_json::Value>(text)
-                        .unwrap_or_else(|_| serde_json::Value::String(text.clone())),
-                ),
+                EventPayload::Note { value, .. } => Some(value.clone()),
                 _ => None,
             })
             .unwrap();
@@ -5301,6 +5301,57 @@ mod tests {
             ["Reply", "Part", "ReplyEnd", "Note", "Handback", "Console"],
             "the fetch logged something of its own"
         );
+    }
+
+    /// **`append`/`fetch` round-trips.** The card promises "read any
+    /// entry back, *whole*" and, until this, an object came back as its
+    /// JSON *text*: a program had to know to `JSON.parse` a value it
+    /// had handed over intact, and nothing said so. Six helpers in this
+    /// suite were doing that parse by hand, which is the defect showing
+    /// through from the other side.
+    #[test]
+    fn what_was_appended_comes_back_as_what_was_appended() {
+        let (mut tree, mut state) = setup();
+        state.kickoff(&mut tree).unwrap();
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::LlmResponse(llm_program(
+                    "history.append({ dead: [\"a\", \"b\"], kept: 3 });",
+                )),
+            )
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+        let note = state
+            .agent_segment(&tree)
+            .iter()
+            .find(|e| matches!(e.payload, EventPayload::Note { .. }))
+            .unwrap()
+            .id;
+
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::LlmResponse(llm_program(&format!(
+                    "const row = history.fetch({}); \
+                     history.append([typeof row, row.kept, row.dead[1]]);",
+                    note.as_u64()
+                ))),
+            )
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+
+        let back = state
+            .agent_segment(&tree)
+            .iter()
+            .rev()
+            .find_map(|e| match &e.payload {
+                EventPayload::Note { value, .. } if value.is_array() => Some(value.clone()),
+                _ => None,
+            })
+            .expect("the second append");
+        // An object, indexable — not a string anyone has to parse.
+        assert_eq!(back, json!(["object", 3, "b"]));
     }
 
     /// A `Note` and a program's own source come back too — the three
@@ -5343,10 +5394,7 @@ mod tests {
             .find_map(|e| match &e.payload {
                 // A reply has no `return`: what it handed forward is its
                 // last `history.append`.
-                EventPayload::Note { text, .. } => Some(
-                    serde_json::from_str::<serde_json::Value>(text)
-                        .unwrap_or_else(|_| serde_json::Value::String(text.clone())),
-                ),
+                EventPayload::Note { value, .. } => Some(value.clone()),
                 _ => None,
             })
             .unwrap();

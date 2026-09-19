@@ -147,7 +147,20 @@ pub enum EventPayload {
     /// back later in the *same* turn, since if you need the value now
     /// you are already holding it.
     Note {
-        text: String,
+        /// **What was appended, not a rendering of it.** This was a
+        /// `String` holding `value.to_string()`, so `history.append(obj)`
+        /// came back from `history.fetch` as the JSON *text* of `obj` —
+        /// against a card that promises "read any entry back, **whole**".
+        /// A program had to know to `JSON.parse` a value it had just
+        /// handed over intact, and nothing said so.
+        ///
+        /// `#[serde(alias = "text")]` reads the old logs unchanged: a
+        /// JSON string there deserialises to `Value::String`, which is
+        /// exactly what the old field meant. The row's display text is
+        /// derived with `note_text` at render, so there is one source of
+        /// truth rather than two fields that can disagree.
+        #[serde(alias = "text")]
+        value: serde_json::Value,
         /// Source byte range of the `history.append(...)` that wrote it,
         /// so the document can point the call at the row it produced.
         /// Zero for notes written before this existed, and for any the

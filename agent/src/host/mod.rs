@@ -2086,7 +2086,9 @@ fn leaf_summary(tree: &Tree, leaf: EventId) -> String {
         EventPayload::Compaction { rendered, budget } => {
             format!("Compaction: {rendered} against {budget}")
         }
-        EventPayload::Note { text, .. } => format!("Note: {text}"),
+        EventPayload::Note { value, .. } => {
+            format!("Note: {}", crate::machine::note_text(value))
+        }
         EventPayload::Compacted { of, text } => match text {
             Some(t) => format!("Compacted #{}: {t}", of.as_u64()),
             None => format!("Compacted #{}: removed", of.as_u64()),
@@ -2417,10 +2419,7 @@ mod tests {
             .iter()
             .rev()
             .find_map(|e| match &e.payload {
-                EventPayload::Note { text, .. } => Some(
-                    serde_json::from_str(text)
-                        .unwrap_or_else(|_| serde_json::Value::String(text.clone())),
-                ),
+                EventPayload::Note { value, .. } => Some(value.clone()),
                 _ => None,
             })
             .expect("a history.append on this branch")
@@ -2812,7 +2811,9 @@ mod tests {
             .events
             .values()
             .find_map(|e| match &e.payload {
-                EventPayload::Note { text, .. } => Some(text.clone()),
+                EventPayload::Note { value, .. } => {
+                    Some(crate::machine::note_text(value))
+                }
                 _ => None,
             })
             .unwrap();
@@ -3216,10 +3217,7 @@ mod tests {
             .find_map(|e| match &e.payload {
                 // A reply has no `return`: what it handed forward is its
                 // last `history.append`.
-                EventPayload::Note { text, .. } => Some(
-                    serde_json::from_str::<serde_json::Value>(text)
-                        .unwrap_or_else(|_| serde_json::Value::String(text.clone())),
-                ),
+                EventPayload::Note { value, .. } => Some(value.clone()),
                 _ => None,
             });
         assert_eq!(
@@ -3266,10 +3264,7 @@ mod tests {
             .find_map(|e| match &e.payload {
                 // A reply has no `return`: what it handed forward is its
                 // last `history.append`.
-                EventPayload::Note { text, .. } => Some(
-                    serde_json::from_str::<serde_json::Value>(text)
-                        .unwrap_or_else(|_| serde_json::Value::String(text.clone())),
-                ),
+                EventPayload::Note { value, .. } => Some(value.clone()),
                 _ => None,
             });
         assert_eq!(
@@ -3356,10 +3351,7 @@ mod tests {
             .find_map(|e| match &e.payload {
                 // A reply has no `return`: what it handed forward is its
                 // last `history.append`.
-                EventPayload::Note { text, .. } => Some(
-                    serde_json::from_str::<serde_json::Value>(text)
-                        .unwrap_or_else(|_| serde_json::Value::String(text.clone())),
-                ),
+                EventPayload::Note { value, .. } => Some(value.clone()),
                 _ => None,
             });
         assert_eq!(
