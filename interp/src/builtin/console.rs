@@ -108,7 +108,7 @@ mod line_split_tests {
     }
 
     /// **One line per entry.** A call that prints four lines makes four
-    /// entries, so the 2,000-line cap, the report's 20-line tail and
+    /// entries, so the cap here, the report's tail and
     /// `history.fetch`'s array all count what the reader counts.
     #[test]
     fn one_call_printing_many_lines_stores_many_lines() {
