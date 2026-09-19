@@ -185,10 +185,51 @@ impl ConditionReport {
 }
 
 /// A stack that names no frame the model did not already know it was
-/// in: empty, or the single synthetic `<root>` every top-level program
-/// runs in.
+/// in: empty, or a single synthetic frame for the top level its code
+/// was already running at.
+///
+/// **Two names, not one.** `<root>` is what a whole-program run calls
+/// its top frame; a notebook cell's has no debug info at all and comes
+/// back as `<unknown>` (`interp`'s `Frame::name`). Only the first was
+/// listed, so every trap under the notebook transport rendered
+///
+/// ```text
+/// ### where it stopped
+/// in <unknown>
+/// ```
+///
+/// — the heading, a newline and a word that repeats what the caret
+/// above already said, which is the exact scaffolding this function
+/// exists to suppress. Seen in a live `glm-5.3` run, 2026-09-19.
 fn stack_is_bare(stack: &[String]) -> bool {
-    stack.is_empty() || stack == ["<root>"]
+    stack.is_empty() || matches!(stack, [only] if only == "<root>" || only == "<unknown>")
+}
+
+#[cfg(test)]
+mod bare_stack_tests {
+    use super::stack_is_bare;
+
+    /// Both synthetic top frames are bare — `<root>` for a whole
+    /// program, `<unknown>` for a notebook cell, whose frame carries no
+    /// debug info at all.
+    #[test]
+    fn a_lone_synthetic_top_frame_says_nothing_worth_a_heading() {
+        for name in ["<root>", "<unknown>"] {
+            assert!(stack_is_bare(&[name.to_owned()]), "{name}");
+        }
+        assert!(stack_is_bare(&[]));
+    }
+
+    /// A frame the model actually wrote is not bare, and neither is a
+    /// synthetic one with a real frame under it.
+    #[test]
+    fn a_named_frame_earns_the_heading() {
+        assert!(!stack_is_bare(&["checkShipping".to_owned()]));
+        assert!(!stack_is_bare(&[
+            "<unknown>".to_owned(),
+            "checkShipping".to_owned()
+        ]));
+    }
 }
 
 /// The harness `Post` for a program that finished with a `return`.

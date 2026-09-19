@@ -145,25 +145,84 @@ impl LlmClient for DeepSeekClient {
             self.thinking,
             self.effort.as_deref(),
         );
-        let mut response = self
-            .agent
-            .post(&url)
-            .header("Authorization", &format!("Bearer {}", self.api_key))
-            .header("User-Agent", "agent2/0.1")
-            .header("x-opencode-session", &self.session_id)
-            .send_json(&body)
-            .map_err(|e| format!("deepseek request failed: {e}"))?;
-        let status = response.status();
-        if !status.is_success() {
-            let text = response
-                .body_mut()
-                .read_to_string()
-                .unwrap_or_else(|_| "(unreadable body)".into());
-            return Err(format!("deepseek http {status}: {text}"));
+        // **Retried only before a single byte has been streamed.**
+        // Everything below this loop hands chunks straight to the
+        // notebook, which appends them to a reply that is already on the
+        // log — so a retry *there* would write the reply twice. Here
+        // nothing has been emitted yet and the attempt can simply be
+        // forgotten, which is exactly the shape of the failure this is
+        // for: `opencode.ai/zen` returned HTTP 530 (`Upstream response
+        // was not valid JSON`) on 5 of 11 runs on 2026-09-19, always
+        // before the stream opened, and the agent exited 1 having done
+        // nothing. Half a suite, lost to a fault that clears on its own.
+        let mut response = None;
+        for attempt in 1..=MAX_ATTEMPTS {
+            if cancel.is_cancelled() {
+                return Err("cancelled".into());
+            }
+            let last = attempt == MAX_ATTEMPTS;
+            match self
+                .agent
+                .post(&url)
+                .header("Authorization", &format!("Bearer {}", self.api_key))
+                .header("User-Agent", "agent2/0.1")
+                .header("x-opencode-session", &self.session_id)
+                .send_json(&body)
+            {
+                Ok(mut got) => {
+                    let status = got.status();
+                    if status.is_success() {
+                        response = Some(got);
+                        break;
+                    }
+                    let text = got
+                        .body_mut()
+                        .read_to_string()
+                        .unwrap_or_else(|_| "(unreadable body)".into());
+                    let failed = format!("deepseek http {status}: {text}");
+                    // A 4xx is the request's own fault and says so the
+                    // same way however often it is asked.
+                    if last || !retryable(status.as_u16()) {
+                        return Err(failed);
+                    }
+                }
+                // No status at all: refused, reset, timed out. Nothing
+                // reached the model, so asking again is free of doubt.
+                Err(e) => {
+                    if last {
+                        return Err(format!("deepseek request failed: {e}"));
+                    }
+                }
+            }
+            std::thread::sleep(backoff(attempt));
         }
+        let mut response = response.expect("the loop returns on its last failing attempt");
         let reader = std::io::BufReader::new(response.body_mut().as_reader());
         parse_sse(reader, cancel, chunk)
     }
+}
+
+/// How many times a request is sent before the failure is the
+/// caller's. Three: one for the ordinary case, and two more because
+/// the observed fault cleared within seconds every time it was probed
+/// by hand.
+const MAX_ATTEMPTS: usize = 3;
+
+/// Whether an HTTP status is worth asking again about.
+///
+/// Every 5xx, which covers the proxy's own 530, plus 429 (rate
+/// limited) and 408 (the server gave up waiting). Deliberately *not*
+/// 4xx otherwise: a 401 or a 400 is the request's own fault and says
+/// so the same way however often it is asked.
+fn retryable(status: u16) -> bool {
+    status == 408 || status == 429 || (500..600).contains(&status)
+}
+
+/// How long to wait before attempt `n + 1`. Short on purpose — this is
+/// in front of a person or an eval run, and the fault it is for clears
+/// in about a second.
+fn backoff(attempt: usize) -> std::time::Duration {
+    std::time::Duration::from_millis(400 * (1 << (attempt - 1)) as u64)
 }
 
 /// The chat-completions request body (OpenAI format, `stream: true`).
@@ -505,6 +564,31 @@ mod tests {
         assert_eq!(turn.thinking.as_deref(), Some("let me think"));
         assert!(!turn.truncated);
         assert_eq!(chunks, ["R:let me ", "R:think", "T:const x = ", "T:42;"]);
+    }
+
+    /// What is worth asking again about, and what is the request's own
+    /// fault however often it is asked.
+    #[test]
+    fn only_a_transient_status_is_retried() {
+        for status in [408, 429, 500, 502, 503, 504, 520, 530, 599] {
+            assert!(retryable(status), "{status}");
+        }
+        for status in [200, 400, 401, 403, 404, 409, 422] {
+            assert!(!retryable(status), "{status}");
+        }
+    }
+
+    /// Backoff grows and stays short: this sits in front of a person,
+    /// or an eval run being timed.
+    ///
+    /// Only `MAX_ATTEMPTS - 1` waits ever happen — the last attempt
+    /// returns its failure rather than sleeping on it — so that is what
+    /// the total is measured over.
+    #[test]
+    fn the_whole_retry_budget_is_about_a_second() {
+        let waits: Vec<u128> = (1..MAX_ATTEMPTS).map(|n| backoff(n).as_millis()).collect();
+        assert!(waits.windows(2).all(|w| w[1] > w[0]), "grows: {waits:?}");
+        assert!(waits.iter().sum::<u128>() <= 1_500, "{waits:?}");
     }
 
     #[test]

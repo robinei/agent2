@@ -1190,9 +1190,19 @@ impl Runner {
         // Logged on arrival either way — visible and crash-safe before
         // anything decides what to do about it. Whether it starts a turn
         // *now* is the trigger rule's call and nothing else's.
-        if self.needs_prompt(tree) {
-            self.phase = Phase::AwaitingLlm;
-            return Ok((post, vec![self.render_request(tree)]));
+        //
+        // **Through the one door**, not a copy of it. This used to
+        // inline `needs_prompt` + `render_request` and so skipped
+        // everything else `prompt_if_needed` does on the way: the
+        // compaction check (so a post arriving on an idle branch with an
+        // over-budget document sent the over-budget request rather than
+        // asking for a handler) and the `stopped_short` notice added on
+        // 2026-09-19 (logged on one path and not the other). Two places
+        // that have to agree about when a branch wakes, and they had
+        // already stopped agreeing twice.
+        let woken = self.prompt_if_needed(tree)?;
+        if !woken.is_empty() {
+            return Ok((post, woken));
         }
         // A running program's next fuel slice is where rule B delivers,
         // and a **parked** program has no next slice of its own — it is
@@ -2934,14 +2944,24 @@ impl Runner {
         // it blind. Logged here because this is the one door an idle
         // branch re-enters its LLM through, and the only place with a
         // `&mut Tree` to log into.
+        //
+        // Appended directly rather than through `deliver`: the wake is
+        // what *this* function is in the middle of doing, and `deliver`
+        // comes back here to decide whether to do it — which is a cycle
+        // with no base case, and was one until the stack overflowed.
         if let Some(text) = self.stopped_short(tree) {
-            let origin = Origin::Direct {
-                text,
-                input: serde_json::Value::Null,
-                options: Vec::new(),
-                expects_reply: false,
-            };
-            self.deliver(tree, Author::Harness, origin)?;
+            tree.append(
+                &mut self.spine,
+                EventPayload::Post {
+                    from: Author::Harness,
+                    origin: Origin::Direct {
+                        text,
+                        input: serde_json::Value::Null,
+                        options: Vec::new(),
+                        expects_reply: false,
+                    },
+                },
+            )?;
         }
         // Checked before the request is built, not after: a document
         // over budget is over budget *for this request*, and the whole
