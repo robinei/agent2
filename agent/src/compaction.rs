@@ -224,6 +224,46 @@ fn renders_a_line(payload: &EventPayload) -> bool {
     )
 }
 
+/// The smallest this document can be made by compaction — every
+/// nameable row shadowed at once.
+///
+/// **The floor is the card, and it does not move.** The worked
+/// examples and the card carry no id, so no handler can touch them;
+/// `compaction_if_needed`'s own doc has said since Part E that a budget
+/// set near that floor makes every batch fail and the condition re-fire
+/// forever. `COMPACTION_ATTEMPTS` was the bound, and it counts fires
+/// *since the last success* — so a round that removes real rows and
+/// shrinks the document by nothing at all resets it.
+///
+/// Measured on `sweep-200`, 2026-09-20, with a 34,000-byte budget
+/// against a 25,792-byte floor: **thirteen compactions in one run**,
+/// 49 rows removed, the document never once below 25,792. Every round
+/// succeeded and none of them helped. Block compaction made it worse
+/// by giving the model more rows it could always find something in.
+///
+/// Asking only when asking can help is the guard that does not depend
+/// on counting attempts at all.
+pub fn floor_size(tree: &Tree, spine: &Spine, budget: usize) -> usize {
+    let all_gone: std::collections::HashMap<EventId, crate::tree::CompactedView> = tree
+        .path_events(spine.leaf_id)
+        .iter()
+        .filter(|e| renders_a_line(&e.payload))
+        .map(|e| (e.id, crate::tree::CompactedView { text: None }))
+        .collect();
+    let leaf = spine.leaf_id;
+    let Some(agent) = tree.enclosing_agent(leaf) else {
+        return 0;
+    };
+    rendered_size(&document::render_with_lookup(
+        tree,
+        agent,
+        leaf,
+        spine.context(),
+        budget,
+        &all_gone,
+    ))
+}
+
 /// Total content bytes across a rendered [`document::Document`] — a
 /// byte-length proxy for what the model attends to, not a real token
 /// count (there is no tokenizer in this crate), but a legitimate,

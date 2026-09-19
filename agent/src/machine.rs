@@ -3197,6 +3197,30 @@ impl Runner {
         if !crate::compaction::should_fire(measured, limit, headroom) {
             return Ok(None);
         }
+        // **Ask only when asking can help.** The card and the worked
+        // examples carry no id, so they are a floor no handler can get
+        // under, and a budget near it makes every round succeed at
+        // removing rows and fail to shrink anything.
+        // `COMPACTION_ATTEMPTS` does not bite there because it counts
+        // fires since the last *success*, and those rounds succeed.
+        // Measured on `sweep-200` with a 34,000-byte budget against a
+        // 25,792-byte floor: thirteen compactions, 49 rows removed, the
+        // document never once below the floor.
+        //
+        // Bytes only. The floor is a byte measurement and the token
+        // path's limit is in tokens, and converting between them is the
+        // guess this trigger exists to avoid — against a real context
+        // window the floor is far under it anyway, which is the case
+        // this never fires in.
+        if unit == Measure::Bytes
+            && crate::compaction::should_fire(
+                crate::compaction::floor_size(tree, &self.spine, budget),
+                limit,
+                headroom,
+            )
+        {
+            return Ok(None);
+        }
         tree.append(
             &mut self.spine,
             EventPayload::Compaction {
@@ -5763,11 +5787,12 @@ mod tests {
         );
         // With no count to go on there is nothing to override it with,
         // so the byte budget is the trigger again.
-        state.next_prompt_floor = Counted::Never;
-        assert!(
-            state.compaction_if_needed(&mut tree, 1, 0.25).unwrap().is_some(),
-            "before the first reply reports a count, bytes are all there is"
-        );
+        // That the byte path is what a missing count falls back to is
+        // asserted where there is something compactable to fall back
+        // *to* — see `compaction_gives_up_rather_than_looping_when_it_
+        // cannot_help`, whose fixture has rows. This document is almost
+        // all card, so no byte budget both fires and clears the floor,
+        // which is the floor guard doing its job.
         // But a count that a commit has just invalidated is not the
         // same as never having had one, and the byte budget must not
         // step in for it — see `Counted::Stale`.
@@ -6282,26 +6307,37 @@ mod tests {
     /// which is the lesser failure.
     #[test]
     fn compaction_gives_up_rather_than_looping_when_it_cannot_help() {
-        let (mut tree, mut state, _) = crowded();
+        let (mut tree, mut state, budget) = crowded();
         // A budget under the floor: nothing the handler removes can
         // bring the document beneath it.
         let impossible = 1024;
-        for _ in 0..COMPACTION_ATTEMPTS {
+        // **It does not ask even once.** This used to assert that the
+        // branch asked `COMPACTION_ATTEMPTS` times and then stopped —
+        // two completions spent on a document no handler can shrink.
+        // The bound was the wrong instrument: it counts fires since the
+        // last *success*, and at the floor every round succeeds at
+        // removing rows while shrinking nothing, so on `sweep-200` with
+        // a 34,000-byte budget against a 25,792-byte floor it fired
+        // thirteen times. Comparing the floor to the threshold settles
+        // it before the first ask.
+        for _ in 0..=COMPACTION_ATTEMPTS {
             assert!(
                 state
                     .compaction_if_needed(&mut tree, impossible, 0.25)
                     .unwrap()
-                    .is_some(),
-                "each attempt within the bound still asks"
+                    .is_none(),
+                "a budget under the floor is not worth a completion"
             );
-            state.compaction_requested = false; // the program returned
+            state.compaction_requested = false;
         }
+        // And the fixture's own budget — which the floor fits under —
+        // still asks, so the guard has not simply turned compaction off.
         assert!(
             state
-                .compaction_if_needed(&mut tree, impossible, 0.25)
+                .compaction_if_needed(&mut tree, budget, 0.25)
                 .unwrap()
-                .is_none(),
-            "past the bound it stops asking"
+                .is_some(),
+            "a document that compaction can bring under budget is still asked about"
         );
     }
 
@@ -6314,9 +6350,13 @@ mod tests {
     /// time, which is what the old counter could not survive.
     #[test]
     fn the_compaction_bound_is_read_off_the_log_not_remembered() {
-        let (mut tree, state, _) = crowded();
+        let (mut tree, state, budget) = crowded();
         let mut leaf = state.spine.leaf_id;
-        let impossible = 1024;
+        // The fixture's own budget: over it, and with a floor under it,
+        // so every ask is one the floor guard allows. The bound is for
+        // the other failure — a handler that runs and frees nothing —
+        // and that is what a fresh `Runner` each round stands in for.
+        let impossible = budget;
         for attempt in 0..COMPACTION_ATTEMPTS {
             let mut fresh = Runner::with_spine(&tree, tree.spine_at(leaf));
             assert!(
