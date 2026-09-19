@@ -85,6 +85,27 @@ There is no way to do that. `console.log` reaches the model in the
 for looking rather than keeping, and for findings **as you go**" —
 where "as you go" is the false promise.
 
+### "Your program did not run", over six rows that had
+
+The blocks of one reply are one program that pauses between them, so
+when the third block fails to compile the first two have already run.
+The report for that case was the heading `## YOUR PROGRAM DID NOT RUN`
+and the diagnostic — no rows, no console, 474 bytes.
+
+| | |
+|---|---|
+| compile failures across 96 runs | 24 |
+| where earlier blocks had already added rows | **24 — all of them** |
+| rows hidden from those reports | 199 |
+
+On `dead-code-sweep`, 2026-09-20, the hidden work was both source files
+read, two rows appended holding them, and a `cargo check`. The next
+reply started the task from the beginning and got it wrong.
+
+The reasoning in the comment was half right: a cell that would not
+compile built no VM, so *that cell* has no console, no rows and no
+stack. The reply is not that cell.
+
 ## The dialect
 
 81 constructs a model might write, probed against what `interp`
