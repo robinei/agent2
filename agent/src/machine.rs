@@ -551,6 +551,24 @@ pub struct Runner {
     /// construction, on every path at once — including the ones nobody
     /// remembered to add a reset to.
     streaming_epoch: Option<u64>,
+    /// Bytes of rendered document per prompt token, **measured**.
+    ///
+    /// The document is sized in bytes and the context window is in
+    /// tokens, so one of them has to be converted, and a constant would
+    /// be a guess about a tokenizer this crate does not have. It does
+    /// not need one: every reply comes back with `usage.prompt`, and
+    /// the bytes that produced it were counted on the way out. Pair
+    /// them and the ratio is measured for this model, on this content,
+    /// this session.
+    ///
+    /// Starts at [`DEFAULT_BYTES_PER_TOKEN`] and is replaced by the
+    /// first real measurement. Clamped, because a single odd reading —
+    /// a reply whose usage never arrived, a cached prompt counted
+    /// strangely — must not move the budget by an order of magnitude.
+    bytes_per_token: f64,
+    /// Rendered size of the request now in flight, waiting for the
+    /// token count that will come back with it.
+    sent_bytes: Option<usize>,
     /// Whether the suspension the branch is parked on **falsified the
     /// text still arriving**. See
     /// [`notebook_cancels_generation`](Self::notebook_cancels_generation);
@@ -776,6 +794,8 @@ impl Runner {
             last_vm: None,
             status_transitions: Vec::new(),
             streaming_epoch: None,
+            bytes_per_token: crate::host::DEFAULT_BYTES_PER_TOKEN,
+            sent_bytes: None,
             pause_falsifies_the_rest: false,
             streaming_reply: String::new(),
             pending_decision: None,
@@ -3016,7 +3036,7 @@ impl Runner {
         // over budget is over budget *for this request*, and the whole
         // point is to not send it. The handler's own request is built
         // from the compacted document on the next pass through here.
-        let budget = crate::host::document_budget();
+        let budget = self.document_budget();
         let headroom = crate::host::compaction_headroom();
         if let Some(request) = self.compaction_if_needed(tree, budget, headroom)? {
             return Ok(vec![request]);
@@ -3127,10 +3147,47 @@ impl Runner {
     /// questions/presence tail every other request gets, even though the
     /// rolling document it folds that tail onto is built by calling
     /// `document` directly rather than through `StepOutput::LlmRequest`.
+    /// The byte budget the document is rendered and compacted against.
+    ///
+    /// **Derived from the context window when one is configured.** The
+    /// window is in tokens and the document is in bytes, so the
+    /// measured [`bytes_per_token`](Self::bytes_per_token) converts,
+    /// after holding back the reply's own share — the document is the
+    /// prompt, and a prompt that filled the window would leave nothing
+    /// to answer with.
+    ///
+    /// With no window configured this is the flat byte budget every
+    /// measurement to date was taken against.
+    pub(crate) fn document_budget(&self) -> usize {
+        let Some(context) = crate::host::context_tokens() else {
+            return crate::host::document_budget();
+        };
+        let usable = context.saturating_sub(crate::host::completion_reserve());
+        ((usable as f64) * self.bytes_per_token) as usize
+    }
+
+    /// Pair a reply's real `prompt_tokens` with the bytes that produced
+    /// it. Ignores a reading with no tokens (a reply whose usage never
+    /// arrived) and clamps the result, so one odd sample cannot move
+    /// the budget by an order of magnitude.
+    fn observe_prompt_tokens(&mut self, usage: &crate::host::Usage) {
+        let (Some(bytes), tokens) = (self.sent_bytes.take(), usage.prompt) else {
+            return;
+        };
+        if tokens == 0 || bytes == 0 {
+            return;
+        }
+        self.bytes_per_token = (bytes as f64 / tokens as f64).clamp(1.0, 12.0);
+    }
+
     pub(crate) fn render_request(&mut self, tree: &Tree) -> StepOutput {
         // Everything logged so far is about to be shown. This is the one
         // place the mark moves.
         self.shown = self.spine.leaf_id.as_u64();
+        // Half of the bytes-per-token measurement: what we are about to
+        // send. The other half arrives with this reply's `usage`.
+        let doc = crate::document::render(tree, &self.spine, self.document_budget());
+        self.sent_bytes = Some(crate::compaction::rendered_size(&doc));
         StepOutput::LlmRequest(LlmRequest {
             tail: self.request_tail(tree),
         })
@@ -4069,12 +4126,14 @@ impl Runner {
                 },
             )?;
         }
+        let usage = usage.unwrap_or_default();
+        self.observe_prompt_tokens(&usage);
         tree.append(
             &mut self.spine,
             EventPayload::ReplyEnd {
                 reply: self.reply_id,
                 how: self.reply_ended.take().unwrap_or(ReplyEnd::Finished),
-                usage: usage.unwrap_or_default(),
+                usage,
             },
         )?;
         Ok(())
@@ -5513,6 +5572,68 @@ mod tests {
             ],
             "each handback logs its own output, not the run's whole history"
         );
+    }
+
+    /// **The budget follows the context window, in the window's own
+    /// unit.** 64 KB is about 16k tokens — a quarter of a 64k window
+    /// and half of a 32k one, so the same flat constant was either
+    /// wasteful or unsafe depending on a model nobody had told the
+    /// harness about.
+    #[test]
+    fn the_budget_is_derived_from_the_context_window() {
+        let (mut tree, mut state) = setup();
+        state.kickoff(&mut tree).unwrap();
+
+        // Unset: the flat byte budget every measurement to date used.
+        assert_eq!(state.document_budget(), crate::host::DEFAULT_DOCUMENT_BUDGET);
+
+        // Set: the window, less the reply's own share, in bytes.
+        unsafe {
+            std::env::set_var("AGENT2_CONTEXT_TOKENS", "65536");
+            std::env::set_var("AGENT2_COMPLETION_RESERVE", "8192");
+        }
+        let expected = ((65536 - 8192) as f64 * crate::host::DEFAULT_BYTES_PER_TOKEN) as usize;
+        assert_eq!(state.document_budget(), expected);
+
+        // A smaller window is a smaller budget — the point of the
+        // exercise.
+        unsafe { std::env::set_var("AGENT2_CONTEXT_TOKENS", "32768") };
+        assert!(state.document_budget() < expected);
+        unsafe {
+            std::env::remove_var("AGENT2_CONTEXT_TOKENS");
+            std::env::remove_var("AGENT2_COMPLETION_RESERVE");
+        }
+    }
+
+    /// And the bytes-per-token is measured, not assumed: a real reply's
+    /// `prompt_tokens` against the bytes that produced it.
+    #[test]
+    fn the_ratio_is_measured_from_what_came_back() {
+        let (mut tree, mut state) = setup();
+        state.kickoff(&mut tree).unwrap();
+        assert_eq!(state.bytes_per_token, crate::host::DEFAULT_BYTES_PER_TOKEN);
+
+        // 12,000 bytes went out; the provider counted 2,000 tokens.
+        state.sent_bytes = Some(12_000);
+        state.observe_prompt_tokens(&crate::host::Usage {
+            prompt: 2_000,
+            ..Default::default()
+        });
+        assert_eq!(state.bytes_per_token, 6.0);
+
+        // A reply whose usage never arrived teaches nothing.
+        state.sent_bytes = Some(9_000);
+        state.observe_prompt_tokens(&crate::host::Usage::default());
+        assert_eq!(state.bytes_per_token, 6.0);
+
+        // And one absurd sample cannot move the budget by an order of
+        // magnitude.
+        state.sent_bytes = Some(1_000_000);
+        state.observe_prompt_tokens(&crate::host::Usage {
+            prompt: 1,
+            ..Default::default()
+        });
+        assert_eq!(state.bytes_per_token, 12.0);
     }
 
     /// **A handback fetches as structure, not as Rust.** It used to

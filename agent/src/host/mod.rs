@@ -107,6 +107,47 @@ fn max_agent_depth() -> usize {
 /// override is needed. Overridable via `AGENT2_DOCUMENT_BUDGET`.
 pub const DEFAULT_DOCUMENT_BUDGET: usize = 64 * 1024;
 
+/// The model's context window, in **tokens**, from
+/// `AGENT2_CONTEXT_TOKENS`.
+///
+/// **The budget below is bytes and the constraint is tokens**, and
+/// until this nothing joined them: `DEFAULT_DOCUMENT_BUDGET` is 64 KB,
+/// which is about 16k tokens — a quarter of a 64k-token window, and
+/// half of a 32k one. The same constant was either wasteful or unsafe
+/// depending on a model nobody had told the harness about.
+///
+/// Unset keeps the flat byte budget, which is what every measurement
+/// to date was taken against.
+pub(crate) fn context_tokens() -> Option<usize> {
+    std::env::var("AGENT2_CONTEXT_TOKENS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+}
+
+/// Tokens held back from the context for the reply itself.
+///
+/// The document is the *prompt*; the completion has to fit after it.
+/// A run whose document filled the window would have no room left to
+/// answer, and the failure would arrive as a truncated reply rather
+/// than as anything naming the cause.
+pub const DEFAULT_COMPLETION_RESERVE: usize = 8192;
+
+pub(crate) fn completion_reserve() -> usize {
+    std::env::var("AGENT2_COMPLETION_RESERVE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_COMPLETION_RESERVE)
+}
+
+/// Bytes per token to assume before this session has measured any.
+///
+/// Measured across seven tasks, two providers and four models on
+/// 2026-09-19: 3.72 to 4.38, clustered on 4. It is only the starting
+/// point — [`Runner`] replaces it with the real ratio as soon as one
+/// request has come back with its `prompt_tokens`.
+pub const DEFAULT_BYTES_PER_TOKEN: f64 = 4.0;
+
 pub(crate) fn document_budget() -> usize {
     std::env::var("AGENT2_DOCUMENT_BUDGET")
         .ok()
