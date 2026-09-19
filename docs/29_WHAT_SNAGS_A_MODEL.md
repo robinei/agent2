@@ -24,8 +24,15 @@ plans the whole job in one program instead of discovering it three
 files at a time.
 
 The pass rate moved on one change too: refusing an edit that would
-double a line's indentation took `skipped-tests` from 2/4 to 6/6, and
-the guard fired once in those six runs with the run recovering from it.
+double a line's indentation took `skipped-tests` from 2/4 to 6/6. The
+guard fired once in those six runs, and the reply after it opened
+
+> The `old` strings were missing the leading indentation.
+
+then rewrote the edit with the indentation included and read the diff
+the write handed back — a message taken verbatim and a result field
+that was undocumented six hours earlier, in the same turn. That is what
+a report earning its place looks like.
 
 ## The method
 
