@@ -166,6 +166,37 @@ The reasoning in the comment was half right: a cell that would not
 compile built no VM, so *that cell* has no console, no rows and no
 stack. The reply is not that cell.
 
+### What one turn looks like now
+
+A real report from the closing runs, and four of the night's fixes are
+in it:
+
+```text
+## YOUR PROGRAM RAN, THEN A BLOCK DID NOT COMPILE
+
+288:7: `test` is already declared — this code shares one scope with
+what ran before it, so that name is taken. Use a different one, or
+assign to it without `const`/`let`.
+const test = await tools.read_file("test_shipping.py");
+      ^
+
+### rows it added
+- `[7]`  `read_file("shipping.py")`      → ok, {content, version}, 433 bytes
+- `[10]` `read_file("test_shipping.py")` → ok, {content, version}, 996 bytes
+- `[15]` `bash("… pytest --collect-only…")` → ok, {status, stdout, stderr}, 77 bytes
+- `[21]` `bash("… pytest -v …")`          → ok, {status, stdout, stderr}, 77 bytes
+
+### it printed
+=== shipping.py ===
+"""Shipping cost rules."""
+…both files, whole…
+```
+
+The heading is true, the diagnostic names the scope, the four rows
+exist, and the files arrived whole. The same turn before tonight was
+the heading `## YOUR PROGRAM DID NOT RUN`, the bare words `test is
+already declared`, and nothing else.
+
 ## The dialect
 
 81 constructs a model might write, probed against what `interp`
