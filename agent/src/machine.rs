@@ -3225,6 +3225,7 @@ impl Runner {
     /// retry rather than a failure: the log is untouched either way.
     fn apply_history_edits(&mut self, tree: &mut Tree) -> io::Result<usize> {
         let ops = std::mem::take(&mut self.pending_edits);
+        let was_a_compaction_program = self.compaction_requested;
         self.compaction_requested = false;
         if ops.is_empty() {
             return Ok(0);
@@ -3244,7 +3245,56 @@ impl Runner {
         for event in events {
             tree.append(&mut self.spine, event)?;
         }
+        if was_a_compaction_program {
+            self.compact_the_compaction_program(tree)?;
+        }
         Ok(n)
+    }
+
+    /// **A compaction program is the one reply that is not conversation**
+    /// — it is work the harness asked for, in a document the harness
+    /// asked to be made smaller — so it goes when it is spent.
+    ///
+    /// Shadowed, like everything else: the blocks stay on the log and
+    /// `history.fetch` still answers for them. What goes is their place
+    /// in the rendered document.
+    ///
+    /// **Because leaving it there taught the model to repeat it.** Live
+    /// on `Qwen3.8-27B`, 2026-09-20: its first compaction program read
+    /// `history.remove(4); history.remove(5); history.remove(9, 12);`
+    /// and worked. Two rounds later it wrote `history.remove(9);
+    /// history.remove(12);` — the same rows, which by then rendered
+    /// nothing. The only place those ids still existed was the spent
+    /// program sitting in its own history, and a model writing a
+    /// compaction program imitates the compaction program in front of
+    /// it.
+    ///
+    /// Anything the program *said* survives: a `tell` and a
+    /// `history.append` are rows of their own, and the summary a good
+    /// compaction leaves behind is exactly such a row.
+    fn compact_the_compaction_program(&mut self, tree: &mut Tree) -> io::Result<()> {
+        let reply = self.reply_id;
+        let blocks: Vec<EventId> = tree
+            .path_events(self.spine.leaf_id)
+            .iter()
+            .filter(|e| {
+                matches!(
+                    &e.payload,
+                    EventPayload::Part {
+                        reply: r,
+                        part: Part::Prose(_) | Part::Cell(_),
+                    } if *r == reply
+                )
+            })
+            .map(|e| e.id)
+            .collect();
+        for of in blocks {
+            tree.append(
+                &mut self.spine,
+                EventPayload::Compacted { of, text: None },
+            )?;
+        }
+        Ok(())
     }
 
     // ── rendering ───────────────────────────────────────────────────
@@ -6436,7 +6486,29 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(compacted, vec![target], "exactly the row it named");
+        // The row it named, **and the program that named it** — a
+        // spent compaction program is harness-requested work in a
+        // document the harness asked to be shrunk, so it goes too.
+        assert!(
+            compacted.contains(&target),
+            "the row it named: {compacted:?}"
+        );
+        let own: Vec<EventId> = tree
+            .events
+            .values()
+            .filter(|e| {
+                matches!(&e.payload, EventPayload::Part { reply, part: Part::Cell(_) }
+                         if *reply == state.reply_id)
+            })
+            .map(|e| e.id)
+            .collect();
+        for block in &own {
+            assert!(
+                compacted.contains(block),
+                "the compaction program's own block #{} is spent: {compacted:?}",
+                block.as_u64()
+            );
+        }
         assert!(
             tree.events.contains_key(&target),
             "the original row is shadowed, never removed"
