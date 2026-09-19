@@ -30,7 +30,7 @@ A ```ts or ```typescript block runs too, with the types erased before anything e
 
 **`history.append(v)`** — the next reply is written with this in front of it, any number of times, from anywhere, and each one a row of its own. It lands the moment you call it, so it survives even a block that traps afterwards, **and it hands back that row's id**, so a later call can name what you just wrote without waiting to read the annotation.
 
-**`console.log(x)`** — the output lands in front of the next reply too: the cheap one, for looking rather than keeping, and for findings as you go. What it shows is the recent tail; what it keeps is all of it, one `history.fetch` away. A loop over two hundred items belongs here, not in the one above.
+**`console.log(x)`** — the output lands in front of the *next* reply, and nowhere before it. **You never see what your own blocks print while you are writing them.** A value you mean to act on in this reply is a variable, not a printout: write `if (t.status !== 0)`, not `console.log(t.stdout)` followed by a sentence about what it said. Printing it and carrying on as though you had read it is how a reply comes to tell somebody the tests passed while the traceback sits in the console. What it shows next turn is the recent tail; what it keeps is all of it, one `history.fetch` away. A loop over two hundred items belongs here, not in the one above.
 
 **`tell(text)`** — reaches the person, and lands on the record whole, as its own row, so you see it again too. For what you just found out: a computed value, a check's verdict, a word to an agent you spawned. Not a way to talk to yourself; `console.log` costs them nothing. But the reply that finishes owes them the answer — say it, then `done()`.
 

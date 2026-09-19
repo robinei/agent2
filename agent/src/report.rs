@@ -289,6 +289,22 @@ pub struct CompletionReport {
     /// otherwise. See `host::tools`'s command ceiling for why this is a
     /// note and no longer a refusal.
     pub long_bash: usize,
+    /// Whether this run ran a command that exited non-zero and then
+    /// spoke to the person anyway, in that order, in the same reply.
+    ///
+    /// **The reply cannot see what it printed.** `console.log` lands in
+    /// front of the *next* reply, so a program that runs a check,
+    /// prints the output and then writes a sentence about how it went
+    /// is writing that sentence blind. Measured across 96 kept runs:
+    /// nine of them spoke after a non-zero command in the same reply,
+    /// and `sweep-8` on 2026-09-19 is what it looks like — the run told
+    /// the person "Syntax check and tests pass" while the console held
+    /// an `AttributeError` and `TEST_EXIT:1`, and the task failed.
+    ///
+    /// Its own prose, between the two blocks, was "Check what came
+    /// back, then report." There is no way to do that here, and the
+    /// report is where saying so arrives in time to matter.
+    pub spoke_after_a_failure: bool,
 }
 
 impl CompletionReport {
@@ -324,6 +340,17 @@ impl CompletionReport {
                  script either way.",
                 self.long_bash
             ));
+        }
+
+        if self.spoke_after_a_failure {
+            out.push_str(
+                "\n\n### worth knowing\n\nA command in this reply exited non-zero, and the \
+                 reply spoke to the person after it. **You cannot see what your own blocks \
+                 print** — `console.log` reaches you in the *next* reply, never this one — so \
+                 anything said here about how the check went was written without reading it. \
+                 If you told them it passed, look again above: the result is a variable, and \
+                 `if (r.status !== 0)` is how a reply acts on it in time.",
+            );
         }
 
         if self.wrote_without_verifying() {
@@ -943,6 +970,41 @@ pub fn derive_report(tree: &Tree, leaf: EventId, outcome: EventId, budget: usize
     text
 }
 
+/// A non-zero command, and then a word to the person — in that order,
+/// in one reply. See [`CompletionReport::spoke_after_a_failure`].
+///
+/// **Order is the whole signal.** Speaking *before* running a check is
+/// ordinary ("about to run the tests"); speaking after one that failed,
+/// without having been able to read it, is the sentence that reports a
+/// success that did not happen. A `bash` whose status is zero is not a
+/// failure here even when its output contains one — a run that writes
+/// `; echo EXIT:$?` has taken the status into its own hands, and this
+/// does not second-guess that.
+fn spoke_after_a_failure(path: &[&Event]) -> bool {
+    let mut bash_calls: std::collections::HashSet<EventId> = Default::default();
+    let mut failed_since_last_word = false;
+    for ev in path {
+        match &ev.payload {
+            EventPayload::Call(crate::types::Call::Invoke { name, .. }) if name == "bash" => {
+                bash_calls.insert(ev.id);
+            }
+            EventPayload::Result {
+                call,
+                outcome: crate::types::Outcome::Delivered(v),
+            } if bash_calls.contains(call) => {
+                if v.get("status").and_then(|s| s.as_i64()).unwrap_or(0) != 0 {
+                    failed_since_last_word = true;
+                }
+            }
+            EventPayload::Call(crate::types::Call::Send { .. }) if failed_since_last_word => {
+                return true;
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
 fn render_handback(h: &Handback<'_>, budget: usize) -> String {
     let _ = budget;
     let EventPayload::Handback {
@@ -969,6 +1031,7 @@ fn render_handback(h: &Handback<'_>, budget: usize) -> String {
                 .filter(|n| *n > crate::host::tools::BASH_COMMAND_LONG_BYTES)
                 .max()
                 .unwrap_or(0),
+            spoke_after_a_failure: spoke_after_a_failure(&h.path[h.turn_at + 1..=h.outcome_at]),
             failed_calls: h.path[h.turn_at + 1..=h.outcome_at]
                 .iter()
                 .filter(|e| {
@@ -1556,6 +1619,34 @@ mod tests {
         assert!(text.contains("1:8: cannot read property"), "{text}");
         assert!(text.contains("not resumable"), "{text}");
 
+        // **A reply cannot read its own output, so the report says what
+        // it could not.** Live on `sweep-8`, 2026-09-19: the run ran
+        // `python3 test.py`, printed the result, and in the next block
+        // of the same reply told the person "Syntax check and tests
+        // pass" while the console held an `AttributeError`. Its prose
+        // in between read "Check what came back, then report."
+        let base = || CompletionReport {
+            console: Vec::new(),
+            console_id: None,
+            new_artifacts: Vec::new(),
+            failed_calls: 0,
+            long_bash: 0,
+            spoke_after_a_failure: false,
+        };
+        let quiet = base().render();
+        assert!(!quiet.contains("cannot see what your own blocks"), "{quiet}");
+        let noisy = CompletionReport {
+            spoke_after_a_failure: true,
+            ..base()
+        }
+        .render();
+        assert!(noisy.contains("exited non-zero"), "{noisy}");
+        assert!(
+            noisy.contains("cannot see what your own blocks print"),
+            "names the cause, not just the symptom: {noisy}"
+        );
+        assert!(noisy.contains("r.status !== 0"), "and what to write: {noisy}");
+
         // Compaction: the handler has to be told what it is being asked
         // for and how much, or it reads the report as an ordinary
         // interruption and carries on with the task — which is what a
@@ -1836,6 +1927,7 @@ mod tests {
             }],
             failed_calls: 0,
             long_bash: 0,
+            spoke_after_a_failure: false,
         }
         .render();
         assert!(rendered.contains(&long), "the row is not clipped");
@@ -1943,6 +2035,7 @@ mod tests {
             new_artifacts: artifacts,
             failed_calls: 0,
             long_bash: 0,
+            spoke_after_a_failure: false,
         }
         .render()
     }
@@ -2042,6 +2135,7 @@ mod tests {
             new_artifacts: Vec::new(),
             failed_calls: 0,
             long_bash: 0,
+            spoke_after_a_failure: false,
         }
         .render();
         assert_eq!(rendered, format!("{RUN_HEADING}\n\nIt completed."));
