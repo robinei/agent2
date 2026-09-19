@@ -124,6 +124,40 @@ fn rejected_await_escalates_and_is_resumable() {
     }
 }
 
+/// **An Error-shaped rejection says its message.** What reaches the
+/// await is usually `{ name, message }` — the shape a caught error
+/// takes in this dialect — and the text described that shape rather
+/// than reading it: `rejected with object ({object with keys message,
+/// name})`, the word "object" twice and the sentence the caller needed
+/// nowhere in it. Seen on the suite of 2026-09-20.
+#[test]
+fn an_error_shaped_rejection_says_its_message() {
+    let prog = compile_ok("await tools.f(); return 1;");
+    let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
+    let id = match vm.step(u64::MAX).unwrap() {
+        StepResult::Pending { calls } => calls[0].promise,
+        other => panic!("expected Pending, got {other:?}"),
+    };
+    let obj = vm
+        .json_to_stack_value(
+            &serde_json::json!({ "name": "Error", "message": "ENOENT: no such file" }),
+            0,
+        )
+        .unwrap();
+    vm.reject_promise(id, obj).unwrap();
+    let err = vm.step(u64::MAX).unwrap_err();
+    assert!(
+        err.message.contains("ENOENT: no such file"),
+        "reads the message: {}",
+        err.message
+    );
+    assert!(
+        !err.message.contains("object with keys"),
+        "rather than describing its shape: {}",
+        err.message
+    );
+}
+
 // ── async functions ────────────────────────────────────────────────
 
 #[test]

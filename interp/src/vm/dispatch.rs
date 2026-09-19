@@ -2834,6 +2834,39 @@ impl VM {
                                         format!("{}…", &s[..end])
                                     }
                                 }
+                                // **An Error-shaped rejection says its
+                                // message.** What reaches here is
+                                // usually `{ name, message }` — the
+                                // shape a caught error takes in this
+                                // dialect — and the old text described
+                                // that shape instead of reading it:
+                                // `rejected with object ({object with
+                                // keys message, name})`, the word
+                                // "object" twice and the sentence the
+                                // caller needed nowhere in it.
+                                Value::Object(p)
+                                    if self
+                                        .objects
+                                        .get(*p as usize)
+                                        .and_then(|o| o.map.get("message"))
+                                        .is_some_and(|m| matches!(m, Value::String(_))) =>
+                                {
+                                    let m = self
+                                        .objects
+                                        .get(*p as usize)
+                                        .and_then(|o| o.map.get("message").cloned())
+                                        .unwrap_or(Value::Undefined);
+                                    let text = match &m {
+                                        Value::String(s) => s.as_str().to_owned(),
+                                        _ => String::new(),
+                                    };
+                                    let mut end = text.len().min(REJECTION_MESSAGE_MAX_BYTES);
+                                    while !text.is_char_boundary(end) {
+                                        end -= 1;
+                                    }
+                                    let more = if end < text.len() { "…" } else { "" };
+                                    format!("awaited promise rejected: {}{more}", &text[..end])
+                                }
                                 _ => format!(
                                     "awaited promise rejected with {} ({})",
                                     errval.type_name(),

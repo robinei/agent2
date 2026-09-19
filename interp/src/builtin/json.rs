@@ -6,8 +6,24 @@ use crate::vm::{ErrorKind, RcStr, VM, VMError, Value};
 /// `JSON.parse(s)` → any.
 pub fn json_parse(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let s = vm.string_from(args.get(vm, 0))?;
-    let json: serde_json::Value =
-        serde_json::from_str(&s).map_err(|_| vm.fail(ErrorKind::ValueError, "value error"))?;
+    // **serde already said what was wrong; this used to throw it away.**
+    // `in `parse`: value error` names neither the reason nor the place,
+    // and both are in hand: serde's message carries "expected value at
+    // line 1 column 1" or "trailing characters", which is the whole
+    // diagnosis. Seen live on the 2026-09-20 suite.
+    //
+    // The head of the input goes with it, because the commonest cause
+    // is parsing something that was never JSON — a command's output, a
+    // file, an object that was already a value — and one look at the
+    // first characters settles which.
+    let json: serde_json::Value = serde_json::from_str(&s).map_err(|e| {
+        let head: String = s.chars().take(60).collect();
+        let more = if s.chars().nth(60).is_some() { "…" } else { "" };
+        vm.fail(
+            ErrorKind::ValueError,
+            &format!("JSON.parse: {e} — the text begins {head:?}{more}"),
+        )
+    })?;
     vm.json_to_stack_value(&json, 0)
 }
 
@@ -125,6 +141,29 @@ fn pretty_print_value(value: &serde_json::Value, indent: &str, depth: usize, out
 
 #[cfg(test)]
 mod tests {
+    /// **serde knew; the message did not pass it on.** A live run on
+    /// the 2026-09-20 suite was told `in `parse`: value error`, which
+    /// names neither the reason nor the place, while both were in the
+    /// error being discarded. The commonest cause is parsing something
+    /// that was never JSON, so the head of the input goes too.
+    #[test]
+    fn json_parse_says_why_and_shows_what_it_was_given() {
+        let err = crate::testutil::run_runtime_err("JSON.parse('not json at all');");
+        assert_eq!(err.kind, crate::ErrorKind::ValueError);
+        assert!(err.message.contains("line 1"), "the place: {}", err.message);
+        assert!(
+            err.message.contains("not json at all"),
+            "and what it was handed: {}",
+            err.message
+        );
+        // A long input is clipped rather than quoted whole.
+        let err = crate::testutil::run_runtime_err(
+            "JSON.parse('x'.repeat(5000));",
+        );
+        assert!(err.message.len() < 220, "{} bytes", err.message.len());
+        assert!(err.message.contains('…'), "{}", err.message);
+    }
+
     use crate::{
         Value,
         builtin::Builtin,
