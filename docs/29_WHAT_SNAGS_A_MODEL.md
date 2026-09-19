@@ -62,8 +62,12 @@ a regression in the harness:
   repo, then asked its question. Four programs where the checker allows
   fewer. Exploring before asking is not wrong, and a card sentence
   pushing models to ask sooner would buy this back by making them ask
-  when they should look. Left alone, and worth watching: it is the one
-  task where showing the directory may invite reading more of it.
+  when they should look.
+
+  I suspected the opening listing of inviting the extra reading, and
+  checked: the reply the question lands on is 2, 2, 4 at HEAD against
+  3, 2 at baseline. Two of three ask *sooner* than before. The four is
+  variance, not a cost of showing the directory.
 
 ## The method
 
