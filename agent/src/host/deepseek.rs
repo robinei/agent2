@@ -156,7 +156,6 @@ impl LlmClient for DeepSeekClient {
         // was not valid JSON`) on 5 of 11 runs on 2026-09-19, always
         // before the stream opened, and the agent exited 1 having done
         // nothing. Half a suite, lost to a fault that clears on its own.
-        let mut response = None;
         for attempt in 1..=MAX_ATTEMPTS {
             if cancel.is_cancelled() {
                 return Err("cancelled".into());
@@ -176,18 +175,43 @@ impl LlmClient for DeepSeekClient {
                 Ok(mut got) => {
                     let status = got.status();
                     if status.is_success() {
-                        response = Some(got);
-                        break;
-                    }
-                    let text = got
-                        .body_mut()
-                        .read_to_string()
-                        .unwrap_or_else(|_| "(unreadable body)".into());
-                    let failed = format!("deepseek http {status}: {text}");
-                    // A 4xx is the request's own fault and says so the
-                    // same way however often it is asked.
-                    if last || !retryable(status.as_u16()) {
-                        return Err(failed);
+                        // **The stream is read here, inside the retry.**
+                        // A stream that dies before its first *text*
+                        // chunk has written nothing: only text reaches
+                        // `notebook_stream` (`host/mod.rs`'s `if
+                        // !thinking`), so no `Reply` was opened and no
+                        // part was logged. That failure is as safe to
+                        // retry as one before the headers, and it is
+                        // the one a slow model actually hits — a local
+                        // Qwen3.6-35B lost a run to it on 2026-09-19,
+                        // reasoning for a long time and then dropping
+                        // the connection with nothing said.
+                        //
+                        // Once a text chunk *has* gone through, never:
+                        // the reply is on the log and a second attempt
+                        // would write it twice.
+                        let mut wrote = false;
+                        let reader = std::io::BufReader::new(got.body_mut().as_reader());
+                        let mut counting = |c: LlmChunk| {
+                            wrote |= matches!(c, LlmChunk::Text(_));
+                            chunk(c);
+                        };
+                        match parse_sse(reader, cancel, &mut counting) {
+                            Ok(turn) => return Ok(turn),
+                            Err(e) if last || wrote => return Err(e),
+                            Err(_) => {}
+                        }
+                    } else {
+                        let text = got
+                            .body_mut()
+                            .read_to_string()
+                            .unwrap_or_else(|_| "(unreadable body)".into());
+                        let failed = format!("deepseek http {status}: {text}");
+                        // A 4xx is the request's own fault and says so
+                        // the same way however often it is asked.
+                        if last || !retryable(status.as_u16()) {
+                            return Err(failed);
+                        }
                     }
                 }
                 // No status at all: refused, reset, resolved nowhere.
@@ -225,9 +249,7 @@ impl LlmClient for DeepSeekClient {
             }
             std::thread::sleep(backoff(attempt));
         }
-        let mut response = response.expect("the loop returns on its last failing attempt");
-        let reader = std::io::BufReader::new(response.body_mut().as_reader());
-        parse_sse(reader, cancel, chunk)
+        Err("every attempt failed".into())
     }
 }
 
@@ -408,6 +430,8 @@ fn parse_sse(
     chunk: &mut dyn FnMut(LlmChunk),
 ) -> Result<LlmTurn, String> {
     let mut acc = Accumulated::default();
+    // Whether the stream said it was over, rather than simply stopping.
+    let mut ended = false;
 
     for line in reader.lines() {
         // The one place a cancellation lands: between SSE lines, so an
@@ -422,6 +446,7 @@ fn parse_sse(
         };
         let data = data.trim();
         if data == "[DONE]" {
+            ended = true;
             break;
         }
         let event: serde_json::Value =
@@ -463,6 +488,23 @@ fn parse_sse(
         }
     }
 
+    // **A connection that just stops has not finished.** SSE ends with
+    // `[DONE]`, or at least with a `finish_reason`; a reader that hits
+    // EOF before either did not receive a completion, it lost one.
+    //
+    // Returning `Ok` there made a dropped connection indistinguishable
+    // from a finished reply: the model's half-sentence became its whole
+    // turn, `truncated: false`, with nothing anywhere saying otherwise.
+    // Found by testing the retry path against a server that hangs up
+    // mid-stream, 2026-09-19 — the retry could never have fired,
+    // because the failure it was written for was not being reported as
+    // one.
+    if !ended && acc.finish_reason.is_none() {
+        return Err(format!(
+            "stream ended without `[DONE]` or a finish_reason after {} bytes of reply",
+            acc.source.len()
+        ));
+    }
     let truncated = acc.finish_reason.as_deref() == Some("length");
     let source = acc.source;
 
@@ -571,6 +613,109 @@ mod tests {
             None,
         );
         assert_eq!(body["thinking"], json!({ "type": "disabled" }));
+    }
+
+    /// A one-shot HTTP server that answers each connection from
+    /// `replies` in order, then hangs up. Returns its base URL.
+    ///
+    /// Enough to exercise `complete`'s retry loop, which has had three
+    /// changes today and no end-to-end coverage: every other test in
+    /// this file drives `parse_sse` directly and never sees the loop
+    /// around it.
+    fn serve(replies: Vec<String>) -> (String, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            for body in replies {
+                let Ok((mut sock, _)) = listener.accept() else { return };
+                // Drain the request head so the client's write completes.
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf);
+                let _ = sock.write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n{body}"
+                    )
+                    .as_bytes(),
+                );
+                let _ = sock.flush();
+                // Dropping the socket ends the body — an abrupt close
+                // for a reply that did not send `[DONE]`.
+            }
+        });
+        (format!("http://127.0.0.1:{port}/v1"), handle)
+    }
+
+    fn delta(field: &str, text: &str) -> String {
+        format!(r#"{{"choices":[{{"delta":{{"{field}":"{text}"}}}}]}}"#)
+    }
+
+    /// SSE that **stops** rather than ending: no `[DONE]`, no
+    /// `finish_reason` — a connection dropped mid-stream. `sse` always
+    /// appends `[DONE]`, so it cannot express this.
+    fn sse_cut(events: &[&str]) -> String {
+        events
+            .iter()
+            .map(|e| format!("data: {e}\n\n"))
+            .collect()
+    }
+
+    /// **A stream that dies before saying anything is retried.** Only
+    /// text chunks reach `notebook_stream`, so a reasoning-only stream
+    /// that drops has written nothing to the log — the case a slow
+    /// local model actually hits.
+    #[test]
+    fn a_stream_that_died_before_any_text_is_retried() {
+        let dies_in_reasoning = sse_cut(&[&delta("reasoning_content", "thinking hard")]);
+        let good = sse(&[
+            &delta("content", "the answer"),
+            r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+        ]);
+        let (base, _h) = serve(vec![dies_in_reasoning, good]);
+
+        let client = DeepSeekClient::new("k".into(), "m".into(), base, true);
+        let mut text = String::new();
+        let turn = client
+            .complete(
+                &doc(vec![msg(ChatRole::User, "hi")]),
+                &Cancel::new(),
+                &mut |c| {
+                    if let LlmChunk::Text(t) = c {
+                        text.push_str(&t);
+                    }
+                },
+            )
+            .expect("the retry got a real reply");
+        assert_eq!(turn.source, "the answer");
+        assert_eq!(text, "the answer", "and the text arrived exactly once");
+    }
+
+    /// **But one that already spoke is not.** Its words are on the log;
+    /// a second attempt would write the reply twice.
+    #[test]
+    fn a_stream_that_died_after_speaking_is_not_retried() {
+        let dies_mid_reply = sse_cut(&[&delta("content", "half a sen")]);
+        let would_be_second = sse(&[
+            &delta("content", "a whole different answer"),
+            r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+        ]);
+        let (base, _h) = serve(vec![dies_mid_reply, would_be_second]);
+
+        let client = DeepSeekClient::new("k".into(), "m".into(), base, true);
+        let mut text = String::new();
+        let err = client
+            .complete(
+                &doc(vec![msg(ChatRole::User, "hi")]),
+                &Cancel::new(),
+                &mut |c| {
+                    if let LlmChunk::Text(t) = c {
+                        text.push_str(&t);
+                    }
+                },
+            )
+            .expect_err("a reply already on the log is not written twice");
+        assert!(err.contains("stream"), "{err}");
+        assert_eq!(text, "half a sen", "what was said stands, and nothing more");
     }
 
     fn sse(events: &[&str]) -> String {
