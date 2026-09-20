@@ -1,6 +1,6 @@
 # 29 — What snags a model
 
-A night spent reading kept eval runs — 96 at first, around 300 by the
+A night spent reading kept eval runs — 96 at first, 352 by the
 end — for places the harness trips the model it is trying to help. Not
 a design phase: an audit, and the fixes that fell out of it. The
 method is worth more than any one finding, so it is first.
