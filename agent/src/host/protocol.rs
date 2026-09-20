@@ -57,6 +57,17 @@ pub enum SessionCommand {
         #[serde(default = "yes")]
         expects_reply: bool,
     },
+    /// **The person typed something.** Whether that is an answer or a
+    /// new instruction is not theirs to declare — it depends on whether
+    /// the branch is holding a question open, and the branch is the
+    /// thing that knows.
+    ///
+    /// Resolved here, in the loop, rather than by the caller: a caller
+    /// can only ask which it is *between* runs, and a line typed while
+    /// a program is running has to reach the branch at its next safe
+    /// point (rule B), not after it finishes. `Submit` is what a driver
+    /// that is not holding the `Session` sends.
+    Submit { branch: BranchId, text: String },
     /// The human's reply to a branch's question. An agent asks the user
     /// with a `Send { to: user }`, which stays pending until this settles
     /// it — the mirror image of `UserTurn`, where the user asks and the

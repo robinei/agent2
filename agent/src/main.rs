@@ -431,20 +431,10 @@ fn queue_nav(session: &host::Session, nav: &SessionNav) {
 /// A kickoff line is a task instruction, not a question, and the
 /// agent's reply reaches the client either way (18_TARGETING).
 fn submit(session: &host::Session, text: String) {
-    let h = session.handle();
-    let branch = session.conversation_branch();
-    match session.asking_user_on(branch) {
-        Some(call) => h.send(host::SessionCommand::Reply {
-            branch,
-            call,
-            value: serde_json::Value::String(text),
-        }),
-        None => h.send(host::SessionCommand::UserTurn {
-            branch,
-            text,
-            expects_reply: false,
-        }),
-    }
+    session.handle().send(host::SessionCommand::Submit {
+        branch: session.conversation_branch(),
+        text,
+    });
 }
 
 /// The attached TUI (9_TUI Step 4) — the harness's primary frontend.
@@ -519,35 +509,46 @@ fn run_session_headless(
         session.handle().send(host::SessionCommand::Shutdown);
         session.run()
     } else if stdin_turns {
-        // **The session outlives the exchange.** A program parked on
-        // `ask()` holds its VM in this process; a driver that starts a
-        // process per turn arrives after that VM is gone, and the
-        // answer lands as a settlement nobody was waiting for. Reading
-        // turns from stdin keeps the one process, so the answer reaches
-        // the expression that asked.
-        let mut session = build_session(log_path, real, nav.resume, tx)?;
+        // **The session outlives the exchange, and stdin is its own
+        // thread.** A program parked on `ask()` holds its VM in this
+        // process; a driver that starts a process per turn arrives
+        // after that VM is gone, and the answer lands as a settlement
+        // nobody was waiting for.
+        //
+        // The reader is a thread rather than a step between runs so a
+        // line typed *during* a run reaches the branch at its next fuel
+        // slice (rule B) instead of after the run finishes — which is
+        // what a person at the TUI gets, and the only way to interrupt
+        // from out here.
+        let session = build_session(log_path, real, nav.resume, tx)?;
         // Someone is typing, by construction.
+        let mut session = session;
         session.set_attached(true);
         queue_nav(&session, &nav);
-        loop {
-            session = session.run();
+        let handle = session.handle();
+        let branch = session.conversation_branch();
+        std::thread::spawn(move || {
+            use std::io::BufRead;
+            let stdin = std::io::stdin();
+            for line in stdin.lock().lines().map_while(Result::ok) {
+                let text = line.trim();
+                if text.is_empty() {
+                    continue;
+                }
+                handle.send(host::SessionCommand::Submit {
+                    branch,
+                    text: text.to_owned(),
+                });
+            }
+            handle.send(host::SessionCommand::Shutdown);
+        });
+        session.serve(|| {
             // The exchange is over. A driver reads until this line,
             // looks at the log, and decides what to say next.
-            println!("--- quiet");
             use std::io::Write;
+            println!("--- quiet");
             let _ = std::io::stdout().flush();
-            let mut line = String::new();
-            match std::io::stdin().read_line(&mut line) {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {}
-            }
-            let text = line.trim();
-            if text.is_empty() {
-                continue;
-            }
-            submit(&session, text.to_owned());
-        }
-        session
+        })
     } else if real || driven || nav.resume.is_some() {
         let mut session = build_session(log_path, real, nav.resume, tx)?;
         if real && !driven {

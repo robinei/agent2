@@ -664,6 +664,32 @@ impl Session {
         self
     }
 
+    /// Run until `Shutdown`, calling `on_quiet` each time the session
+    /// settles and then **blocking for the next message**.
+    ///
+    /// [`run`](Self::run) stops at quiet, which is right for a caller
+    /// that drives the session between runs. A caller whose input
+    /// arrives on its own thread wants the opposite: stay in the loop,
+    /// so a line typed while a program is running reaches the branch at
+    /// its next safe point (rule B) rather than after the run finishes.
+    pub fn serve(mut self, mut on_quiet: impl FnMut()) -> Self {
+        loop {
+            while self.pump_one() {}
+            if self.done {
+                break;
+            }
+            on_quiet();
+            match self.rx.recv() {
+                Ok(msg) => self.on_msg(msg),
+                Err(_) => break,
+            }
+            if self.done {
+                break;
+            }
+        }
+        self
+    }
+
     /// **Quiet: no branch has work in flight.** Not "no branch has
     /// anything left to do" — a branch parked on a question to the human
     /// is quiet, because nothing will move it until someone speaks, and
@@ -801,21 +827,13 @@ impl Session {
                 branch,
                 text,
                 expects_reply,
-            }) => {
-                if !self.open_branch(branch) {
-                    return self.unaddressable(branch);
+            }) => self.on_msg_user_post(branch, text, expects_reply),
+            // The branch decides which this is — see `Submit`'s doc.
+            LoopMsg::Command(SessionCommand::Submit { branch, text }) => {
+                match self.asking_user_on(branch) {
+                    Some(call) => self.cmd_reply(branch, call, serde_json::Value::String(text)),
+                    None => self.on_msg_user_turn(branch, text),
                 }
-                self.deliver_post(
-                    branch,
-                    Author::User,
-                    Origin::Direct {
-                        text,
-                        input: serde_json::Value::Null,
-                        options: Vec::new(),
-                        expects_reply,
-                    },
-                )
-                .map(|_| ())
             }
             LoopMsg::Command(SessionCommand::Reply {
                 branch,
@@ -1241,6 +1259,33 @@ impl Session {
     /// leaf: a CLI deciding whether what the person just typed is an
     /// answer or a new turn, which is the same question the TUI asks
     /// through `BranchInfo::asking_user`.
+    /// A line the person typed, as a new instruction.
+    fn on_msg_user_turn(&mut self, branch: BranchId, text: String) -> io::Result<()> {
+        self.on_msg_user_post(branch, text, false)
+    }
+
+    fn on_msg_user_post(
+        &mut self,
+        branch: BranchId,
+        text: String,
+        expects_reply: bool,
+    ) -> io::Result<()> {
+        if !self.open_branch(branch) {
+            return self.unaddressable(branch);
+        }
+        self.deliver_post(
+            branch,
+            Author::User,
+            Origin::Direct {
+                text,
+                input: serde_json::Value::Null,
+                options: Vec::new(),
+                expects_reply,
+            },
+        )
+        .map(|_| ())
+    }
+
     pub fn asking_user_on(&self, branch: BranchId) -> Option<EventId> {
         let leaf = self.states.get(&branch)?.spine.leaf_id;
         self.asking_user(leaf)
@@ -4998,6 +5043,75 @@ mod tests {
                 json!(value)
             )))
         }
+    }
+
+    /// **The branch decides what a typed line is.** A person types; a
+    /// `Submit` carries it; whether it becomes an answer to an open
+    /// question or a fresh instruction depends on what the branch is
+    /// holding, which only the branch knows.
+    ///
+    /// Resolved in the loop rather than by the caller because a caller
+    /// can only ask *between* runs: a line typed while a program is
+    /// running has to reach the branch at its next safe point (rule B),
+    /// and by then the caller is blocked inside `run`.
+    #[test]
+    fn a_submit_answers_an_open_question_and_otherwise_starts_a_turn() {
+        let (session, _rx) = open(
+            tree_with_answered_root(),
+            vec![
+                scripted_program(
+                    r#"const n = await ask("user", "how many?"); history.append(n);"#,
+                ),
+                scripted_program(r#"history.append("a fresh turn");"#),
+            ],
+        );
+        let branch = session.conversation_branch();
+        let h = session.handle();
+        h.send(SessionCommand::Submit {
+            branch,
+            text: "start".into(),
+        });
+        let session = drain(session);
+
+        // The branch is holding a question, so this is its answer —
+        // and it reaches the expression that asked.
+        let asking = session.asking_user_on(branch).expect("it asked");
+        h.send(SessionCommand::Submit {
+            branch,
+            text: "seven".into(),
+        });
+        let session = drain(session);
+        assert!(
+            session.tree().events.values().any(|e| matches!(
+                &e.payload,
+                EventPayload::Result { call, outcome: Outcome::Delivered(v) }
+                    if *call == asking && v == "seven"
+            )),
+            "the answer settled the ask it was owed to"
+        );
+        let after = said(&session, branch);
+        assert!(
+            after.values().contains(&&json!("seven")),
+            "and reached the program that asked: {:?}",
+            after.values()
+        );
+
+        // Nothing open now, so the next one is an instruction — a post
+        // on the branch, not an answer to anything.
+        assert!(session.asking_user_on(branch).is_none());
+        let posts_before = after.kinds.iter().filter(|k| **k == "Post").count();
+        h.send(SessionCommand::Submit {
+            branch,
+            text: "now do this".into(),
+        });
+        h.send(SessionCommand::Shutdown);
+        let session = drain(session);
+        let posts_after = said(&session, branch)
+            .kinds
+            .iter()
+            .filter(|k| **k == "Post")
+            .count();
+        assert_eq!(posts_after, posts_before + 1, "a second post landed");
     }
 
     /// **`list_agents()` answers.** The card has advertised it since
