@@ -711,8 +711,17 @@ fn delivered_tail(v: &serde_json::Value, label: &str) -> String {
             // Silent when it is zero, like every other count in this
             // file: a line that says the same thing on every row is
             // one the reader learns to skip.
+            //
+            // **And a value that says `ok: false` is not led with the
+            // word "ok".** `parse_errors` answers `{ok, errors}`, so a
+            // failed syntax check rendered as `→ ok, {ok, errors}, N
+            // bytes` — the row's own first word contradicting the
+            // field beside it. Nothing in the kept corpus hit it (74
+            // calls, every one of them `ok: true`), which is why it
+            // survived; the rare case is the one the row exists for.
             let lead = match map.get("status").and_then(serde_json::Value::as_i64) {
                 Some(n) if n != 0 => format!("status {n}"),
+                _ if map.get("ok") == Some(&serde_json::Value::Bool(false)) => "not ok".to_owned(),
                 _ => "ok".to_owned(),
             };
             format!(
@@ -2555,6 +2564,15 @@ mod tests {
             delivered_tail(&json!({"version": "abc"}), "create_file(\"n.md\", …)")
                 .starts_with("ok, {version}")
         );
+
+        // A value whose own `ok` is false is not led with "ok".
+        assert!(
+            delivered_tail_t(&json!({"ok": false, "errors": [{"line": 7}]}))
+                .starts_with("not ok, {ok, errors}"),
+            "got: {}",
+            delivered_tail_t(&json!({"ok": false, "errors": []}))
+        );
+        assert!(delivered_tail_t(&json!({"ok": true, "errors": []})).starts_with("ok, {ok,"));
 
         assert_eq!(delivered_tail_t(&json!(null)), "ok");
         assert_eq!(delivered_tail_t(&json!(42)), "42");
