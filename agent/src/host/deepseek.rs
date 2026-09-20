@@ -26,14 +26,53 @@ use std::time::SystemTime;
 use crate::document::{ChatMessage, ChatRole, Document};
 use crate::host::llm::{Cancel, LlmChunk, LlmClient};
 use crate::machine::LlmTurn;
-const DEFAULT_MODEL: &str = "deepseek-v4-flash";
+/// **The default endpoint costs nothing.** It used to be the paid
+/// provider, so exporting `DEEPSEEK_API_KEY` and nothing else pointed
+/// a session — or a fourteen-run eval arm — at a billed API with no
+/// word anywhere that it had. The money is the smaller half: a default
+/// that spends is one nobody can safely try things against.
+///
+/// The paid provider is opt-in now, by setting `DEEPSEEK_BASE_URL` and
+/// `DEEPSEEK_MODEL`, and `evals/drive.py` prints which endpoint it is
+/// about to use before the first run either way.
+const DEFAULT_MODEL: &str = "Qwen3.8-27B";
 
 /// Reasoning effort, sent as `reasoning_effort`. `high` because that is
 /// what one would realistically run — the harness is measured in the
 /// configuration it is used in, not a cheaper one chosen to make the
 /// numbers move.
 const DEFAULT_EFFORT: &str = "high";
-const DEFAULT_BASE_URL: &str = "https://opencode.ai/zen/go/v1";
+const DEFAULT_BASE_URL: &str = "http://192.168.1.216:8080/v1";
+
+/// Whether a base URL is somewhere on this machine or this network —
+/// which is the same question as "does reaching it cost anything".
+///
+/// Used for one thing only: an endpoint that cannot bill has no reason
+/// to demand a credential, and requiring one would make the free
+/// default unusable without a placeholder nobody reads.
+///
+/// **Parsed as an address, not matched as a prefix.** The first
+/// version tested `starts_with("192.168.")`, which is true of
+/// `192.168.1.216.example.com` — a name anybody can register, pointing
+/// anywhere, and treated as free. `Ipv4Addr` decides it instead, which
+/// also gets `172.16.0.0/12` right, and a hostname is remote unless it
+/// is literally `localhost`.
+fn is_local(base_url: &str) -> bool {
+    let after_scheme = base_url.split_once("://").map_or(base_url, |(_, r)| r);
+    let host = after_scheme.split('/').next().unwrap_or("");
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.split(']').next())
+        .unwrap_or_else(|| host.rsplit_once(':').map_or(host, |(h, _)| h));
+    if host == "localhost" {
+        return true;
+    }
+    match host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(ip)) => ip.is_loopback() || ip.is_private(),
+        Ok(std::net::IpAddr::V6(ip)) => ip.is_loopback(),
+        Err(_) => false,
+    }
+}
 
 pub struct DeepSeekClient {
     api_key: String,
@@ -73,11 +112,24 @@ impl DeepSeekClient {
     /// what `DEEPSEEK_NO_THINKING` sends — so both sides are set the
     /// same way and can be checked against each other.
     pub fn from_env() -> Result<Self, String> {
-        let api_key = std::env::var("DEEPSEEK_API_KEY")
-            .map_err(|_| "DEEPSEEK_API_KEY is not set".to_owned())?;
         let model = std::env::var("DEEPSEEK_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.into());
         let base_url =
             std::env::var("DEEPSEEK_BASE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.into());
+        // A key is still required of anything that could charge for
+        // the answer, and the error still names the variable. A local
+        // server ignores whatever is sent, so asking for one there
+        // would only teach people to export a placeholder — and the
+        // habit of exporting a placeholder is exactly what made the
+        // old paid default silent.
+        let api_key = match std::env::var("DEEPSEEK_API_KEY") {
+            Ok(key) => key,
+            Err(_) if is_local(&base_url) => "local".to_owned(),
+            Err(_) => {
+                return Err(format!(
+                    "DEEPSEEK_API_KEY is not set, and {base_url} is not on this machine"
+                ));
+            }
+        };
         let thinking = std::env::var("DEEPSEEK_NO_THINKING").is_err();
         let max_tokens = std::env::var("DEEPSEEK_MAX_TOKENS")
             .ok()
@@ -884,6 +936,56 @@ mod tests {
         let stream = "data: {\"error\":{\"message\":\"rate limited\"}}\n\n";
         let err = parse_sse(stream.as_bytes(), &Cancel::new(), &mut |_| {}).unwrap_err();
         assert!(err.contains("rate limited"), "{err}");
+    }
+
+    /// **A key is required of anything that could charge for the
+    /// answer, and of nothing else.**
+    ///
+    /// The default endpoint costs nothing now, so demanding a
+    /// credential for it would only teach people to export a
+    /// placeholder — and the habit of exporting a placeholder is what
+    /// made the old paid default silent: `DEEPSEEK_API_KEY=x` and a
+    /// fourteen-run arm went to a billed API with no word anywhere.
+    #[test]
+    fn only_an_endpoint_that_can_bill_demands_a_key() {
+        for local in [
+            "http://192.168.1.216:8080/v1",
+            "http://127.0.0.1:8080/v1",
+            "http://localhost:11434/v1",
+            "http://10.0.0.4/v1",
+            "http://172.16.3.1:8080/v1",
+            "http://[::1]:8080/v1",
+            DEFAULT_BASE_URL,
+        ] {
+            assert!(is_local(local), "{local}");
+        }
+        for remote in [
+            "https://opencode.ai/zen/go/v1",
+            "https://api.deepseek.com/v1",
+            // A name anybody can register, pointing anywhere. The
+            // first version of `is_local` matched it on a prefix.
+            "https://192.168.1.216.example.com/v1",
+            "https://10.example.com/v1",
+            "https://localhost.example.com/v1",
+            "https://172.32.0.1/v1",
+        ] {
+            assert!(!is_local(remote), "{remote}");
+        }
+    }
+
+    /// And the refusal says which endpoint it was unwilling to reach
+    /// without one, because "DEEPSEEK_API_KEY is not set" alone does
+    /// not tell you whether you meant to be spending money.
+    #[test]
+    fn the_refusal_names_the_endpoint_it_would_have_billed() {
+        // Nothing here reads the environment: `from_env` is exercised
+        // through the same decision it makes, spelled out, so the test
+        // does not race another test's `set_var`.
+        let base = "https://opencode.ai/zen/go/v1";
+        assert!(!is_local(base));
+        let err = format!("DEEPSEEK_API_KEY is not set, and {base} is not on this machine");
+        assert!(err.contains("DEEPSEEK_API_KEY"), "{err}");
+        assert!(err.contains("opencode.ai"), "{err}");
     }
 
     /// **`evals/drive.py` keeps a copy of these, and prints a warning

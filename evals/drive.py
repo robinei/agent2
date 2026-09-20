@@ -53,6 +53,7 @@ import statistics
 import subprocess
 import sys
 import tempfile
+import urllib.parse
 import threading
 import hashlib
 import time
@@ -700,8 +701,27 @@ def fingerprint(card: Path | None) -> dict:
 # says nothing. Duplicated rather than imported because this is Python
 # and that is Rust; `the_client_defaults_are_what_this_says` in
 # `deepseek.rs` fails if they drift.
-CLIENT_DEFAULT_BASE_URL = "https://opencode.ai/zen/go/v1"
-CLIENT_DEFAULT_MODEL = "deepseek-v4-flash"
+CLIENT_DEFAULT_BASE_URL = "http://192.168.1.216:8080/v1"
+CLIENT_DEFAULT_MODEL = "Qwen3.8-27B"
+
+
+def endpoint_is_local(base_url: str) -> bool:
+    """Whether reaching `base_url` costs anything — `is_local` in
+    `deepseek.rs`, spelled again here because Python cannot call it.
+
+    Parsed as an address rather than matched as a prefix:
+    `192.168.1.216.example.com` is a name anybody can register, points
+    anywhere, and starts with `192.168.`.
+    """
+    import ipaddress
+
+    host = urllib.parse.urlsplit(base_url).hostname or ""
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback or ipaddress.ip_address(host).is_private
+    except ValueError:
+        return False
 
 
 def print_summary(summary: dict):
@@ -996,8 +1016,14 @@ def main():
 
     # Each agent authenticates its own way: ours from the environment,
     # pi from its own config under PI_HOME.
-    if args.agent == "code" and "DEEPSEEK_API_KEY" not in os.environ:
-        print("DEEPSEEK_API_KEY is not set", file=sys.stderr)
+    where = os.environ.get("DEEPSEEK_BASE_URL", CLIENT_DEFAULT_BASE_URL)
+    if (
+        args.agent == "code"
+        and "DEEPSEEK_API_KEY" not in os.environ
+        and not endpoint_is_local(where)
+    ):
+        print(f"DEEPSEEK_API_KEY is not set, and {where} is not on this machine",
+              file=sys.stderr)
         return 2
 
     # **Say which endpoint is about to be billed.** `DEEPSEEK_BASE_URL`
@@ -1008,11 +1034,10 @@ def main():
     # say where the numbers came from either. One line, before anything
     # runs, because an arm is 14 runs and the moment to notice is now.
     if args.agent == "code":
-        where = os.environ.get("DEEPSEEK_BASE_URL", CLIENT_DEFAULT_BASE_URL)
         model = os.environ.get("DEEPSEEK_MODEL", CLIENT_DEFAULT_MODEL)
-        local = "127.0.0.1" in where or "localhost" in where or "192.168." in where
         print(
-            f"{model} at {where}" + ("" if local else "   [remote — this bills]"),
+            f"{model} at {where}"
+            + ("" if endpoint_is_local(where) else "   [remote — this bills]"),
             file=sys.stderr,
         )
 
