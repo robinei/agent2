@@ -248,6 +248,8 @@ pub struct Said {
     pub compacted: Vec<EventId>,
     /// Settlements logged in this reply's scope, `(call, outcome)`.
     pub settled: Vec<(EventId, Outcome)>,
+    /// Questions this reply discharged with `answer(id, …)`.
+    pub answered: Vec<(EventId, serde_json::Value)>,
     /// How the program ended.
     pub ended: Ending,
     /// How the *reply* ended, which is a fact about the text and not
@@ -649,6 +651,12 @@ impl Conversation {
             .unwrap_or_else(|e| panic!("fetch #{} : {e}", id.as_u64()))
     }
 
+    /// The posts on this branch still owed an answer — what a program
+    /// names to `answer(id, …)`.
+    pub fn open(&self) -> &[EventId] {
+        self.runner.open()
+    }
+
     /// What the branch is: `idle`, `thinking`, `running`, `suspended`.
     /// The same word the session's own branch list reports.
     pub fn status(&self) -> &'static str {
@@ -811,6 +819,7 @@ impl Conversation {
             notices: Vec::new(),
             compacted: Vec::new(),
             settled: Vec::new(),
+            answered: Vec::new(),
             ended: Ending::Running,
             reply_ended: None,
             // **Rested, not merely quiet.** A reply that parked — on a
@@ -876,6 +885,9 @@ impl Conversation {
                 EventPayload::Compacted { of, .. } => s.compacted.push(*of),
                 EventPayload::Console { lines } => s.printed.extend(lines.iter().cloned()),
                 EventPayload::Result { call, outcome } => s.settled.push((*call, outcome.clone())),
+                EventPayload::Answer { question, value } => {
+                    s.answered.push((*question, value.clone()))
+                }
                 EventPayload::ReplyEnd { how, .. } => s.reply_ended = Some(how.clone()),
                 EventPayload::Handback { how, site, .. } => {
                     s.ended = ending_of(how, *site);

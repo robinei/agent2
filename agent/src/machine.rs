@@ -4860,7 +4860,7 @@ fn asker_of(tree: &Tree, question: EventId) -> Option<Author> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testkit::{Conversation, Ending};
+    use crate::testkit::{Conversation, Ending, Invariant};
     use serde_json::json;
 
     const FUEL: u64 = 100_000;
@@ -5731,25 +5731,16 @@ mod tests {
 
     #[test]
     fn append_history_logs_a_note_and_is_never_re_sent_to_context() {
-        let (mut tree, mut state) = setup();
-        state.kickoff(&mut tree).unwrap();
-        let out = state
-            .step(
-                &mut tree,
-                StepInput::LlmResponse(llm_program(
-                    "await append_history(\"figured out the bug is in parsing\"); history.append(1);",
-                )),
-            )
-            .unwrap();
-        drain(&mut state, &mut tree, out);
-        let note = state
-            .agent_segment(&tree)
-            .iter()
-            .find_map(|e| match &e.payload {
-                EventPayload::Note { value, .. } => Some(note_text(value)),
-                _ => None,
-            });
-        assert_eq!(note.as_deref(), Some("figured out the bug is in parsing"));
+        let mut c = Conversation::new();
+        let r = c.reply(
+            "```js\nawait append_history(\"figured out the bug is in parsing\");\n\
+             history.append(1);\n```\n",
+        );
+        assert_eq!(
+            r.values(),
+            [&json!("figured out the bug is in parsing"), &json!(1)],
+            "both spellings write a row"
+        );
     }
 
     #[test]
@@ -6328,30 +6319,19 @@ mod tests {
             "await answer(undefined, undefined);",
         ];
         for src in hostile {
-            let (mut tree, mut state) = setup();
-            state.kickoff(&mut tree).unwrap();
+            let mut c = Conversation::new();
+            // An `ask` left open is an ordinary outcome here, not a
+            // stalled harness — the point is only that the process is
+            // still alive to report whatever happened.
+            c.allow(Invariant::CallsSettle);
             // Wrapped, because a rejected promise is an ordinary
-            // outcome here — the point is that the process is still
-            // alive to report it.
-            let wrapped = format!("try {{ {src} }} catch (e) {{ /* fine */ }}");
-            let out = state
-                .step(&mut tree, StepInput::LlmResponse(llm_program(&wrapped)))
-                .unwrap_or_else(|e| panic!("`{src}` failed the step: {e}"));
-            drain(&mut state, &mut tree, out);
+            // outcome here too.
+            let r = c.reply(&format!("```js\ntry {{ {src} }} catch (e) {{ /* fine */ }}\n```\n"));
             // **And it has to have run.** A case that does not compile
             // exercises the parser and nothing else, which is how a
             // sweep like this quietly stops testing what it names.
             assert!(
-                !tree
-                    .path_events(state.spine.leaf_id)
-                    .iter()
-                    .any(|e| matches!(
-                        e.payload,
-                        EventPayload::Handback {
-                            how: Handback::CellFailed { .. },
-                            ..
-                        }
-                    )),
+                !matches!(r.ended, Ending::CellFailed(_)),
                 "`{src}` never compiled, so it tested nothing"
             );
         }
@@ -6409,27 +6389,15 @@ mod tests {
 
     #[test]
     fn answer_dispatches_from_inside_a_program() {
-        let (mut tree, mut state) = setup();
-        let out = user_post(&mut state, &mut tree, "which one?");
-        let question = state.open()[0];
-        drain(&mut state, &mut tree, out);
+        let mut c = Conversation::new();
+        c.user("which one?");
+        let question = c.open()[0];
 
-        let src = format!(
-            "await answer({}, \"q\", \"the second\"); history.append(1);",
+        let r = c.reply(&format!(
+            "```js\nawait answer({}, \"q\", \"the second\");\nhistory.append(1);\n```\n",
             question.as_u64()
-        );
-        let out = state
-            .step(&mut tree, StepInput::LlmResponse(llm_program(&src)))
-            .unwrap();
-        let settled = drain(&mut state, &mut tree, out);
-        let answered = settled.iter().find_map(|o| match o {
-            StepOutput::Answered { question: q, value } => Some((*q, value.clone())),
-            _ => None,
-        });
-        assert_eq!(answered, Some((question, json!("the second"))));
-        assert!(state.agent_segment(&tree).iter().any(
-            |e| matches!(&e.payload, EventPayload::Answer { question: q, .. } if *q == question)
         ));
+        assert_eq!(r.answered, [(question, json!("the second"))]);
     }
 
     #[test]
@@ -7134,50 +7102,23 @@ mod tests {
     /// path the host already has rather than a second mechanism.
     #[test]
     fn a_prose_send_settles_exactly_once() {
-        let (mut tree, mut state) = setup_under();
-        user_post(&mut state, &mut tree, "go");
-        let reply = "Just a sentence.\n\n```js\nfinish(\"ok\");\n```\n";
-        let out = state
-            .step(&mut tree, StepInput::LlmResponse(llm_program(reply)))
-            .unwrap();
-        let outs = drain(&mut state, &mut tree, out);
+        let mut c = Conversation::new();
+        c.user("go");
+        let r = c.reply("Just a sentence.\n\n```js\nfinish(\"ok\");\n```\n");
 
-        // The host is handed the send to deliver, exactly once. Two
-        // sends leave this reply — the prose and the `finish("ok")` that
-        // ends it — and only the first is what this test is about.
-        let delivered: Vec<EventId> = outs
+        // Two sends leave this reply — the prose and the `finish("ok")`
+        // that ends it. The prose one settles the way the host settles
+        // it, through the same unwaited-`tell` path, with no program
+        // awaiting it and no complaint. That every call in a reply
+        // settles exactly once is `Invariant::CallsSettle`, checked on
+        // every reply; this one names the prose send in particular.
+        assert_eq!(r.prose, ["Just a sentence."], "one prose segment");
+        let settlements = r
+            .settled
             .iter()
-            .filter_map(|o| match o {
-                StepOutput::Sends(ids) => Some(ids.clone()),
-                _ => None,
-            })
-            .flatten()
-            .filter(|id| {
-                matches!(&tree.events[id].payload,
-                    EventPayload::Call(Call::Send { prose: true, .. }))
-            })
-            .collect();
-        assert_eq!(delivered.len(), 1, "one prose segment, one delivery");
-
-        // Settle it the way the host does, and it takes exactly one
-        // `Result` — with no program awaiting it and no complaint.
-        let out = state
-            .step(
-                &mut tree,
-                StepInput::ToolResults(vec![ToolResult {
-                    call: delivered[0],
-                    result: Ok(serde_json::Value::Null),
-                }]),
-            )
-            .unwrap();
-        drain(&mut state, &mut tree, out);
-        let prose = delivered[0];
-        let results = state
-            .agent_segment(&tree)
-            .iter()
-            .filter(|e| matches!(e.payload, EventPayload::Result { call, .. } if call == prose))
+            .filter(|(call, _)| c.site_of(*call) == (0, 0))
             .count();
-        assert_eq!(results, 1, "exactly one Result for the prose send");
+        assert_eq!(settlements, 2, "one delivery each, for the prose and the finish");
     }
 
     /// A multi-paragraph report — the case this whole phase exists for —
@@ -7204,27 +7145,24 @@ mod tests {
     /// three. The branch prompts exactly once, when the *reply* ends.
     #[test]
     fn a_three_cell_reply_prompts_once() {
-        let (mut tree, mut state) = setup_under();
-        user_post(&mut state, &mut tree, "go");
-        let reply = "```js\nconsole.log(\"a\");\n```\n\n\
-                     ```js\nconsole.log(\"b\");\n```\n\n\
-                     ```js\nconsole.log(\"c\");\n```\n";
-        let out = state
-            .step(&mut tree, StepInput::LlmResponse(llm_program(reply)))
-            .unwrap();
-        let outs = drain(&mut state, &mut tree, out);
-
-        let requests = outs
-            .iter()
-            .filter(|o| matches!(o, StepOutput::LlmRequest(_)))
-            .count();
-        assert_eq!(requests, 1, "one next completion, not one per cell");
-        let outcomes = state
-            .agent_segment(&tree)
-            .iter()
-            .filter(|e| matches!(e.payload, EventPayload::Handback { .. }))
-            .count();
-        assert_eq!(outcomes, 1, "one report, not one per cell");
+        let mut c = Conversation::new();
+        c.user("go");
+        let r = c.reply(
+            "```js\nconsole.log(\"a\");\n```\n\n\
+             ```js\nconsole.log(\"b\");\n```\n\n\
+             ```js\nconsole.log(\"c\");\n```\n",
+        );
+        assert_eq!(r.printed, ["a", "b", "c"], "three cells, one scope");
+        // One report and one next completion, not one per cell — the
+        // handback is the reply's, not the cell's. `Invariant::OneReply`
+        // already holds the other half of this.
+        assert_eq!(
+            r.kinds.iter().filter(|k| **k == "Handback").count(),
+            1,
+            "one report, not one per cell: {:?}",
+            r.kinds
+        );
+        assert!(!r.rests, "and exactly one next completion");
     }
 
     /// **A raise in cell 0, resumed, runs cells 1 and 2.** The VM is
@@ -7643,34 +7581,15 @@ mod tests {
     /// already decided it was finished.
     #[test]
     fn finish_in_cell_0_stops_the_later_cells() {
-        let (mut tree, mut state) = setup_under();
-        user_post(&mut state, &mut tree, "go");
-        let reply = "```js\nfinish(\"ok\");\n```\n\n\
-                     ```js\nconsole.log(\"must not run\");\n```\n";
-        let out = state
-            .step(&mut tree, StepInput::LlmResponse(llm_program(reply)))
-            .unwrap();
-        drain(&mut state, &mut tree, out);
-        let printed: Vec<String> = tree
-            .path_events(state.spine.leaf_id)
-            .iter()
-            .filter_map(|e| match &e.payload {
-                EventPayload::Console { lines } => Some(lines.join("\n")),
-                _ => None,
-            })
-            .collect();
-        assert!(
-            !printed.iter().any(|l| l.contains("must not run")),
-            "the block after finish() must not run: {printed:?}"
+        let mut c = Conversation::new();
+        c.user("go");
+        let r = c.reply(
+            "```js\nfinish(\"ok\");\n```\n\n\
+             ```js\nconsole.log(\"must not run\");\n```\n",
         );
-        // And the answer reached the person.
-        assert!(
-            tree.path_events(state.spine.leaf_id).iter().any(|e| matches!(
-                &e.payload,
-                EventPayload::Call(Call::Send { text, .. }) if text == "ok"
-            )),
-            "finish's text goes out as the last word"
-        );
+        assert!(r.printed.is_empty(), "the block after finish() must not run: {:?}", r.printed);
+        assert_eq!(r.tells, ["ok"], "and the answer reached the person");
+        assert!(r.rests, "finish's text goes out as the last word");
     }
 
     /// The existing transport is untouched: a plain program under
