@@ -255,6 +255,107 @@ Each case has to compile and run too, or a sweep like this quietly
 stops testing what it names; that assertion immediately caught two
 cases that were exercising the parser and nothing else.
 
+## Rows that said the same thing whichever way it went
+
+The narrow-channel shape has a mirror image, and it took a second pass
+to see it. A channel can be wide enough and still tell the reader
+nothing, because it says the same words whatever happened. Two of
+these were in the menu — the part of the document a model reads on
+every single turn.
+
+**A failed command looked exactly like a successful one.** Every
+`bash` row read `→ ok, {status, stdout, stderr}, N bytes`: the field
+names, which the card declares anyway, in place of the one number that
+varies. The card opens `bash`'s description with "Read `status` before
+`stdout`. A command that ran and failed writes nothing, and nothing
+reads as 'found no problems'" — and then the menu hid the status. 105
+of 1,178 bash calls in the corpus exited non-zero and not one row
+mentioned it; the only way to find out was to spend a `fetch` on a row
+indistinguishable from the 1,073 that had nothing to report. Now:
+
+    - `[54]` `bash("python3 test.py 2>&1")` → status 1, {status, …}, 414 bytes
+
+Silent at zero, like every other count in that file.
+
+**A write that changed nothing was reported by omitting a field.** The
+weakest signal there is. A `sweep-40` run computed a cleaned
+`helpers.py`, wrote back bytes identical to what was on disk, read no
+`diff`, and told the person it had deleted the dead helpers — all 24
+were still there. Its row said `→ ok, {version}, 17 bytes`, exactly
+like a write that had done something. Five writes in 323 changed
+nothing and two of those runs failed. The row now says `no change`.
+
+**The commonest trap pointed a caret at the model's own prose.**
+
+    1:1: cannot read .length of undefined
+    Dead-code hunting in `helpers.py` — first, what's in the repo and
+    ^
+
+    ### where it stopped
+    in <unknown> → <unknown>
+
+Nothing in that report is true except the words "of undefined". The
+higher-order methods lower to real JS helpers compiled ahead of the
+user's program, so `xs.map(f)` on an undefined `xs` fails at
+`a.length` inside `__map`; that instruction's span is in the prelude
+region, rebasing subtracts the prelude's length and saturates to zero,
+and zero renders as line 1, column 1. The span cannot be recovered —
+there is genuinely no user source there — but the name can, and it is
+the half the reader needs: the trap now reads "`map` was called on
+undefined". And a site of zero renders no location at all, which is
+already the convention elsewhere in that file. 11 of 121 diagnostics
+in the corpus, 9%, pointed at prose this way.
+
+**A reply's own marker, doubled.**
+
+    ↓ history[77]
+    Let me get the full source with line numbers.
+
+    ↓ history[78]
+    ↓ history[78]
+    ```js
+
+The model reads `↓ history[N]` above every block of its own and writes
+them back. The replacement pass only looked *forward* from a block's
+start, which catches a marker at the head of a paragraph and misses
+one at the tail of the paragraph before — the same line, one byte
+either side of a boundary the writer cannot see. 17 across 291 runs,
+0 after. It matters more than 6% of runs suggests, for the reason the
+sibling fix on `/* ← history[N] */` already records: the doubled form
+is what gets imitated next turn.
+
+## Two things the model is spending turns on
+
+Neither is a defect, and one may not be fixable, but both are large
+enough to name.
+
+**A quarter of every reply that runs anything does nothing but load.**
+26% of the 1,072 replies with a cell make no write, no `tell`, no
+`append` and no `done` — they read, print, and stop. It is flat across
+every arm measured tonight, baseline and HEAD alike, 20% to 34%.
+Much of that is the documented rhythm: end when what to do next
+genuinely depends on what came back.
+
+The sharp subset is not. 86 of 818 replies with calls (10.5%) spend
+the *whole* reply re-reading files the run had already read, with no
+write in between — a turn that cannot be waiting on new information,
+because there is none. 341 of the 352 files read twice were re-read
+that way. The card said results do not cross replies and that `fetch`
+reads them back, but never that a fetch hands the value straight to
+the block that asked, so "get it into view" reads like a step you take
+before you can work with something. `fetch`'s entry now says it is
+not. Untested against a live arm; the number to watch is that 10.5%.
+
+**A check that ran and was never read.** 125 of 216 closing blocks
+(57%) call a tool and assert nothing on the result. The pass rates
+are 81% with the shape and 88% without, n=25 on the smaller arm —
+noise, and I will not claim otherwise. But the transport fact behind
+it is not statistical: the report carrying that block's console is the
+one that is never sent, so a verification written as a `console.log`
+in the block that calls `done()` has told nobody anything. A run read
+in full did exactly that, printed a grep showing all forty helpers
+still present, and told the person "Removed 0 dead helpers: , , , …".
+
 ## What was actually wrong
 
 ### `outline` returned something other than what it declared
