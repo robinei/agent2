@@ -106,6 +106,28 @@ An outcome can move for any reason; a guideline naming `getattr` and
 then tripling how often programs mention `getattr` is the guideline
 doing the thing it was written to do.
 
+**The same is true of the assertion paragraph**, and this one is
+measured on matched task mix rather than on one pair of tasks. Does a
+run's program ever `throw` or `console.assert` on something it worked
+out?
+
+| task | baseline | HEAD |
+|---|---|---|
+| ambiguous-config | 0/5 | 1/4 |
+| dead-code-sweep | 0/6 | 2/4 |
+| skipped-tests | 1/4 | 3/4 |
+| sweep-200 | 3/4 | 2/2 |
+| sweep-40 | 2/6 | 2/2 |
+| sweep-8 | 2/6 | 2/2 |
+| **total** | **8/31** | **12/19** |
+
+p = 0.016, and not one task moves the other way. It shows up in the
+run summaries too, as traps that are the model's own assertions
+firing: "dynamic access mechanisms present — reviewing before
+deleting", "double blank at output line 603", "name refs changed:
+app.py:helper_004". Each of those is a reply that stopped instead of
+writing a wrong file.
+
 Per task: `sweep-200` 11 → 5 programs and 395 → 146 KB, `sweep-8` 4 → 2
 and 107 → 53 KB, `skipped-tests` 5.5 → 3 and 146 → 82 KB,
 `dead-code-sweep` 7 → 6, `ambiguous-config` 2.5 → 2, `sweep-40` and
