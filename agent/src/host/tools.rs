@@ -330,7 +330,12 @@ fn replace_file_def() -> ToolDef {
             "`diff` comes back with the new version — the lines that actually changed. Read it: it is the cheap check that the edit landed where you meant, and it costs nothing where re-reading the file costs a call and its bytes. It is absent only when the write changed nothing.".into(),
             "What the diff cannot tell you is whether the result *works*. Run the thing that would fail, in this same program.".into(),
         ],
-        example: Some("const { diff } = await tools.replace_file(p, Edit.replaceOnce(f.content, old, new), f.version);".into()),
+        // **`new` is a reserved word.** The example read
+        // `Edit.replaceOnce(f.content, old, new)` and a model copying
+        // it gets "Unexpected token" — while the card's own `Edit`
+        // declaration, two screens up, correctly writes the parameter
+        // as `new_`. An example nobody can copy is worse than none.
+        example: Some("const { diff } = await tools.replace_file(p, Edit.replaceOnce(f.content, old, replacement), f.version);".into()),
         returns: Some("{ version: string; diff?: string }".into()),
         handler: Box::new(|args| {
             let path = args
