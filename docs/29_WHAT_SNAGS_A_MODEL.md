@@ -5,6 +5,27 @@ the model it is trying to help. Not a design phase: an audit, and the
 fixes that fell out of it. The method is worth more than any one
 finding, so it is first.
 
+## What wants a decision
+
+Everything below is done and measured. Three things are not, and each
+is a judgement rather than a repair:
+
+1. **The large sweeps.** `sweep-40` and `sweep-200` are the only tasks
+   that got worse (6/6 → 6/9, 4/4 → 7/9, p = 0.25 overall). The
+   mechanism looks like bigger programs — HEAD's cells average 726
+   bytes against 472 — which is the same batching that bought a third
+   of the cost. Trade, not defect. Re-run those two at n≥10 a side
+   before doing anything about it.
+2. **Whether the document should shrink a duplicated `history.append`.**
+   72% of appended bytes copy a result. The report now names it, which
+   costs nothing and acts a turn late; rendering it as a pointer would
+   save the bytes now and needs the card's "what you get is what its
+   row shows" promise re-read first. I did not decide this at one in
+   the morning.
+3. **The local model.** `Qwen3.8-27B` works and is far too slow for the
+   suite — 450 seconds a program, a `skipped-tests` run capped out
+   after two. Useful for watching behaviour, not for measuring it.
+
 ## What it came to
 
 The whole suite, `deepseek-v4-flash`, `--repeat 3` both sides — the
