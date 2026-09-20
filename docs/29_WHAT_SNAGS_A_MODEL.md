@@ -312,6 +312,34 @@ Each case has to compile and run too, or a sweep like this quietly
 stops testing what it names; that assertion immediately caught two
 cases that were exercising the parser and nothing else.
 
+## The declarations are clean, checked against the runs
+
+The class this audit found most expensive was a tool whose `returns`
+described something other than what it handed back — four of them.
+Worth re-checking against data rather than against the source, so:
+every `Delivered` result in the 295 kept runs, bucketed by its actual
+key set.
+
+| tool | shapes returned | n |
+|---|---|---|
+| `bash` | `{status, stdout, stderr}` | 1,423 |
+| `read_file` | `{content, version}` | 1,453 |
+| `replace_file` | `{version, diff}` / `{version}` | 327 / 5 |
+| `outline` | `{items}` | 95 |
+| `parse_errors` | `{ok, errors}` | 70 |
+| `create_file` | `{version}` | 15 |
+
+Nothing else, and nothing that disagrees with the manifest. The 31
+`outline` results shaped as a bare array are from before it was
+fixed. `read_file` never returned `truncated` in 1,453 calls, which is
+what the declaration now says; `bash` still declares it and still
+means it, though nothing in this corpus reached the cap.
+
+Every non-object result is a proper `Failed` with a usable message —
+a version mismatch that names the current version and the last-write
+route, a missing path, a `create_file` on an existing file that names
+`replace_file` instead. No silent nulls.
+
 ## Rows that said the same thing whichever way it went
 
 The narrow-channel shape has a mirror image, and it took a second pass
