@@ -346,6 +346,45 @@ fn the_dialect_table_says_what_the_interpreter_does() {
     }
 }
 
+/// **The card does not contradict its own declarations about `await`.**
+///
+/// The sentence teaching `await` said "of everything above, only
+/// `ask` is [async]" while the block above it declared `choose`
+/// returning `Promise<string>`. No run paid for it — 27 `choose`
+/// calls in the corpus, every one awaited, because the worked example
+/// awaits it and the example wins. That is the third time in this
+/// audit that an example covered for a rule that was wrong, which is
+/// a reason to check the rule rather than to trust the example again.
+#[test]
+fn every_promise_above_the_tools_is_named_as_one() {
+    let card = active().text.clone();
+    let decls = card
+        .split_once("## What you can call")
+        .expect("the declaration block")
+        .1
+        .split_once("## Three places")
+        .expect("and its end")
+        .0;
+    let promised: Vec<&str> = decls
+        .lines()
+        .filter(|l| l.contains("Promise<"))
+        .filter_map(|l| l.split_once("declare function ").map(|(_, r)| r))
+        .filter_map(|r| r.split_once('(').map(|(n, _)| n))
+        .collect();
+    assert_eq!(
+        promised,
+        vec!["ask", "choose"],
+        "the async verbs above `tools.*`"
+    );
+    for name in &promised {
+        assert!(
+            card.contains(&format!("only `ask` and `choose` are"))
+                || card.contains(&format!("`{name}`")),
+            "`{name}` returns a Promise and the `await` paragraph does not say so"
+        );
+    }
+}
+
 /// **A closed value set renders as a union, not as `string`.**
 ///
 /// Everything rendered as `string`, so a small fixed vocabulary
@@ -1026,7 +1065,7 @@ mod tests {
         // `card()` shows up as a diff review must look at, not a byte
         // count that silently drifts. Comparing full text (not just a
         // hash) so the diff itself is legible in a failure message.
-        const EXPECTED_LEN: usize = 19200;
+        const EXPECTED_LEN: usize = 19248;
         assert_eq!(
             card().len(),
             EXPECTED_LEN,

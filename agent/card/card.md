@@ -154,7 +154,7 @@ declare namespace Edit {
 }
 ```
 
-**`await` works at the top level of a block**, and is the only way to settle a promise. `tools.*` below are this session's capabilities and are all async; of everything above, only `ask` is.
+**`await` works at the top level of a block**, and is the only way to settle a promise. `tools.*` below are this session's capabilities and are all async; of everything above, only `ask` and `choose` are — the two that wait on somebody.
 
 ## Three places this dialect answers differently
 
