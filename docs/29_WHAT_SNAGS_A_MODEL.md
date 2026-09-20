@@ -53,10 +53,18 @@ is a judgement rather than a repair:
    | `ask` | 258 |
    | **total** | **2,164 — 11.3% of the card** |
 
-   Paid for on every turn of every run, and never used once. `ask` is
-   the surprise: `ambiguous-config` passes by asking, and every one of
-   those runs reaches for `choose` instead — 29 uses in 28 runs
-   against zero for `ask`.
+   (`ask`'s 258 are in that total and arguably should not be; see
+   below.)
+
+   Paid for on every turn of every run, and never used once.
+
+   `ask` is not really one of them, on a second look. The card says
+   `choose` when a person must decide between things you can name and
+   `ask` when the question is open — and the only task that asks
+   anything, `ambiguous-config`, has two nameable values. 29 `choose`
+   against zero `ask` is that rule being followed exactly, which makes
+   it evidence the card works rather than a gap. What is missing is a
+   task with an open question, not a reason to doubt the verb.
 
    `raise`/`resume`/`abandon` is the one to think hardest about,
    because it is not a convenience: `docs/20_CODE_MODE.md` calls
