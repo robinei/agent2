@@ -3593,7 +3593,24 @@ impl Runner {
                     measured,
                     limit,
                     unit,
-                } => Some(crate::report::compaction_message(*measured, *limit, *unit)),
+                } => {
+                    // The preamble's share, so the directive names the
+                    // job rather than the window — see
+                    // `compaction_message`. Rendering again costs a
+                    // pass, and this runs once per compaction.
+                    let fixed = matches!(unit, crate::types::Measure::Bytes).then(|| {
+                        let doc = crate::document::render(
+                            tree,
+                            &self.spine,
+                            self.document_budget(),
+                        );
+                        crate::compaction::rendered_size(&doc)
+                            - doc.conversation().iter().map(|m| m.content.len()).sum::<usize>()
+                    });
+                    Some(crate::report::compaction_message(
+                        *measured, *limit, *unit, fixed,
+                    ))
+                }
                 _ => None,
             })
     }

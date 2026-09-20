@@ -1363,10 +1363,26 @@ fn render_handback(h: &Handback<'_>, budget: usize) -> String {
 /// written this week. So the register here is a stop, not a request:
 /// the run is *blocked*, and the only thing that unblocks it is a
 /// compaction program.
+/// `fixed` is how much of `measured` is the preamble — the card and
+/// the worked examples — which no compaction program can touch.
+///
+/// **Without it the number is the wrong job.** Live on 2026-09-20 the
+/// directive read "35552 Bytes against a 42000-Byte budget", of which
+/// 27797 was the card: the model read "free 4,000 of 35,552", which is
+/// eleven percent and sounds easy, and wrote a program that removed
+/// eight rows. The real ask was 4,000 of a 7,668-byte conversation,
+/// which is more than half of it, and needed the reply's own blocks
+/// and its console gone rather than a tidy-up. It fired again with 87
+/// bytes freed.
+///
+/// `None` where the measure is tokens: the split is known in bytes and
+/// there is no tokenizer here to convert it, and a number in the wrong
+/// unit is worse than no number.
 pub(crate) fn compaction_message(
     measured: usize,
     limit: usize,
     unit: crate::types::Measure,
+    fixed: Option<usize>,
 ) -> String {
     let noun = unit.noun();
     // Built from the constant rather than spelled out, because a
@@ -1374,9 +1390,18 @@ pub(crate) fn compaction_message(
     // lie told at the worst possible moment — see the forgery guard,
     // which matched a row shape nothing emitted for the same reason.
     let arrow = crate::document::BLOCK_ARROW;
+    // What is actually on the table, when that is knowable.
+    let share = match fixed {
+        Some(fixed) if fixed < measured => format!(
+            " Of that, {fixed} is the card and the worked examples, which do not change: the \
+             conversation itself is {}, and it is the only thing that can get smaller.",
+            measured - fixed
+        ),
+        _ => String::new(),
+    };
     format!(
         "## STOP — THIS CONVERSATION IS FULL\n\n\
-         {measured} {noun}s against a {limit}-{noun} budget. **The task above is not being \
+         {measured} {noun}s against a {limit}-{noun} budget.{share} **The task above is not being \
          worked on in this program.** No tool call, no answer and no continuation of it will \
          be accepted from here; the only thing that can happen next is that the history gets \
          smaller.\n\n\
@@ -2236,7 +2261,7 @@ mod tests {
         // interruption and carries on with the task — which is what a
         // live run did on 2026-09-16, answering the user's question
         // instead of compacting anything.
-        let text = compaction_message(60_555, 32_768, crate::types::Measure::Bytes);
+        let text = compaction_message(60_555, 32_768, crate::types::Measure::Bytes, None);
         assert!(text.contains("60555 bytes"), "says how big it is: {text}");
         assert!(
             text.contains("32768-byte budget"),
@@ -2245,7 +2270,7 @@ mod tests {
         // And when the count is what filled up, it says so in tokens —
         // naming a byte budget that is not the binding constraint asks
         // the handler to shrink against the wrong number.
-        let counted = compaction_message(43_100, 57_344, crate::types::Measure::Tokens);
+        let counted = compaction_message(43_100, 57_344, crate::types::Measure::Tokens, None);
         assert!(counted.contains("43100 tokens"), "{counted}");
         assert!(counted.contains("57344-token budget"), "{counted}");
         assert!(text.contains("compaction program"), "{text}");
@@ -2289,6 +2314,36 @@ mod tests {
         let leaf = tree.list_leaves()[0].0;
         let text = derive_report(&tree, leaf, o, 64 * 1024);
         assert!(text.contains("interrupted"), "{text}");
+    }
+
+    /// **The directive names the job, not the window.** Most of the
+    /// document is the card and the worked examples, which no
+    /// compaction program can touch — so a number that includes them
+    /// describes a much easier task than the one being asked for.
+    ///
+    /// Live on 2026-09-20: "35552 Bytes against a 42000-Byte budget",
+    /// of which 27797 was the card. The model read that as freeing an
+    /// eleventh, removed eight rows, and freed 87 bytes. The real ask
+    /// was more than half of a 7,668-byte conversation.
+    #[test]
+    fn the_compaction_directive_says_how_much_is_actually_yours() {
+        let with = compaction_message(
+            35_552,
+            42_000,
+            crate::types::Measure::Bytes,
+            Some(27_797),
+        );
+        assert!(with.contains("27797 is the card"), "{with}");
+        assert!(
+            with.contains("conversation itself is 7755"),
+            "and what is left is the job: {with}"
+        );
+
+        // In tokens the split is not knowable — it is measured in bytes
+        // and there is no tokenizer here. A number in the wrong unit is
+        // worse than no number.
+        let tokens = compaction_message(43_100, 57_344, crate::types::Measure::Tokens, None);
+        assert!(!tokens.contains("is the card"), "{tokens}");
     }
 
     /// **Every artifact appears in exactly one report**: each menu is
