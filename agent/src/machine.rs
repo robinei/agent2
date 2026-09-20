@@ -3701,6 +3701,44 @@ pub(crate) fn note_display(value: &serde_json::Value) -> String {
     value.to_string()
 }
 
+/// An appended row: what it shows, and what it says about the rest.
+///
+/// **Bounded here and nowhere else.** This was the one visible thing in
+/// the system with no cap on it — and by bytes it is how models read,
+/// whatever the card says: 72% of everything appended across 352 kept
+/// runs was a verbatim copy of a result, and the biggest single row was
+/// 38,342 bytes, re-rendered on every completion until something
+/// compacted it.
+///
+/// **The JSON head survives the clip**, because the row is the model's
+/// only evidence of what `history.fetch` will hand back — a leading `"`
+/// means a string and a leading `{` an object, and
+/// `an_appended_row_renders_as_the_json_it_will_hand_back` exists
+/// because rendering a string bare made `append("{\"a\":1}")` and
+/// `append({a:1})` identical on the page and different in the hand.
+/// Clipping the tail keeps that distinction; clipping the head would
+/// destroy it.
+///
+/// Clipped *before* escaping, so the byte counts it quotes are the
+/// value's own — the thing `fetch` returns — rather than the rendering's.
+fn note_row(id: u64, value: &serde_json::Value) -> String {
+    let full = note_display(value);
+    if full.len() <= crate::report::NOTE_ROW_MAX_BYTES {
+        return format!("appended: {}", crate::document::escape_untrusted(&full));
+    }
+    let mut end = crate::report::NOTE_ROW_MAX_BYTES;
+    while !full.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(
+        "appended: {}\n  … {} of {} bytes — `history.fetch({id})` for all of it, \
+         or append a slice of what you already hold",
+        crate::document::escape_untrusted(&full[..end]),
+        end,
+        full.len(),
+    )
+}
+
 fn json_arg(vm: &mut VM, json: &serde_json::Value) -> Value {
     vm.json_to_stack_value(json, 0).unwrap_or(Value::Null)
 }
@@ -3939,10 +3977,7 @@ pub(crate) fn menu_rows(
                 EventPayload::Note { value, .. } => Some(Artifact {
                     id,
                     label: String::new(),
-                    state: ArtifactState::Whole(format!(
-                        "appended: {}",
-                        crate::document::escape_untrusted(&note_display(value))
-                    )),
+                    state: ArtifactState::Whole(note_row(id, value)),
                 }),
                 _ => None,
             }
@@ -5657,6 +5692,111 @@ mod tests {
             .expect("the second append");
         // An object, indexable — not a string anyone has to parse.
         assert_eq!(back, json!(["object", 3, "b"]));
+    }
+
+    /// **The row is the view; `fetch` is the value.**
+    ///
+    /// `history.append` was the one visible thing in the system with no
+    /// bound on it, and by bytes it is how models read — 72% of
+    /// everything appended across 352 kept runs was a verbatim copy of
+    /// a result, rendered whole on every turn until something compacted
+    /// it. Bounded at render and never on the log, so the same call is
+    /// a bounded view *and* a whole value.
+    #[test]
+    fn a_long_appended_row_is_clipped_and_fetch_still_hands_back_all_of_it() {
+        let (mut tree, mut state) = setup();
+        state.kickoff(&mut tree).unwrap();
+        let n = crate::report::NOTE_ROW_MAX_BYTES * 3;
+        let src = format!("history.append(\"x\".repeat({n}));");
+        let out = state
+            .step(&mut tree, StepInput::LlmResponse(llm_program(&src)))
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+
+        let segment = state.agent_segment(&tree);
+        let note = segment
+            .iter()
+            .find(|e| matches!(e.payload, EventPayload::Note { .. }))
+            .unwrap()
+            .id;
+
+        // What the model is shown: bounded, and it says how much is left.
+        let rows = menu_rows(&segment, 0, &Default::default());
+        let shown = rows
+            .iter()
+            .find(|a| a.id == note.as_u64())
+            .map(|a| match &a.state {
+                ArtifactState::Whole(t) => t.clone(),
+                _ => panic!("an appended row renders whole"),
+            })
+            .expect("the appended row is in the menu");
+        assert!(
+            shown.len() < n / 2,
+            "the row is bounded: {} bytes for a {n}-byte value",
+            shown.len()
+        );
+        assert!(
+            shown.contains(&format!("history.fetch({})", note.as_u64())),
+            "and names the id that has the rest: {}",
+            &shown[shown.len().saturating_sub(200)..]
+        );
+        assert!(
+            shown.contains(&format!("of {} bytes", n + 2)),
+            "and how much there is (+2 for the JSON quotes): {}",
+            &shown[shown.len().saturating_sub(200)..]
+        );
+        // The JSON head survives, so the row still says what kind of
+        // thing `fetch` will return.
+        assert!(
+            shown.starts_with("appended: \"x"),
+            "a string still looks like a string: {}",
+            &shown[..40.min(shown.len())]
+        );
+
+        // And the value itself is untouched — the clip is a rendering.
+        let fetch = format!(
+            "history.append((await fetch_history({})).length);",
+            note.as_u64()
+        );
+        let out = state
+            .step(&mut tree, StepInput::LlmResponse(llm_program(&fetch)))
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+        let back = tree
+            .path_events(state.spine.leaf_id)
+            .iter()
+            .rev()
+            .find_map(|e| match &e.payload {
+                EventPayload::Note { value, .. } => Some(value.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(back, json!(n), "fetch hands back all {n} characters");
+    }
+
+    /// A row under the bound renders exactly as it always did — which
+    /// is 90% of them: appended rows run to a median of 450 bytes.
+    #[test]
+    fn a_short_appended_row_is_untouched_by_the_bound() {
+        let (mut tree, mut state) = setup();
+        state.kickoff(&mut tree).unwrap();
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::LlmResponse(llm_program("history.append({ dead: 3 });")),
+            )
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+        let segment = state.agent_segment(&tree);
+        let rows = menu_rows(&segment, 0, &Default::default());
+        let shown = rows
+            .iter()
+            .find_map(|a| match &a.state {
+                ArtifactState::Whole(t) if t.starts_with("appended:") => Some(t.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(shown, r#"appended: {"dead":3}"#);
     }
 
     /// **And the row says which it will be.** A note is shown whole,

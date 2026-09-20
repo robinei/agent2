@@ -96,6 +96,26 @@ pub const ANNOTATIONS_PER_LINE: usize = 6;
 /// Per-entry preview bytes in the artifact menu.
 pub const PREVIEW_MAX_BYTES: usize = 256;
 
+/// Bytes of an appended row shown before it says how much is left.
+///
+/// **The row is the view; `fetch` is the value.** `history.append` was
+/// the one visible thing in the system with no bound on it, and by
+/// bytes it is how models actually read: 72% of everything appended
+/// across 352 kept runs was a verbatim copy of a result, against a card
+/// rule forbidding it in bold. A rule with 28% compliance is not being
+/// disobeyed — it is the only door, and it was rendering whole on every
+/// turn until something compacted it. One row reached 38,342 bytes.
+///
+/// 4 KB because of the distribution, not a guess: appended rows run to
+/// a median of 450 bytes and a p90 of 3,759, so this leaves 90% of them
+/// untouched — every genuine conclusion — and bounds only the
+/// file-shaped ones, halving the bytes appended across the corpus.
+///
+/// Clipped at render and never on the log, like every other bound here,
+/// so one `history.append(f.content)` is a bounded view *and* a whole
+/// value that `history.fetch` still hands back.
+pub const NOTE_ROW_MAX_BYTES: usize = 4096;
+
 /// One artifact-menu entry: a `Call` (settled or still pending) or a
 /// `ProgramResult`, named by its event id and fetchable via
 /// `fetch_history(id)`.

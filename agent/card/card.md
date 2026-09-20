@@ -91,11 +91,15 @@ declare namespace history {
 
   Worth a row: **a conclusion you reached**. You write the next reply out of what is in front of you, so a row holds what you want to still be looking at then — the four paths that matter out of the two hundred you listed, never the two hundred. Every row is paid for again on every turn, until something compacts it.
 
-  **Not the bytes of something you read.** A result is already kept: its row names the call, and `history.fetch(id)` hands the content back whole, from the log, for nothing — so a program that needs those bytes fetches them. Copy them into a note instead and they sit in the record twice, charged on every turn, for nothing you could not have had free. To *look* at something once, `console.log` it. To keep what you made of it, append that. Keep an id, or a conclusion, never a copy.
+  **And this is how you read something.** A call's result is on the record but not in front of you — the row names the call and its shape, and nothing more. Appending the bytes is what puts them where you can read them: `history.append(f.content)` after a `read_file`, and the next reply has the file in front of it. **Append what you will read; fetch what you will compute with.** A program that only needs to search or edit those bytes calls `history.fetch(id)` and never pays to look at them.
+
+  **A row shows its first 4 KB.** More than that and it says how many bytes there are and which id holds them all, because a file you cannot see the end of is still a file you can page through — and the program is the pager. `history.append(f.content.slice(4096))` for the next stretch, or `.split("\n").slice(200, 400)`, or the one section a regex found. Slicing by what the thing *is* beats slicing by where you stopped.
+
+  `console.log` is for tracing, not for reading: a value you want to check, a count, what a loop saw. It shows you its tail, which is right for a trace and wrong for a document.
 
   Hands back the new row's id, so a later call can name what you just wrote. */
   function append(value: unknown): number;
-  /** Read any entry back, whole, by its id — **what you get is what its row shows**. A call's row gives the tool's own result, the object its signature above describes: `read_file` hands back `{ content, version }`, not the text. A row shown as `"…"` is a string and a row shown as `{…}` is an object, so a note you appended comes back as whatever you appended. Entries that no longer show in the conversation too: `remove` takes them out of what you are shown, never off the log.
+  /** Read any entry back, whole, by its id — **what you get is what its row shows**, or all of it where the row said it was clipped. A call's row gives the tool's own result, the object its signature above describes: `read_file` hands back `{ content, version }`, not the text. A row shown as `"…"` is a string and a row shown as `{…}` is an object, so a note you appended comes back as whatever you appended. Entries that no longer show in the conversation too: `remove` takes them out of what you are shown, never off the log.
 
   It hands the value to the block that asked for it, so there is no step where you bring something *into view* before working with it — `const f = await history.fetch(9)` and the next line already has `f.content`. A reply whose every call reloads what the record is holding for it has spent a turn and learned nothing. Fetch it in the reply that uses it. */
   function fetch(id: number): unknown;
