@@ -183,6 +183,7 @@ fn line_for(tree: &Tree, path: &[&Event], event: &Event) -> Option<String> {
                 format!("#{id}    ✗ would not compile: {}", clip(message))
             }
             Handback::Abandoned => format!("#{id}    ⏏ abandoned"),
+            Handback::Superseded => format!("#{id}    ⏏ superseded"),
             Handback::Posted { .. } => format!("#{id}    ⏸ a message arrived"),
             // **The process died and took the VM with it.** A program
             // parked on an `ask()` or mid-call does not survive the

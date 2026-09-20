@@ -499,6 +499,15 @@ pub enum Handback {
         rested: bool,
     },
     Abandoned,
+    /// A suspended program a **new program was written over**.
+    ///
+    /// **Nobody decided this**, which is the whole of why it is not
+    /// `Abandoned`. A reply that neither resumes nor abandons the frame
+    /// beneath it discards it implicitly, and the report used to tell
+    /// the model "a handler abandoned this program" — a deliberate act
+    /// by an agent that does not exist. It is the common case, too: 93
+    /// of 95 traps in the kept corpus were answered by rewriting.
+    Superseded,
     Interrupted,
 }
 
@@ -508,7 +517,10 @@ impl Handback {
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,
-            Handback::Completed { .. } | Handback::Abandoned | Handback::Interrupted
+            Handback::Completed { .. }
+                | Handback::Abandoned
+                | Handback::Superseded
+                | Handback::Interrupted
         )
     }
 }

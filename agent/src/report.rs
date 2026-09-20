@@ -1608,6 +1608,12 @@ fn what_happened(h: &Handback<'_>, cause: &HandbackHow, site: u32) -> String {
              below are still fetchable by id; rewrite to continue."
                 .to_owned()
         }
+        HandbackHow::Superseded => {
+            "You wrote a new program over one that was suspended, so that one is gone — \
+             nothing resumed it and nothing had to. Calls it had already issued still \
+             settle, and everything it completed is below, fetchable by id."
+                .to_owned()
+        }
         HandbackHow::Abandoned => {
             "A handler abandoned this program: it was discarded rather than continued, and \
              its VM is gone. Calls it had already issued still settle, and everything it \

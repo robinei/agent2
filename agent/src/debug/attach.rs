@@ -2614,6 +2614,7 @@ fn condition_line(cause: &crate::types::Handback) -> String {
         // A handler decided `return abandon()`: the suspended run was
         // discarded, not continued.
         crate::types::Handback::Abandoned => "abandoned".to_owned(),
+        crate::types::Handback::Superseded => "superseded".to_owned(),
     }
 }
 

@@ -3193,7 +3193,12 @@ impl Runner {
                 &mut self.spine,
                 EventPayload::Handback {
                     reply: self.reply_id,
-                    how: Handback::Abandoned,
+                    // **Superseded, not abandoned.** Nothing decided
+                    // this: the reply simply wrote a new program over a
+                    // suspended one. Saying a handler abandoned it
+                    // describes a deliberate act by an agent that does
+                    // not exist.
+                    how: Handback::Superseded,
                     site: 0,
                     stack: Vec::new(),
                 },
@@ -6258,6 +6263,38 @@ mod tests {
             json!(n),
             "fetch hands back all {n} characters"
         );
+    }
+
+    /// **Writing over a suspended program supersedes it; it does not
+    /// abandon it.** Nothing decided — the reply simply wrote
+    /// something else — and the report used to tell the model a
+    /// handler had made a decision no handler made.
+    #[test]
+    fn a_rewritten_frame_is_superseded_not_abandoned() {
+        let mut c = Conversation::new();
+        c.user("go");
+        c.reply("```js\nconst v = null; v.x;\n```\n");
+        // Neither resume nor abandon: just a different program.
+        let r = c.reply("```js\ntell(\"took another route\");\nfinish();\n```\n");
+
+        let how: Vec<String> = c
+            .tree()
+            .events
+            .values()
+            .filter_map(|e| match &e.payload {
+                EventPayload::Handback { how, .. } => Some(format!("{how:?}")),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            how.iter().any(|h| h.contains("Superseded")),
+            "the parked frame is superseded: {how:?}"
+        );
+        assert!(
+            !how.iter().any(|h| h.contains("Abandoned")),
+            "nobody abandoned anything: {how:?}"
+        );
+        assert_eq!(r.tells, ["took another route"]);
     }
 
     /// **A program with the fence left off is caught, and prose is
