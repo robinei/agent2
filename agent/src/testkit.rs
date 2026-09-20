@@ -1490,7 +1490,8 @@ mod tests {
     /// Found live against `Qwen3.8-27B` on 2026-09-20, driving a real
     /// session as the person at the keyboard: the answer that reached
     /// the screen opened with an annotation the person never saw the
-    /// original of.
+    /// original of. Then counted across the kept corpus — 36 of 373
+    /// runs delivered one, 52 of 1,640 prose messages.
     #[test]
     fn a_marker_the_model_copied_does_not_reach_the_person() {
         let mut c = Conversation::new();

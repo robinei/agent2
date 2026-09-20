@@ -486,7 +486,11 @@ pub(crate) const ARROW: &str = " ←";
 /// ```
 ///
 /// which is an annotation the harness wrote, quoted back at the person
-/// who never saw the original. The part on the log keeps every byte —
+/// who never saw the original. Not an edge case: across the 373 kept
+/// runs readable by this build, **36 delivered one** — 52 of 1,640
+/// prose messages, 3.2%.
+///
+/// The part on the log keeps every byte —
 /// that is what makes the parts concatenate back to the reply (28) —
 /// and only what is *delivered* is cleaned, which is the split
 /// `advance_notebook` already names: verbatim on the log, trimmed to
