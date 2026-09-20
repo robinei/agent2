@@ -199,7 +199,15 @@ fn read_file_def() -> ToolDef {
             "Hold onto `version` and hand it to `replace_file`, so a write fails rather than clobbering a file that moved.".into(),
         ],
         example: Some("const f = await tools.read_file(\"README.md\");".into()),
-        returns: Some("{ content: string; version: string; truncated?: boolean }".into()),
+        // **No `truncated`.** It was declared and the handler cannot
+        // produce it: the returns line is `{ content, version }` on
+        // every path, and a range is an explicit `from`/`to` the caller
+        // asked for rather than a clip anyone needs telling about.
+        // `bash` does have one — it fires at the 4MB stream cap — which
+        // is presumably where this was copied from. A field a program
+        // can branch on and never see is a dead branch in every program
+        // that checks it.
+        returns: Some("{ content: string; version: string }".into()),
         handler: Box::new(|args| {
             let path = args
                 .get(0)

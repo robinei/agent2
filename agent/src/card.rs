@@ -179,6 +179,10 @@ fn the_shipped_manifest_tells_the_truth_about_itself() {
         manifest.contains("start_line: number"),
         "`outline`'s entries carry start_line/end_line, not `line`: {manifest}"
     );
+    assert!(
+        manifest.contains("read_file(path: string, from?: number, to?: number): Promise<{ content: string; version: string }>"),
+        "`read_file` declares no field its handler cannot produce: {manifest}"
+    );
 }
 
 /// The opening listing: bounded, two deep, and quiet about build
