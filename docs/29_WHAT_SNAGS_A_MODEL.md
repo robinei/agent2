@@ -7,7 +7,7 @@ finding, so it is first.
 
 ## What wants a decision
 
-Everything below is done and measured. Three things are not, and each
+Everything below is done and measured. Four things are not, and each
 is a judgement rather than a repair:
 
 1. **Whether the document should shrink a duplicated `history.append`.**
@@ -33,7 +33,18 @@ is a judgement rather than a repair:
    the lever for it is the card. It is the small lever either way:
    6.7% of bytes, against round trips that cost whole completions.
 
-3. **The local model.** `Qwen3.8-27B` works and is far too slow for the
+3. **A twentieth of the card is unmeasured.** `spawn`, `fork`,
+   `list_agents`, `answer`, the `Agent` type and the two-argument
+   `tell` come to 923 bytes, 4.9% of the card, on every turn of every
+   run — and not one program in 295 kept runs calls any of them. The
+   suite has no multi-agent task, so this is not evidence that the
+   vocabulary is unused in general; it is evidence that **we know
+   nothing about it**. Two honest options: add a task that needs a
+   second agent, or accept that a twentieth of the prompt is carried
+   on faith. Deleting it is a third, and the wrong one — it would
+   remove a capability rather than test it.
+
+4. **The local model.** `Qwen3.8-27B` works and is far too slow for the
    suite — 450 seconds a program, a `skipped-tests` run capped out
    after two. Useful for watching behaviour, not for measuring it.
 
