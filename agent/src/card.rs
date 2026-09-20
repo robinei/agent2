@@ -1345,6 +1345,16 @@ mod tests {
             // order, in one scope — which is what the notebook driver
             // does with the real thing.
             let source = cells_of(&ex.assistant);
+            // **An exemplar with no cells has already ended.** A reply
+            // that runs nothing rests the branch (D4, and card.md's own
+            // "a reply with no code blocks in it rests the branch");
+            // there is no end to run off. The rule below is about a
+            // *program* falling through, and applying it to a reply
+            // with no program in it is what made every exemplar open
+            // with a fence.
+            if source.trim().is_empty() {
+                continue;
+            }
             let ending = run_against_stubs(&source)
                 .unwrap_or_else(|e| panic!("exemplar for {:?} trapped: {e}", ex.user));
             // **The two endings a reply has.** `finish(text)` says the task is
@@ -1405,6 +1415,20 @@ mod tests {
                 continue;
             }
             let card = load_from(&dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
+            // **Whether "no fences" means prose is a fact about the
+            // card, not about one exemplar.** A bare-JS variant's
+            // assistant turns are programs whole; a markdown one's are
+            // replies whose ```js blocks are the program — and in a
+            // markdown card an exemplar with no block is a reply that
+            // runs nothing, which is a shape worth demonstrating
+            // (card.md: "a reply with no code blocks in it rests the
+            // branch"). Read off the variant's other exemplars, so a
+            // cell-less one is not compiled as JavaScript and told its
+            // em-dash is an invalid character.
+            let markdown = card
+                .exemplars
+                .iter()
+                .any(|ex| !crate::notebook::split_cells(&ex.assistant).is_empty());
             for ex in &card.exemplars {
                 // **What "the assistant turn" *is* depends on the
                 // transport the variant is for.** Under
@@ -1414,6 +1438,11 @@ mod tests {
                 // contains a cell is read the way that transport reads
                 // it: split first, then compile each cell.
                 let cells = crate::notebook::split_cells(&ex.assistant);
+                if cells.is_empty() && markdown {
+                    // A reply that runs nothing. Nothing to compile,
+                    // and nothing to end — it has already ended.
+                    continue;
+                }
                 if cells.is_empty() {
                     interp::compile(&ex.assistant).unwrap_or_else(|e| {
                         panic!(
@@ -1437,7 +1466,11 @@ mod tests {
                 // And what counts as an *ending* depends on it too. A
                 // notebook cell cannot `return` at all (D5), so the verb
                 // that hands work to the next reply is `history.append`.
-                let ends = ex.assistant.contains("finish(")
+                // A variant's exemplar with no cells is a rest, same
+                // as the shipped card's — see
+                // `every_exemplar_ends_on_purpose`.
+                let ends = cells.is_empty()
+                    || ex.assistant.contains("finish(")
                     || ex.assistant.contains("stop(")
                     || ex.assistant.contains("history.append")
                     || ex

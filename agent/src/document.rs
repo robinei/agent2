@@ -104,12 +104,21 @@ impl Document {
         if tail.is_empty() {
             return self;
         }
+        // **Under a heading, after a blank line.** It used to be glued
+        // on with one `\n`, so the harness's words ran straight out of
+        // the person's: `[27] user told you: present as a table` was
+        // followed on the next line by `7 rows on this branch…` with
+        // nothing saying who was speaking. Every other section of the
+        // document announces itself (`## MESSAGES`, `## RAN YOUR
+        // PROGRAM`), and this one is in the position with the most
+        // influence over the reply, so it is the last place to leave
+        // the speaker ambiguous.
+        let block = format!("\n\n## RIGHT NOW\n\n{tail}");
         match self.messages.last_mut() {
-            Some(m) if m.role == ChatRole::User => {
-                m.content.push('\n');
-                m.content.push_str(tail);
-            }
-            _ => self.messages.push(ChatMessage::text(ChatRole::User, tail)),
+            Some(m) if m.role == ChatRole::User => m.content.push_str(&block),
+            _ => self
+                .messages
+                .push(ChatMessage::text(ChatRole::User, block.trim_start())),
         }
         self
     }

@@ -258,7 +258,23 @@ fn print_document(log: Option<&str>, at: Option<&String>) -> Result<(), String> 
             .max_by_key(|id| id.as_u64())
             .ok_or("the log is empty")?,
     };
-    let doc = document::render(&tree, &tree.spine_at(leaf), 64 * 1024);
+    // **With the tail on**, which this printed without for as long as
+    // it has existed. The tail is the last thing in the request — it
+    // rides the end of the final `User` message and is never logged —
+    // so the one tool for reading the prompt was omitting the part in
+    // the strongest position, which is exactly the part you cannot
+    // recover by reading the log.
+    //
+    // `attached` is false on a `Runner` rebuilt from a log, so the
+    // presence line reads as an unattached request. Everything else
+    // is what a real one would carry.
+    let spine = tree.spine_at(leaf);
+    let state = machine::Runner::with_spine(&tree, tree.spine_at(leaf));
+    let doc = document::render(&tree, &spine, 64 * 1024);
+    let doc = match state.request_tail(&tree) {
+        Some(tail) => doc.with_tail(&tail),
+        None => doc,
+    };
 
     let total: usize = doc.messages.iter().map(|m| m.content.len()).sum();
     println!("{} messages, {total} bytes\n", doc.messages.len());

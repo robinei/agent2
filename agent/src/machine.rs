@@ -192,6 +192,31 @@ const STOPPED_SHORT_NOTICE: &str = "Your last reply ran nothing, and nobody had 
      done, say so with `finish(text)` inside a ```js block. Otherwise carry on from where you left \
      off.";
 
+/// **The reply-shape line**, for the request where someone has just
+/// asked something and the branch has no work of its own outstanding.
+///
+/// The card says this already (card.md: "A reply with no code blocks in
+/// it rests the branch... That is the right shape for answering a
+/// question"), and its five worked examples say the opposite by
+/// example: every one opens with a ```js block. The measurement is
+/// `evals/spoke_in_code.py` — across 320 kept logs, 25% of replies that
+/// ran a program had that program make no tool call at all, and in the
+/// one conversation in the corpus it was 5 of 6.
+///
+/// It rides the **tail** rather than the card because the card's last
+/// line is not the request's last line: in a two-exchange session the
+/// card ends 11 KB from the end, and in `try21.jsonl` before compaction
+/// it was 28 KB. The one precedent in this file points the same way —
+/// a card sentence forbidding foreign tool calls was ignored 3 runs of
+/// 3, and the same words in the report worked.
+///
+/// **Off unless asked for** (`AGENT2_REPLY_SHAPE_TAIL=1`), because it
+/// is a guess until an arm says otherwise and every request pays for
+/// it uncached.
+const REPLY_SHAPE_TAIL: &str = "Someone has asked you something and you have no work of your \
+     own outstanding. If answering needs nothing run, answer in prose and stop — a reply with \
+     no ```js block in it is a complete answer, and it rests the branch.";
+
 /// Whether this reply tried to call a tool in another harness's syntax.
 ///
 /// Deliberately a short list of shapes that are **actions**, not prose:
@@ -742,6 +767,10 @@ pub struct Runner {
     /// each other. Read from `AGENT2_STOPPED_SHORT_NOTICE` when the
     /// runner is built, and settable directly in a test.
     nudge_when_nothing_ran: bool,
+    /// Whether the tail carries [`REPLY_SHAPE_TAIL`] on a request that
+    /// is answering a post. A field for the same reason as the line
+    /// above: an arm has to be settable per-runner, not per-process.
+    reply_shape_tail: bool,
     /// Runs suspended **beneath** the one currently in `phase`, each
     /// frozen exactly where it stopped, oldest first popped last (a
     /// stack) — see `Phase::Suspended`'s own doc for why this, and not
@@ -878,6 +907,7 @@ impl Runner {
             // reply was `done();`. See `stopped_short`.
             nudge_when_nothing_ran: std::env::var("AGENT2_STOPPED_SHORT_NOTICE")
                 .is_ok_and(|v| v != "0"),
+            reply_shape_tail: std::env::var("AGENT2_REPLY_SHAPE_TAIL").is_ok_and(|v| v != "0"),
             spine,
             agent,
             branch,
@@ -3697,7 +3727,7 @@ impl Runner {
     ///   the model needs the id to reach for `answer` even when only one
     ///   post is open.
     /// - **presence**: whether a client is attached right now.
-    fn request_tail(&self, tree: &Tree) -> Option<String> {
+    pub(crate) fn request_tail(&self, tree: &Tree) -> Option<String> {
         // While a compaction is outstanding the directive *is* the tail,
         // and nothing else rides with it — the directive's own words are
         // "Write a compaction program. Nothing else", and the open-
@@ -3746,8 +3776,44 @@ impl Runner {
                  history.fetch(id)."
             ));
         }
+        if self.reply_shape_tail && self.answering_a_post(tree) {
+            lines.push(REPLY_SHAPE_TAIL.to_owned());
+        }
         lines.push(if self.attached { PRESENT } else { ABSENT }.to_owned());
         Some(lines.join("\n"))
+    }
+
+    /// **Somebody just asked, and nothing of the branch's own is
+    /// outstanding** — the one request shape where "you may simply
+    /// answer" is apt. A continuation of the branch's own work is the
+    /// opposite case, and the card is right about it: you are not
+    /// trying to finish the task in one reply.
+    fn answering_a_post(&self, tree: &Tree) -> bool {
+        let replies = self.replies(tree);
+        // A post since the last reply — `replies`'s own `answering`
+        // fold, read for the reply that is about to be written rather
+        // than for one already on the log.
+        let last_reply = replies.last().map(|r| r.id.as_u64()).unwrap_or(0);
+        let posted_since = self
+            .agent_segment(tree)
+            .iter()
+            .any(|e| e.id.as_u64() > last_reply && matches!(e.payload, EventPayload::Post { .. }));
+        // An **agent** waiting on this branch is the exception: its
+        // program is suspended until a program here calls
+        // `answer(question, …)`, so there is something to run and the
+        // line would be wrong. A person's open question is the case
+        // this is for — answering it needs nothing run.
+        let agent_waiting = self
+            .open()
+            .iter()
+            .any(|id| matches!(asker_of(tree, *id), Some(crate::types::Author::Agent(_))));
+        // **Nothing parked.** A suspended run is a program waiting to
+        // be resumed, so there is something to carry on with even
+        // though a post arrived — `request_tail` runs at render time,
+        // by which point the phase has already left `Idle`, so this
+        // asks what is parked rather than what the phase is.
+        let parked = matches!(self.phase, Phase::Suspended(..)) || !self.beneath.is_empty();
+        posted_since && !agent_waiting && !parked
     }
 
     /// How many **menu rows** this branch's path holds, and the id range
@@ -7632,6 +7698,54 @@ mod tests {
             "the branch rests: {settled:?}"
         );
         assert!(!state.needs_prompt(&tree));
+    }
+
+    /// **The reply-shape line rides the tail, and only where it is
+    /// apt.** It says "you may simply answer", which is right when
+    /// somebody has just asked and wrong when the branch is carrying on
+    /// its own work — the card is right about the second case ("you are
+    /// not trying to finish the task in one reply").
+    #[test]
+    fn the_reply_shape_line_is_on_the_answering_request_only() {
+        let (mut tree, mut state) = setup_under();
+        state.reply_shape_tail = true;
+        user_post(&mut state, &mut tree, "what is a mutex?");
+
+        let tail = state
+            .request_tail(&tree)
+            .expect("every request carries a tail");
+        assert!(
+            tail.contains("no ```js block in it is a complete answer"),
+            "somebody just asked: {tail}"
+        );
+        // Last in the request, and inside the final `User` message —
+        // never its own trailing turn, which is the position that makes
+        // it worth saying at all.
+        let doc = state.document(&tree, TEST_BUDGET).with_tail(&tail);
+        let last = doc.messages.last().expect("a rendered request");
+        assert_eq!(last.role, crate::document::ChatRole::User);
+        assert!(last.content.ends_with(&tail), "{}", last.content);
+
+        // Now a reply that carries the work on, with nobody having
+        // asked anything since.
+        let out = state
+            .step(&mut tree, StepInput::LlmResponse(llm_program("let a = 1;")))
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+        let tail = state.request_tail(&tree).expect("a tail");
+        assert!(
+            !tail.contains("no ```js block"),
+            "nobody asked anything; this is the branch's own work: {tail}"
+        );
+    }
+
+    /// And it is off unless asked for.
+    #[test]
+    fn the_reply_shape_line_is_off_by_default() {
+        let (mut tree, mut state) = setup_under();
+        user_post(&mut state, &mut tree, "what is a mutex?");
+        let tail = state.request_tail(&tree).expect("a tail");
+        assert!(!tail.contains("no ```js block"), "{tail}");
     }
 
     #[test]
