@@ -35,31 +35,35 @@
 //! why the corpus sweep prints a tally rather than asserting. The
 //! invariants are the half that says a direction is wrong.
 //!
-//! **First sweep, 2026-09-20, 368 logs in 14 seconds:**
+//! **First sweep, 2026-09-20, 369 logs in 14 seconds:**
 //!
 //! | | |
 //! |---|---|
-//! | identical | 82 |
-//! | name event ids, so unreplayable ([`Script::names_ids`]) | 160 |
+//! | identical | 97 |
+//! | name event ids, and their ids did not line up ([`Script::names_ids`]) | 147 |
 //! | stopped following the run ([`Replayed::drift`]) | 2 |
-//! | moved | 126 |
+//! | moved | 123 |
 //!
-//! Every one of the 126 traced to a change that was made on purpose or
-//! to a shape the log format has since left behind: `done()` with no
-//! argument, now a compile error (107); the console recorded once per
-//! `console.log` rather than once per line (30); the `↓ history[N]`
-//! annotation that used to reach the person (11); a row stored as a
-//! JSON string rather than a value (2); and one reply from before the
-//! notebook splitter worked, logged whole as prose with its fence
-//! inside it. **No unexplained regression** — which is the result to
-//! want from a first run, and the baseline the next one is read
-//! against.
+//! Every one of the moved traced to a change that was made on purpose
+//! or to a shape the log format has since left behind: `done()` with no
+//! argument, now a compile error; the console recorded once per
+//! `console.log` rather than once per line; the `↓ history[N]`
+//! annotation that used to reach the person; a row stored as a JSON
+//! string rather than a value; and one reply from before the notebook
+//! splitter worked, logged whole as prose with its fence inside it.
+//! **No unexplained regression** — which is the result to want from a
+//! first run, and the baseline the next one is read against.
 //!
-//! That 160 of 368 name an id is worth reading twice. `history.fetch(20)`
-//! is the vocabulary working: the model reads a row's id out of its
-//! document and writes it back. It also means a replay's own ids have
-//! to line up with the original's, and settlement batching alone is
-//! enough that they do not.
+//! **Feeding the reasoning back is what makes the ids line up.** A real
+//! completion carries the model's thinking, and the harness logs it as
+//! a part of the reply — so a replay that left it out logged one event
+//! fewer per reply and everything after shifted. Programs name ids
+//! constantly (`history.fetch(9)` is the vocabulary working: the model
+//! reads a row's id out of its document and writes it back), so that
+//! one missing part put 160 of 368 runs out of reach. Feeding it
+//! brought 63 of them back, and the rest are logs whose ids genuinely
+//! do not line up — a run that drifted for its own reasons, or a shape
+//! this adapter does not reproduce.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -80,8 +84,15 @@ pub struct Called {
 pub enum Step {
     /// The person said something.
     User(String),
-    /// The model replied — the whole completion, prose and fences.
-    Reply(String),
+    /// The model replied — the whole completion, prose and fences,
+    /// with whatever the provider said it was thinking. The reasoning
+    /// is not an input to the *program*, but it is logged as a part of
+    /// the reply, so a replay that drops it logs one event fewer and
+    /// every id after it shifts.
+    Reply {
+        text: String,
+        thinking: Option<String>,
+    },
     /// A question to the person was answered.
     Answer(serde_json::Value),
 }
@@ -132,15 +143,19 @@ pub fn script_of(tree: &Tree, leaf: EventId) -> Result<Script, String> {
         .ok_or("the branch has no Agent root")?;
 
     // The reply text, rebuilt from its parts — the one input that is
-    // not recorded as itself.
+    // not recorded as itself — and the reasoning beside it.
     let mut replies: HashMap<EventId, String> = HashMap::new();
+    let mut thinking: HashMap<EventId, String> = HashMap::new();
     for event in &path {
         if let EventPayload::Part { reply, part } = &event.payload {
-            let text = match part {
-                crate::types::Part::Prose(t) | crate::types::Part::Cell(t) => t.as_str(),
-                crate::types::Part::Thinking(_) => continue,
-            };
-            replies.entry(*reply).or_default().push_str(text);
+            match part {
+                crate::types::Part::Prose(t) | crate::types::Part::Cell(t) => {
+                    replies.entry(*reply).or_default().push_str(t)
+                }
+                crate::types::Part::Thinking(t) => {
+                    thinking.entry(*reply).or_default().push_str(t)
+                }
+            }
         }
     }
 
@@ -174,9 +189,10 @@ pub fn script_of(tree: &Tree, leaf: EventId) -> Result<Script, String> {
             // short and report the ending as moved, which is the
             // adapter's fault and not the harness's.
             EventPayload::Reply | EventPayload::Restart => {
-                steps.push(Step::Reply(
-                    replies.get(&event.id).cloned().unwrap_or_default(),
-                ));
+                steps.push(Step::Reply {
+                    text: replies.get(&event.id).cloned().unwrap_or_default(),
+                    thinking: thinking.get(&event.id).cloned(),
+                });
             }
             EventPayload::Call(Call::Invoke { name, args, .. }) => calls.push(Called {
                 name: name.clone(),
@@ -294,7 +310,10 @@ pub fn run(script: &Script) -> Replayed {
             Step::User(text) => {
                 c.user(text);
             }
-            Step::Reply(text) => {
+            Step::Reply { text, thinking } => {
+                if let Some(thinking) = thinking {
+                    c.thinking(thinking);
+                }
                 c.reply(text);
             }
             Step::Answer(value) => {
@@ -447,17 +466,28 @@ pub fn replay_file(path: &std::path::Path) -> Result<Verdict, String> {
         .map(|(l, _)| *l)
         .ok_or("the log has no branches")?;
     let script = script_of(&tree, leaf)?;
-    if script.names_ids {
-        return Ok(Verdict::NamesIds);
-    }
     let was = Said::of_branch(&tree, leaf);
     let now = run(&script);
     if let Some(why) = now.drift {
-        return Ok(Verdict::Drifted(why));
+        // A run that named an id may have drifted *because* of it: the
+        // fetch returned a neighbour's row, the program branched on
+        // something else, and the next call is not the one recorded.
+        // Attributing that to the harness would be wrong.
+        return Ok(if script.names_ids {
+            Verdict::NamesIds
+        } else {
+            Verdict::Drifted(why)
+        });
     }
     let moved = compare(&was, &now.said);
     Ok(if moved.is_empty() {
         Verdict::Identical
+        // **Tried first, explained second.** Naming an id is only a
+        // problem if the ids actually failed to line up, and once the
+        // reasoning is fed back they usually do. Short-circuiting on
+        // the name alone gave up on 160 logs that mostly replay fine.
+    } else if script.names_ids {
+        Verdict::NamesIds
     } else {
         Verdict::Moved(moved)
     })
@@ -561,6 +591,36 @@ mod tests {
         let leaf = tree.list_leaves().first().map(|(l, _)| *l).expect("a branch");
         let script = script_of(&tree, leaf).expect("a script");
         println!("{} steps, {} calls", script.steps.len(), script.calls.len());
+        if script.names_ids {
+            println!(
+                "NOTE: this run names event ids literally, so a replay's own ids do not \n                       line up and any divergence below may be that rather than behaviour."
+            );
+        }
+        // Where the two id sequences part company — the fact that
+        // decides whether naming an id could ever replay faithfully.
+        let replayed_kinds = {
+            let now = run(&script);
+            now.said.kinds.clone()
+        };
+        let was_kinds = Said::of_branch(&tree, leaf).kinds.clone();
+        if let Some(at) = was_kinds
+            .iter()
+            .zip(&replayed_kinds)
+            .position(|(a, b)| a != b)
+        {
+            println!(
+                "event sequences part at {at}: was {:?}, now {:?}",
+                &was_kinds[at.saturating_sub(2)..(at + 3).min(was_kinds.len())],
+                &replayed_kinds[at.saturating_sub(2)..(at + 3).min(replayed_kinds.len())]
+            );
+        } else {
+            println!(
+                "event sequences agree for {} events (was {}, now {})",
+                was_kinds.len().min(replayed_kinds.len()),
+                was_kinds.len(),
+                replayed_kinds.len()
+            );
+        }
         let was = Said::of_branch(&tree, leaf);
         let now = run(&script);
         if let Some(why) = &now.drift {

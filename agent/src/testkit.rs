@@ -375,6 +375,8 @@ pub struct Conversation {
     open_reply: Option<(u64, String)>,
     /// What the next completion to close will report having cost.
     usage: Option<crate::host::Usage>,
+    /// What the next completion to close will report having thought.
+    thinking: Option<String>,
     /// Whether the reply just fed woke a program suspended beneath it,
     /// in which case two replies were producing events at once — see
     /// [`Invariant::SitesAreReplyAbsolute`].
@@ -408,6 +410,7 @@ impl Conversation {
             epoch: 0,
             open_reply: None,
             usage: None,
+            thinking: None,
             resumed: false,
         }
     }
@@ -559,6 +562,16 @@ impl Conversation {
         self.close_reply(true)
     }
 
+    /// What the provider said it was thinking. A real completion
+    /// carries it, and it is logged as a part of the reply — so a
+    /// replay that leaves it out logs one event fewer and every id
+    /// after it shifts, which is enough to break a program that named
+    /// one.
+    pub fn thinking(&mut self, text: &str) -> &mut Self {
+        self.thinking = Some(text.to_owned());
+        self
+    }
+
     /// The completion is over and cost this many output tokens — for
     /// the tests that are about the figure riding on `ReplyEnd` rather
     /// than about what the reply did.
@@ -584,6 +597,7 @@ impl Conversation {
                 StepInput::LlmResponse(crate::machine::LlmTurn {
                     truncated,
                     usage: self.usage.take(),
+                    thinking: self.thinking.take(),
                     ..crate::host::scripted_markdown("")
                 }),
             )
@@ -612,6 +626,7 @@ impl Conversation {
         self.resumed = self.runner.status() == "suspended";
         let before = self.tree.id_counter;
         self.requests = 0;
+        let thinking = self.thinking.take();
         let out = if streamed {
             self.epoch += 1;
             let mut out = self
@@ -622,7 +637,10 @@ impl Conversation {
                 self.runner
                     .step(
                         &mut self.tree,
-                        StepInput::LlmResponse(crate::host::scripted_program("")),
+                        StepInput::LlmResponse(crate::machine::LlmTurn {
+                            thinking,
+                            ..crate::host::scripted_markdown("")
+                        }),
                     )
                     .expect("stream end"),
             );
@@ -631,7 +649,10 @@ impl Conversation {
             self.runner
                 .step(
                     &mut self.tree,
-                    StepInput::LlmResponse(crate::host::scripted_markdown(markdown)),
+                    StepInput::LlmResponse(crate::machine::LlmTurn {
+                        thinking,
+                        ..crate::host::scripted_markdown(markdown)
+                    }),
                 )
                 .expect("reply")
         };
