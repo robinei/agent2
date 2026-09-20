@@ -86,6 +86,35 @@ impl super::Compiler {
                 ast::Expression::UpdateExpression(u) => {
                     self.compile_update(u, false);
                 }
+                // **An async IIFE is not awaited, and nothing said
+                // so.** `(async () => { … })();` at the top level
+                // builds a promise nobody holds: the block reaches its
+                // end while the `await`s inside are still parked, and
+                // the reply is logged with its calls in flight. The
+                // report says "issued; no result recorded; may have
+                // happened", which is true and does not name the
+                // cause. The one run in 300 that wrote this spent two
+                // replies working it out from that sentence and one
+                // more recovering, and failed the task for taking
+                // five programs to ask one question.
+                //
+                // The card's rule for this whole class is explicit —
+                // "Everything else that differs stops the block and
+                // says what to write instead" — and this was the case
+                // that silently did not. Refused here because the
+                // shape is syntactic: nobody writes an async IIFE in a
+                // notebook cell meaning fire-and-forget. An
+                // *un-awaited call* is left alone, because that is the
+                // documented way to `tell`.
+                ast::Expression::CallExpression(c) if is_async_function(&c.callee) => {
+                    self.error(
+                        es.span.into(),
+                        "an async function called here is never awaited, so the block ends \
+                         while the `await`s inside it are still waiting and the calls they \
+                         made are left in flight. Write the body at the top level of the \
+                         block instead — `await` works there.",
+                    );
+                }
                 _ => {
                     self.compile_expr(&es.expression);
                     self.emit(Instr::Pop(1), es.span.into());
@@ -302,5 +331,15 @@ impl super::Compiler {
                 },
             }
         }
+    }
+}
+
+/// Whether `callee` is an async function written in place — the head
+/// of an async IIFE. See the refusal in `compile_stmt`.
+fn is_async_function(callee: &ast::Expression<'_>) -> bool {
+    match callee.get_inner_expression() {
+        ast::Expression::ArrowFunctionExpression(f) => f.r#async,
+        ast::Expression::FunctionExpression(f) => f.r#async,
+        _ => false,
     }
 }

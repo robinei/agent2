@@ -1209,3 +1209,39 @@ fn break_crossing_plain_catch_still_works() {
         json!([1])
     );
 }
+
+/// **An async IIFE is not awaited, and nothing said so.**
+///
+/// `(async () => { … })();` at the top level builds a promise nobody
+/// holds: the block reaches its end while the `await`s inside are
+/// still parked, and the reply is logged with its calls in flight. A
+/// run on 2026-09-20 spent two replies working that out from "issued;
+/// no result recorded; may have happened" and failed for taking five
+/// programs to ask one question. One run in 300 — kept because the
+/// shape is syntactic and the contract is not about frequency. The card's rule for the whole class
+/// is that a difference "stops the block and says what to write
+/// instead"; this was the case that silently did not.
+#[test]
+fn an_unawaited_async_iife_is_refused_with_the_way_round_it() {
+    for src in [
+        "(async () => { await f(); })();",
+        "(async function () { await f(); })();",
+    ] {
+        let errs = crate::compile(src).expect_err("refused");
+        let msg = format!("{errs:?}");
+        assert!(msg.contains("never awaited"), "names it: {msg}");
+        assert!(
+            msg.contains("at the top level"),
+            "and says what to write instead: {msg}"
+        );
+    }
+
+    // Awaited, it is an ordinary expression and compiles.
+    crate::compile("await (async () => { return 1; })();").expect("awaited is fine");
+    // So is one whose value is kept.
+    crate::compile("const p = (async () => { return 1; })();").expect("bound is fine");
+    // A plain IIFE is not async and has nothing to wait for.
+    crate::compile("(() => { return 1; })();").expect("sync IIFE is fine");
+    // And an un-awaited *call* stays legal — that is how `tell` works.
+    crate::compile("tell(\"hi\");").expect("an unawaited call is the documented way");
+}
