@@ -313,6 +313,33 @@ fn the_cards_declarations_are_valid_typescript() {
     assert!(blocks >= 1, "the card should carry a ```ts block");
 }
 
+/// **Every tool's `@example` compiles.**
+///
+/// They are one line each and they are copied verbatim — the `outline`
+/// one taught `const { items }` against a tool that returned a bare
+/// array for months. That particular failure was semantic and a
+/// compiler cannot see it; a typo in one is the cheap half, and it
+/// ships in every prompt just the same.
+///
+/// The bodies use `path`, `body`, `candidate`, `lang`, `p`, `f`, `old`
+/// and `new` as stand-ins, so they are declared before the example is
+/// compiled — the same thing a reply does before using a name.
+#[test]
+fn every_tool_example_compiles() {
+    let preamble = "const path = 'p'; const body = ''; const candidate = ''; \
+                    const lang = 'rust'; const p = 'p'; const f = { content: '', version: '' }; \
+                    const old = 'a'; const new_ = 'b';";
+    for def in crate::host::tools::real_registry().iter() {
+        let Some(example) = &def.example else { continue };
+        // `new` is a reserved word; the examples use it as a stand-in
+        // for the replacement text, which reads better than `new_`.
+        let src = format!("{preamble}\nasync function __ex() {{ {} }}", example.replace(", new)", ", new_)"));
+        if let Err(errs) = interp::compile(&src) {
+            panic!("`{}`'s @example does not compile:\n{errs:?}\n{src}", def.name);
+        }
+    }
+}
+
 /// Every shipped tool's description fits inside the clip above.
 ///
 /// The doc there says they all "fit comfortably", and `bash` did not:
