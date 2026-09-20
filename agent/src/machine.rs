@@ -146,9 +146,17 @@ const OPEN_NOTE_MAX_IDS: usize = 8;
 /// about the *client*, not the person: attached means a client is
 /// connected, and claiming to know a human is reading would be a lie the
 /// model would act on.
-const PRESENT: &str = "Someone is attached to this session right now.";
-const ABSENT: &str = "No one is attached to this session right now; a question to the user \
-                      may sit unanswered for a long time.";
+///
+/// **And the wording has to hold that line too.** "No one is attached"
+/// reads as "nobody is there", which is the inference the paragraph
+/// above refuses to license — in a headless eval it is always false in
+/// that sense, since a person reads the transcript afterwards. So it
+/// says what is known (a client) and what follows from it (whether an
+/// `ask` is worth the wait), and nothing about who is reading.
+const PRESENT: &str = "A client is attached to this session, so a question to the user may be \
+                       answered promptly.";
+const ABSENT: &str = "No client is attached to this session; a question to the user may sit \
+                      unanswered for a long time.";
 
 /// What the harness says when the user interrupts a running program and
 /// has nothing else to add. It is a `tell` — the branch owes no answer —
@@ -202,14 +210,19 @@ const STOPPED_SHORT_NOTICE: &str = "Your last reply ran nothing, and nobody had 
 /// of a round trip. Said here it costs nothing and arrives before the
 /// reply is written.
 ///
+/// **"Since you were last spoken to", not "since anyone spoke".** The
+/// model speaks constantly — every `tell`, every line of prose — so
+/// the first wording was simply false from where it sits. The
+/// condition is the last `Post`: someone speaking *to* the branch.
+///
 /// It names the consequence rather than the unit. There is no word for
 /// "the stretch of replies since the person last spoke": `turn` is one
 /// reply (the card's own usage, and `<end_of_turn>` in the model's
 /// prior), `run` is a program. The card already says what happens
 /// without naming it, and this borrows the phrase.
-const WORK_UNDER_WAY: &str = "A program has already run since anyone last spoke. A reply with \
-     no ```js block in it ends here: nothing runs, and the next thing to happen is whatever the \
-     person says.";
+const WORK_UNDER_WAY: &str = "A program has already run since you were last spoken to. A reply \
+     with no ```js block in it ends here: nothing runs, and the next thing to happen is whatever \
+     the person says.";
 
 /// **The contract, restated where it is about to be acted on.**
 ///
@@ -7854,7 +7867,7 @@ mod tests {
         user_post(&mut state, &mut tree, "what is a mutex?");
         let tail = state.request_tail(&tree).expect("a tail");
         assert!(
-            !tail.contains("already run since anyone last spoke"),
+            !tail.contains("already run since you were last spoken to"),
             "nobody has run anything yet: {tail}"
         );
 
@@ -7864,7 +7877,7 @@ mod tests {
         drain(&mut state, &mut tree, out);
         let tail = state.request_tail(&tree).expect("a tail");
         assert!(
-            tail.contains("already run since anyone last spoke"),
+            tail.contains("already run since you were last spoken to"),
             "a cell has run: {tail}"
         );
 
@@ -7873,7 +7886,7 @@ mod tests {
         user_post(&mut state, &mut tree, "and a semaphore?");
         let tail = state.request_tail(&tree).expect("a tail");
         assert!(
-            !tail.contains("already run since anyone last spoke"),
+            !tail.contains("already run since you were last spoken to"),
             "a new post resets it: {tail}"
         );
     }

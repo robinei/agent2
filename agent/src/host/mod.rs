@@ -6362,8 +6362,8 @@ mod tests {
             "no rendered message before the tail varies"
         );
         assert_ne!(tail(&away), tail(&here), "only the trailing line flips");
-        assert!(tail(&away).contains("No one is attached"));
-        assert!(tail(&here).contains("Someone is attached"));
+        assert!(tail(&away).contains("No client is attached"));
+        assert!(tail(&here).contains("A client is attached"));
         // Presence goes last **of the per-request facts**. The one
         // line after it is not one: `REPLY_IS_MARKDOWN` is the standing
         // shape of the thing being written, and it is last so that it
@@ -6372,7 +6372,7 @@ mod tests {
         let lines: Vec<&str> = here_tail.lines().collect();
         assert_eq!(
             lines[lines.len() - 2],
-            "Someone is attached to this session right now."
+            "A client is attached to this session, so a question to the user may be answered promptly."
         );
         assert!(
             lines[lines.len() - 1].starts_with("Your reply is markdown"),
