@@ -349,6 +349,16 @@ redeclaration diagnostic was catching all along:
 The survivors are defensible — a test re-run after a change is not a
 repeat of the same question.
 
+**What is not demonstrated:** the copy advisory. Appended bytes per run
+are 1,538 at baseline against 981 and 2,803 across the two HEAD suites,
+and the share of them that duplicates a result is 64% against 60% and
+16%. The direction is right and the variance is larger than the effect.
+The model in that `sweep-8` run appended all four files *in the same
+program that read them*, before any report could have reached it — so
+the advisory can only work on the turn after, and one turn after is
+where the evidence would have to come from. Worth re-measuring with
+more runs before believing it.
+
 Not from the message, which changed after both suites: from the report
 that now shows what an earlier block already did, and from the console
 that now returns a file whole rather than its last twenty lines. A
