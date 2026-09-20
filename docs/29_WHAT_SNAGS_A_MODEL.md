@@ -11,24 +11,38 @@ The whole suite, `deepseek-v4-flash`, `--repeat 3` both sides — the
 same shape as the 2026-09-19 baseline. Each arm from a worktree pinned
 to one commit, so no run straddles a build.
 
-| | baseline (18 runs) | HEAD (63 runs) |
+Both sides measured at scale, from worktrees pinned to one commit each,
+so no run straddles a build.
+
+| | baseline (37 runs) | HEAD (63 runs) |
 |---|---|---|
-| passed | 17/18 (94%) | 56/63 (89%) |
-| prompt bytes | 1,052 KB | **684 KB (−35%)** |
-| programs per run | 4.8 | **3.3 (−30%)** |
+| passed | 36/37 (97%) | 56/63 (89%) |
+| prompt bytes | 1,074 KB | **684 KB (−36%)** |
+| programs per run | 5.0 | **3.3 (−33%)** |
 
-**The cost numbers are solid and the pass rate is not yet settled.**
-Three suites were run at HEAD, and 89% against a baseline measured once
-over 18 runs is a difference those 18 runs cannot resolve — the
-baseline's own interval is about 73–99%. A matching 21-run arm at the
-baseline commit is running to close that, and until it lands the honest
-claim is "cost down by a third, pass rate unresolved", not "pass rate
-held".
+**The cost is a third lower and the pass rate is a question, not a
+win.** Fisher's exact on 36/37 against 56/63 gives p = 0.25: the drop
+is not distinguishable from chance, and it is not evidence of safety
+either. What can be said about it:
 
-The seven failures are task judgement: tests un-skipped that still
-fail, dead helpers left behind, a helper removed that was still reached
-through `getattr`, and one run that took four programs to ask its
-question. None is a harness fault.
+- It concentrates in the two **large** sweeps. `sweep-40` 6/6 → 6/9 and
+  `sweep-200` 4/4 → 7/9, while `sweep-8` — the same task, smaller —
+  went 5/6 → 9/9, and `dead-code-sweep`, `plain-question`,
+  `ambiguous-config` and `skipped-tests` all held or improved.
+- Every failure is the same task judgement: a definition deleted that
+  something still reached without naming it. None is a harness fault.
+- The obvious mechanism does not hold. Fewer programs per run was the
+  suspect, and within HEAD the failing runs average 5.6 programs
+  against 5.4 for the passing ones. Brevity is not what distinguishes
+  them.
+
+`outline` now says it lists what a file defines and never what uses it,
+and names the mechanisms — `getattr`, string tables, registries — to
+look for instead of the names. That is aimed squarely at these
+failures and landed after every run above, so it is untested.
+
+**If one thing is worth re-running first, it is `sweep-40` and
+`sweep-200` at n≥10 a side.**
 
 Per task: `sweep-200` 11 → 5 programs and 395 → 146 KB, `sweep-8` 4 → 2
 and 107 → 53 KB, `skipped-tests` 5.5 → 3 and 146 → 82 KB,
