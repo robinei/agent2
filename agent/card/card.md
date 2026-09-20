@@ -93,7 +93,9 @@ declare namespace history {
 
   Hands back the new row's id, so a later call can name what you just wrote. */
   function append(value: unknown): number;
-  /** Read any entry back, whole, by its id — **what you get is what its row shows**. A call's row gives the tool's own result, the object its signature above describes: `read_file` hands back `{ content, version }`, not the text. A row shown as `"…"` is a string and a row shown as `{…}` is an object, so a note you appended comes back as whatever you appended. Entries that no longer show in the conversation too: `remove` takes them out of what you are shown, never off the log. */
+  /** Read any entry back, whole, by its id — **what you get is what its row shows**. A call's row gives the tool's own result, the object its signature above describes: `read_file` hands back `{ content, version }`, not the text. A row shown as `"…"` is a string and a row shown as `{…}` is an object, so a note you appended comes back as whatever you appended. Entries that no longer show in the conversation too: `remove` takes them out of what you are shown, never off the log.
+
+  It hands the value to the block that asked for it, so there is no step where you bring something *into view* before working with it — `const f = await history.fetch(9)` and the next line already has `f.content`. A reply whose every call reloads what the record is holding for it has spent a turn and learned nothing. Fetch it in the reply that uses it. */
   function fetch(id: number): unknown;
   /** Stop showing these entries — one id, or an inclusive range. For what you have finished with and will not need again: the listing you have already picked the four paths out of, the file you read one number from. Nothing is lost — `fetch` still answers for them — and the conversation stops carrying them. */
   function remove(from: number, to?: number): void;
