@@ -427,6 +427,15 @@ and an enum do not both become "type". The declaration lists the
 fourteen values instead of saying `string`, so there is nothing left
 to guess.
 
+A live probe afterwards, one completion: asked how many functions a
+small Python file defines, the model wrote
+
+    const functions = items.filter((i) => i.kind === "function");
+
+— the guess it always makes — and answered correctly in one program.
+The same program against the old `kind` returns `0 function(s)`, in a
+sentence with nothing wrong with it.
+
 This is the fourth declaration in this document that described
 something other than what the tool did, and the only one that cost a
 file. The lesson is narrower than "check your declarations": an enum
