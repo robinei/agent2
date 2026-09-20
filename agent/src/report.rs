@@ -1007,9 +1007,25 @@ fn copied_note(rows: &[(u64, u64)]) -> Option<String> {
     if rows.is_empty() {
         return None;
     }
-    let pairs = rows
+    // Grouped by the note, so four sources read as one sentence
+    // rather than four.
+    let mut by_note: Vec<(u64, Vec<u64>)> = Vec::new();
+    for (note, src) in rows {
+        match by_note.iter_mut().find(|(n, _)| n == note) {
+            Some((_, srcs)) => srcs.push(*src),
+            None => by_note.push((*note, vec![*src])),
+        }
+    }
+    let pairs = by_note
         .iter()
-        .map(|(note, src)| format!("`[{note}]` holds the bytes of `[{src}]`"))
+        .map(|(note, srcs)| {
+            let list = srcs
+                .iter()
+                .map(|s| format!("`[{s}]`"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("`[{note}]` holds the bytes of {list}")
+        })
         .collect::<Vec<_>>()
         .join("; ");
     Some(format!(
@@ -1065,11 +1081,14 @@ fn copied_rows(h: &Handback<'_>) -> Vec<(u64, u64)> {
         };
         let mut mine = Vec::new();
         strings(value, &mut mine);
-        if let Some((src, _)) = delivered
-            .iter()
-            .find(|(_, theirs)| mine.iter().any(|m| theirs.contains(m)))
-        {
-            out.push((ev.id.as_u64(), *src));
+        // **Every source, not the first.** A note holding four files
+        // holds four results, and naming one of them understates what
+        // it cost — seen on `sweep-8` at HEAD, where `[18]` carried
+        // `[9]`, `[10]`, `[11]` and `[12]` and the report said `[10]`.
+        for (src, theirs) in &delivered {
+            if mine.iter().any(|m| theirs.contains(m)) {
+                out.push((ev.id.as_u64(), *src));
+            }
         }
     }
     out
