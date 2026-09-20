@@ -170,25 +170,42 @@ impl DeepSeekClient {
         // Completions stream for minutes, so the body read cannot be
         // held to a short deadline — but "no deadline at all" means a
         // dead socket hangs the branch forever, with the TUI showing a
-        // session that is simply never going to continue. Seen after the
-        // machine slept mid-request: ten minutes on a connection nothing
-        // was ever coming back on.
+        // session that is simply never going to continue.
         //
-        // Two bounds, both deliberately far past anything healthy.
-        // `recv_response` covers time to the first response headers,
-        // which is where a dead connection sits. It was 180s, chosen
-        // because a direct probe showed headers arriving in under a
-        // second — and that was wrong twice in one evening: under load
-        // this endpoint *queues* rather than refusing, so a busy moment
-        // looks exactly like a dead socket and two real runs were killed
-        // mid-task by their own client. A timeout meant to catch a
-        // hardware event should never be tight enough to catch a slow
-        // one.
+        // **The two knobs are not what their names suggest**, and the
+        // comment that used to sit here had them backwards. Measured
+        // against a local server on 2026-09-20
+        // (`recv_response_caps_the_whole_response`,
+        // `recv_body_is_an_idle_bound`):
+        //
+        // - `timeout_recv_response` is a ceiling on the **whole
+        //   response**, body included — not on time-to-headers. With a
+        //   3s value against a server that sent headers instantly and
+        //   then went silent, the read failed at 3.0s naming "receive
+        //   response".
+        // - `timeout_recv_body` is an **idle** bound: it restarts on
+        //   every byte. A 3s value survived a trickle of one keep-alive
+        //   per second for eight seconds.
+        //
+        // So the old pair — 10 minutes "to the first headers" and 30
+        // for the body — was a hard 10-minute cap on every completion,
+        // with the idle bound set past it and therefore unreachable.
+        // The LAN box routinely spends longer than that on one program,
+        // which is what "two real runs killed mid-task by their own
+        // client" actually was; and because the kill lands before any
+        // text chunk, the retry loop re-sends and the branch sits
+        // silent for a multiple of it, writing nothing to the log.
+        //
+        // The roles are now the right way round. The ceiling is
+        // generous because a slow model is not a broken one; the idle
+        // bound is what catches a peer that has gone away, and it is
+        // the tight one because silence is the symptom that actually
+        // distinguishes dead from slow.
         let config = ureq::Agent::config_builder()
             .http_status_as_error(false)
             .timeout_connect(Some(std::time::Duration::from_secs(15)))
-            .timeout_recv_response(Some(std::time::Duration::from_secs(10 * 60)))
-            .timeout_recv_body(Some(std::time::Duration::from_secs(30 * 60)))
+            .timeout_recv_response(Some(COMPLETION_CEILING))
+            .timeout_recv_body(Some(SOCKET_IDLE))
             .build();
         DeepSeekClient {
             api_key,
@@ -296,15 +313,14 @@ impl LlmClient for DeepSeekClient {
                 // doubt — **except on a timeout**, which is the one
                 // transport failure that is not fast.
                 //
-                // `timeout_recv_response` is ten minutes on purpose
-                // (see `new`): this endpoint *queues* under load rather
-                // than refusing, so a busy moment looks exactly like a
-                // dead socket and a tight bound killed two real runs
-                // mid-task. A queued request that is retried simply
-                // queues again — and three attempts at ten minutes is
-                // half an hour of a branch doing nothing, where before
-                // this retry existed it was ten. Retrying a timeout
-                // costs the most and buys the least.
+                // The bounds are generous on purpose (see `new`): this
+                // endpoint *queues* under load rather than refusing, so
+                // a busy moment looks exactly like a dead socket, and a
+                // tight bound killed two real runs mid-task. A queued
+                // request that is retried simply queues again — and
+                // seven attempts at the ceiling is most of a day of a
+                // branch doing nothing. Retrying a timeout costs the
+                // most and buys the least.
                 // **A timeout is not retried — unless the machine
                 // slept.** A queued request that is retried simply
                 // queues again, so the generous ten-minute bound exists
@@ -329,6 +345,22 @@ impl LlmClient for DeepSeekClient {
         Err("every attempt failed".into())
     }
 }
+
+/// **A ceiling on one whole completion**, body included — ureq's
+/// `timeout_recv_response`, whose name describes a phase it does not
+/// actually bound. Deliberately far past anything healthy: a slow model
+/// is not a broken one, and the bound that catches a broken one is
+/// [`SOCKET_IDLE`].
+const COMPLETION_CEILING: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// **No bytes at all for this long means the peer is gone** — ureq's
+/// `timeout_recv_body`, which restarts on every byte received.
+///
+/// This is the one that has to be tight, because silence is what
+/// separates a dead socket from a slow one: a generating model emits
+/// deltas continuously, and the long legitimate gap is the wait before
+/// the first token, which is minutes rather than tens of them.
+const SOCKET_IDLE: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
 /// How many times a request is sent before the failure is the
 /// caller's.
@@ -741,6 +773,130 @@ mod tests {
             }
         });
         (format!("http://127.0.0.1:{port}/v1"), handle)
+    }
+
+    /// A server that answers, sends `head`, then goes silent forever
+    /// without closing — the dead-peer shape. Holds the socket open on
+    /// a parked thread so nothing closes it.
+    fn serve_then_go_silent(head: String) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let Ok((mut sock, _)) = listener.accept() else {
+                return;
+            };
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf);
+            let _ = sock.write_all(head.as_bytes());
+            let _ = sock.flush();
+            // Never write again, never close.
+            std::thread::sleep(std::time::Duration::from_secs(600));
+            drop(sock);
+        });
+        format!("http://127.0.0.1:{port}/v1")
+    }
+
+    /// **`timeout_recv_body` is an idle bound**: it restarts on every
+    /// byte received. That is what makes it the right knob for "the
+    /// peer has gone away" — a completion that streams for twenty
+    /// minutes is healthy, and a socket silent for ten is not. Pinned
+    /// for the same reason as the test above: `SOCKET_IDLE` is only
+    /// safe to set tight while this holds.
+    #[test]
+    fn recv_body_is_an_idle_bound() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let Ok((mut sock, _)) = listener.accept() else {
+                return;
+            };
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf);
+            let _ = sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n");
+            let _ = sock.flush();
+            // A byte every second for eight seconds: healthy trickle.
+            for _ in 0..8 {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                if sock.write_all(b": keep-alive\n\n").is_err() {
+                    return;
+                }
+                let _ = sock.flush();
+            }
+        });
+        let config = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .timeout_recv_response(Some(std::time::Duration::from_secs(60)))
+            .timeout_recv_body(Some(std::time::Duration::from_secs(3)))
+            .build();
+        let agent: ureq::Agent = config.into();
+        let started = std::time::Instant::now();
+        let mut got = agent
+            .post(&format!("http://127.0.0.1:{port}/v1/chat/completions"))
+            .send_json(serde_json::json!({"a": 1}))
+            .unwrap();
+        let mut s = String::new();
+        let r = got.body_mut().as_reader().read_to_string(&mut s);
+        let elapsed = started.elapsed();
+        r.unwrap_or_else(|e| {
+            panic!("a 3s bound killed an 8s trickle after {elapsed:?}: {e} — `recv_body` is a total bound, and `SOCKET_IDLE` is now unsafe")
+        });
+        assert!(
+            elapsed >= std::time::Duration::from_secs(7),
+            "the trickle should have been read to its end, not cut short: {elapsed:?}"
+        );
+    }
+
+    /// **`timeout_recv_response` caps the whole response**, body
+    /// included — it does not bound time-to-headers, whatever its name
+    /// says. The production pair is chosen on this fact
+    /// (`COMPLETION_CEILING`), so it is pinned rather than remembered:
+    /// a dependency upgrade that changed it would silently reinstate a
+    /// hard cap on every completion.
+    #[test]
+    fn recv_response_caps_the_whole_response() {
+        for (resp, body, expect) in [
+            (3u64, 10u64, "receive response"),
+            (10, 3, "receive body"),
+            (3, 3, "receive response"),
+        ] {
+            let url = serve_then_go_silent(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\ndata: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"
+                    .to_owned(),
+            );
+            let config = ureq::Agent::config_builder()
+                .http_status_as_error(false)
+                .timeout_connect(Some(std::time::Duration::from_secs(5)))
+                .timeout_recv_response(Some(std::time::Duration::from_secs(resp)))
+                .timeout_recv_body(Some(std::time::Duration::from_secs(body)))
+                .build();
+            let agent: ureq::Agent = config.into();
+            let started = std::time::Instant::now();
+            let out = (|| -> Result<String, String> {
+                let mut got = agent
+                    .post(&format!("{url}/chat/completions"))
+                    .send_json(serde_json::json!({"a": 1}))
+                    .map_err(|e| format!("send: {e}"))?;
+                let mut s = String::new();
+                use std::io::Read;
+                got.body_mut()
+                    .as_reader()
+                    .read_to_string(&mut s)
+                    .map_err(|e| format!("read: {e}"))?;
+                Ok(s)
+            })();
+            let elapsed = started.elapsed();
+            let err = out.expect_err("the peer went silent");
+            assert!(
+                err.contains(expect),
+                "resp={resp}s body={body}s named {err:?}, not {expect:?}"
+            );
+            assert!(
+                elapsed < std::time::Duration::from_secs(resp.min(body) + 3),
+                "resp={resp}s body={body}s took {elapsed:?}"
+            );
+        }
     }
 
     fn delta(field: &str, text: &str) -> String {
