@@ -192,6 +192,25 @@ const STOPPED_SHORT_NOTICE: &str = "Your last reply ran nothing, and nobody had 
      done, say so with `finish(text)` inside a ```js block. Otherwise carry on from where you left \
      off.";
 
+/// **What a reply with no block does, said while it would be a
+/// mistake.**
+///
+/// Prose-only is the right shape for answering a question and the
+/// wrong one once work is under way: it runs nothing and hands back to
+/// the person, mid-task, silently. That is the discrimination
+/// `stopped_short`'s third branch makes *after* the fact, at the cost
+/// of a round trip. Said here it costs nothing and arrives before the
+/// reply is written.
+///
+/// It names the consequence rather than the unit. There is no word for
+/// "the stretch of replies since the person last spoke": `turn` is one
+/// reply (the card's own usage, and `<end_of_turn>` in the model's
+/// prior), `run` is a program. The card already says what happens
+/// without naming it, and this borrows the phrase.
+const WORK_UNDER_WAY: &str = "A program has already run since anyone last spoke. A reply with \
+     no ```js block in it ends here: nothing runs, and the next thing to happen is whatever the \
+     person says.";
+
 /// **The contract, restated where it is about to be acted on.**
 ///
 /// The card says this in its first paragraph, and the first paragraph
@@ -3815,8 +3834,34 @@ impl Runner {
             lines.push(REPLY_SHAPE_TAIL.to_owned());
         }
         lines.push(if self.attached { PRESENT } else { ABSENT }.to_owned());
+        if self.work_under_way(tree) {
+            lines.push(WORK_UNDER_WAY.to_owned());
+        }
         lines.push(REPLY_IS_MARKDOWN.to_owned());
         Some(lines.join("\n"))
+    }
+
+    /// **Has a cell run since the person last spoke?** If so the
+    /// branch is mid-work, and a reply that runs nothing stops it
+    /// rather than answering anything.
+    fn work_under_way(&self, tree: &Tree) -> bool {
+        let segment = self.agent_segment(tree);
+        let last_post = segment
+            .iter()
+            .rev()
+            .find(|e| matches!(e.payload, EventPayload::Post { .. }))
+            .map(|e| e.id.as_u64())
+            .unwrap_or(0);
+        segment.iter().any(|e| {
+            e.id.as_u64() > last_post
+                && matches!(
+                    &e.payload,
+                    EventPayload::Part {
+                        part: crate::types::Part::Cell(_),
+                        ..
+                    }
+                )
+        })
     }
 
     /// **Did this reply put anything in front of anybody?** Prose and
@@ -7799,6 +7844,40 @@ mod tests {
         );
     }
 
+    /// **The mid-work line appears once work is under way, and not
+    /// before.** Before any cell has run, a prose-only reply is the
+    /// right answer to a question; after one has, it stops the work
+    /// silently. The tail says which situation this is.
+    #[test]
+    fn the_mid_work_line_waits_until_a_cell_has_run() {
+        let (mut tree, mut state) = setup_under();
+        user_post(&mut state, &mut tree, "what is a mutex?");
+        let tail = state.request_tail(&tree).expect("a tail");
+        assert!(
+            !tail.contains("already run since anyone last spoke"),
+            "nobody has run anything yet: {tail}"
+        );
+
+        let out = state
+            .step(&mut tree, StepInput::LlmResponse(llm_program("let a = 1;")))
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+        let tail = state.request_tail(&tree).expect("a tail");
+        assert!(
+            tail.contains("already run since anyone last spoke"),
+            "a cell has run: {tail}"
+        );
+
+        // The person speaks again and it is a fresh question, so the
+        // line goes away until work restarts.
+        user_post(&mut state, &mut tree, "and a semaphore?");
+        let tail = state.request_tail(&tree).expect("a tail");
+        assert!(
+            !tail.contains("already run since anyone last spoke"),
+            "a new post resets it: {tail}"
+        );
+    }
+
     /// **The reply-shape line rides the tail, and only where it is
     /// apt.** It says "you may simply answer", which is right when
     /// somebody has just asked and wrong when the branch is carrying on
@@ -7832,8 +7911,11 @@ mod tests {
             .unwrap();
         drain(&mut state, &mut tree, out);
         let tail = state.request_tail(&tree).expect("a tail");
+        // Its own wording, not the shared phrase: `WORK_UNDER_WAY`
+        // also says "no ```js block", and says the complementary half
+        // — these two never fire on the same request.
         assert!(
-            !tail.contains("no ```js block"),
+            !tail.contains("is a complete answer"),
             "nobody asked anything; this is the branch's own work: {tail}"
         );
     }
@@ -7885,7 +7967,7 @@ mod tests {
         let (mut tree, mut state) = setup_under();
         user_post(&mut state, &mut tree, "what is a mutex?");
         let tail = state.request_tail(&tree).expect("a tail");
-        assert!(!tail.contains("no ```js block"), "{tail}");
+        assert!(!tail.contains("is a complete answer"), "{tail}");
     }
 
     #[test]
