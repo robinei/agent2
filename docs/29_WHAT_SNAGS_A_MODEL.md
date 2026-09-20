@@ -31,10 +31,22 @@ either. What can be said about it:
   `ambiguous-config` and `skipped-tests` all held or improved.
 - Every failure is the same task judgement: a definition deleted that
   something still reached without naming it. None is a harness fault.
-- The obvious mechanism does not hold. Fewer programs per run was the
-  suspect, and within HEAD the failing runs average 5.6 programs
-  against 5.4 for the passing ones. Brevity is not what distinguishes
-  them.
+- Fewer *programs* is not the mechanism: within HEAD the failing runs
+  average 5.6 programs against 5.4 for the passing ones.
+- **Bigger programs may be.** On the sweep tasks, HEAD's cells average
+  726 bytes against the baseline's 472, and the median is 473 against
+  296 — half again as much logic per block, which is the batching the
+  opening listing was meant to buy. The failure read is a plain logic
+  bug of the kind a long block invites: the run built a set of
+  *suffixes* (`"004"`) from `helper_(\w+)` and then asked it about
+  full names (`helper_004`), so every helper looked unused. Three
+  small blocks have fewer places to disagree with themselves than one
+  large one.
+
+  That is a trade, not a defect: fewer round trips against more logic
+  per round trip, and it is the hardest tasks that pay. Worth watching
+  rather than reversing — the same batching is where a third of the
+  cost went.
 
 `outline` now says it lists what a file defines and never what uses it,
 and names the mechanisms — `getattr`, string tables, registries — to
