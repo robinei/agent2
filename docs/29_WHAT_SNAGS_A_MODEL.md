@@ -340,11 +340,14 @@ have helped while looking at a file whole was impossible any other way.
 The same file read twice inside one reply — the thing the
 redeclaration diagnostic was catching all along:
 
-| | read_file calls | repeats of the same path in one reply |
-|---|---|---|
-| baseline | 95 | 7 (7%) |
-| HEAD, suite 1 | 91 | 0 |
-| HEAD, suite 2 | 120 | 1 (1%) |
+| | read_file calls | same path twice in one reply | *any* call repeated identically |
+|---|---|---|---|
+| baseline | 95 | 7 (7%) | 11 of 205 (5.4%) |
+| HEAD, suite 1 | 91 | 0 | 1 of 166 (0.6%) |
+| HEAD, suite 2 | 120 | 1 (1%) | 3 of 211 (1.4%) |
+
+The survivors are defensible — a test re-run after a change is not a
+repeat of the same question.
 
 Not from the message, which changed after both suites: from the report
 that now shows what an earlier block already did, and from the console
