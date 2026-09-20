@@ -6,13 +6,24 @@ runs no program had ever called one.  That is not evidence the
 vocabulary is unused — it is evidence the suite never asked for it.  This
 asks.
 
-**The pressure, and why it is real.**  Each review is about 12 KB and
-there are three; the card and its worked examples are about 23 KB; the
-budget is 64 KB.  Reading all three into one context leaves nothing.  So
-the task has two honest answers — spawn a helper per review, whose
-context is its own and whose answer comes back a sentence long, or read
-one at a time and `history.remove` the row afterwards — and the point is
-to find out which one gets reached for.
+**The pressure, and why it is real.**  It is not the 64 KB budget —
+it is `report::CONSOLE_SECTION_MAX_BYTES`, which is 4,096.  A reply
+sees at most that much of what its own blocks printed, so a 12 KB
+review takes at least three print-and-read round trips to get in front
+of a reader, and three reviews take nine.  A helper does its three in a
+context that is its own and answers in a sentence, which costs the
+caller one.
+
+So the task has two honest answers — a helper per review, or one review
+at a time with the row removed afterwards — and the point is to find
+out which gets reached for.
+
+**And a third, which is cleverer than both.**  The thread in each
+review is a bullet list, so a program can pull just those lines out and
+print three hundred bytes instead of twelve thousand.  That is good
+work and the task will pass it.  One of the three reviews resists it:
+the value it reverts to is stated in the body prose rather than in the
+thread, so something has to read the body either way.
 
 Neither is required.  A task that *gates* on `spawn` would measure
 whether a model can follow an instruction nobody gave it; the delegation
