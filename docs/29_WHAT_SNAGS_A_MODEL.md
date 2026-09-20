@@ -7,7 +7,7 @@ finding, so it is first.
 
 ## What wants a decision
 
-Everything below is done and measured. Four things are not, and each
+Everything below is done and measured. Five things are not, and each
 is a judgement rather than a repair:
 
 1. **Whether the document should shrink a duplicated `history.append`.**
@@ -63,7 +63,29 @@ is a judgement rather than a repair:
    now. It is the kind of thing that only shows up when the path is
    actually run, which is the argument for the eval task.
 
-4. **The local model.** `Qwen3.8-27B` works and is far too slow for the
+4. **What the person actually reads, and who pays for it.** Of 237
+   closing messages, 44 (18%) carry raw tool output — a traceback, a
+   `Ran 6 tests` tail, a lint dump — and 20 (8%) enumerate eight or
+   more names. The good ones are very good ("the ones on
+   `legacy_scale`, `retired`, `suffix`, `trim` still suppress real
+   warnings"); the weak ones hand over a lint dump with no word about
+   whether it is a problem.
+
+   It looks like the copying the card forbids in bold, and it is not
+   quite. A row's bytes are recoverable with `fetch`, which is why
+   copying them into a note is waste — but **the person cannot
+   `fetch`**. They see prose and `tell` and nothing else, so a
+   traceback pasted into the closing message may be the only way that
+   traceback ever reaches them. The cost falls on the model's own
+   context, where the same bytes are already sitting in a row.
+
+   So it is a trade the card has never named, not a mistake, and I
+   have no evidence about which way it should go: the suite scores
+   "spoke" as a yes-or-no and nothing measures whether the person was
+   well served. Naming it would mean deciding what `tell` is for when
+   the two readers want different things.
+
+5. **The local model.** `Qwen3.8-27B` works and is far too slow for the
    suite — 450 seconds a program, a `skipped-tests` run capped out
    after two. Useful for watching behaviour, not for measuring it.
 
