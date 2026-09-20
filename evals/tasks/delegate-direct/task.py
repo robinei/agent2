@@ -25,9 +25,16 @@ def setup(env):
     env.copy_fixture()
 
 
+def _said_the_number(env) -> bool:
+    """`1066` or `1,066` — a thousands separator is not a wrong answer."""
+    plain = ANSWER
+    grouped = f"{int(ANSWER):,}"
+    return any(plain in t or grouped in t for t in env.tells)
+
+
 def check(env):
     spawned = env.score.get("spawn_children", 0)
-    said = env.said(ANSWER)
+    said = _said_the_number(env)
 
     env.credit(0 if env.score["silent"] else 1, 1, "said something to a person")
     env.credit(1 if spawned else 0, 1, "spawned a helper")
@@ -58,6 +65,10 @@ def EXPECT(root):
         "fail-wrong-sum": {
             "spawn_children": 1,
             "tells": ["The closing balance is 1100."],
+        },
+        "pass-grouped": {
+            "spawn_children": 1,
+            "tells": [f"The closing balance is {int(ANSWER):,}."],
         },
         "fail-silent": {"spawn_children": 1, "tells": []},
     }.items():
