@@ -1,9 +1,19 @@
 # 29 — What snags a model
 
-A night spent reading 96 kept eval runs for places the harness trips
-the model it is trying to help. Not a design phase: an audit, and the
-fixes that fell out of it. The method is worth more than any one
-finding, so it is first.
+A night spent reading kept eval runs — 96 at first, around 300 by the
+end — for places the harness trips the model it is trying to help. Not
+a design phase: an audit, and the fixes that fell out of it. The
+method is worth more than any one finding, so it is first.
+
+The second half went differently from the first and the difference is
+the lesson. The first half found tools whose descriptions did not
+match what they did. The second half came from building `agent
+document <log> [id]`, which renders the prompt as of any point in a
+run rather than only at the end — and then reading what came out. That
+turned up two crashes, a report section that showed none of what a
+program printed, a caret pointing at the model's own prose, and an
+enum rendered as `string` that cost a source file. None of those are
+visible from the source; all of them are obvious on the page.
 
 ## What wants a decision
 
