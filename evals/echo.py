@@ -8,10 +8,15 @@ front of the *next* reply without spending a program on fetching them.
 
     python3 evals/echo.py ~/.claude/jobs/*/tmp
 
-Measured 2026-09-20 across 377 kept logs, before any card change:
+Measured 2026-09-20, before any card change:
 
-    runs printing back a file they just read   235 of 377   (62%)
+    runs printing back a file they just read   235 of 303   (78%)
     console bytes in those sections      1,970,004 of 2,782,871  (71%)
+
+The denominator is runs that *could* echo — ones that both received a
+big value and printed something. Against all 377 readable logs it is
+62%, which is the wrong fraction to quote: a run with nothing to echo
+is not a run that chose not to.
 
 That is not a bug and it is not obviously wrong — a model that has just
 read a file and needs to reason about it on the *next* turn has two
