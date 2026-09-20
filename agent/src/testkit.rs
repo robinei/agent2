@@ -155,7 +155,10 @@ pub enum Ending {
     /// `stop(reason)` — this reply cannot finish, and says why.
     Stopped(String),
     /// `raise(name, payload)` — parked for a judgement.
-    Raised { name: String, payload: Option<serde_json::Value> },
+    Raised {
+        name: String,
+        payload: Option<serde_json::Value>,
+    },
     /// A runtime error nobody caught, and where in the reply it
     /// happened.
     Trapped { message: String, site: u32 },
@@ -193,7 +196,10 @@ impl Row {
 
 /// An `ask` this reply issued and nobody has answered.
 #[derive(Debug, Clone)]
-#[allow(dead_code, reason = "a harness's shape is its API; `to` is read by tests not yet written")]
+#[allow(
+    dead_code,
+    reason = "a harness's shape is its API; `to` is read by tests not yet written"
+)]
 pub struct Ask {
     /// The logged `Call::Send`, to answer with
     /// [`Conversation::answer`].
@@ -221,6 +227,8 @@ pub struct Said {
     pub parts: Vec<EventId>,
     /// The outcome, when the program reached one.
     pub handback: Option<EventId>,
+    /// The `finish(text)` send, if the reply ended itself with one.
+    pub finished_by: Option<EventId>,
     /// The source of each ```js cell, fences included — what `Part::Cell`
     /// carries, so a test can assert on what ran as well as on what it
     /// did.
@@ -268,7 +276,10 @@ pub struct Said {
     span: (u64, u64),
 }
 
-#[allow(dead_code, reason = "the projection is the API; not every field has a test yet")]
+#[allow(
+    dead_code,
+    reason = "the projection is the API; not every field has a test yet"
+)]
 impl Said {
     /// Whether `id` is an event this reply produced.
     pub fn owns(&self, id: EventId) -> bool {
@@ -278,7 +289,10 @@ impl Said {
 
     /// Whether anything this reply said contains `needle`.
     pub fn said(&self, needle: &str) -> bool {
-        self.tells.iter().chain(&self.prose).any(|t| t.contains(needle))
+        self.tells
+            .iter()
+            .chain(&self.prose)
+            .any(|t| t.contains(needle))
     }
 
     /// The single row this reply appended. Panics naming what it found
@@ -287,7 +301,10 @@ impl Said {
     pub fn row(&self) -> &Row {
         match self.rows.as_slice() {
             [r] => r,
-            other => panic!("expected exactly one appended row, got {}: {other:?}", other.len()),
+            other => panic!(
+                "expected exactly one appended row, got {}: {other:?}",
+                other.len()
+            ),
         }
     }
 
@@ -301,7 +318,10 @@ impl Said {
     pub fn ask(&self) -> &Ask {
         match self.asks.as_slice() {
             [a] => a,
-            other => panic!("expected exactly one open ask, got {}: {other:?}", other.len()),
+            other => panic!(
+                "expected exactly one open ask, got {}: {other:?}",
+                other.len()
+            ),
         }
     }
 }
@@ -420,7 +440,10 @@ impl Conversation {
             options: Vec::new(),
             expects_reply,
         };
-        let (post, out) = self.runner.deliver(&mut self.tree, from, origin).expect("deliver");
+        let (post, out) = self
+            .runner
+            .deliver(&mut self.tree, from, origin)
+            .expect("deliver");
         self.settle(out);
         post
     }
@@ -454,7 +477,10 @@ impl Conversation {
         }
         let end = self
             .runner
-            .step(&mut self.tree, StepInput::LlmResponse(crate::host::scripted_program("")))
+            .step(
+                &mut self.tree,
+                StepInput::LlmResponse(crate::host::scripted_program("")),
+            )
             .expect("stream end");
         self.settle(end);
         let said = self.project(before);
@@ -554,7 +580,10 @@ impl Conversation {
                 .expect("stream");
             out.extend(
                 self.runner
-                    .step(&mut self.tree, StepInput::LlmResponse(crate::host::scripted_program("")))
+                    .step(
+                        &mut self.tree,
+                        StepInput::LlmResponse(crate::host::scripted_program("")),
+                    )
                     .expect("stream end"),
             );
             out
@@ -586,7 +615,10 @@ impl Conversation {
             .runner
             .step(
                 &mut self.tree,
-                StepInput::ToolResults(vec![ToolResult { call: ask, result: Ok(value) }]),
+                StepInput::ToolResults(vec![ToolResult {
+                    call: ask,
+                    result: Ok(value),
+                }]),
             )
             .expect("answer");
         self.settle(out);
@@ -804,109 +836,158 @@ impl Conversation {
 
     fn project(&self, before: u64) -> Said {
         let events = self.scope(before);
-        let mut s = Said {
-            reply: self.runner.reply_id,
-            parts: Vec::new(),
-            handback: None,
-            prose: Vec::new(),
-            cells: Vec::new(),
-            tells: Vec::new(),
-            told: Vec::new(),
-            asks: Vec::new(),
-            rows: Vec::new(),
-            calls: Vec::new(),
-            printed: Vec::new(),
-            notices: Vec::new(),
-            compacted: Vec::new(),
-            settled: Vec::new(),
-            answered: Vec::new(),
-            ended: Ending::Running,
-            reply_ended: None,
-            // **Rested, not merely quiet.** A reply that parked — on a
-            // raise, on a `stop` — also leaves no request behind at
-            // this layer, because the one that wakes it is the host's
-            // to send. Resting is the branch going *idle* owing
-            // nothing, which is a different state and the only one
-            // `finish` produces.
-            rests: self.requests == 0 && self.runner.is_idle(),
-            kinds: Vec::new(),
-            span: (before, self.tree.id_counter),
-        };
-        for e in &events {
-            s.kinds.push(kind_of(&e.payload));
-            // Thinking is not a piece of the reply, so it is not a part.
-            if let EventPayload::Part { part, .. } = &e.payload
-                && !matches!(part, crate::types::Part::Thinking(_))
-            {
-                s.parts.push(e.id);
-            }
-            match &e.payload {
-                EventPayload::Part { part, .. } => match part {
-                    crate::types::Part::Cell(t) => s.cells.push(t.clone()),
-                    // The verbatim prose is the invariant's business,
-                    // not a test's: what a test reads is the `Send`
-                    // below, which is what the person actually got.
-                    crate::types::Part::Prose(_) | crate::types::Part::Thinking(_) => {}
-                },
-                // **Prose is a `Send` too** — a paragraph between cells
-                // reaches the person as a message like any other. It is
-                // its own field rather than a `tell`, because counting
-                // it as one would make every narrating reply look like
-                // it said everything twice.
-                EventPayload::Call(Call::Send { prose: true, text, .. }) => {
-                    s.prose.push(text.clone())
-                }
-                EventPayload::Call(Call::Send { text, expects_reply, to, options, .. }) => {
-                    if *expects_reply {
-                        s.asks.push(Ask {
-                            call: e.id,
-                            to: *to,
-                            text: text.clone(),
-                            options: options.clone(),
-                        });
-                    } else {
-                        s.tells.push(text.clone());
-                        s.told.push(e.id);
-                    }
-                }
-                EventPayload::Call(Call::Invoke { name, args, .. }) => {
-                    s.calls.push((name.clone(), args.clone()))
-                }
-                EventPayload::Note { value, site, site_end, .. } => s.rows.push(Row {
-                    id: e.id,
-                    value: value.clone(),
-                    site: (*site, *site_end),
-                }),
-                EventPayload::Post { from: Author::Harness, origin } => {
-                    if let Some((text, _, _)) = self.tree.resolve(origin).direct() {
-                        s.notices.push(text.to_owned());
-                    }
-                }
-                EventPayload::Compacted { of, .. } => s.compacted.push(*of),
-                EventPayload::Console { lines } => s.printed.extend(lines.iter().cloned()),
-                EventPayload::Result { call, outcome } => s.settled.push((*call, outcome.clone())),
-                EventPayload::Answer { question, value } => {
-                    s.answered.push((*question, value.clone()))
-                }
-                EventPayload::ReplyEnd { how, .. } => s.reply_ended = Some(how.clone()),
-                EventPayload::Handback { how, site, .. } => {
-                    s.ended = ending_of(how, *site);
-                    s.handback = Some(e.id);
-                }
-                _ => {}
-            }
-        }
-        // `finish` is a `Completed` handback with the flag that rests
-        // the branch — the log does not spell the two apart, and the
-        // difference is exactly what a test wants to name.
-        if s.ended == Ending::Completed && s.rests {
-            s.ended = Ending::Finished;
-        }
+        let mut s = fold(&self.tree, &events, (before, self.tree.id_counter));
+        s.reply = self.runner.reply_id;
+        s.rests = self.requests == 0 && self.runner.is_idle();
         s
     }
+}
 
-    // ── the invariants ──────────────────────────────────────────────
+/// The same projection over a whole branch of a finished log — what a
+/// session test reads instead of walking the tree by hand.
+///
+/// **`rests` is not knowable here.** Resting is the absence of a
+/// request, which a log does not record; from a finished log the
+/// honest reading is "nothing is open and the last program ended", and
+/// that is what this reports. Everything else means exactly what it
+/// means from a live reply, because it is the same fold.
+impl Said {
+    pub fn of_branch(tree: &Tree, leaf: EventId) -> Said {
+        let owned = tree.path_events(leaf);
+        let events: Vec<&Event> = owned.to_vec();
+        let mut s = fold(tree, &events, (0, leaf.as_u64()));
+        s.reply = events
+            .iter()
+            .rev()
+            .find(|e| matches!(e.payload, EventPayload::Reply | EventPayload::Restart))
+            .map(|e| e.id)
+            .unwrap_or(leaf);
+        s.rests = s.asks.is_empty() && matches!(s.ended, Ending::Finished | Ending::Completed);
+        s
+    }
+}
 
+fn fold(tree: &Tree, events: &[&Event], span: (u64, u64)) -> Said {
+    let mut s = Said {
+        reply: EventId::new(1),
+        parts: Vec::new(),
+        handback: None,
+        finished_by: None,
+        prose: Vec::new(),
+        cells: Vec::new(),
+        tells: Vec::new(),
+        told: Vec::new(),
+        asks: Vec::new(),
+        rows: Vec::new(),
+        calls: Vec::new(),
+        printed: Vec::new(),
+        notices: Vec::new(),
+        compacted: Vec::new(),
+        settled: Vec::new(),
+        answered: Vec::new(),
+        ended: Ending::Running,
+        reply_ended: None,
+        // **Rested, not merely quiet.** A reply that parked — on a
+        // raise, on a `stop` — also leaves no request behind at
+        // this layer, because the one that wakes it is the host's
+        // to send. Resting is the branch going *idle* owing
+        // nothing, which is a different state and the only one
+        // `finish` produces.
+        rests: false,
+        kinds: Vec::new(),
+        span,
+    };
+    for e in events {
+        s.kinds.push(kind_of(&e.payload));
+        // Thinking is not a piece of the reply, so it is not a part.
+        if let EventPayload::Part { part, .. } = &e.payload
+            && !matches!(part, crate::types::Part::Thinking(_))
+        {
+            s.parts.push(e.id);
+        }
+        match &e.payload {
+            EventPayload::Part { part, .. } => match part {
+                crate::types::Part::Cell(t) => s.cells.push(t.clone()),
+                // The verbatim prose is the invariant's business,
+                // not a test's: what a test reads is the `Send`
+                // below, which is what the person actually got.
+                crate::types::Part::Prose(_) | crate::types::Part::Thinking(_) => {}
+            },
+            // **Prose is a `Send` too** — a paragraph between cells
+            // reaches the person as a message like any other. It is
+            // its own field rather than a `tell`, because counting
+            // it as one would make every narrating reply look like
+            // it said everything twice.
+            EventPayload::Call(Call::Send {
+                prose: true, text, ..
+            }) => s.prose.push(text.clone()),
+            EventPayload::Call(Call::Send {
+                text,
+                expects_reply,
+                to,
+                options,
+                site,
+                site_end,
+                ..
+            }) => {
+                if *expects_reply {
+                    s.asks.push(Ask {
+                        call: e.id,
+                        to: *to,
+                        text: text.clone(),
+                        options: options.clone(),
+                    });
+                } else {
+                    s.tells.push(text.clone());
+                    s.told.push(e.id);
+                    // No call expression behind it: `finish(text)`
+                    // is an effect, not a call, so its send has the
+                    // synthetic zero-width site.
+                    if (*site, *site_end) == (0, 0) {
+                        s.finished_by = Some(e.id);
+                    }
+                }
+            }
+            EventPayload::Call(Call::Invoke { name, args, .. }) => {
+                s.calls.push((name.clone(), args.clone()))
+            }
+            EventPayload::Note {
+                value,
+                site,
+                site_end,
+                ..
+            } => s.rows.push(Row {
+                id: e.id,
+                value: value.clone(),
+                site: (*site, *site_end),
+            }),
+            EventPayload::Post {
+                from: Author::Harness,
+                origin,
+            } => {
+                if let Some((text, _, _)) = tree.resolve(origin).direct() {
+                    s.notices.push(text.to_owned());
+                }
+            }
+            EventPayload::Compacted { of, .. } => s.compacted.push(*of),
+            EventPayload::Console { lines } => s.printed.extend(lines.iter().cloned()),
+            EventPayload::Result { call, outcome } => s.settled.push((*call, outcome.clone())),
+            EventPayload::Answer { question, value } => s.answered.push((*question, value.clone())),
+            EventPayload::ReplyEnd { how, .. } => s.reply_ended = Some(how.clone()),
+            EventPayload::Handback { how, site, .. } => {
+                s.ended = ending_of(how, *site);
+                s.handback = Some(e.id);
+            }
+            _ => {}
+        }
+    }
+    finish_up(&mut s);
+    s
+}
+
+// ── the invariants ──────────────────────────────────────────────
+
+impl Conversation {
     fn enforced(&self, inv: Invariant) -> bool {
         !self.allowed.contains(&inv)
     }
@@ -914,7 +995,11 @@ impl Conversation {
     fn check(&self, s: &Said, markdown: &str) {
         let events = self.scope(s.span.0);
         if self.enforced(Invariant::OneReply) {
-            let replies = s.kinds.iter().filter(|k| **k == "Reply" || **k == "Restart").count();
+            let replies = s
+                .kinds
+                .iter()
+                .filter(|k| **k == "Reply" || **k == "Restart")
+                .count();
             assert_eq!(
                 replies, 1,
                 "one completion must log exactly one Reply, got {replies}: {:?}",
@@ -923,15 +1008,25 @@ impl Conversation {
         }
         if self.enforced(Invariant::ReplyEnds) {
             let ends = s.kinds.iter().filter(|k| **k == "ReplyEnd").count();
-            assert_eq!(ends, 1, "a reply must end exactly once, got {ends}: {:?}", s.kinds);
+            assert_eq!(
+                ends, 1,
+                "a reply must end exactly once, got {ends}: {:?}",
+                s.kinds
+            );
         }
         if self.enforced(Invariant::PartsConcatenate) {
             let rebuilt: String = s.prose.iter().chain(&s.cells).map(String::as_str).collect();
             let rebuilt_in_order: String = events
                 .iter()
                 .filter_map(|e| match &e.payload {
-                    EventPayload::Part { part: crate::types::Part::Prose(t), .. } => Some(t.as_str()),
-                    EventPayload::Part { part: crate::types::Part::Cell(t), .. } => Some(t.as_str()),
+                    EventPayload::Part {
+                        part: crate::types::Part::Prose(t),
+                        ..
+                    } => Some(t.as_str()),
+                    EventPayload::Part {
+                        part: crate::types::Part::Cell(t),
+                        ..
+                    } => Some(t.as_str()),
                     _ => None,
                 })
                 .collect();
@@ -958,8 +1053,13 @@ impl Conversation {
         }
         if self.enforced(Invariant::ProseIsSynthetic) {
             for e in &events {
-                if let EventPayload::Call(Call::Send { prose: true, site, site_end, text, .. }) =
-                    &e.payload
+                if let EventPayload::Call(Call::Send {
+                    prose: true,
+                    site,
+                    site_end,
+                    text,
+                    ..
+                }) = &e.payload
                 {
                     assert_eq!(
                         (*site, *site_end),
@@ -998,11 +1098,22 @@ impl Conversation {
         if self.enforced(Invariant::CallsSettle) {
             // Not while something is parked: a suspended or abandoned
             // run leaves calls open by design.
-            let parked = !matches!(s.ended, Ending::Completed | Ending::Finished | Ending::Stopped(_));
+            let parked = !matches!(
+                s.ended,
+                Ending::Completed | Ending::Finished | Ending::Stopped(_)
+            );
             if !parked {
                 for e in &events {
-                    let EventPayload::Call(call) = &e.payload else { continue };
-                    if matches!(call, Call::Send { expects_reply: true, .. }) {
+                    let EventPayload::Call(call) = &e.payload else {
+                        continue;
+                    };
+                    if matches!(
+                        call,
+                        Call::Send {
+                            expects_reply: true,
+                            ..
+                        }
+                    ) {
                         continue; // an answer is someone else's to give
                     }
                     let settled = events.iter().any(|x| {
@@ -1020,16 +1131,33 @@ impl Conversation {
     }
 }
 
+/// **Finishing and handing on are one `Completed` on the log.** The
+/// difference is whether the reply *said* something on its way out, and
+/// `finish(text)` is the only thing that sends with no call expression
+/// behind it — the synthetic zero-width site the verb gives its send,
+/// which an ordinary `tell` never has.
+///
+/// Read from the events rather than from whether the branch rested,
+/// because resting is a live fact and this has to be decidable from a
+/// finished log too.
+fn finish_up(s: &mut Said) {
+    if s.ended == Ending::Completed && s.finished_by.is_some() {
+        s.ended = Ending::Finished;
+    }
+}
+
 fn ending_of(how: &Handback, site: u32) -> Ending {
     match how {
         Handback::Completed => Ending::Completed,
         Handback::Stopped { reason } => Ending::Stopped(reason.clone()),
-        Handback::Raised { name, payload, .. } => {
-            Ending::Raised { name: name.clone(), payload: payload.clone() }
-        }
-        Handback::Trapped { message, .. } => {
-            Ending::Trapped { message: message.clone(), site }
-        }
+        Handback::Raised { name, payload, .. } => Ending::Raised {
+            name: name.clone(),
+            payload: payload.clone(),
+        },
+        Handback::Trapped { message, .. } => Ending::Trapped {
+            message: message.clone(),
+            site,
+        },
         Handback::CellFailed { message } => Ending::CellFailed(message.clone()),
         Handback::Abandoned => Ending::Abandoned,
         Handback::Posted { .. } => Ending::Posted,
@@ -1097,8 +1225,14 @@ mod tests {
         );
 
         assert_eq!(r.ended, Ending::Stopped("CHECK fails:\n2 failed".into()));
-        assert!(r.tells.is_empty(), "it stopped before it could claim success");
-        assert!(!r.rests, "a stop is not an ending — the branch is asked again");
+        assert!(
+            r.tells.is_empty(),
+            "it stopped before it could claim success"
+        );
+        assert!(
+            !r.rests,
+            "a stop is not an ending — the branch is asked again"
+        );
     }
 
     /// **`finish(text)` halts, and the cells after it never run** (D8,
@@ -1121,7 +1255,11 @@ mod tests {
             "\n```js\ntell(\"after finish\");\n```\n",
         ]);
 
-        assert_eq!(r.cells.len(), 2, "the cell it wrote after `finish` is on the log");
+        assert_eq!(
+            r.cells.len(),
+            2,
+            "the cell it wrote after `finish` is on the log"
+        );
         assert_eq!(r.tells, ["ok"], "and nothing after `finish(text)` ran");
         assert_eq!(r.ended, Ending::Finished);
         assert!(r.rests, "`finish(text)` rests the branch");
@@ -1165,14 +1303,20 @@ mod tests {
         let mut c = Conversation::new();
         c.user("set it to whatever I say");
 
-        let r = c.reply("```js\nconst n = await ask(\"user\", \"how many?\");\nfinish(`set to ${n}.`);\n```\n");
+        let r = c.reply(
+            "```js\nconst n = await ask(\"user\", \"how many?\");\nfinish(`set to ${n}.`);\n```\n",
+        );
 
         assert_eq!(r.ask().text, "how many?");
         assert!(r.tells.is_empty(), "nothing said yet — it is waiting");
 
         let call = r.ask().call;
         let after = c.answer(call, json!(7));
-        assert_eq!(after.tells, ["set to 7."], "the answer reached the expression that asked");
+        assert_eq!(
+            after.tells,
+            ["set to 7."],
+            "the answer reached the expression that asked"
+        );
         assert_eq!(after.ended, Ending::Finished);
     }
 
@@ -1196,8 +1340,16 @@ mod tests {
             post.as_u64()
         ));
 
-        assert_eq!(r.tells, ["done"], "no refusal, the program ran straight through");
-        assert_eq!(r.compacted, [post], "and the edit landed when the program finished");
+        assert_eq!(
+            r.tells,
+            ["done"],
+            "no refusal, the program ran straight through"
+        );
+        assert_eq!(
+            r.compacted,
+            [post],
+            "and the edit landed when the program finished"
+        );
         // **And it does not compact itself.** That rule is for the
         // reply the harness *asked* for, which is work in a document it
         // asked to be made smaller. An ordinary program that happens to
@@ -1258,12 +1410,19 @@ mod tests {
 
         assert_eq!(
             r.ended,
-            Ending::Raised { name: "pick_one".into(), payload: Some(json!({ "n": 41 })) }
+            Ending::Raised {
+                name: "pick_one".into(),
+                payload: Some(json!({ "n": 41 }))
+            }
         );
         assert!(!r.rests, "a parked branch is not a rested one");
 
         let after = c.resume(json!("b2"));
-        assert_eq!(after.tells, ["took b2, n was 41."], "the frame was still standing");
+        assert_eq!(
+            after.tells,
+            ["took b2, n was 41."],
+            "the frame was still standing"
+        );
     }
 
     /// What the reply left behind is what the next request carries —
@@ -1309,7 +1468,9 @@ mod tests {
         // parts concatenate back to the reply, which the harness
         // checks on every reply.
         assert!(
-            c.fetch(r.parts[0]).as_str().is_some_and(|t| t.contains("history[17]")),
+            c.fetch(r.parts[0])
+                .as_str()
+                .is_some_and(|t| t.contains("history[17]")),
             "the part keeps what the model wrote"
         );
     }
@@ -1319,7 +1480,8 @@ mod tests {
     fn only_a_bare_marker_line_is_dropped() {
         let mut c = Conversation::new();
         c.user("go");
-        let r = c.reply("The count ↓ history[3] is the one I want.\n\n```js\nfinish(\"ok\");\n```\n");
+        let r =
+            c.reply("The count ↓ history[3] is the one I want.\n\n```js\nfinish(\"ok\");\n```\n");
         assert_eq!(r.prose, ["The count ↓ history[3] is the one I want."]);
     }
 

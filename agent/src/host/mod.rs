@@ -2490,6 +2490,18 @@ mod tests {
             .expect("a Return on this branch")
     }
 
+    /// What a branch did, through the same projection the reply-level
+    /// tests use — so "what did the worker say" is a field rather than
+    /// a fold written out again here.
+    fn said(session: &Session, branch: BranchId) -> crate::testkit::Said {
+        let leaf = session
+            .state(branch)
+            .unwrap_or_else(|| panic!("#{} is not a live branch", branch.as_u64()))
+            .spine
+            .leaf_id;
+        crate::testkit::Said::of_branch(session.tree(), leaf)
+    }
+
     /// The value this branch's last `history.append` handed forward.
     ///
     /// **The replacement for `returned`.** A reply has no `return` (D5):
@@ -5113,6 +5125,15 @@ mod tests {
             .collect();
         answers.sort();
         assert_eq!(answers, ["a: ok", "b: ok", "c: ok"]);
+        // Each worker answered exactly once and said its own word on
+        // the way out — read as what the branch did, not as a fold over
+        // the log.
+        for charter in ["worker a", "worker b", "worker c"] {
+            let w = said(&session, agent_by_charter(tree, charter));
+            assert_eq!(w.answered.len(), 1, "one question, one answer");
+            assert_eq!(w.tells, ["ok"], "and `finish(\"ok\")` said it");
+            assert_eq!(w.ended, crate::testkit::Ending::Finished);
+        }
         // One question each, one turn each: `answer(...)` settles
         // synchronously and does not end the turn on its own
         // (`structured_answer_reaches_the_program`'s doc), so each
@@ -5420,12 +5441,13 @@ mod tests {
         // trapped — which is what got the worker another program to put
         // it right, rather than the asker a value it was promised would
         // be one of two strings and wasn't.
-        let worker_leaf = session.state(worker).unwrap().spine.leaf_id;
-        let answers: Vec<_> = kinds(tree, worker_leaf)
-            .into_iter()
-            .filter(|k| *k == "Answer")
-            .collect();
-        assert_eq!(answers.len(), 1, "{:?}", kinds(tree, worker_leaf));
+        let w = said(&session, worker);
+        assert_eq!(
+            w.answered.len(),
+            1,
+            "one answer landed, not the refused one too: {:?}",
+            w.kinds
+        );
         assert_eq!(appended(tree, root_leaf(&session)), json!("big"));
     }
 
