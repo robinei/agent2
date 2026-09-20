@@ -39,4 +39,3 @@ pub(super) fn input_val(vm: &VM, key: &str) -> Value {
         .cloned()
         .unwrap_or_else(|| panic!("no input.{key}"))
 }
-

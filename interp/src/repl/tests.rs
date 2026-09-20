@@ -125,11 +125,7 @@ fn a_const_in_fragment_0_is_readable_in_fragment_1() {
 
 #[test]
 fn a_let_in_fragment_0_is_readable_and_writable_in_fragment_1() {
-    let repl = run_all(&[
-        "let n = 1;",
-        "n = n + 41;",
-        "console.log(n);",
-    ]);
+    let repl = run_all(&["let n = 1;", "n = n + 41;", "console.log(n);"]);
     assert_eq!(console(&repl), vec!["42"]);
 }
 
@@ -151,10 +147,7 @@ fn the_root_store_is_never_elided() {
     let mut repl = Repl::new(serde_json::Value::Null, serde_json::Value::Null).unwrap();
     repl.push(&unit.buffer(0)).unwrap();
     assert!(
-        repl.vm
-            .code
-            .iter()
-            .any(|i| matches!(i, Instr::SetLocal(0))),
+        repl.vm.code.iter().any(|i| matches!(i, Instr::SetLocal(0))),
         "the pinned root must store its declaration, not only fold its reads: {:?}",
         repl.vm.code
     );
@@ -226,9 +219,16 @@ fn a_slot_captured_in_its_own_fragment_is_boxed_without_a_fresh_cell() {
         "nothing pre-existing flipped, so nothing is promoted"
     );
     let Some(Instr::EnterFrame(_, _, kinds)) = repl.vm.code.first() else {
-        panic!("expected an EnterFrame prologue, got {:?}", repl.vm.code.first());
+        panic!(
+            "expected an EnterFrame prologue, got {:?}",
+            repl.vm.code.first()
+        );
     };
-    assert_eq!(kinds[0], SlotKind::Boxed, "`z` is captured here, so it is boxed here");
+    assert_eq!(
+        kinds[0],
+        SlotKind::Boxed,
+        "`z` is captured here, so it is boxed here"
+    );
 }
 
 // ── functions across fragments ────────────────────────────────────────
@@ -288,7 +288,8 @@ fn an_undeclared_name_is_reported_and_names_it() {
     let mut repl = Repl::new(serde_json::Value::Null, serde_json::Value::Null).unwrap();
     repl.push(&unit.buffer(0)).unwrap();
     repl.vm.step(u64::MAX).unwrap();
-    repl.push(&unit.buffer(1)).expect("it compiles, as it does one-shot");
+    repl.push(&unit.buffer(1))
+        .expect("it compiles, as it does one-shot");
     let err = repl.vm.step(u64::MAX).expect_err("but it does not run");
     assert_eq!(err.kind, crate::vm::ErrorKind::ReferenceError);
     assert!(
@@ -304,7 +305,8 @@ fn an_undeclared_name_is_reported_and_names_it() {
 fn a_redeclaration_across_fragments_is_caught() {
     let errs = errs_from(&["let dup = 1;", "let dup = 2;"]);
     assert!(
-        errs.iter().any(|e| e.contains("dup") && e.contains("already declared")),
+        errs.iter()
+            .any(|e| e.contains("dup") && e.contains("already declared")),
         "expected a redeclaration diagnostic: {errs:?}"
     );
 }
@@ -531,7 +533,10 @@ fn the_frame_is_quiescent_at_every_prologue() {
 /// same source allocates *no* slot for `f` and renumbers `x` down to 0.)
 #[test]
 fn a_root_function_is_never_slot_eliminated() {
-    let unit = Unit::new(&["function f() { return 1; }\nlet x = 5;", "f = 2;\nconsole.log(x);"]);
+    let unit = Unit::new(&[
+        "function f() { return 1; }\nlet x = 5;",
+        "f = 2;\nconsole.log(x);",
+    ]);
     let mut repl = Repl::new(serde_json::Value::Null, serde_json::Value::Null).unwrap();
     repl.push(&unit.buffer(0)).unwrap();
     let Some(Instr::EnterFrame(_, _, kinds)) = repl.vm.code.first() else {
@@ -545,7 +550,11 @@ fn a_root_function_is_never_slot_eliminated() {
     repl.vm.step(u64::MAX).unwrap();
     repl.push(&unit.buffer(1)).unwrap();
     repl.vm.step(u64::MAX).unwrap();
-    assert_eq!(console(&repl), vec!["5"], "`x` is still where fragment 0 put it");
+    assert_eq!(
+        console(&repl),
+        vec!["5"],
+        "`x` is still where fragment 0 put it"
+    );
 }
 
 // ── the frame stays usable ────────────────────────────────────────────
@@ -634,7 +643,9 @@ fn a_rejected_top_level_return_carries_the_callers_message() {
     repl.reject_top_level_return("use `history.append` and `done()` instead");
     repl.push(&unit.buffer(0)).unwrap();
     repl.vm.step(u64::MAX).unwrap();
-    let errs = repl.push(&unit.buffer(1)).expect_err("the fragment is refused");
+    let errs = repl
+        .push(&unit.buffer(1))
+        .expect_err("the fragment is refused");
     let rendered: Vec<String> = errs.iter().map(|d| d.render(&unit.buffer(1))).collect();
     assert!(
         rendered

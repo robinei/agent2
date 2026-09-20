@@ -21,8 +21,12 @@
 //! which one you have.
 
 fn val(src: &str) -> serde_json::Value {
-    let program = interp::compile(src)
-        .unwrap_or_else(|e| panic!("{src}\n{:?}", e.iter().map(|d| &d.message).collect::<Vec<_>>()));
+    let program = interp::compile(src).unwrap_or_else(|e| {
+        panic!(
+            "{src}\n{:?}",
+            e.iter().map(|d| &d.message).collect::<Vec<_>>()
+        )
+    });
     let mut vm = interp::VM::for_program(program, serde_json::Value::Null).unwrap();
     match vm.step(u64::MAX).unwrap() {
         interp::StepResult::Done { value, .. } => {
@@ -36,12 +40,24 @@ fn val(src: &str) -> serde_json::Value {
 fn annotations_and_generics_do_not_change_the_answer() {
     for (src, want) in [
         ("let x: number = 2; return x + 1;", 3),
-        ("const f = (a: number, b?: number): number => a + 1; return f(2);", 3),
+        (
+            "const f = (a: number, b?: number): number => a + 1; return f(2);",
+            3,
+        ),
         ("function g<T>(v: T): T { return v } return g(2) + 1;", 3),
-        ("interface P { a: number } const p: P = { a: 3 }; return p.a;", 3),
+        (
+            "interface P { a: number } const p: P = { a: 3 }; return p.a;",
+            3,
+        ),
         ("type T = number; const c: T = 3; return c;", 3),
-        ("let n: number = 0; for (let i: number = 0; i < 3; i++) { n += i } return n;", 3),
-        ("class C { x: number = 3; get(): number { return this.x } } return new C().get();", 3),
+        (
+            "let n: number = 0; for (let i: number = 0; i < 3; i++) { n += i } return n;",
+            3,
+        ),
+        (
+            "class C { x: number = 3; get(): number { return this.x } } return new C().get();",
+            3,
+        ),
     ] {
         assert_eq!(val(src), serde_json::json!(want), "{src}");
     }
@@ -79,8 +95,14 @@ fn erasure_leaves_the_same_instructions() {
 /// refused — loudly, which is the point.
 #[test]
 fn constructs_that_emit_code_are_still_refused() {
-    for src in ["enum E { A, B } return E.A;", "namespace N { export const a = 1; } return 1;"] {
-        assert!(interp::compile(src).is_err(), "{src} compiled and should not have");
+    for src in [
+        "enum E { A, B } return E.A;",
+        "namespace N { export const a = 1; } return 1;",
+    ] {
+        assert!(
+            interp::compile(src).is_err(),
+            "{src} compiled and should not have"
+        );
     }
 }
 
@@ -92,10 +114,15 @@ fn constructs_that_emit_code_are_still_refused() {
 /// not break, and the echo must not shadow the real thing.
 #[test]
 fn the_builtin_namespaces_survive_their_own_declaration() {
-    assert_eq!(val(r#"return Edit.count("aaa", "a");"#), serde_json::json!(3));
     assert_eq!(
-        val(r#"declare namespace Edit { function count(t: string, n: string): number }
-               return Edit.count("aaa", "a");"#),
+        val(r#"return Edit.count("aaa", "a");"#),
+        serde_json::json!(3)
+    );
+    assert_eq!(
+        val(
+            r#"declare namespace Edit { function count(t: string, n: string): number }
+               return Edit.count("aaa", "a");"#
+        ),
         serde_json::json!(3),
         "the ambient declaration erases; the builtin is still there"
     );

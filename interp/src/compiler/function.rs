@@ -130,11 +130,7 @@ impl super::Compiler {
     }
 
     /// Compile an arrow function expression.
-    pub(super) fn compile_arrow_expr(
-        &mut self,
-        arrow: &ast::ArrowFunctionExpression,
-        span: Span,
-    ) {
+    pub(super) fn compile_arrow_expr(&mut self, arrow: &ast::ArrowFunctionExpression, span: Span) {
         let Some(scope_id) = self.scope_for_node(arrow.span.start) else {
             self.error(span, "internal error: arrow function not found in analysis");
             return;

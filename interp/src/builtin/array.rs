@@ -224,21 +224,13 @@ pub fn array_keys(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 
 pub fn array_values(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let arr_ptr = args.array_receiver(vm)?;
-    let copy = vm
-        .arrays
-        .get(arr_ptr as usize)
-        .cloned()
-        .unwrap_or_default();
+    let copy = vm.arrays.get(arr_ptr as usize).cloned().unwrap_or_default();
     Ok(vm.alloc_array(copy))
 }
 
 pub fn array_entries(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let arr_ptr = args.array_receiver(vm)?;
-    let items = vm
-        .arrays
-        .get(arr_ptr as usize)
-        .cloned()
-        .unwrap_or_default();
+    let items = vm.arrays.get(arr_ptr as usize).cloned().unwrap_or_default();
     let mut out: ThinVec<Value> = ThinVec::with_capacity(items.len());
     for (i, v) in items.into_iter().enumerate() {
         let pair: ThinVec<Value> = vec![Value::PosInt(i as u64), v].into();
@@ -253,11 +245,7 @@ pub fn array_entries(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 /// `xs`, which is rarely what it meant.
 pub fn array_to_reversed(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let arr_ptr = args.array_receiver(vm)?;
-    let mut copy = vm
-        .arrays
-        .get(arr_ptr as usize)
-        .cloned()
-        .unwrap_or_default();
+    let mut copy = vm.arrays.get(arr_ptr as usize).cloned().unwrap_or_default();
     copy.reverse();
     Ok(vm.alloc_array(copy))
 }
@@ -780,7 +768,11 @@ mod tests {
         let err = testutil::run_runtime_err("Array.from(42);");
         assert_eq!(err.kind, crate::ErrorKind::TypeError);
         assert!(err.message.contains("Array.from needs"), "{}", err.message);
-        assert!(err.message.contains("42"), "names the value: {}", err.message);
+        assert!(
+            err.message.contains("42"),
+            "names the value: {}",
+            err.message
+        );
     }
 
     /// `[...Array(n).keys()]` is the other way to write a range, and

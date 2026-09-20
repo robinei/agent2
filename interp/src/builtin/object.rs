@@ -413,9 +413,7 @@ mod tests {
         );
         // And the round trip both ways.
         assert_eq!(
-            crate::testutil::run_ret(
-                "return Object.fromEntries(new Map(Object.entries({x: 7})));"
-            ),
+            crate::testutil::run_ret("return Object.fromEntries(new Map(Object.entries({x: 7})));"),
             serde_json::json!({"x": 7})
         );
     }
@@ -435,7 +433,11 @@ mod tests {
         ] {
             let err = crate::testutil::run_runtime_err(&format!("{src};"));
             assert_eq!(err.kind, crate::ErrorKind::TypeError, "{src}");
-            assert!(err.message.contains("needs an object"), "{src}: {}", err.message);
+            assert!(
+                err.message.contains("needs an object"),
+                "{src}: {}",
+                err.message
+            );
             assert!(err.message.contains(want), "{src}: {}", err.message);
         }
     }

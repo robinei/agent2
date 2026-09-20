@@ -134,8 +134,7 @@ impl ReplCore {
     /// ordinary function return, and the root scope is the only one this
     /// applies to.
     pub fn reject_top_level_return(&mut self, message: impl Into<String>) {
-        self.compiler
-            .set_no_top_level_return(Some(message.into()));
+        self.compiler.set_no_top_level_return(Some(message.into()));
     }
 
     /// Compile the **whole** prelude as this unit's first fragment, and stop
@@ -339,9 +338,7 @@ impl ReplCore {
     fn promotions(&self, now: &[SlotKind], first_new_slot: u32) -> Vec<u32> {
         let ceiling = (first_new_slot as usize).min(self.prev_slot_kinds.len());
         (0..ceiling)
-            .filter(|&i| {
-                self.prev_slot_kinds[i] == SlotKind::Plain && now[i] == SlotKind::Boxed
-            })
+            .filter(|&i| self.prev_slot_kinds[i] == SlotKind::Plain && now[i] == SlotKind::Boxed)
             .map(|i| i as u32)
             .collect()
     }
@@ -377,7 +374,11 @@ impl ReplCore {
         // is how a function declared in one fragment is called from the next.
         let at = |table: &[CodeAddr], l: u32| -> CodeAddr {
             let a = table[l as usize];
-            debug_assert_ne!(a, CodeAddr::MAX, "label {l} was referenced but never defined");
+            debug_assert_ne!(
+                a,
+                CodeAddr::MAX,
+                "label {l} was referenced but never defined"
+            );
             a
         };
         let mut out_code = Vec::with_capacity(code.len());
@@ -394,9 +395,7 @@ impl ReplCore {
                 Instr::ClosureNew(l, arity, caps) => {
                     Instr::ClosureNew(at(&self.label_addr, l), arity, caps)
                 }
-                Instr::PushFn(l, ptr, arity) => {
-                    Instr::PushFn(at(&self.label_addr, l), ptr, arity)
-                }
+                Instr::PushFn(l, ptr, arity) => Instr::PushFn(at(&self.label_addr, l), ptr, arity),
                 other => other,
             };
             out_code.push(rewritten);

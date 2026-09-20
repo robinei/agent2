@@ -30,7 +30,11 @@ pub fn json_parse(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     // first characters settles which.
     let json: serde_json::Value = serde_json::from_str(&s).map_err(|e| {
         let head: String = s.chars().take(60).collect();
-        let more = if s.chars().nth(60).is_some() { "…" } else { "" };
+        let more = if s.chars().nth(60).is_some() {
+            "…"
+        } else {
+            ""
+        };
         vm.fail(
             ErrorKind::ValueError,
             format!("JSON.parse: {e} — the text begins {head:?}{more}").as_str(),
@@ -178,9 +182,7 @@ mod tests {
             err.message
         );
         // A long input is clipped rather than quoted whole.
-        let err = crate::testutil::run_runtime_err(
-            "JSON.parse('x'.repeat(5000));",
-        );
+        let err = crate::testutil::run_runtime_err("JSON.parse('x'.repeat(5000));");
         assert!(err.message.len() < 220, "{} bytes", err.message.len());
         assert!(err.message.contains('…'), "{}", err.message);
     }

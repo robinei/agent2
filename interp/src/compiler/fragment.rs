@@ -135,8 +135,8 @@ impl super::Compiler {
         // range (the convention `span.rs` names).
         let prologue_span = Span::point(program.span.start);
         let prologue_at = self.code.len();
-        let emitted_prologue = !prologue.new_kinds.is_empty()
-            || (prologue.first_fragment && prologue.uses_arguments);
+        let emitted_prologue =
+            !prologue.new_kinds.is_empty() || (prologue.first_fragment && prologue.uses_arguments);
 
         if emitted_prologue {
             let kinds = prologue.new_kinds.clone();

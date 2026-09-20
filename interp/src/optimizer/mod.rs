@@ -584,7 +584,11 @@ fn peephole(code: Vec<Instr>, spans: Vec<Span>) -> (Vec<Instr>, Vec<Span>) {
 /// changing. Instruction count is monotonically non-increasing (every transform
 /// removes/fuses or is an idempotent operand rewrite), so this terminates well
 /// before the safety cap.
-fn optimize(mut code: Vec<Instr>, mut spans: Vec<Span>, next_label: u32) -> (Vec<Instr>, Vec<Span>) {
+fn optimize(
+    mut code: Vec<Instr>,
+    mut spans: Vec<Span>,
+    next_label: u32,
+) -> (Vec<Instr>, Vec<Span>) {
     for _ in 0..32 {
         let prev = code.clone();
         let (c, s) = invert_branches(code, spans);

@@ -182,10 +182,7 @@ impl VM {
     pub(crate) fn method_receiver_error(&self, recv: &Value, accepts: &str) -> VMError {
         self.fail(
             ErrorKind::TypeError,
-            format!(
-                "expected {accepts}, got {}",
-                self.describe_operand(recv)
-            ),
+            format!("expected {accepts}, got {}", self.describe_operand(recv)),
         )
     }
 
@@ -566,6 +563,17 @@ impl VM {
         // table's function ranges are keyed the same way (by node start).
         let idx = self.debug.function_at_span(span.start)?;
         Some((idx, &self.debug.functions[idx]))
+    }
+
+    /// The call-site spelling of the prelude helper the instruction
+    /// pointer is inside — `.map`, `Array.from` — or `None` in the
+    /// user's own code.
+    ///
+    /// Used to name a trap that has no user source to point at; see
+    /// [`crate::prelude::call_site_spelling`].
+    pub(crate) fn inside_prelude_helper(&self) -> Option<&'static str> {
+        let (_, f) = self.function_at(self.ip)?;
+        crate::prelude::call_site_spelling(f.name.as_str())
     }
 
     /// Read-only views of the live call frames, outermost (root) first.

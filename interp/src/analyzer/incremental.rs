@@ -77,7 +77,15 @@ impl IncrementalAnalyzer {
         // The root's label, allocated first exactly as `analyze_top_level`
         // does, so label numbering matches the one-shot path.
         let label = analyzer.new_label();
-        let mut root = FuncScope::new(usize::MAX, label, u32::MAX, u32::MAX, Vec::new(), None, false);
+        let mut root = FuncScope::new(
+            usize::MAX,
+            label,
+            u32::MAX,
+            u32::MAX,
+            Vec::new(),
+            None,
+            false,
+        );
         root.id = ROOT;
         Self {
             pristine: vec![root],
@@ -110,8 +118,15 @@ impl IncrementalAnalyzer {
         // Take the root out to walk into it; `pristine` meanwhile receives
         // this fragment's nested function scopes, which `push_scope` numbers
         // from `pristine.len()` upward.
-        let placeholder =
-            FuncScope::new(usize::MAX, u32::MAX, u32::MAX, u32::MAX, Vec::new(), None, false);
+        let placeholder = FuncScope::new(
+            usize::MAX,
+            u32::MAX,
+            u32::MAX,
+            u32::MAX,
+            Vec::new(),
+            None,
+            false,
+        );
         let mut root = std::mem::replace(&mut self.pristine[ROOT], placeholder);
 
         analyzer.analyze_hoist(

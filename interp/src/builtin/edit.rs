@@ -168,7 +168,10 @@ fn match_count_error(what: &str, n: usize, needle: &str, lines: &[usize]) -> Str
         let at = if lines.is_empty() {
             String::new()
         } else {
-            format!(", at line{} {where_}", if lines.len() == 1 { "" } else { "s" })
+            format!(
+                ", at line{} {where_}",
+                if lines.len() == 1 { "" } else { "s" }
+            )
         };
         format!(
             "{what} expected 1 match, found {n} of `{shown}`{at} — widen it with the \
@@ -859,7 +862,10 @@ mod match_count_tests {
         // so the next program can name a line instead of re-reading the
         // file to find what this call had already found.
         assert!(many.contains("at lines 3, 11, 19, 27"), "{many}");
-        assert!(many.contains("replaceLines"), "and the verb that takes one: {many}");
+        assert!(
+            many.contains("replaceLines"),
+            "and the verb that takes one: {many}"
+        );
 
         // Five or more is still four and an ellipsis — one trap must
         // not crowd out the report around it.
@@ -941,9 +947,7 @@ mod match_count_tests {
 
         // And an ordinary mid-line replacement is untouched: what
         // precedes the match is not whitespace, so nothing doubles.
-        let out = crate::testutil::run_ret(
-            "return Edit.replaceOnce('let a = b;', 'b', '  c');",
-        );
+        let out = crate::testutil::run_ret("return Edit.replaceOnce('let a = b;', 'b', '  c');");
         assert_eq!(out, serde_json::json!("let a =   c;"));
     }
 
@@ -981,7 +985,10 @@ mod tests {
         )
         .message;
         assert!(e.contains("`text` is undefined"), "{e}");
-        assert!(e.contains("replaceCount"), "names the sibling that does return an object: {e}");
+        assert!(
+            e.contains("replaceCount"),
+            "names the sibling that does return an object: {e}"
+        );
     }
 
     #[test]

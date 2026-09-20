@@ -152,13 +152,20 @@ mod line_split_tests {
     fn a_capped_line_fits_the_report_section_exactly() {
         let out = console(&format!(r#"console.log("{}");"#, "z".repeat(9000)));
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0].len(), crate::builtin::console::CONSOLE_LINE_CAP, "capped length");
+        assert_eq!(
+            out[0].len(),
+            crate::builtin::console::CONSOLE_LINE_CAP,
+            "capped length"
+        );
     }
 
     /// Each call still starts its own line, so two calls never merge.
     #[test]
     fn separate_calls_stay_separate_lines() {
-        assert_eq!(console(r#"console.log("a"); console.log("b");"#), vec!["a", "b"]);
+        assert_eq!(
+            console(r#"console.log("a"); console.log("b");"#),
+            vec!["a", "b"]
+        );
     }
 }
 

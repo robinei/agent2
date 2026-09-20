@@ -300,12 +300,15 @@ impl super::Compiler {
                 None
             }
             None => {
-                self.error(span, format!(
+                self.error(
+                    span,
+                    format!(
                         "assignment to undeclared variable `{name}` — there is no implicit \
                          global here. Declare it with `let` (or `const` if it never changes), \
                          and remember that a name bound in an earlier reply is not bound in \
                          this one."
-                    ));
+                    ),
+                );
                 None
             }
         }

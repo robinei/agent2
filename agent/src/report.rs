@@ -232,7 +232,32 @@ fn stack_is_bare(stack: &[String]) -> bool {
 
 #[cfg(test)]
 mod bare_stack_tests {
-    use super::{fenced, stack_is_bare};
+    use super::{diagnostic, fenced, stack_is_bare};
+
+    /// **A wrong location is worse than none.** A site of zero means
+    /// nobody knows where — an instruction whose span sits in the
+    /// prelude region rebases to it — and rendering it as a location
+    /// put `1:1:` and a caret under the first line of the reply, which
+    /// is the model's own opening sentence. 11 of 121 diagnostics in
+    /// the corpus pointed at prose that way.
+    #[test]
+    fn an_unknown_site_renders_no_location_at_all() {
+        let reply =
+            "Dead-code hunting in `helpers.py` — first, the repo.\n\n```js\nx.map(f);\n```\n";
+        let out = diagnostic(reply, 0, "`map` was called on undefined");
+        assert_eq!(out, "`map` was called on undefined");
+        assert!(!out.contains("1:1"), "no invented line: {out}");
+        assert!(
+            !out.contains("Dead-code"),
+            "and no caret under prose: {out}"
+        );
+
+        // A site it does know still renders whole.
+        let at = reply.find("x.map").unwrap() as u32;
+        let out = diagnostic(reply, at, "`map` was called on undefined");
+        assert!(out.contains("x.map(f);"), "the real line is shown: {out}");
+        assert!(out.contains('^'), "with its caret: {out}");
+    }
 
     /// A console entry is one `console.log` call's output, not one
     /// line, and most end with a newline — which used to print a blank
@@ -1465,6 +1490,26 @@ pub(crate) fn author_label(from: Author) -> String {
 /// host to log the whole call), so this stays a caret.
 fn diagnostic(source: &str, site: u32, message: &str) -> String {
     if source.is_empty() {
+        return message.to_owned();
+    }
+    // **A site of zero means nobody knows where.** It is already the
+    // convention for that — the `CellFailed` arm parks there on
+    // purpose — and it reaches here whenever an instruction's span sits
+    // in the prelude region, because rebasing subtracts the prelude's
+    // length and saturates. Rendered as a location it becomes `1:1:`
+    // with a caret under the first line of the reply, which is almost
+    // always the model's own opening sentence:
+    //
+    // ```text
+    // 1:1: cannot read .length of undefined
+    // Dead-code hunting in `helpers.py` — first, what's in the repo…
+    // ^
+    // ```
+    //
+    // 11 of 121 diagnostics in the corpus pointed at prose that way.
+    // A wrong location is worse than none: it is the one part of a
+    // diagnostic a reader trusts without checking.
+    if site == 0 {
         return message.to_owned();
     }
     interp::Diagnostic {

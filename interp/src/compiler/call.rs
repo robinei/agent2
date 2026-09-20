@@ -511,7 +511,12 @@ impl super::Compiler {
     }
 
     /// Global function calls recognized structurally.
-    pub(super) fn compile_global_call(&mut self, name: &str, argv: &[&ast::Expression], span: Span) {
+    pub(super) fn compile_global_call(
+        &mut self,
+        name: &str,
+        argv: &[&ast::Expression],
+        span: Span,
+    ) {
         match name {
             // Step 2a Part 2: constructor names called as plain functions.
             // `String(x)`/`Number(x)`/`Boolean(x)` keep their dedicated
@@ -861,7 +866,10 @@ impl super::Compiler {
                 return match argv.len() {
                     1 => self.emit_prelude_call("__toSorted", recv, argv, span, optional),
                     0 => self.emit_prelude_call("__toSortedDefault", recv, argv, span, optional),
-                    n => self.error(span, format!("`toSorted` expects 0 or 1 argument(s), got {n}")),
+                    n => self.error(
+                        span,
+                        format!("`toSorted` expects 0 or 1 argument(s), got {n}"),
+                    ),
                 };
             }
             // The promise combinators. `await` inside `try`/`catch` is

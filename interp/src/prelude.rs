@@ -104,6 +104,69 @@ const HOFS: &[Hof] = &[
     },
 ];
 
+/// How a prelude helper was spelled at the call site: `__map` → `.map`,
+/// `__arrayFrom` → `Array.from`.
+///
+/// **A trap inside a helper has nowhere to point.** The helpers are
+/// real JS compiled ahead of the user's program, so a failure in one
+/// carries a span in the prelude region — which rebases to zero, which
+/// renders as `1:1:` with a caret under the first line of the reply,
+/// usually the model's own opening sentence. `xs.map(f)` on an
+/// undefined `xs` failed at `a.length` inside `__map` and came back as
+/// a bare "cannot read .length of undefined" pointing at prose. It was
+/// the commonest runtime trap in the corpus, 16 of them, and 9% of all
+/// diagnostics rendered.
+///
+/// The span cannot be recovered — there is genuinely no user source at
+/// that instruction — but the *name* can, and the name is the half the
+/// reader needs: which call it was.
+pub fn call_site_spelling(helper: &str) -> Option<&'static str> {
+    if helper == "__arrayFrom" {
+        return Some("Array.from");
+    }
+    let decl = format!("function {helper}(");
+    HOFS.iter()
+        .find(|h| h.source.contains(&decl))
+        .map(|h| h.method)
+}
+
+#[cfg(test)]
+mod call_site_tests {
+    use crate::testutil;
+
+    #[test]
+    fn a_helper_knows_how_it_was_spelled() {
+        assert_eq!(super::call_site_spelling("__map"), Some("map"));
+        assert_eq!(super::call_site_spelling("__filter"), Some("filter"));
+        assert_eq!(super::call_site_spelling("__arrayFrom"), Some("Array.from"));
+        assert_eq!(super::call_site_spelling("checkShipping"), None);
+    }
+
+    /// **The trap names the call, not just the value.** A failure
+    /// inside a lowered helper has no user source to point at — the
+    /// caret lands on line 1 of the reply, usually the model's own
+    /// opening sentence — so the method name is the only part of
+    /// "where" that survives, and it is the part worth having.
+    #[test]
+    fn calling_a_higher_order_method_on_undefined_names_the_method() {
+        let msg =
+            testutil::run_ret(r#"try { undefined.map(x => x); } catch (e) { return e.message; }"#);
+        let msg = msg.as_str().unwrap();
+        assert!(msg.contains("`map` was called on undefined"), "got: {msg}");
+
+        // And the ordinary `.length` read, in the user's own code with
+        // a caret that works, is left exactly as it was.
+        let msg = testutil::run_ret(
+            r#"try { const x = undefined; x.length; } catch (e) { return e.message; }"#,
+        );
+        let msg = msg.as_str().unwrap();
+        assert!(
+            msg.contains("cannot read .length of undefined"),
+            "got: {msg}"
+        );
+    }
+}
+
 /// `Promise.all(xs)` lowers to `__all(xs)`: serial awaits over the input.
 /// Because every tool promise in `xs` was already started at its `tools.*`
 /// call site, awaiting them one by one IS full fan-out concurrency — the

@@ -2562,9 +2562,24 @@ impl VM {
                             Value::Float(n as f64)
                         }
                         _ => {
+                            let what = self.describe_operand(&val);
                             return Err(self.fail(
                                 ErrorKind::TypeError,
-                                format!("cannot read .length of {}", self.describe_operand(&val)),
+                                match self.inside_prelude_helper() {
+                                    // **Say which call it was.** A trap
+                                    // inside a lowered helper has no
+                                    // user source to point at, so the
+                                    // caret lands on line 1 of the
+                                    // reply and the reader is told
+                                    // only that *something* was
+                                    // undefined. The method name is
+                                    // the half that can be recovered.
+                                    Some(m) => format!(
+                                        "`{m}` was called on {what} — it needs an array, \
+                                         and the value it got is not one"
+                                    ),
+                                    None => format!("cannot read .length of {what}"),
+                                },
                             ));
                         }
                     };
@@ -2656,7 +2671,11 @@ impl VM {
                     let id = self.alloc_promise();
                     // `ip` still points at this `Invoke`, so `spans[ip]` is
                     // the call site the harness annotates its report with.
-                    let span = self.spans.get(self.ip as usize).copied().unwrap_or_default();
+                    let span = self
+                        .spans
+                        .get(self.ip as usize)
+                        .copied()
+                        .unwrap_or_default();
                     self.outbox.push(InvokeCall {
                         promise: id,
                         name,
@@ -2683,7 +2702,11 @@ impl VM {
                     }
                     let args = self.stack.split_off(self.stack.len() - n);
                     let id = self.alloc_promise();
-                    let span = self.spans.get(self.ip as usize).copied().unwrap_or_default();
+                    let span = self
+                        .spans
+                        .get(self.ip as usize)
+                        .copied()
+                        .unwrap_or_default();
                     self.outbox.push(InvokeCall {
                         promise: id,
                         name,
@@ -2722,7 +2745,11 @@ impl VM {
                     // own doc). The end travels too now: `append_history`
                     // logs a `Note`, whose row the document cross-
                     // references back to the call that wrote it.
-                    let span = self.spans.get(self.ip as usize).copied().unwrap_or_default();
+                    let span = self
+                        .spans
+                        .get(self.ip as usize)
+                        .copied()
+                        .unwrap_or_default();
                     self.ip += 1;
                     self.settling = true;
                     return Ok(StepResult::Settle {
