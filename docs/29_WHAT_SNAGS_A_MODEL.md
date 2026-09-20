@@ -312,6 +312,24 @@ repeated immediately — the same message on the next handback. All four
 are in this table. **That ratio is the most direct score there is for
 whether a message works**, and it is worth watching.
 
+## What now holds itself
+
+Four of the night's findings were a claim in the prompt that nothing
+checked. So the checks exist now, and each was verified by breaking the
+thing it guards:
+
+| guard | catches |
+|---|---|
+| `every_tool_description_fits_the_clip` | a description cut where the model reads it |
+| `the_shipped_manifest_tells_the_truth_about_itself` | a `returns` that names a field the handler cannot produce |
+| `every_worked_example_compiles` | an exemplar teaching a construct this dialect does not have |
+| `the_cards_declarations_are_valid_typescript` | a stray brace in half the card |
+| `the_card_teaches_the_markers_the_document_uses` | a glyph renamed in the renderer and not in the card |
+
+The two largest imitated surfaces in the prompt — the declarations and
+the worked examples — are checked mechanically rather than by reading.
+That is the part of tonight most likely to still be paying next month.
+
 ## What was rejected
 
 **A nudge for "spoke to the person after a failing command".** Built
