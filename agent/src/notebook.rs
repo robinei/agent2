@@ -456,11 +456,20 @@ fn prose_between(reply: &str, start: usize, end: usize) -> Option<String> {
 /// **The diagnostic matters more than the rule**, because ending a program
 /// with `return {…}` is the *trained* habit — exemplar 02 teaches it — so this
 /// has to say what to write instead rather than merely that it is disallowed.
-/// Under this transport `return` did two things and something else already
+/// Under this transport `return` did three things and something else already
 /// does each: falling off the last cell ends the run, `finish(text)` rests the
-/// branch, and `history.append` is what leaves a row the next turn reads.
-pub const NO_TOP_LEVEL_RETURN: &str = "a cell cannot `return`: use `history.append(...)` to leave a row the next \
-     turn reads, and `finish(text)` to rest once the work is finished";
+/// branch, `history.append` leaves a row the next turn reads — and
+/// `stop(reason)` ends the reply *here*, which is what a `return` in the
+/// middle of a cell was reaching for.
+///
+/// **`stop` used to be missing from it**, so a model that wrote `return`
+/// meaning "not this, not now" was sent to the two verbs that do not mean
+/// that. Nothing has hit this message in 478 kept logs — models write no
+/// top-level `return` at all — but the one thing it exists for is being
+/// right when one does.
+pub const NO_TOP_LEVEL_RETURN: &str = "a cell cannot `return`: `history.append(...)` leaves a row the next turn \
+     reads, `stop(reason)` ends the reply here and says why, and `finish(text)` rests the branch once the work \
+     is finished";
 
 /// One executable cell, as a byte range into the markdown it came from.
 ///
@@ -1277,7 +1286,7 @@ three\n";
 
     // --- the `return` diagnostic (D5, 25.3) ---
 
-    /// The gate: the message names both replacements, because a model that is
+    /// The gate: the message names every replacement, because a model that is
     /// only told `return` is disallowed has nowhere to go. It is carried into
     /// `interp` by `Repl::reject_top_level_return`, which supplies no wording
     /// of its own.
@@ -1290,6 +1299,11 @@ three\n";
         assert!(
             NO_TOP_LEVEL_RETURN.contains("finish("),
             "the message must name what rests the branch"
+        );
+        assert!(
+            NO_TOP_LEVEL_RETURN.contains("stop("),
+            "and what ends the reply here, which is what a `return` in the \
+             middle of a cell is reaching for"
         );
         assert!(
             NO_TOP_LEVEL_RETURN.contains("return"),
