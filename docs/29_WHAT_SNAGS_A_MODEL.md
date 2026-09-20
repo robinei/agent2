@@ -90,10 +90,27 @@ is a judgement rather than a repair:
    now.
 
    So: the mechanisms work, one of them had a three-times cost nobody
-   had paid yet, and 11% of the prompt rests on two probes rather than
-   on the suite. The options are an eval task per family, or an
-   explicit decision to carry it on faith. Deleting is the wrong
-   third — it would remove capability rather than test it.
+   had paid yet, and 11% of the prompt rested on two probes rather than
+   on the suite. Deleting would be the wrong answer — it removes
+   capability rather than testing it — so the suite got two tasks
+   instead:
+
+   - **`delegate-direct`** names the verb, so it measures nothing about
+     judgement. It exists because a task that watches for a choice
+     cannot tell "the model did not reach for it" from "the path is
+     broken", and those look identical from a failure.
+   - **`delegate-notes`** does not name it. Three 12 KB incident
+     reviews, one settled number in each, and
+     `CONSOLE_SECTION_MAX_BYTES` is 4,096 — so a review costs at least
+     three print-and-read round trips and three reviews cost nine,
+     where a helper does its three in its own context and answers in
+     one. The delegation is credited, not required; gating on `spawn`
+     would measure whether a model can follow an instruction nobody
+     gave it.
+
+   `raise`/`resume`/`abandon` still has no task. It needs one where a
+   judgement arrives mid-program and the program acts on it afterwards,
+   and that is a harder fixture to write honestly than either of these.
 
 4. **What the person actually reads, and who pays for it.** Of 237
    closing messages, 44 (18%) carry raw tool output — a traceback, a
@@ -991,6 +1008,16 @@ It also never caught the case that motivated it, because that run wrote
 
 A report section that is wrong most of the time it appears is how a
 reader learns to skip that section.
+
+**Nothing that asks an agent to build something.** Also closed: every
+task in the suite edited code that was already there, which leaves out
+the case where a model is confidently wrong at length — a program that
+looks right, reads right, and does not run. `build-stats` asks for a
+CSV summariser against a written spec and grades it by running it on a
+held-out file the run never saw, exercising five edges the shipped
+example does not. The fixture ships an `expected.txt` so a run can
+check itself, which also makes it gameable; one of the fail fixtures is
+a `stats.py` that prints that file, and the held-out catches it.
 
 **A search tool, to remove a layer of quoting.** A `grep` regex
 written inside a JS template literal inside a shell double-quoted
