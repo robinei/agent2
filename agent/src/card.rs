@@ -249,6 +249,39 @@ fn a_huge_directory_costs_a_bounded_amount_of_work() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// **The worked examples compile.**
+///
+/// They are the most directly imitated thing the model is given — the
+/// `outline` example taught `const { items }` against a tool that
+/// returned a bare array, and the fifth one taught a copy the card
+/// forbids in bold. Syntax is the cheapest of those failures to catch
+/// and the only one a test can catch on its own, so it is caught here:
+/// an exemplar teaching a construct this dialect does not have would
+/// be a broken example shipped in every prompt.
+///
+/// The blocks of one exemplar are concatenated before compiling,
+/// because that is how a reply's blocks see each other — the fourth
+/// binds `hits` in its first block and reads it in its second.
+#[test]
+fn every_worked_example_compiles() {
+    for ex in &active().exemplars {
+        let js: String = ex
+            .assistant
+            .split("```js")
+            .skip(1)
+            .filter_map(|rest| rest.split_once("```").map(|(code, _)| code.to_owned()))
+            .collect::<Vec<_>>()
+            .join("
+");
+        assert!(!js.is_empty(), "an exemplar with no ```js block: {}", ex.user);
+        if let Err(errs) = interp::compile(&js) {
+            panic!(
+                "a worked example does not compile — it is shipped in every prompt:\n{errs:?}\n{js}"
+            );
+        }
+    }
+}
+
 /// Every shipped tool's description fits inside the clip above.
 ///
 /// The doc there says they all "fit comfortably", and `bash` did not:
