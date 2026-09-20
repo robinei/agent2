@@ -1,4 +1,4 @@
-"""Three long documents, one number in each, and not enough room for all three.
+"""Three long documents, one number in each, and 4 KB of window on any of them.
 
 **What this is for.**  `spawn`, `fork` and `list_agents` are 1,247 bytes
 of the card, shipped on every turn of every run, and across 352 kept

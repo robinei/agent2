@@ -20,9 +20,11 @@ numeric except for one cell, and a column that is empty throughout.
 Those are the edges a spec-reader gets right and a pattern-matcher does
 not.
 
-**Credit is per line, not per run.**  Getting four of five columns right
-is most of the way there and scores as such; the pass gate still wants
-all of it.
+**Credit is per line, not per run.**  The held-out file has six
+columns and three of them are numeric, so two right out of three is
+most of the way there and scores as such; the pass gate still wants all
+of it, and a fourth line printed where three were wanted loses the
+credit for restraint.
 """
 
 PROMPT = (
