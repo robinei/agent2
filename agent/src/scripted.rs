@@ -1939,6 +1939,76 @@ pub(crate) mod tests {
         assert!((DESTRUCTIVE_MIGRATION_GATE.check)(&outcome, sandbox.path()).is_err());
     }
 
+    /// **A finished branch stays finished across a reopen.**
+    ///
+    /// Recovery asks the log which outcome was owed a request it never
+    /// got, and every program that ended logged the same `Completed`.
+    /// So the last reply of a finished session looked exactly like one
+    /// whose report the crash swallowed, and reopening the log woke it:
+    /// seen live in `try21.jsonl`, where #50 called `finish` and #61
+    /// spent a round trip saying "the task was already finished — the
+    /// branch is resting as intended". It was resting until the log was
+    /// opened.
+    ///
+    /// Two halves, and this checks both: the session itself rests after
+    /// a `finish` (which it already did), and the trigger-rule pass
+    /// `reconcile` runs over a re-hydrated branch finds nothing owed.
+    /// The second half is the one that was false.
+    #[test]
+    fn a_finished_branch_is_not_woken_by_reopening_its_log() {
+        let llm = host::ScriptedLlm::new([host::scripted_program(concat!(
+            "I answered already, landing it as the last word.\n",
+            "\n",
+            "```js\n",
+            "finish(\"It is a Rust workspace.\");\n",
+            "```\n",
+        ))]);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut session = host::Session::new(
+            Tree::new(None),
+            crate::REAL_PROMPT,
+            host::real_registry(),
+            Box::new(llm),
+            tx,
+        )
+        .expect("a fresh tree always opens");
+        let handle = session.handle();
+        let branch = session.conversation_branch();
+        handle.send(host::SessionCommand::UserTurn {
+            branch,
+            text: "what is this project?".to_owned(),
+            expects_reply: false,
+        });
+        session = session.run();
+        let events: Vec<host::SessionEvent> = rx.try_iter().collect();
+        let outcome = fold(session, collect_errors(&events));
+        let tree = outcome.tree();
+        assert_eq!(
+            tree.events
+                .values()
+                .filter(|e| matches!(e.payload, EventPayload::Reply))
+                .count(),
+            1,
+            "one reply, not a second unprompted one"
+        );
+
+        // What reopening does, which is `reconcile`'s trigger-rule
+        // loop: a fresh `Runner` over the same leaf, its mark lowered
+        // to whatever the log says was owed a request.
+        let leaf = tree.events.keys().copied().max().expect("events");
+        let mut state = crate::machine::Runner::with_spine(tree, tree.spine_at(leaf));
+        assert_eq!(
+            state.unrendered_cause(tree),
+            None,
+            "a finished reply is not an outcome waiting to be reported"
+        );
+        state.owe_prompt(leaf);
+        assert!(
+            !state.needs_prompt(tree),
+            "and lowering the mark under it still wakes nothing"
+        );
+    }
+
     /// **Interrupt while a real call is in flight.** The only coverage in
     /// this file (or, structurally, anywhere: `host::mod`'s own
     /// `interrupt_pauses_program` test spins an idle VM in a `while

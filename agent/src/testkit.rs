@@ -1110,7 +1110,6 @@ fn fold(tree: &Tree, events: &[&Event], span: (u64, u64)) -> Said {
             _ => {}
         }
     }
-    finish_up(&mut s);
     s
 }
 
@@ -1254,24 +1253,10 @@ impl Conversation {
     }
 }
 
-/// **Finishing and handing on are one `Completed` on the log.** The
-/// difference is whether the reply *said* something on its way out, and
-/// `finish(text)` is the only thing that sends with no call expression
-/// behind it — the synthetic zero-width site the verb gives its send,
-/// which an ordinary `tell` never has.
-///
-/// Read from the events rather than from whether the branch rested,
-/// because resting is a live fact and this has to be decidable from a
-/// finished log too.
-fn finish_up(s: &mut Said) {
-    if s.ended == Ending::Completed && s.finished_by.is_some() {
-        s.ended = Ending::Finished;
-    }
-}
-
 fn ending_of(how: &Handback, site: u32) -> Ending {
     match how {
         Handback::Completed => Ending::Completed,
+        Handback::Finished => Ending::Finished,
         Handback::Stopped { reason } => Ending::Stopped(reason.clone()),
         Handback::Raised { name, payload, .. } => Ending::Raised {
             name: name.clone(),

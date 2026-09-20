@@ -2067,6 +2067,15 @@ fn render_chat(
         {
             style = style.fg(color);
         }
+        // **Compaction fades a row; it does not take it away.** What
+        // the next request carries and what the person has read are two
+        // different things, and this pane is the second one. A
+        // compacted row used to have its text replaced by the word
+        // `[removed]`, so one pass over a long conversation left fifty
+        // of those in the scrollback and nothing else.
+        if app.chat.is_compacted(*id) {
+            style = style.add_modifier(Modifier::DIM);
+        }
         // **Selection is a mark in the gutter, not an inversion.**
         // `REVERSED` meant three different things at once — the
         // selected sub-item, the fork-from-here target, and the help
@@ -2601,6 +2610,7 @@ fn condition_line(cause: &crate::types::Handback) -> String {
         crate::types::Handback::Posted { .. } => "a message arrived".to_owned(),
         crate::types::Handback::CellFailed { .. } => "compile error".to_owned(),
         crate::types::Handback::Completed => "completed".to_owned(),
+        crate::types::Handback::Finished => "finished".to_owned(),
         crate::types::Handback::Interrupted => "interrupted".to_owned(),
         // A handler decided `return abandon()`: the suspended run was
         // discarded, not continued.

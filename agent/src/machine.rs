@@ -803,6 +803,9 @@ struct ReplyShape {
     /// branch's own work, and a continuation that runs nothing has
     /// stopped that work rather than finished it.
     answering: bool,
+    /// Its program called `finish(text)`: the branch rested on purpose,
+    /// and its outcome is owed nothing.
+    finished: bool,
 }
 
 impl Runner {
@@ -1056,6 +1059,7 @@ impl Runner {
                         handed_back: false,
                         text: String::new(),
                         answering: std::mem::take(&mut posted_since),
+                        finished: false,
                     });
                 }
                 EventPayload::Post { .. } => posted_since = true,
@@ -1075,9 +1079,10 @@ impl Runner {
                         }
                     }
                 }
-                EventPayload::Handback { .. } => {
+                EventPayload::Handback { how, .. } => {
                     if let Some(last) = out.last_mut() {
                         last.handed_back = true;
+                        last.finished |= matches!(how, crate::types::Handback::Finished);
                     }
                 }
                 _ => {}
@@ -1093,10 +1098,19 @@ impl Runner {
     /// cause), `unrendered_cause` deliberately does not (reconciliation
     /// needs the fact independent of a `shown` a crash may have left
     /// pointing past it).
+    ///
+    /// **A reply that called `finish(text)` is owed nothing.** It is the
+    /// one terminal that says the branch rested on purpose, so it is
+    /// not an outcome waiting to be reported — and treating it as one
+    /// meant that reopening a finished log woke it for a further reply
+    /// (`try21.jsonl`: #50 finished, #61 said so again). Before
+    /// `Handback::Finished` existed the log could not tell the two
+    /// apart, which is why this went unnoticed until a live session
+    /// was closed and reopened.
     fn last_turn_outcome(&self, tree: &Tree) -> Option<EventId> {
         let replies = self.replies(tree);
         let last = replies.last()?;
-        (last.ran && last.handed_back).then_some(last.id)
+        (last.ran && last.handed_back && !last.finished).then_some(last.id)
     }
 
     /// **The last reply stopped short of doing anything**, and the one
@@ -3054,11 +3068,21 @@ impl Runner {
         // which is what makes recovery decidable from the log alone. It
         // carries no value: a reply has no `return` (D5), and the field
         // was null 68 times out of 68 before it was removed.
+        //
+        // **Which terminal it is, is the difference between a branch
+        // that rested and one that merely stopped running.** `finish`
+        // says the task is over; running off the end says nothing and
+        // the branch carries on. See `Handback::Finished`.
+        let how = if self.finished {
+            Handback::Finished
+        } else {
+            Handback::Completed
+        };
         let outcome = tree.append(
             &mut self.spine,
             EventPayload::Handback {
                 reply: self.reply_id,
-                how: Handback::Completed,
+                how,
                 site: 0,
                 stack: Vec::new(),
             },
@@ -6300,14 +6324,25 @@ mod tests {
         );
     }
 
-    /// And a terminal one is still just the fact that it happened.
+    /// And a terminal one is still just the fact that it happened —
+    /// **which terminal** being the fact, now that `finish` has one of
+    /// its own and a program running off its end has another.
     #[test]
     fn a_completed_handback_fetches_as_a_bare_name() {
         let mut c = Conversation::new();
         let r = c.reply("```js\nfinish(\"ok\");\n```\n");
         assert_eq!(
             c.fetch(r.handback.expect("the handback")),
-            json!("Completed")
+            json!("Finished")
+        );
+
+        let mut c = Conversation::new();
+        c.user("go");
+        let r = c.reply("```js\ntell(\"one step done\");\n```\n");
+        assert_eq!(
+            c.fetch(r.handback.expect("the handback")),
+            json!("Completed"),
+            "a program that ran off its end handed on; it did not finish"
         );
     }
 

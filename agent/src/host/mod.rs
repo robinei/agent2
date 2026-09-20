@@ -2165,6 +2165,7 @@ fn cause_label(how: &crate::types::Handback) -> &'static str {
         H::Posted { .. } => "posted",
         H::CellFailed { .. } => "cell failed",
         H::Completed => "completed",
+        H::Finished => "finished",
         H::Interrupted => "interrupted",
         H::Abandoned => "abandoned",
     }

@@ -1255,7 +1255,11 @@ fn render_handback(h: &Handback<'_>, budget: usize) -> String {
         return "(not an outcome)".to_owned();
     };
     match how {
-        HandbackHow::Completed => CompletionReport {
+        // A `finish` reports like any other completion: the branch
+        // rested, and this is only reached when something later woke
+        // it — a new question from the person, which the report is
+        // there to hand the previous program's rows to.
+        HandbackHow::Completed | HandbackHow::Finished => CompletionReport {
             console: h.console.clone(),
             console_id: h.console_id,
             new_artifacts: menu_since(h, h.previous_outcome),
@@ -1605,7 +1609,7 @@ fn what_happened(h: &Handback<'_>, cause: &HandbackHow, site: u32) -> String {
         // same reply did run and have rows to show. Kept so this match
         // stays exhaustive over `Handback` rather than letting a
         // wildcard hide a variant added later.
-        HandbackHow::Completed => String::new(),
+        HandbackHow::Completed | HandbackHow::Finished => String::new(),
         HandbackHow::CellFailed { message } => message.clone(),
     }
 }

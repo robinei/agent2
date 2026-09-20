@@ -486,6 +486,24 @@ pub enum Handback {
     },
 
     Completed,
+    /// The program called `finish(text)`: the task is done and the
+    /// branch is at rest.
+    ///
+    /// **Not the same thing as `Completed`**, which is a program that
+    /// ran off its end — the branch carries on from there by default
+    /// (`26_RETURN_CONTINUES`). Both used to be logged as `Completed`,
+    /// and the difference was only recoverable by guessing: a `Send`
+    /// with a zero-width site is what `finish` emits, so two readers
+    /// were inferring "this branch finished" from the shape of a call
+    /// beside the handback.
+    ///
+    /// Reopening a log is where that mattered. Recovery asks the log
+    /// which outcome was owed a request and found no way to tell a
+    /// branch that rested on purpose from one that stopped mid-task,
+    /// so every reopen of a finished session woke it for one more
+    /// reply — seen live in `try21.jsonl` (#50 finished, #61 replied
+    /// "the task was already finished").
+    Finished,
     Abandoned,
     Interrupted,
 }
@@ -496,7 +514,7 @@ impl Handback {
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,
-            Handback::Completed | Handback::Abandoned | Handback::Interrupted
+            Handback::Completed | Handback::Finished | Handback::Abandoned | Handback::Interrupted
         )
     }
 }

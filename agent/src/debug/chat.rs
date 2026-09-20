@@ -157,12 +157,6 @@ enum Entry {
         /// the person driving can see when a restart gesture (`e`/`v`)
         /// stood in for what would otherwise have been the model's turn.
         by_user: bool,
-        /// Set once an `EventPayload::Compacted` op names this program:
-        /// the marker text shown in place of the ordinary status line.
-        /// The row is never removed from `entries` — only its rendering
-        /// is substituted (`Compacted`'s own doc: "never removes the
-        /// target row") — so the program stays fetchable by its id.
-        compacted: Option<String>,
         /// The `Turn`'s own source.
         ///
         /// Rendered beneath the header only under `Transport::Notebook`
@@ -215,8 +209,7 @@ pub struct ChatState {
     /// organizing invariant made literal (22_ONE_VOCABULARY: "every
     /// document row is exactly one event, addressed by its id"). What a
     /// logged `Call`'s `Result` completes in place, an `Invoke` row
-    /// attaches beneath, and a `Compacted` op substitutes the rendering
-    /// of.
+    /// attaches beneath, and a `Compacted` op marks.
     entry_index: HashMap<EventId, usize>,
     /// Per branch, the ids of currently-open programs, innermost last —
     /// mirrors `tree::programs_for`'s own `stack` exactly: pushed on
@@ -259,6 +252,12 @@ pub struct ChatState {
     /// as `entries`, so an index is always valid to look up.
     classified_line_cache: LineCache,
     raw_line_cache: LineCache,
+    /// Events a compaction op has dropped from the model's window.
+    ///
+    /// **A fact about the row, not a replacement for it.** What the
+    /// next request carries and what the person has read are two
+    /// different things; the renderer fades these, and the text stays.
+    compacted: std::collections::HashSet<EventId>,
     /// How many times `classify_entry_lines` has actually run (cache
     /// misses) — mirrors `ReportMemo::derivations` (`types.rs`), a
     /// counter for exactly this purpose: a test asserting the memo, not
@@ -445,7 +444,6 @@ impl ChatState {
                     program: id,
                     depth,
                     by_user,
-                    compacted: None,
                     // The reply's text arrives as `Part`s; the header
                     // opens empty and they append to it.
                     source: String::new(),
@@ -564,15 +562,32 @@ impl ChatState {
             // place, per its own doc in `types.rs` ("never removes the
             // target row... a renderer consults [a lookup] instead").
             EventPayload::Compacted { of, text, .. } => {
-                let marker = match text {
-                    Some(t) => format!("[compacted] {t}"),
-                    None => "[removed]".to_owned(),
-                };
+                // **The person's transcript is not the model's window.**
+                // Compaction decides what the *next request* carries;
+                // what was said is still what was said. This used to
+                // overwrite the row's text with `[removed]`, so one
+                // compaction pass replaced fifty-odd rows of a live
+                // conversation with that word and the scrollback was
+                // gone — seen in `try21.jsonl`, where a single pass
+                // took out 53 rows. The row keeps its text and is
+                // rendered faded instead; a summary the model wrote in
+                // its place is worth reading, so it lands as its own
+                // marker beside the original rather than on top of it.
                 if let Some(&row) = self.entry_index.get(of) {
-                    match self.entries.get_mut(row) {
-                        Some(Entry::Line { text, .. }) => *text = marker,
-                        Some(Entry::Header { compacted, .. }) => *compacted = Some(marker),
-                        None => {}
+                    self.compacted.insert(*of);
+                    let where_ = match self.entries.get(row) {
+                        Some(Entry::Line { branch, id, .. }) => Some((*branch, *id)),
+                        _ => None,
+                    };
+                    if let (Some((branch, id)), Some(t)) = (where_, text) {
+                        let text = format!("compacted to: {t}");
+                        self.push_entry(Entry::Line {
+                            branch,
+                            id,
+                            kind: ChatKind::Marker,
+                            text,
+                            program: None,
+                        });
                     }
                     self.classified_line_cache.get_mut()[row] = None;
                     self.raw_line_cache.get_mut()[row] = None;
@@ -685,6 +700,12 @@ impl ChatState {
     /// a table wider than the pane used to fall through to the generic
     /// word-wrapper, which has no notion of box-drawing structure and
     /// shredded the frame.
+    /// Whether a compaction op has dropped this event from the
+    /// model's window. The row is still on the screen; it is faded.
+    pub fn is_compacted(&self, id: EventId) -> bool {
+        self.compacted.contains(&id)
+    }
+
     pub fn rows(
         &self,
         branch: Option<BranchId>,
@@ -852,19 +873,9 @@ impl ChatState {
                     program,
                     depth,
                     by_user,
-                    compacted,
                     source,
                 } if visible(*branch, *program) => {
                     let indent = "  ".repeat(*depth);
-                    if let Some(marker) = compacted {
-                        out.push((
-                            ChatKind::Marker,
-                            format!("{indent}{marker}"),
-                            RowDetail::Program(*program),
-                            *program,
-                        ));
-                        continue;
-                    }
                     // **A reply with no cells has no program block.**
                     // It spoke and stopped (D4); its prose is already
                     // on the screen as its own rows, and a bare
@@ -1558,6 +1569,56 @@ mod tests {
                 },
             },
         )
+    }
+
+    /// **Compaction is about the next request, not about the
+    /// scrollback.** A compacted row used to have its text overwritten
+    /// with `[removed]`; a single pass over a long conversation (53
+    /// rows, in `try21.jsonl`) then left that word fifty-three times
+    /// where the conversation had been.
+    #[test]
+    fn a_compacted_row_keeps_its_text_and_is_marked() {
+        let mut chat = ChatState::new();
+        chat.apply(&agent_event());
+        chat.apply(&post(2, "how long is a.txt?"));
+        chat.apply(&post(3, "and b.txt?"));
+
+        chat.apply(&ev(
+            10,
+            EventPayload::Compacted {
+                of: EventId::new(2),
+                text: None,
+                window: None,
+            },
+        ));
+        let rows = chat.rows(None, 80, None);
+        assert!(
+            rows.iter()
+                .any(|(_, t, ..)| t.contains("how long is a.txt?")),
+            "the person can still read what was said: {rows:?}"
+        );
+        assert!(!rows.iter().any(|(_, t, ..)| t.contains("[removed]")));
+        assert!(chat.is_compacted(EventId::new(2)));
+        assert!(!chat.is_compacted(EventId::new(3)));
+
+        // A replacement is something the model wrote *about* the row —
+        // worth reading, and beside the original rather than on top of
+        // it.
+        chat.apply(&ev(
+            11,
+            EventPayload::Compacted {
+                of: EventId::new(3),
+                text: Some("asked about two files".into()),
+                window: None,
+            },
+        ));
+        let rows = chat.rows(None, 80, None);
+        assert!(rows.iter().any(|(_, t, ..)| t.contains("and b.txt?")));
+        assert!(
+            rows.iter()
+                .any(|(_, t, ..)| t.contains("compacted to: asked about two files")),
+            "{rows:?}"
+        );
     }
 
     #[test]

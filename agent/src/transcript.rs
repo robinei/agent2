@@ -159,14 +159,13 @@ fn line_for(tree: &Tree, path: &[&Event], event: &Event) -> Option<String> {
             };
             format!("#{id}    ✂ #{} {how}", of.as_u64())
         }
-        // **Finishing and handing on are one `Completed` on the log**
-        // and two very different things to read: one says the task is
-        // over, the other says the next reply carries on. The log does
-        // not spell them apart — the difference is whether the branch
-        // rested — so this asks the same question the closing line
-        // does, one reply at a time.
+        // **Finishing and handing on are two terminals** and two very
+        // different things to read: one says the task is over, the
+        // other says the next reply carries on. They were one
+        // `Completed` on the log once, and this had to ask after the
+        // fact whether the branch had rested.
         EventPayload::Handback { how, .. } => match how {
-            Handback::Completed if finished_here(path, event.id) => "       ✓ finished".to_owned(),
+            Handback::Finished => "       ✓ finished".to_owned(),
             Handback::Completed => "       ⏎ handed on".to_owned(),
             Handback::Stopped { reason } => format!("       ⏹ stopped: {}", clip(reason)),
             Handback::Raised { name, .. } => format!("#{id}    ⏸ raised «{name}»"),
@@ -192,37 +191,6 @@ fn line_for(tree: &Tree, path: &[&Event], event: &Event) -> Option<String> {
         },
         _ => return None,
     })
-}
-
-/// Whether the `Completed` at `at` was a `finish(text)` rather than a
-/// handover.
-///
-/// `finish` sends its text and then rests, so the tell-tale is a
-/// `Send { to: user, expects_reply: false }` in the same reply with no
-/// call expression behind it — the synthetic zero-width site the verb
-/// gives it, which an ordinary `tell` never has.
-fn finished_here(path: &[&Event], at: EventId) -> bool {
-    let reply = path
-        .iter()
-        .rev()
-        .skip_while(|e| e.id.as_u64() > at.as_u64())
-        .find(|e| matches!(e.payload, EventPayload::Reply | EventPayload::Restart))
-        .map(|e| e.id.as_u64())
-        .unwrap_or(0);
-    path.iter()
-        .filter(|e| e.id.as_u64() > reply && e.id.as_u64() < at.as_u64())
-        .any(|e| {
-            matches!(
-                &e.payload,
-                EventPayload::Call(Call::Send {
-                    prose: false,
-                    expects_reply: false,
-                    site: 0,
-                    site_end: 0,
-                    ..
-                })
-            )
-        })
 }
 
 /// What a program printed, bounded by **rows** as well as by width.
