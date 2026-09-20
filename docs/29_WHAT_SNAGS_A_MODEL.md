@@ -830,6 +830,19 @@ It also never caught the case that motivated it, because that run wrote
 A report section that is wrong most of the time it appears is how a
 reader learns to skip that section.
 
+**A parse check inside `replace_file`.** Tempting after the
+indentation findings: the harness can see for nothing that a write
+turns a valid Python file into a syntax error. Reading the runs says
+not to. One `sweep-40` run already wrote
+`tools.parse_errors(null, kept, "python")` and refused to write when
+it failed — the guidance works and the check would be redundant with
+what the program is doing. And in the run that motivated the idea, the
+model had the whole `IndentationError` traceback in front of it and
+gave up anyway, so detecting the breakage later was never what was
+missing. Refusing the *edit*, before it lands, is the fix; the
+`Edit.*` guards do that, and a second check downstream would only
+catch the cases those already refuse.
+
 ## The one that had a cause underneath it
 
 `history.append` carrying bytes already on the log is 72% of everything
