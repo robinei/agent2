@@ -365,7 +365,10 @@ impl AttachedApp {
     }
 
     pub fn auto_reset_chat_scroll(&mut self) {
-        let current = self.chat.rows(self.selected, self.chat_wrap_width()).len();
+        let current = self
+            .chat
+            .rows(self.selected, self.chat_wrap_width(), self.selected_program)
+            .len();
         if current != self.last_chat_lines {
             self.chat_scroll = None;
             self.last_chat_lines = current;
@@ -409,7 +412,7 @@ impl AttachedApp {
         self.pane_rects
             .iter()
             .find(|(p, _)| *p == Pane::Chat)
-            .map(|(_, info)| info.area.width.saturating_sub(2).max(1) as usize)
+            .map(|(_, info)| info.area.width.saturating_sub(2 + 2 * CHAT_MARGIN).max(1) as usize)
             .unwrap_or(80)
     }
 
@@ -446,7 +449,9 @@ impl AttachedApp {
             Pane::Chat => {
                 let Some(body) = body else { return };
                 let line = info.scroll_top + body;
-                let rows = self.chat.rows(self.selected, self.chat_wrap_width());
+                let rows =
+                    self.chat
+                        .rows(self.selected, self.chat_wrap_width(), self.selected_program);
                 // `line` is a wrapped-line offset; translate it back to
                 // the logical row it belongs to before indexing `rows`.
                 let Some(&row_idx) = self.chat_line_rows.get(line) else {
@@ -471,18 +476,6 @@ impl AttachedApp {
                         {
                             self.collapsed.insert(branch);
                         }
-                        return;
-                    }
-                    // **Click toggles a cell** (D13) — clicking the *code*,
-                    // which is the thing you want more or less of. The
-                    // header keeps selecting the program, so folding and
-                    // selecting stay separate gestures on separate rows.
-                    // One cell at a time: the state is keyed by `Turn` id,
-                    // so a reply's other cells are untouched.
-                    if *kind == ChatKind::Code
-                        && let RowDetail::Program(pid) = detail
-                    {
-                        self.chat.toggle_cell(*pid);
                         return;
                     }
                     match detail {
@@ -929,16 +922,6 @@ impl AttachedApp {
             KeyCode::Char('c') if self.view == View::Chat => {
                 self.view = View::Running;
                 self.focus = Focus::Input;
-                KeyAction::None
-            }
-            // The keyboard equivalent of clicking a cell's code (D13).
-            // **Not `c`**: that is the pane-collapse gesture, one bit per
-            // *branch*, and this is one bit per *cell* — a different thing
-            // at a different scope, which is exactly the trap D13 names.
-            KeyCode::Char('z') if self.view != View::FullDebug => {
-                if let Some(pid) = self.selected_program {
-                    self.chat.toggle_cell(pid);
-                }
                 KeyAction::None
             }
             KeyCode::Char(' ') => KeyAction::TogglePause,
@@ -1779,6 +1762,13 @@ fn token_color(kind: super::highlight::Kind) -> Option<Color> {
     }
 }
 
+/// **A column of air down each side of the chat pane**, between the
+/// border and anything a row paints. The left one doubles as the
+/// selection gutter, which is why it is reserved rather than claimed
+/// when needed: a mark that has to be made room for moves the text it
+/// is marking.
+const CHAT_MARGIN: u16 = 1;
+
 /// **The three backgrounds a program block is made of.** A block is one
 /// shape on the screen: a lid saying what it is and how it went, the
 /// source under it, and the calls it made attached below. They share a
@@ -2021,11 +2011,21 @@ fn render_chat(
     // math ever sees the line count — a long error message (or any long
     // single-line text with no `\n` of its own) gets to span rows instead
     // of losing everything past the border.
-    let wrap_width = transcript_area.width.saturating_sub(2).max(1) as usize;
+    // Less the borders, and less **a column of margin down each side**.
+    // The left one is where a selection's gutter mark goes, so selecting
+    // a row paints that column rather than pushing the row's text over
+    // by one — a block used to shuffle sideways as you moved through it.
+    // The right one just keeps a slab off the border.
+    let wrap_width = transcript_area
+        .width
+        .saturating_sub(2 + 2 * CHAT_MARGIN)
+        .max(1) as usize;
     let rows = if app.show_markdown {
-        app.chat.rows(app.selected, wrap_width)
+        app.chat
+            .rows(app.selected, wrap_width, app.selected_program)
     } else {
-        app.chat.rows_raw(app.selected, wrap_width)
+        app.chat
+            .rows_raw(app.selected, wrap_width, app.selected_program)
     };
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(rows.len());
     // One entry per wrapped line pushed below, naming which `rows` index
@@ -2053,7 +2053,8 @@ fn render_chat(
             RowDetail::Program(pid) | RowDetail::Invoke(pid, _) => Some(*pid),
             RowDetail::None => None,
         };
-        if prev_speaker.is_some_and(|p| p != speaker) || (prev_block.is_some() && block != prev_block)
+        if prev_speaker.is_some_and(|p| p != speaker)
+            || (prev_block.is_some() && block != prev_block)
         {
             lines.push(Line::from(""));
             row_at_line.resize(lines.len(), row_idx);
@@ -2073,10 +2074,19 @@ fn render_chat(
         // swapped the slab for the foreground, which read as damage
         // rather than as a cursor. A gutter mark composes with a
         // background instead of fighting it.
-        let selected = app.selected_subitem.is_some_and(|sel| {
-            matches!(detail, RowDetail::Invoke(pid, idx)
-                if app.selected_program == Some(*pid) && *idx == sel)
-        }) || app.last_clicked_event == Some(*id);
+        //
+        // **The whole selected block is marked**, not just a row of it.
+        // The block being open is the other half of the same fact — its
+        // source is showing because it is the one you are looking at —
+        // and a bar down its edge is what says so. Narrowed to a single
+        // row once a sub-item is picked out, which is then the finer
+        // thing being pointed at.
+        let in_block = block.is_some() && block == app.selected_program;
+        let selected = match app.selected_subitem {
+            Some(sel) => matches!(detail, RowDetail::Invoke(pid, idx)
+                if app.selected_program == Some(*pid) && *idx == sel),
+            None => in_block,
+        } || app.last_clicked_event == Some(*id);
         let before = lines.len();
         if app.show_markdown
             && matches!(
@@ -2124,29 +2134,33 @@ fn render_chat(
         // can become several of them and every one is part of the same
         // shape.
         let slab = slab_of(*kind, detail);
-        if slab.is_some() || selected {
-            for line in &mut lines[before..] {
-                let width: usize = line
-                    .spans
-                    .iter()
-                    .map(|s| s.content.chars().count())
-                    .sum::<usize>();
-                if let Some(bg) = slab {
-                    if width < wrap_width {
-                        line.spans
-                            .push(Span::styled(" ".repeat(wrap_width - width), style));
-                    }
-                    for span in &mut line.spans {
-                        span.style = span.style.bg(bg);
-                    }
+        for line in &mut lines[before..] {
+            let width: usize = line
+                .spans
+                .iter()
+                .map(|s| s.content.chars().count())
+                .sum::<usize>();
+            if let Some(bg) = slab {
+                if width < wrap_width {
+                    line.spans
+                        .push(Span::styled(" ".repeat(wrap_width - width), style));
                 }
-                if selected {
-                    line.spans.insert(
-                        0,
-                        Span::styled("▌", Style::default().fg(Color::Cyan)),
-                    );
+                for span in &mut line.spans {
+                    span.style = span.style.bg(bg);
                 }
             }
+            // The margins, outside whatever the slab painted: the mark
+            // occupies the left one when this row is selected, and the
+            // row is laid out as if it always did.
+            line.spans.insert(
+                0,
+                if selected {
+                    Span::styled("▌", Style::default().fg(Color::Cyan))
+                } else {
+                    Span::raw(" ")
+                },
+            );
+            line.spans.push(Span::raw(" "));
         }
         row_at_line.resize(lines.len(), row_idx);
     }
@@ -2741,27 +2755,23 @@ mod tests {
             guidelines: Vec::new(),
             example: None,
             returns: None,
-            handler: Box::new(|_| {
-                Ok(serde_json::json!({ "content": "x = 1\n", "version": "v1" }))
-            }),
+            handler: Box::new(|_| Ok(serde_json::json!({ "content": "x = 1\n", "version": "v1" }))),
         });
         let session = Session::new(
             Tree::new(None),
             "a test agent",
             registry,
-            Box::new(ScriptedLlm::new([scripted_markdown(
-                concat!(
-                    "Reading it first, then I will say what I found.\n\n",
-                    "```js\n",
-                    "const f = await tools.read_file(\"a.txt\");\n",
-                    "const n = f.content.trim().length;\n",
-                    "const doubled = n * 2;\n",
-                    "const label = `len ${n}`;\n",
-                    "console.log(label, doubled);\n",
-                    "tell(`a.txt is ${n} characters.`);\n",
-                    "```\n",
-                ),
-            )])),
+            Box::new(ScriptedLlm::new([scripted_markdown(concat!(
+                "Reading it first, then I will say what I found.\n\n",
+                "```js\n",
+                "const f = await tools.read_file(\"a.txt\");\n",
+                "const n = f.content.trim().length;\n",
+                "const doubled = n * 2;\n",
+                "const label = `len ${n}`;\n",
+                "console.log(label, doubled);\n",
+                "tell(`a.txt is ${n} characters.`);\n",
+                "```\n",
+            ))])),
             tx,
         )
         .unwrap();
@@ -2824,7 +2834,9 @@ mod tests {
             screen.dump()
         );
         assert!(
-            screen.inner(screen.find("program:").unwrap()).contains("· js"),
+            screen
+                .inner(screen.find("program:").unwrap())
+                .contains("· js"),
             "the lid names the dialect the fence did"
         );
     }
@@ -2889,11 +2901,63 @@ mod tests {
             !screen.modifiers(y).contains(Modifier::REVERSED),
             "and nothing is inverted"
         );
-        assert_eq!(
-            screen.backgrounds(y)[1].0,
-            before,
-            "the slab is untouched"
+        assert_eq!(screen.backgrounds(y)[1].0, before, "the slab is untouched");
+    }
+
+    /// **The mark costs the row nothing.** The gutter is a reserved
+    /// column, not one taken when there is something to put in it, so a
+    /// row's text is at the same x selected or not — a block used to
+    /// shuffle a column sideways as the selection passed through it.
+    #[test]
+    fn selecting_a_row_does_not_move_it() {
+        let column_of = |screen: &Screen, needle: char| {
+            let y = screen.find("⚙ read_file").expect("a call to look at");
+            screen.inner(y).chars().position(|c| c == needle)
+        };
+        let mut app = a_session_with_one_of_everything();
+        let before = column_of(&Screen::chat(&app, 64, 26), '⚙');
+
+        app.selected_program = Some(EventId::new(3));
+        app.selected_subitem = Some(0);
+        let screen = Screen::chat(&app, 64, 26);
+        assert!(
+            column_of(&screen, '▌').is_some(),
+            "the row is marked:\n{}",
+            screen.dump()
         );
+        assert_eq!(
+            column_of(&screen, '⚙'),
+            before,
+            "and its text did not move:\n{}",
+            screen.dump()
+        );
+    }
+
+    /// **The open block is the selected one**, end to end: the source a
+    /// collapsed block hides is on the screen once you are looking at
+    /// it, and gone again when you look elsewhere.
+    #[test]
+    fn selecting_a_block_opens_its_source() {
+        let mut app = a_session_with_one_of_everything();
+        let shut = Screen::chat(&app, 64, 26);
+        assert!(
+            shut.find("more line").is_some(),
+            "the fixture's cell is long enough to fold:\n{}",
+            shut.dump()
+        );
+
+        app.selected_program = Some(EventId::new(3));
+        let open = Screen::chat(&app, 64, 26);
+        assert!(
+            open.find("more line").is_none(),
+            "nothing is hidden, so nothing says so:\n{}",
+            open.dump()
+        );
+
+        // And looking at something else shuts it, with no gesture of
+        // its own — which is the whole point of dropping the sticky bit.
+        app.selected_program = Some(EventId::new(99));
+        assert!(Screen::chat(&app, 64, 26).find("more line").is_some());
     }
 
     /// Not an assertion — a picture, for changing how this looks.
@@ -2901,10 +2965,15 @@ mod tests {
     #[test]
     #[ignore = "prints the pane; it asserts nothing"]
     fn look_at_the_chat_pane() {
-        let app = a_session_with_one_of_everything();
-        for (kind, text, detail, id) in app.chat.rows(app.selected, 60) {
+        let mut app = a_session_with_one_of_everything();
+        for (kind, text, detail, id) in app.chat.rows(app.selected, 60, app.selected_program) {
             println!("ROW {kind:?} {detail:?} #{} {text:?}", id.as_u64());
         }
+        println!("{}", Screen::chat(&app, 64, 26).dump());
+        // Selected too, because selecting is what opens a block now —
+        // the two states are one gesture apart and worth seeing together.
+        app.selected_program = Some(EventId::new(3));
+        println!("--- with the block selected:");
         println!("{}", Screen::chat(&app, 64, 26).dump());
     }
     use crate::host::{
@@ -3893,14 +3962,14 @@ mod tests {
 
         // Sanity check on the data model first: with markdown ON, the
         // delimiter row is gone by design.
-        let classified = app.chat.rows(app.selected, 80);
+        let classified = app.chat.rows(app.selected, 80, app.selected_program);
         assert!(
             !classified.iter().any(|(_, t, _, _)| t.contains("------")),
             "the delimiter row is dropped when markdown rendering is on"
         );
 
         app.show_markdown = false;
-        let raw = app.chat.rows_raw(app.selected, 80);
+        let raw = app.chat.rows_raw(app.selected, 80, app.selected_program);
         assert!(
             raw.iter().any(|(_, t, _, _)| t.contains("------")),
             "but must survive verbatim in the raw row data: {raw:?}"
@@ -4459,7 +4528,7 @@ mod tests {
         for event in rx.try_iter() {
             app.apply(&event);
         }
-        let rows = app.chat.rows(Some(branch), 80);
+        let rows = app.chat.rows(Some(branch), 80, None);
         assert!(rows.len() >= 2, "the demo logs more than one row");
         let (first_id, second_id) = (rows[0].3, rows[1].3);
         app.pane_rects.push((
@@ -4515,7 +4584,7 @@ mod tests {
         for event in rx.try_iter() {
             app.apply(&event);
         }
-        let rows = app.chat.rows(Some(branch), 80);
+        let rows = app.chat.rows(Some(branch), 80, None);
         assert!(rows.len() >= 3, "the demo logs at least three rows");
         let (row1_id, row2_id) = (rows[1].3, rows[2].3);
         app.pane_rects.push((
@@ -4711,51 +4780,5 @@ mod tests {
         // root's final answer on its branch.
         while session.pump_one() {}
         assert!(session.quiet());
-    }
-
-    /// **The cell-fold gesture is not `c`** (D13). `c` is the pane-collapse
-    /// key — one bit per *branch*, a different thing at a different scope —
-    /// and it keeps doing exactly that.
-    #[test]
-    fn the_cell_fold_key_is_not_the_pane_collapse_key() {
-        let mut app = AttachedApp::new(fid(1));
-        app.chat.set_show_cells(true);
-        app.selected_program = Some(EventId::new(7));
-        app.focus = Focus::Debug;
-
-        // `c` still folds the panes, and folds no cell.
-        app.view = View::Running;
-        app.on_debug_key(KeyCode::Char('c'), &[], None);
-        assert_eq!(app.view, View::Chat);
-        assert!(!app.chat.cell_expanded(EventId::new(7)));
-
-        // `z` folds the cell, and leaves the panes alone.
-        let view = app.view;
-        app.on_debug_key(KeyCode::Char('z'), &[], None);
-        assert!(app.chat.cell_expanded(EventId::new(7)));
-        assert_eq!(app.view, view, "the panes are untouched");
-
-        // And it toggles back.
-        app.on_debug_key(KeyCode::Char('z'), &[], None);
-        assert!(!app.chat.cell_expanded(EventId::new(7)));
-    }
-
-    /// One cell at a time: the fold key names the selected program, so a
-    /// reply's other cells are untouched.
-    #[test]
-    fn folding_one_cell_leaves_the_others_alone() {
-        let mut app = AttachedApp::new(fid(1));
-        app.chat.set_show_cells(true);
-        app.focus = Focus::Debug;
-
-        app.selected_program = Some(EventId::new(2));
-        app.on_debug_key(KeyCode::Char('z'), &[], None);
-        assert!(app.chat.cell_expanded(EventId::new(2)));
-        assert!(!app.chat.cell_expanded(EventId::new(3)));
-
-        app.selected_program = Some(EventId::new(3));
-        app.on_debug_key(KeyCode::Char('z'), &[], None);
-        assert!(app.chat.cell_expanded(EventId::new(2)), "still open");
-        assert!(app.chat.cell_expanded(EventId::new(3)));
     }
 }

@@ -196,7 +196,7 @@ pub struct ChatState {
     /// Keyed by the cell's `Turn` id, deliberately not an extension of the
     /// navigator's per-branch `collapsed: HashSet<BranchId>`: one bit per
     /// branch cannot express several cells in one reply.
-    expanded_cells: std::collections::HashSet<EventId>,
+
     /// Accumulating streamed text per branch, shown until the logged
     /// assistant message replaces it.
     streaming: Vec<(BranchId, String)>,
@@ -278,19 +278,6 @@ impl ChatState {
     /// Toggle one cell open or shut. Keyed by the cell's `Turn` id, **not**
     /// by branch: a single reply holds several cells, so the per-branch
     /// `collapsed` set the navigator uses cannot express this.
-    pub fn toggle_cell(&mut self, program: EventId) {
-        if !self.expanded_cells.remove(&program) {
-            self.expanded_cells.insert(program);
-        }
-    }
-
-    /// Whether `program`'s cell is showing its whole source.
-    #[allow(dead_code)] // read from test modules, which the non-test
-    // build does not compile; the renderer reads `expanded_cells` directly.
-    pub fn cell_expanded(&self, program: EventId) -> bool {
-        self.expanded_cells.contains(&program)
-    }
-
     pub fn new() -> Self {
         Self::default()
     }
@@ -702,8 +689,9 @@ impl ChatState {
         &self,
         branch: Option<BranchId>,
         width: usize,
+        selected: Option<EventId>,
     ) -> Vec<(ChatKind, String, RowDetail, EventId)> {
-        self.rows_impl(branch, true, width)
+        self.rows_impl(branch, true, width, selected)
     }
 
     /// A cell's source, as rows beneath its header (D13).
@@ -721,12 +709,20 @@ impl ChatState {
         program: EventId,
         source: &str,
         indent: &str,
+        selected: Option<EventId>,
     ) -> Vec<(ChatKind, String, RowDetail, EventId)> {
         if !self.show_cells || source.trim().is_empty() {
             return Vec::new();
         }
         let (lines, _) = unfenced(source);
-        let expanded = self.expanded_cells.contains(&program);
+        // **The open block is the selected one.** Expansion used to be
+        // its own sticky bit, toggled by clicking a source row while
+        // clicking the lid selected instead — two gestures on two rows
+        // of the same block, which read as one gesture until you moved
+        // the selection and the block stayed open. There is nothing to
+        // keep in sync now: a block is open because it is the one you
+        // are looking at, which the gutter mark already says.
+        let expanded = selected == Some(program);
         let shown = if expanded {
             lines.len()
         } else {
@@ -743,24 +739,16 @@ impl ChatState {
                 )
             })
             .collect();
-        // **The affordance is on the row, in both directions.** A
-        // collapsed block said how much was hidden and not how to see
-        // it; an expanded one said nothing at all, so the way back was
-        // a thing you had to remember. Both are a row now, and both say
-        // what happens if you use them.
+        // **The affordance is on the row.** It used to say how much
+        // was hidden and not how to see it. Only one direction needs
+        // saying: an open block closes by your looking at something
+        // else, which is not a thing to be told.
         if shown < lines.len() {
             let rest = lines.len() - shown;
             let plural = if rest == 1 { "" } else { "s" };
             out.push((
                 ChatKind::Code,
-                format!("{indent}… {rest} more line{plural} — click or ⏎ to expand"),
-                RowDetail::Program(program),
-                program,
-            ));
-        } else if expanded && lines.len() > CELL_COLLAPSED_LINES {
-            out.push((
-                ChatKind::Code,
-                format!("{indent}… click or ⏎ to collapse"),
+                format!("{indent}… {rest} more line{plural} — click to open"),
                 RowDetail::Program(program),
                 program,
             ));
@@ -789,8 +777,10 @@ impl ChatState {
             let stale = !matches!(&cache_mut[entry_index], Some((w, _)) if *w == width);
             if stale {
                 self.line_derivations.set(self.line_derivations.get() + 1);
-                cache_mut[entry_index] =
-                    Some((width, classify_entry_lines(kind, text, render_markdown, width)));
+                cache_mut[entry_index] = Some((
+                    width,
+                    classify_entry_lines(kind, text, render_markdown, width),
+                ));
             }
         }
         cache.borrow()[entry_index].as_ref().unwrap().1.clone()
@@ -806,8 +796,9 @@ impl ChatState {
         &self,
         branch: Option<BranchId>,
         width: usize,
+        selected: Option<EventId>,
     ) -> Vec<(ChatKind, String, RowDetail, EventId)> {
-        self.rows_impl(branch, false, width)
+        self.rows_impl(branch, false, width, selected)
     }
 
     fn rows_impl(
@@ -815,6 +806,7 @@ impl ChatState {
         branch: Option<BranchId>,
         render_markdown: bool,
         width: usize,
+        selected: Option<EventId>,
     ) -> Vec<(ChatKind, String, RowDetail, EventId)> {
         let Some(target) = branch.or(self.main_branch) else {
             return Vec::new();
@@ -907,7 +899,7 @@ impl ChatState {
                         RowDetail::Program(*program),
                         *program,
                     ));
-                    out.extend(self.cell_rows(*program, source, &indent));
+                    out.extend(self.cell_rows(*program, source, &indent, selected));
                     grouped.insert(*program);
                     for i in calls_of.get(program).into_iter().flatten().copied() {
                         let Entry::Line { id, text, .. } = &self.entries[i] else {
@@ -1588,7 +1580,7 @@ mod tests {
             thinking: false,
             text: "thinki".into(),
         });
-        let rows = chat.rows(None, 80);
+        let rows = chat.rows(None, 80, None);
         assert!(
             rows.iter()
                 .any(|(k, t, _, _)| *k == ChatKind::User && t.contains("hi"))
@@ -1602,7 +1594,7 @@ mod tests {
         for e in run_program(3) {
             chat.apply(&e);
         }
-        let rows = chat.rows(None, 80);
+        let rows = chat.rows(None, 80, None);
         assert!(!rows.iter().any(|(k, _, _, _)| *k == ChatKind::Streaming));
         // A run_program renders as a status-titled block header.
         assert!(rows.iter().any(|(k, t, p, _)| *k == ChatKind::Program
@@ -1610,7 +1602,7 @@ mod tests {
             && *p == RowDetail::Program(EventId::new(3))));
 
         // Return/Rename never reach the transcript.
-        let before = chat.rows(None, 80).len();
+        let before = chat.rows(None, 80, None).len();
         chat.apply(&ev(
             5,
             EventPayload::Handback {
@@ -1626,7 +1618,7 @@ mod tests {
                 name: "note".into(),
             },
         ));
-        assert_eq!(chat.rows(None, 80).len(), before);
+        assert_eq!(chat.rows(None, 80, None).len(), before);
     }
 
     /// A run_program with two inner calls renders as one block: a
@@ -1655,7 +1647,7 @@ mod tests {
         chat.apply(&settled(5, 3, serde_json::json!("A")));
         chat.apply(&settled(6, 4, serde_json::json!(true)));
 
-        let rows = chat.rows(None, 80);
+        let rows = chat.rows(None, 80, None);
         let glyphs: Vec<&(ChatKind, String, RowDetail, EventId)> = rows
             .iter()
             .filter(|(k, t, _, _)| *k == ChatKind::Program && t.starts_with('⚙'))
@@ -1680,7 +1672,7 @@ mod tests {
 
         // Header starts at running…
         assert!(
-            chat.rows(None, 80)
+            chat.rows(None, 80, None)
                 .iter()
                 .any(|(_, t, _, _)| t == "program: running")
         );
@@ -1692,7 +1684,7 @@ mod tests {
             status: ProgramStatus::Completed,
         });
         assert!(
-            chat.rows(None, 80)
+            chat.rows(None, 80, None)
                 .iter()
                 .any(|(_, t, _, _)| t == "program: completed")
         );
@@ -1701,7 +1693,7 @@ mod tests {
         // never even an event: it is derived from the outcome.
         assert!(
             !chat
-                .rows(None, 80)
+                .rows(None, 80, None)
                 .iter()
                 .any(|(_, t, _, _)| t.contains("program completed"))
         );
@@ -1719,12 +1711,12 @@ mod tests {
         chat.apply(&assistant_turn(2, "one **bold** line"));
         chat.apply(&assistant_turn(3, "another line"));
 
-        chat.rows(None, 80);
+        chat.rows(None, 80, None);
         let after_first = chat.line_derivations.get();
         assert!(after_first > 0, "the first call must actually derive");
 
-        chat.rows(None, 80);
-        chat.rows(None, 80);
+        chat.rows(None, 80, None);
+        chat.rows(None, 80, None);
         assert_eq!(
             chat.line_derivations.get(),
             after_first,
@@ -1734,7 +1726,7 @@ mod tests {
         // A genuinely new entry must derive exactly once more — not the
         // whole history again.
         chat.apply(&assistant_turn(4, "a third line"));
-        chat.rows(None, 80);
+        chat.rows(None, 80, None);
         assert_eq!(chat.line_derivations.get(), after_first + 1);
     }
 
@@ -1747,16 +1739,16 @@ mod tests {
         chat.apply(&agent_event());
         chat.apply(&assistant_turn(2, "# Heading"));
 
-        chat.rows(None, 80); // primes the classified cache
-        chat.rows_raw(None, 80); // primes the raw cache
+        chat.rows(None, 80, None); // primes the classified cache
+        chat.rows_raw(None, 80, None); // primes the raw cache
 
-        let classified = chat.rows(None, 80);
+        let classified = chat.rows(None, 80, None);
         assert!(
             classified
                 .iter()
                 .any(|(k, _, _, _)| *k == ChatKind::Heading)
         );
-        let raw = chat.rows_raw(None, 80);
+        let raw = chat.rows_raw(None, 80, None);
         assert!(
             raw.iter()
                 .all(|(k, _, _, _)| matches!(k, ChatKind::System | ChatKind::Assistant)),
@@ -1778,7 +1770,7 @@ mod tests {
         chat.apply(&invoke(3, "fetch"));
 
         assert!(
-            chat.rows(None, 80)
+            chat.rows(None, 80, None)
                 .iter()
                 .any(|(_, t, _, _)| t.contains("fetch → …")),
             "pending before the result lands"
@@ -1787,7 +1779,7 @@ mod tests {
 
         chat.apply(&settled(4, 3, serde_json::json!("A")));
         assert!(
-            chat.rows(None, 80)
+            chat.rows(None, 80, None)
                 .iter()
                 .any(|(_, t, _, _)| t.contains("fetch → \"A\"")),
             "the row must reflect the outcome, not the stale cached pending text"
@@ -1826,7 +1818,7 @@ mod tests {
         chat.apply(&settled(6, 4, serde_json::json!("A")));
 
         let glyphs: Vec<String> = chat
-            .rows(None, 80)
+            .rows(None, 80, None)
             .into_iter()
             .filter(|(k, t, _, _)| *k == ChatKind::Program && t.starts_with('⚙'))
             .map(|(_, t, _, _)| t)
@@ -1884,12 +1876,12 @@ mod tests {
         // `Assistant`-kind messages, exactly like the agent's own text.
         assert!(
             !chat
-                .rows(None, 80)
+                .rows(None, 80, None)
                 .iter()
                 .any(|(k, t, _, _)| *k == ChatKind::Program && t.starts_with('⚙'))
         );
         let messages: Vec<String> = chat
-            .rows(None, 80)
+            .rows(None, 80, None)
             .into_iter()
             .filter(|(k, _, _, _)| *k == ChatKind::Assistant)
             .map(|(_, t, _, _)| t)
@@ -1935,7 +1927,7 @@ mod tests {
         ));
 
         // Root's slice: leading system row, then the user message.
-        let root_rows = chat.rows(Some(EventId::new(1)), 80);
+        let root_rows = chat.rows(Some(EventId::new(1)), 80, None);
         assert_eq!(root_rows[0].0, ChatKind::System);
         assert_eq!(root_rows[0].2, RowDetail::None);
         assert!(
@@ -1947,7 +1939,7 @@ mod tests {
         assert!(!root_rows.iter().any(|(_, t, _, _)| t.contains("CHILD")));
 
         // The child's slice leads with its own system header.
-        let child_rows = chat.rows(Some(child), 80);
+        let child_rows = chat.rows(Some(child), 80, None);
         assert_eq!(child_rows[0].0, ChatKind::System);
         assert_eq!(child_rows[0].2, RowDetail::None);
         assert!(!child_rows.iter().any(|(_, t, _, _)| t.contains("root q")));
@@ -2016,7 +2008,7 @@ mod tests {
             },
         ));
 
-        let fork_rows = chat.rows(Some(EventId::new(10)), 80);
+        let fork_rows = chat.rows(Some(EventId::new(10)), 80, None);
         assert!(
             fork_rows
                 .iter()
@@ -2039,7 +2031,7 @@ mod tests {
             "a fork owes nothing of what the original does afterward"
         );
 
-        let original_rows = chat.rows(Some(EventId::new(1)), 80);
+        let original_rows = chat.rows(Some(EventId::new(1)), 80, None);
         assert!(
             original_rows
                 .iter()
@@ -2098,7 +2090,7 @@ mod tests {
             }),
         ));
 
-        let rows = chat.rows(None, 80);
+        let rows = chat.rows(None, 80, None);
         let thinking_idx = rows
             .iter()
             .position(|(k, t, _, _)| *k == ChatKind::Thinking && t.contains("6*7"))
@@ -2141,7 +2133,7 @@ mod tests {
             thinking: false,
             text: "partial answer".into(),
         });
-        let rows = chat.rows(None, 80);
+        let rows = chat.rows(None, 80, None);
         assert!(
             rows.iter()
                 .any(|(k, t, _, _)| *k == ChatKind::Thinking && t.contains("reasoning"))
@@ -2174,7 +2166,7 @@ mod tests {
                 usage: Default::default(),
             },
         ));
-        let rows = chat.rows(None, 80);
+        let rows = chat.rows(None, 80, None);
         assert!(
             !rows.iter().any(|(_, t, _, _)| t.contains("partial answer")),
             "the live text stream is replaced by the logged turn"
@@ -2237,7 +2229,7 @@ mod tests {
             "# Heading\n> quoted\n```\ncode line\n```\nplain",
         ));
 
-        let raw = chat.rows_raw(None, 80);
+        let raw = chat.rows_raw(None, 80, None);
         assert!(
             raw.iter()
                 .all(|(k, _, _, _)| matches!(k, ChatKind::System | ChatKind::Assistant)),
@@ -2253,7 +2245,7 @@ mod tests {
 
         // The classified version is unaffected — this is a read-time
         // choice, not a destructive one.
-        let classified = chat.rows(None, 80);
+        let classified = chat.rows(None, 80, None);
         assert!(
             classified
                 .iter()
@@ -2426,7 +2418,7 @@ mod tests {
             2,
             &format!("Here's the layout:\n\n{table}"),
         ));
-        let prose_rows = with_prose.rows(None, 40);
+        let prose_rows = with_prose.rows(None, 40, None);
         let (_, prose, _, _) = prose_rows
             .iter()
             .find(|(k, t, _, _)| *k == ChatKind::Assistant && t.contains("layout"))
@@ -2436,7 +2428,7 @@ mod tests {
         let mut table_only = ChatState::new();
         table_only.apply(&agent_event());
         table_only.apply(&assistant_turn(2, table));
-        let bare_rows = table_only.rows(None, 40);
+        let bare_rows = table_only.rows(None, 40, None);
 
         let border = |rows: &[(ChatKind, String, RowDetail, EventId)]| {
             rows.iter()
@@ -2463,7 +2455,7 @@ mod tests {
         chat.apply(&agent_event());
         chat.apply(&assistant_turn(2, "before\n---\nafter"));
 
-        let rows = chat.rows(None, 20);
+        let rows = chat.rows(None, 20, None);
         let (kind, text, _, _) = rows
             .iter()
             .find(|(k, ..)| *k == ChatKind::Hr)
@@ -2480,7 +2472,9 @@ mod tests {
             chat.apply(&agent_event());
             chat.apply(&assistant_turn(2, variant));
             assert!(
-                chat.rows(None, 10).iter().any(|(k, ..)| *k == ChatKind::Hr),
+                chat.rows(None, 10, None)
+                    .iter()
+                    .any(|(k, ..)| *k == ChatKind::Hr),
                 "{variant:?} must be recognized as a rule"
             );
         }
@@ -2490,7 +2484,7 @@ mod tests {
         let mut chat = ChatState::new();
         chat.apply(&agent_event());
         chat.apply(&assistant_turn(2, "--\n| a | b |\n|---|---|\n| 1 | 2 |"));
-        let rows = chat.rows(None, 20);
+        let rows = chat.rows(None, 20, None);
         assert!(!rows.iter().any(|(k, ..)| *k == ChatKind::Hr));
         assert!(rows.iter().any(|(k, ..)| *k == ChatKind::TableHeader));
     }
@@ -2502,7 +2496,7 @@ mod tests {
         chat.apply(&agent_event());
         chat.apply(&assistant_turn(2, "# Heading\ntext after"));
 
-        let rows = chat.rows(None, 80);
+        let rows = chat.rows(None, 80, None);
         let heading_idx = rows
             .iter()
             .position(|(k, t, _, _)| *k == ChatKind::Heading && t.contains("Heading"))
@@ -2527,7 +2521,7 @@ mod tests {
         chat.apply(&agent_event());
         chat.apply(&assistant_turn(2, "> quoted\nplain"));
 
-        let rows = chat.rows(None, 80);
+        let rows = chat.rows(None, 80, None);
         let (_, text, _, _) = rows
             .iter()
             .find(|(k, t, _, _)| *k == ChatKind::Blockquote && t.contains("quoted"))
@@ -2548,7 +2542,7 @@ mod tests {
         chat.apply(&agent_event());
         chat.apply(&assistant_turn(2, "before\n```\ncode line\n```\nafter"));
 
-        let rows = chat.rows(None, 80);
+        let rows = chat.rows(None, 80, None);
         assert!(
             !rows.iter().any(|(_, t, _, _)| t.contains("```")),
             "delimiter lines must never appear as rows"
@@ -2577,7 +2571,7 @@ mod tests {
         chat.apply(&agent_event());
         chat.apply(&assistant_turn(2, "```markdown\n# Project Plan\n```"));
 
-        let rows = chat.rows(None, 80);
+        let rows = chat.rows(None, 80, None);
         assert!(!rows.iter().any(|(_, t, _, _)| t.contains("```")));
         let (kind, text, _, _) = rows
             .iter()
@@ -2601,7 +2595,7 @@ mod tests {
             text: "```\nin progress\n".into(),
         });
 
-        let rows = chat.rows(None, 80);
+        let rows = chat.rows(None, 80, None);
         assert!(
             rows.iter()
                 .any(|(k, t, _, _)| *k == ChatKind::Code && t.contains("in progress")),
@@ -2619,7 +2613,7 @@ mod tests {
         chat.apply(&agent_event());
         chat.apply(&post(2, "# not a heading"));
 
-        let rows = chat.rows(None, 80);
+        let rows = chat.rows(None, 80, None);
         let (kind, text, _, _) = rows
             .iter()
             .find(|(_, t, _, _)| t.contains("not a heading"))
@@ -2643,7 +2637,7 @@ mod tests {
             "| AAA | BBB |\n|---|---|\n| 111 | 222 |",
         ));
 
-        let rows = chat.rows(None, 80);
+        let rows = chat.rows(None, 80, None);
         let header = &rows
             .iter()
             .find(|(k, ..)| *k == ChatKind::TableHeader)
@@ -2676,7 +2670,7 @@ mod tests {
             "| Name | Role |\n|------|------|\n| Ada | Engineer |\n| Grace | Admiral |",
         ));
 
-        let rows = chat.rows(None, 80);
+        let rows = chat.rows(None, 80, None);
         assert!(!rows.iter().any(|(_, t, _, _)| t.contains('-')));
         let header = rows
             .iter()
@@ -2732,7 +2726,7 @@ mod tests {
              | `agent/` | dir | — | Sep 7 | **Harness crate** — the product: branch-step machine, host loop, TUI, subagent tree |",
         ));
         for width in [60, 80, 100] {
-            let rows = probe.rows(None, width);
+            let rows = probe.rows(None, width, None);
             for (kind, t, _, _) in &rows {
                 if matches!(
                     kind,
@@ -2759,7 +2753,7 @@ mod tests {
         ));
 
         let width = 80;
-        let rows = chat.rows(None, width);
+        let rows = chat.rows(None, width, None);
         let table_rows: Vec<&(ChatKind, String, RowDetail, EventId)> = rows
             .iter()
             .filter(|(k, ..)| {
@@ -2808,7 +2802,7 @@ mod tests {
              | Quote | `> text` | ✅ |",
         ));
 
-        let rows = chat.rows(None, 80);
+        let rows = chat.rows(None, 80, None);
         let label_width = "agent ❯ ".chars().count();
         let widths: Vec<usize> = rows
             .iter()
@@ -2840,7 +2834,7 @@ mod tests {
             "| Name | Role |\n|------|------|\n| Ada | Engineer |\n| Grace | Admiral |",
         ));
 
-        let rows = chat.rows(None, 80);
+        let rows = chat.rows(None, 80, None);
         let kinds: Vec<ChatKind> = rows.iter().map(|(k, ..)| *k).collect();
         assert_eq!(
             kinds,
@@ -2890,8 +2884,8 @@ mod tests {
         chat.apply(&assistant_turn(2, text));
 
         for (label, rows) in [
-            ("classified", chat.rows(None, 80)),
-            ("raw", chat.rows_raw(None, 80)),
+            ("classified", chat.rows(None, 80, None)),
+            ("raw", chat.rows_raw(None, 80, None)),
         ] {
             assert!(
                 !rows
@@ -2925,7 +2919,7 @@ mod tests {
              | Short |",
         ));
 
-        let rows = chat.rows(None, 80);
+        let rows = chat.rows(None, 80, None);
         assert!(!rows.iter().any(|(_, t, _, _)| t.contains("---")));
         let table_rows: Vec<_> = rows
             .iter()
@@ -2959,7 +2953,7 @@ mod tests {
             "before\n| A | B |\n|---|---|\n| 1 | 2 |\nafter",
         ));
 
-        let rows = chat.rows(None, 80);
+        let rows = chat.rows(None, 80, None);
         assert!(
             rows.iter()
                 .any(|(k, t, _, _)| *k == ChatKind::Assistant && t.contains("before"))
@@ -2978,7 +2972,7 @@ mod tests {
         chat.apply(&agent_event());
         chat.apply(&assistant_turn(2, "```\n| a | b |\n|---|---|\n```"));
 
-        let rows = chat.rows(None, 80);
+        let rows = chat.rows(None, 80, None);
         assert!(!rows.iter().any(|(_, t, _, _)| t.contains("```")));
         assert!(
             !rows
@@ -3016,7 +3010,13 @@ mod tests {
     }
 
     fn code_rows(chat: &ChatState) -> Vec<String> {
-        chat.rows(None, 80)
+        code_rows_under(chat, None)
+    }
+
+    /// The same, with a block selected — which is now the only way a
+    /// cell's source opens.
+    fn code_rows_under(chat: &ChatState, selected: Option<EventId>) -> Vec<String> {
+        chat.rows(None, 80, selected)
             .into_iter()
             .filter(|(k, ..)| *k == ChatKind::Code)
             .map(|(_, text, ..)| text)
@@ -3059,8 +3059,7 @@ mod tests {
         assert_eq!(rows[0], "line1();");
         assert_eq!(rows[CELL_COLLAPSED_LINES - 1], "line5();");
         assert_eq!(
-            rows[CELL_COLLAPSED_LINES],
-            "… 3 more lines — click or ⏎ to expand",
+            rows[CELL_COLLAPSED_LINES], "… 3 more lines — click to open",
             "the row says how much is hidden and how to see it"
         );
     }
@@ -3077,9 +3076,12 @@ mod tests {
         assert_eq!(code_rows(&chat), vec!["tell(\"hi\");", "finish(\"ok\");"]);
     }
 
-    /// Expanding shows the rest.
+    /// **Selecting a block opens it, and selecting another shuts it.**
+    /// Expansion was its own sticky bit once: you clicked a source row
+    /// to open it and the lid to select it, which looked like one
+    /// gesture until the selection moved and the block stayed open.
     #[test]
-    fn expanding_a_cell_shows_its_whole_source() {
+    fn the_selected_block_is_the_open_one() {
         let mut chat = ChatState::new();
         chat.apply(&agent_event());
         chat.set_show_cells(true);
@@ -3090,23 +3092,22 @@ mod tests {
         for e in cell(2, &source) {
             chat.apply(&e);
         }
-        chat.toggle_cell(EventId::new(2));
-        assert!(chat.cell_expanded(EventId::new(2)));
-        // Every line, and the way back — an expanded block used to say
-        // nothing at all, so collapsing it again was something you had
-        // to remember rather than something you could see.
-        let open = code_rows(&chat);
-        assert_eq!(open.len(), 9);
-        assert_eq!(open[8], "… click or ⏎ to collapse");
-        chat.toggle_cell(EventId::new(2));
-        assert_eq!(code_rows(&chat).len(), CELL_COLLAPSED_LINES + 1);
+
+        let open = code_rows_under(&chat, Some(EventId::new(2)));
+        assert_eq!(open.len(), 8, "every line, and no affordance left to say");
+        assert_eq!(open[7], "line8();");
+
+        // Look at something else and it shuts itself. Nothing says how
+        // to close it, because closing it is not a thing you do.
+        let shut = code_rows_under(&chat, Some(EventId::new(99)));
+        assert_eq!(shut.len(), CELL_COLLAPSED_LINES + 1);
     }
 
-    /// **A reply with two cells collapses them independently** — the gate's
-    /// own case, and the reason the state is keyed by `Turn` id rather than
-    /// being one bit per branch.
+    /// **Only the selected one of a reply's two cells is open** — the
+    /// gate's own case, and the reason expansion is read per `Turn` id
+    /// rather than being one bit per branch.
     #[test]
-    fn two_cells_in_one_reply_collapse_independently() {
+    fn only_the_selected_cell_of_two_is_open() {
         let mut chat = ChatState::new();
         chat.apply(&agent_event());
         chat.set_show_cells(true);
@@ -3123,20 +3124,13 @@ mod tests {
             chat.apply(&e);
         }
 
-        // Both collapsed: five lines and a count each.
+        // Neither selected: five lines and a count each.
         assert_eq!(code_rows(&chat).len(), 2 * (CELL_COLLAPSED_LINES + 1));
 
-        // Open only the first.
-        chat.toggle_cell(EventId::new(2));
-        assert!(chat.cell_expanded(EventId::new(2)));
-        assert!(
-            !chat.cell_expanded(EventId::new(3)),
-            "the other cell is untouched"
-        );
-        let rows = code_rows(&chat);
-        // The open one is eight lines and its collapse row; the shut
-        // one is five and its count row.
-        assert_eq!(rows.len(), (8 + 1) + (CELL_COLLAPSED_LINES + 1));
+        let rows = code_rows_under(&chat, Some(EventId::new(2)));
+        // The open one is its eight lines; the shut one is five and
+        // its count row.
+        assert_eq!(rows.len(), 8 + (CELL_COLLAPSED_LINES + 1));
         assert!(rows.contains(&"a8();".to_string()), "the first is open");
         assert!(!rows.contains(&"b8();".to_string()), "the second is not");
     }
@@ -3155,7 +3149,7 @@ mod tests {
             chat.apply(&e);
         }
         let owners: Vec<(String, RowDetail)> = chat
-            .rows(None, 80)
+            .rows(None, 80, None)
             .into_iter()
             .filter(|(k, ..)| *k == ChatKind::Code)
             .map(|(_, text, detail, _)| (text, detail))
