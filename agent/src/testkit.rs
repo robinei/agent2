@@ -997,7 +997,7 @@ fn fold(tree: &Tree, events: &[&Event], span: (u64, u64)) -> Said {
             EventPayload::Answer { question, value } => s.answered.push((*question, value.clone())),
             EventPayload::ReplyEnd { how, usage, .. } => {
                 s.reply_ended = Some(how.clone());
-                s.usage.push(usage.clone());
+                s.usage.push(*usage);
             }
             EventPayload::Handback { how, site, .. } => {
                 s.ended = ending_of(how, *site);
