@@ -52,6 +52,24 @@ so no run straddles a build.
 | prompt bytes | 1,074 KB | **684 KB (−36%)** |
 | programs per run | 5.0 | **3.3 (−33%)** |
 
+**The round-trip figure reconfirmed on fresh arms**, measured a
+different way — replies rather than programs, and the mean of task
+means rather than a pooled average, so the task mix cannot carry it:
+
+| task | baseline | HEAD |
+|---|---|---|
+| ambiguous-config | 2.2 | 3.0 |
+| dead-code-sweep | 6.7 | 3.0 |
+| plain-question | 1.0 | 1.0 |
+| skipped-tests | 5.8 | 2.0 |
+| sweep-200 | 10.5 | 9.5 |
+| sweep-40 | 5.3 | 4.0 |
+| sweep-8 | 6.0 | 5.0 |
+| **mean of task means** | **5.3** | **3.9 (−27%)** |
+
+One task moved the wrong way, and the run that did it is the async
+IIFE below — five programs to ask one question, now a compile error.
+
 **The cost is a third lower and the pass rate is a question, not a
 win.** Fisher's exact on 36/37 against 56/63 gives p = 0.25: the drop
 is not distinguishable from chance, and it is not evidence of safety
