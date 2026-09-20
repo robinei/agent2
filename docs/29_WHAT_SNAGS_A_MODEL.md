@@ -513,6 +513,25 @@ So the error stays and the remedy it leads with changed: **use what you
 already have.** The card says a `const` in the first block is still
 bound in the second; the diagnostic is where that gets read.
 
+## The next round trip, untried
+
+If the lever is round trips, the list of them in a run is short:
+orientate, read, edit, verify, recover, compact, answer. Tonight
+removed or bounded four — orientation, the re-read, the compaction that
+could not help, and a share of the traps. What is left is *read*, and
+the opening context is where it would go: a fixture whose four files
+are two kilobytes could be handed over whole and the first read turn
+would vanish.
+
+Not done, and not obviously right. The bound is the problem — 50
+directory entries is a fixed cost and file contents are not — and the
+card's whole account of `read_file`, `history.fetch` and what a row
+holds assumes the model fetches what it needs. Pre-loading changes that
+relationship for every session to save one turn in small ones.
+
+Recording it because it is the obvious next question, not because it is
+the obvious next change.
+
 ## Compaction, forced
 
 None of the suite's documents get near a 64 KB budget any more, so
