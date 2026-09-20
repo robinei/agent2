@@ -497,8 +497,12 @@ and an enum do not both become "type". The declaration lists the
 fourteen values instead of saying `string`, so there is nothing left
 to guess.
 
-A live probe afterwards, one completion: asked how many functions a
-small Python file defines, the model wrote
+Confirmed twice over. In production, the first `sweep-8` run at the
+fixed HEAD wrote `["function", "class", "const", "variable"]
+.includes(i.kind)` — the natural vocabulary, no round trip spent
+finding out — and the filter matched. And a live probe, one
+completion: asked how many functions a small Python file defines, the
+model wrote
 
     const functions = items.filter((i) => i.kind === "function");
 
