@@ -1364,7 +1364,10 @@ pub(crate) fn compaction_message(
          return.\n\n\
          `history.remove(id)` shows nothing for that entry from here on, and \
          `history.remove(from, to)` does the same for every entry in an inclusive range. \
-         `history.replace(id, text)` shows `text` in its place instead. Everything carrying \
+         `history.replace(id, text)` shows `text` in its place instead, and \
+         `history.slice(id, from, to)` shows a window of what is already there, in bytes, \
+         writing nothing — the first 500 of a long note, say, where a summary of it would \
+         cost you the words to write one. Everything carrying \
          an id above can be named — a report, a note, a post, any single line of a \
          report's menu, and **any block of any reply you have written**, which is what the \
          `{arrow} history[12]` line above a block is for. Anything else you name is simply \

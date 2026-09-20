@@ -1069,7 +1069,7 @@ mod tests {
         // `card()` shows up as a diff review must look at, not a byte
         // count that silently drifts. Comparing full text (not just a
         // hash) so the diff itself is legible in a failure message.
-        const EXPECTED_LEN: usize = 20501;
+        const EXPECTED_LEN: usize = 21118;
         assert_eq!(
             card().len(),
             EXPECTED_LEN,
@@ -1113,6 +1113,20 @@ mod tests {
             assert!(card().contains(verb), "card is missing {verb}");
         }
         // `history.remove`/`history.replace` are named here too now.
+        // They stay named, against the argument that they belong only
+        // to the compactor: three of the four runs that rewrote outside
+        // compaction were *correcting* a row they had found to be wrong
+        // ("superseded — that row's computation was broken"), which a
+        // compaction handler later cannot know; and `remove` is how a
+        // reply stops paying for a file it appended in order to read.
+        //
+        // What they carry instead is where they are cheap. Changing
+        // what a row shows makes every turn after it new text: measured
+        // across the kept runs, a rewrite in a conversation under 5k
+        // tokens costs nothing (88% cached either way), and one past 5k
+        // cuts the cached share to 47.5% and multiplies uncached tokens
+        // by 4.4. Recent rows are nearly free; the oldest row in a long
+        // conversation is the whole conversation.
         // They used to be withheld, because they were refused outside a
         // compaction program and advertising them would have pointed
         // the model at two verbs that fail where it would first try
@@ -1125,6 +1139,7 @@ mod tests {
             "function fetch(",
             "function remove(",
             "function replace(",
+            "function slice(",
         ] {
             assert!(
                 card().contains(member),

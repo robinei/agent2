@@ -105,11 +105,17 @@ declare namespace history {
 
   It hands the value to the block that asked for it, so there is no step where you bring something *into view* before working with it — `const f = await history.fetch(9)` and the next line already has `f.content`. A reply whose every call reloads what the record is holding for it has spent a turn and learned nothing. Fetch it in the reply that uses it. */
   function fetch(id: number): unknown;
-  /** Stop showing these entries — one id, or an inclusive range. For what you have finished with and will not need again: the listing you have already picked the four paths out of, the file you read one number from. Nothing is lost — `fetch` still answers for them — and the conversation stops carrying them. */
-  function remove(from: number, to?: number): void;
-  /** Set what that entry shows. Two things want this, and they are the same operation: an entry worth something in one line but not in eighty — spend the words on what you concluded, not on saying something was removed — and a long row you are reading a window at a time, where the next window takes the place of the last instead of piling up beside it.
+  /** Show a different part of that entry instead of its first 4 KB — `from` and `to` in bytes, half-open, the same offsets `content.slice(from, to)` takes, and `to` defaulting to a windowful.
 
-  Either way the row is a view and the log is not. `fetch(id)` still hands back what was appended, so write the replacement from *that*, never from the text the row happens to be showing now: a summary of a summary loses the detail that made it worth keeping, and a window cut from a window cannot reach the rest. */
+  This is how you read on through something long you appended. It writes nothing: the bytes are already on the record, so a window is two numbers and you can move it as often as you like for nothing. */
+  function slice(id: number, from: number, to?: number): void;
+  /** Stop showing these entries — one id, or an inclusive range. For what you have finished with and will not need again: the file you appended in order to read and have now read, the listing you already picked the four paths out of. Nothing is lost — `fetch` still answers for them — and the conversation stops carrying them.
+
+  **Do it while the row is recent.** What a row shows is part of the text of every turn after it, so changing one makes everything below it new again. For something you appended a reply or two ago that costs nothing; for the oldest row in a long conversation it costs the whole conversation. Old and bulky is the compactor's job, not yours. */
+  function remove(from: number, to?: number): void;
+  /** Show `text` in place of that entry — for when the entry is worth something in one line but not in eighty, or when you have found out that what it says is wrong. Spend the words on what you concluded, not on saying something was removed.
+
+  An entry already showing as `[id] … text` is standing in for something longer. Replacing that one summarises a summary, and the detail that made it useful is what goes. `fetch` the original and write from that instead. */
   function replace(id: number, text: string): void;
 }
 
