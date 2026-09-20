@@ -689,17 +689,24 @@ fn delivered_tail(v: &serde_json::Value, label: &str) -> String {
             if map.len() > SHAPE_MAX_KEYS {
                 keys.push("…");
             }
-            // **A command that failed says so here.** `bash` is the
-            // one tool whose result carries a verdict rather than only
-            // a value, the card opens its description with "Read
-            // `status` before `stdout`", and the row said `ok,
+            // **The status, because it is the number that varies.**
+            // `bash` is the one tool whose result carries a verdict as
+            // well as a value, the card opens its description with
+            // "Read `status` before `stdout`", and the row said `ok,
             // {status, stdout, stderr}` either way — the field names,
             // which the card already declares, in place of the one
-            // number that varies. 105 of 1,178 bash calls in the kept
-            // corpus exited non-zero and not one row mentioned it; the
-            // only way to find out was to spend a `fetch` on a row
-            // that looked exactly like the 1,073 that had nothing to
-            // report.
+            // thing a reader could not predict. 105 of 1,178 bash
+            // calls in the kept corpus exited non-zero and not one row
+            // mentioned it; the only way to find out was to spend a
+            // `fetch` on a row that looked exactly like the 1,073 that
+            // had nothing to report.
+            //
+            // The number, not a verdict on it: 42 of those 105 are a
+            // `grep` that matched nothing, where 1 is an ordinary
+            // answer and the card says so ("Non-zero is a result, not
+            // an error"). `status 1` is worth reading in both cases
+            // and wrong in neither; "failed" would be wrong in 40% of
+            // them.
             //
             // Silent when it is zero, like every other count in this
             // file: a line that says the same thing on every row is
