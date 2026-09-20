@@ -114,7 +114,20 @@ pub fn obj_from_entries(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     for entry in entries {
         let pair_ptr = match entry {
             Value::Array(p) => p,
-            _ => return Err(vm.fail(ErrorKind::TypeError, "type error")),
+            // **Which entry, and what it was.** `Object.fromEntries`
+            // takes `[key, value]` pairs, and the commonest way to get
+            // this wrong is to hand it a flat list — `[a, b]` rather
+            // than `[[a, b]]`. "type error" leaves the reader to work
+            // out that the fault is one element deep.
+            other => {
+                let other = other.clone();
+                let what = vm.describe_operand(&other);
+                return Err(vm.fail(
+                    ErrorKind::TypeError,
+                    format!("Object.fromEntries needs [key, value] pairs; one entry is {what}")
+                        .as_str(),
+                ));
+            }
         };
         let pair = vm
             .arrays
@@ -136,7 +149,10 @@ pub fn obj_from_entries(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 pub fn obj_assign(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let target_ptr = match args.get(vm, 0) {
         Value::Object(p) => *p,
-        _ => return Err(vm.fail(ErrorKind::TypeError, "type error")),
+        other => {
+            let other = other.clone();
+            return Err(object_needs_an_object(vm, "assign", &other));
+        }
     };
     // Copy from all source objects (args 1..) into target.
     let ip = vm.ip;
@@ -169,10 +185,10 @@ pub fn obj_assign(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 pub fn obj_has_own(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let recv = args.get(vm, 0).clone();
     let key = vm.to_js_string(args.get(vm, 1), 0);
-    let has = vm
-        .own_prop_contains(&recv, key.as_str())
-        .ok_or_else(|| vm.fail(ErrorKind::TypeError, "type error"))?;
-    Ok(Value::Bool(has))
+    match vm.own_prop_contains(&recv, key.as_str()) {
+        Some(has) => Ok(Value::Bool(has)),
+        None => Err(object_needs_an_object(vm, "hasOwn", &recv)),
+    }
 }
 
 /// `obj.hasOwnProperty(key)` → bool. Instance version of `Object.hasOwn`.
@@ -185,10 +201,10 @@ pub fn obj_has_own(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 pub fn obj_has_own_property(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let recv = args.get(vm, 0).clone();
     let key = vm.to_js_string(args.get(vm, 1), 0);
-    let has = vm
-        .own_prop_contains(&recv, key.as_str())
-        .ok_or_else(|| vm.fail(ErrorKind::TypeError, "type error"))?;
-    Ok(Value::Bool(has))
+    match vm.own_prop_contains(&recv, key.as_str()) {
+        Some(has) => Ok(Value::Bool(has)),
+        None => Err(object_needs_an_object(vm, "hasOwn", &recv)),
+    }
 }
 
 /// `Object.create(proto [, properties])` — creates a new object with
@@ -254,7 +270,10 @@ pub fn obj_get_proto_of(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 pub fn obj_set_proto_of(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let obj_ptr = match args.get(vm, 0) {
         Value::Object(p) => *p,
-        _ => return Err(vm.fail(ErrorKind::TypeError, "type error")),
+        other => {
+            let other = other.clone();
+            return Err(object_needs_an_object(vm, "setPrototypeOf", &other));
+        }
     };
     let proto = args.get(vm, 1).clone();
     vm.set_object_proto(obj_ptr, proto)?;
@@ -394,6 +413,43 @@ pub fn obj_is_extensible(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 }
 
 // ── tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod named_value_tests {
+    use crate::testutil;
+
+    fn msg(src: &str) -> String {
+        testutil::run_ret(&format!(
+            "try {{ {src} }} catch (e) {{ return e.message; }}"
+        ))
+        .as_str()
+        .unwrap_or_default()
+        .to_owned()
+    }
+
+    /// **Every reachable `Object.*` refusal names the value.** Four of
+    /// them said only "type error", which is the message this codebase
+    /// has twice found a real bug behind: `Object.fromEntries needs an
+    /// object; got a map` is what made the `Map` gap visible, an hour
+    /// after that message was written.
+    #[test]
+    fn an_object_builtin_says_what_it_got() {
+        let m = msg("Object.assign(undefined, {});");
+        assert!(m.contains("Object.assign needs an object"), "got: {m}");
+        assert!(m.contains("undefined"), "and names it: {m}");
+
+        let m = msg("Object.hasOwn(undefined, \"x\");");
+        assert!(m.contains("Object.hasOwn needs an object"), "got: {m}");
+
+        // A flat list where pairs were wanted — the commonest way to
+        // get `fromEntries` wrong, and the fault is one element deep.
+        let m = msg("Object.fromEntries([1, 2]);");
+        assert!(
+            m.contains("[key, value] pairs") && m.contains("one entry is"),
+            "got: {m}"
+        );
+    }
+}
 
 #[cfg(test)]
 mod tests {
