@@ -103,7 +103,19 @@ IIFE below — five programs to ask one question, now a compile error.
 **The cost is a third lower and the pass rate is a question, not a
 win.** Fisher's exact on 36/37 against 56/63 gives p = 0.25: the drop
 is not distinguishable from chance, and it is not evidence of safety
-either. What can be said about it:
+either.
+
+**Two more arms did not settle it.** 27 further runs at later HEADs
+came back 23/27, which pools to **79/90 (88%) against the baseline's
+36/37**, p = 0.18. Three sets of arms now, the same direction each
+time, and never significant — which is what a small real effect and a
+small sample look like from the outside, and also what noise looks
+like. Worth saying plainly: the two arms were built before two of
+their own four failures had their causes fixed (a no-op write nobody
+could see, and the async IIFE), so they are not a clean read on the
+current tree either.
+
+What can be said about the original drop:
 
 - It concentrates in the two **large** sweeps. `sweep-40` 6/6 → 6/9 and
   `sweep-200` 4/4 → 7/9, while `sweep-8` — the same task, smaller —
@@ -175,6 +187,17 @@ firing: "dynamic access mechanisms present — reviewing before
 deleting", "double blank at output line 603", "name refs changed:
 app.py:helper_004". Each of those is a reply that stopped instead of
 writing a wrong file.
+
+**The flip side, which I could not measure.** One `sweep-40` run threw
+five of its own assertions in a row — two of them wrong, comparing
+`helpers.helper_000` against `helper_000`, and comparing a fresh grep
+against a stale `history.fetch` — and never reached a write at all.
+Each throw is a round trip, and the card tells the model to assert
+without saying what to do when the assertion is the thing that is
+wrong. Across the six arms only two runs threw three or more, and one
+of those passed: n=2, so this is a thing to watch rather than a
+finding, and not grounds for touching a paragraph that is otherwise
+doing its job.
 
 Per task: `sweep-200` 11 → 5 programs and 395 → 146 KB, `sweep-8` 4 → 2
 and 107 → 53 KB, `skipped-tests` 5.5 → 3 and 146 → 82 KB,
