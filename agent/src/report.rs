@@ -128,6 +128,7 @@ pub struct Artifact {
 }
 
 /// What the menu says about a row, and whether it can be fetched.
+#[derive(Debug)]
 pub enum ArtifactState {
     /// A `Result` landed with a value.
     Delivered(serde_json::Value),

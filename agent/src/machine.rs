@@ -665,7 +665,7 @@ pub struct Runner {
     /// written (28). Allocated before a byte arrives, so everything in
     /// the reply can name it — and so a generation that produces nothing
     /// still leaves the record that it was attempted.
-    reply_id: EventId,
+    pub(crate) reply_id: EventId,
     /// How the reply being assembled stopped arriving, when it was
     /// anything but `Finished`. Set by whoever cut it off; read once by
     /// `finish_notebook_generation`.
@@ -2687,7 +2687,7 @@ impl Runner {
     /// (`document::pending_line`). This reads the log, so it reads the
     /// original. That asymmetry is the design: the document shrinks,
     /// the history does not.
-    fn fetch_history(&self, tree: &Tree, args: &[Value]) -> Result<serde_json::Value, String> {
+    pub(crate) fn fetch_history(&self, tree: &Tree, args: &[Value]) -> Result<serde_json::Value, String> {
         let id = match args.first() {
             Some(Value::PosInt(n)) => *n,
             _ => return Err("history.fetch needs a numeric id".into()),
@@ -5921,74 +5921,39 @@ mod tests {
     /// a bounded view *and* a whole value.
     #[test]
     fn a_long_appended_row_is_clipped_and_fetch_still_hands_back_all_of_it() {
-        let (mut tree, mut state) = setup();
-        state.kickoff(&mut tree).unwrap();
+        let mut c = Conversation::new();
         let n = crate::report::NOTE_ROW_MAX_BYTES * 3;
-        let src = format!("history.append(\"x\".repeat({n}));");
-        let out = state
-            .step(&mut tree, StepInput::LlmResponse(llm_program(&src)))
-            .unwrap();
-        drain(&mut state, &mut tree, out);
-
-        let segment = state.agent_segment(&tree);
-        let note = segment
-            .iter()
-            .find(|e| matches!(e.payload, EventPayload::Note { .. }))
-            .unwrap()
-            .id;
+        let r = c.reply(&format!("```js\nhistory.append(\"x\".repeat({n}));\n```\n"));
+        let id = r.row().id;
 
         // What the model is shown: bounded, and it says how much is left.
-        let rows = menu_rows(&segment, 0, &Default::default());
-        let shown = rows
-            .iter()
-            .find(|a| a.id == note.as_u64())
-            .map(|a| match &a.state {
-                ArtifactState::Whole(t) => t.clone(),
-                _ => panic!("an appended row renders whole"),
-            })
-            .expect("the appended row is in the menu");
+        let shown = c.row_shown(id);
         assert!(
             shown.len() < n / 2,
             "the row is bounded: {} bytes for a {n}-byte value",
             shown.len()
         );
         assert!(
-            shown.contains(&format!("history.fetch({})", note.as_u64())),
-            "and names the id that has the rest: {}",
-            &shown[shown.len().saturating_sub(200)..]
+            shown.contains(&format!("history.fetch({})", id.as_u64())),
+            "and names the id that has the rest: {shown}"
         );
         assert!(
             shown.contains(&format!("of {}", n + 2)),
-            "and how much there is (+2 for the JSON quotes): {}",
-            &shown[shown.len().saturating_sub(200)..]
+            "and how much there is (+2 for the JSON quotes): {shown}"
         );
         // The JSON head survives, so the row still says what kind of
         // thing `fetch` will return.
         assert!(
             shown.starts_with("appended: \"x"),
-            "a string still looks like a string: {}",
-            &shown[..40.min(shown.len())]
+            "a string still looks like a string: {shown}"
         );
 
         // And the value itself is untouched — the clip is a rendering.
-        let fetch = format!(
-            "history.append((await fetch_history({})).length);",
-            note.as_u64()
-        );
-        let out = state
-            .step(&mut tree, StepInput::LlmResponse(llm_program(&fetch)))
-            .unwrap();
-        drain(&mut state, &mut tree, out);
-        let back = tree
-            .path_events(state.spine.leaf_id)
-            .iter()
-            .rev()
-            .find_map(|e| match &e.payload {
-                EventPayload::Note { value, .. } => Some(value.clone()),
-                _ => None,
-            })
-            .unwrap();
-        assert_eq!(back, json!(n), "fetch hands back all {n} characters");
+        let back = c.reply(&format!(
+            "```js\nhistory.append((await fetch_history({})).length);\n```\n",
+            id.as_u64()
+        ));
+        assert_eq!(back.row().value, json!(n), "fetch hands back all {n} characters");
     }
 
     /// **A stop skips the rest of the reply, blocks and prose alike.**
@@ -6027,94 +5992,49 @@ mod tests {
     /// `replace` goes on meaning one thing — say something else here.
     #[test]
     fn slicing_a_row_moves_its_window_without_writing_any_bytes() {
-        let (mut tree, mut state) = setup();
-        state.kickoff(&mut tree).unwrap();
+        let mut c = Conversation::new();
         let n = crate::report::NOTE_ROW_MAX_BYTES * 2;
-        let src = format!("history.append(\"a\".repeat({n}) + \"TAIL\");");
-        let out = state
-            .step(&mut tree, StepInput::LlmResponse(llm_program(&src)))
-            .unwrap();
-        drain(&mut state, &mut tree, out);
-        let id = state
-            .agent_segment(&tree)
-            .iter()
-            .find(|e| matches!(e.payload, EventPayload::Note { .. }))
-            .unwrap()
-            .id
-            .as_u64();
+        let r = c.reply(&format!(
+            "```js\nhistory.append(\"a\".repeat({n}) + \"TAIL\");\n```\n"
+        ));
+        let id = r.row().id;
 
         // The last window of the value, named by offset alone.
-        let page = format!("history.slice({id}, {}, {});", n - 8, n + 6);
-        let out = state
-            .step(&mut tree, StepInput::LlmResponse(llm_program(&page)))
-            .unwrap();
-        drain(&mut state, &mut tree, out);
+        let sliced = c.reply(&format!(
+            "```js\nhistory.slice({}, {}, {});\n```\n",
+            id.as_u64(),
+            n - 8,
+            n + 6
+        ));
+        assert_eq!(sliced.compacted, [id], "a shadow was written");
 
-        let segment = state.agent_segment(&tree);
-        let shadow = segment
-            .iter()
-            .find_map(|e| match &e.payload {
-                EventPayload::Compacted { of, text, window } if of.as_u64() == id => {
-                    Some((text.clone(), *window))
-                }
-                _ => None,
-            })
-            .expect("a shadow was written");
-        assert_eq!(shadow.0, None, "no text was written — that is the point");
-        assert!(shadow.1.is_some(), "a window was");
-
-        let compacted = tree.compacted_lookup(state.spine.leaf_id);
-        let rows = menu_rows(&segment, 0, &compacted);
-        let shown = rows
-            .iter()
-            .find(|a| a.id == id)
-            .map(|a| match &a.state {
-                ArtifactState::Whole(t) => t.clone(),
-                _ => panic!("renders whole"),
-            })
-            .expect("one row");
+        let shown = c.row_shown(id);
         assert!(shown.contains("TAIL"), "the window moved: {shown}");
         assert!(shown.len() < 200, "and it is small: {} bytes", shown.len());
-        assert_eq!(rows.iter().filter(|a| a.id == id).count(), 1, "one row");
+        assert_eq!(c.rows_named(id), 1, "a window moves a row, it does not add one");
 
         // The value behind it is untouched.
-        let check = format!("history.append((await fetch_history({id})).length);");
-        let out = state
-            .step(&mut tree, StepInput::LlmResponse(llm_program(&check)))
-            .unwrap();
-        drain(&mut state, &mut tree, out);
-        let back = tree
-            .path_events(state.spine.leaf_id)
-            .iter()
-            .rev()
-            .find_map(|e| match &e.payload {
-                EventPayload::Note { value, .. } => Some(value.clone()),
-                _ => None,
-            })
-            .unwrap();
-        assert_eq!(back, json!(n + 4), "fetch still hands back the whole value");
+        let back = c.reply(&format!(
+            "```js\nhistory.append((await fetch_history({})).length);\n```\n",
+            id.as_u64()
+        ));
+        assert_eq!(
+            back.row().value,
+            json!(n + 4),
+            "fetch still hands back the whole value"
+        );
     }
 
     /// An empty window is a mistake with an obvious cause, so it says
     /// which way round the arguments go rather than showing nothing.
     #[test]
     fn an_empty_window_is_refused_by_name() {
-        let (mut tree, mut state) = setup();
-        state.kickoff(&mut tree).unwrap();
-        let src = "history.append(\"hello there\");\n                   try { history.slice(4, 8, 2); } catch (e) { history.append(String(e)); }";
-        let out = state
-            .step(&mut tree, StepInput::LlmResponse(llm_program(src)))
-            .unwrap();
-        drain(&mut state, &mut tree, out);
-        let said = tree
-            .path_events(state.spine.leaf_id)
-            .iter()
-            .rev()
-            .find_map(|e| match &e.payload {
-                EventPayload::Note { value, .. } => value.as_str().map(str::to_owned),
-                _ => None,
-            })
-            .unwrap_or_default();
+        let mut c = Conversation::new();
+        let r = c.reply(
+            "```js\nhistory.append(\"hello there\");\n\
+             try { history.slice(4, 8, 2); } catch (e) { history.append(String(e)); }\n```\n",
+        );
+        let said = r.values().last().and_then(|v| v.as_str()).unwrap_or_default();
         assert!(said.contains("half-open"), "names the convention: {said}");
     }
 
@@ -6127,84 +6047,44 @@ mod tests {
     /// always in reach without re-reading anything.
     #[test]
     fn paging_a_row_moves_its_window_and_leaves_the_value_whole() {
-        let (mut tree, mut state) = setup();
-        state.kickoff(&mut tree).unwrap();
+        let mut c = Conversation::new();
         let n = crate::report::NOTE_ROW_MAX_BYTES * 2;
-        let src = format!("history.append(\"a\".repeat({n}) + \"TAIL\");");
-        let out = state
-            .step(&mut tree, StepInput::LlmResponse(llm_program(&src)))
-            .unwrap();
-        drain(&mut state, &mut tree, out);
-        let id = state
-            .agent_segment(&tree)
-            .iter()
-            .find(|e| matches!(e.payload, EventPayload::Note { .. }))
-            .unwrap()
-            .id
-            .as_u64();
+        let r = c.reply(&format!(
+            "```js\nhistory.append(\"a\".repeat({n}) + \"TAIL\");\n```\n"
+        ));
+        let id = r.row().id;
 
         // Move the window to the end of the value, from the value itself.
-        let page = format!(
-            "const all = await fetch_history({id});              await replace_history({id}, all.slice(all.length - 12));"
-        );
-        let out = state
-            .step(&mut tree, StepInput::LlmResponse(llm_program(&page)))
-            .unwrap();
-        drain(&mut state, &mut tree, out);
+        c.reply(&format!(
+            "```js\nconst all = await fetch_history({0});\n\
+             await replace_history({0}, all.slice(all.length - 12));\n```\n",
+            id.as_u64()
+        ));
 
-        let segment = state.agent_segment(&tree);
-        let compacted = tree.compacted_lookup(state.spine.leaf_id);
-        let rows = menu_rows(&segment, 0, &compacted);
-        let note_rows: Vec<&Artifact> = rows.iter().filter(|a| a.id == id).collect();
-        assert_eq!(note_rows.len(), 1, "one row, not two");
-        let shown = match &note_rows[0].state {
-            ArtifactState::Whole(t) => t.clone(),
-            _ => panic!("renders whole"),
-        };
+        assert_eq!(c.rows_named(id), 1, "one row, not two");
+        let shown = c.row_shown(id);
         assert!(shown.contains("TAIL"), "the window moved: {shown}");
         assert!(shown.len() < 100, "and it is small: {} bytes", shown.len());
 
         // And the value behind it is still all of it.
-        let check = format!("history.append((await fetch_history({id})).length);");
-        let out = state
-            .step(&mut tree, StepInput::LlmResponse(llm_program(&check)))
-            .unwrap();
-        drain(&mut state, &mut tree, out);
-        let back = tree
-            .path_events(state.spine.leaf_id)
-            .iter()
-            .rev()
-            .find_map(|e| match &e.payload {
-                EventPayload::Note { value, .. } => Some(value.clone()),
-                _ => None,
-            })
-            .unwrap();
-        assert_eq!(back, json!(n + 4), "fetch still hands back the whole value");
+        let back = c.reply(&format!(
+            "```js\nhistory.append((await fetch_history({})).length);\n```\n",
+            id.as_u64()
+        ));
+        assert_eq!(
+            back.row().value,
+            json!(n + 4),
+            "fetch still hands back the whole value"
+        );
     }
 
     /// A row under the bound renders exactly as it always did — which
     /// is 90% of them: appended rows run to a median of 450 bytes.
     #[test]
     fn a_short_appended_row_is_untouched_by_the_bound() {
-        let (mut tree, mut state) = setup();
-        state.kickoff(&mut tree).unwrap();
-        let out = state
-            .step(
-                &mut tree,
-                StepInput::LlmResponse(llm_program("history.append({ dead: 3 });")),
-            )
-            .unwrap();
-        drain(&mut state, &mut tree, out);
-        let segment = state.agent_segment(&tree);
-        let rows = menu_rows(&segment, 0, &Default::default());
-        let shown = rows
-            .iter()
-            .find_map(|a| match &a.state {
-                ArtifactState::Whole(t) if t.starts_with("appended:") => Some(t.clone()),
-                _ => None,
-            })
-            .unwrap();
-        assert_eq!(shown, r#"appended: {"dead":3}"#);
+        let mut c = Conversation::new();
+        let r = c.reply("```js\nhistory.append({ dead: 3 });\n```\n");
+        assert_eq!(c.row_shown(r.row().id), r#"appended: {"dead":3}"#);
     }
 
     /// **And the row says which it will be.** A note is shown whole,
@@ -6378,25 +6258,10 @@ mod tests {
     /// reach a program; this was the same mistake one function over.
     #[test]
     fn a_handback_fetches_as_structure_not_as_rust() {
-        let (mut tree, mut state) = setup();
-        state.kickoff(&mut tree).unwrap();
-        let out = state
-            .step(
-                &mut tree,
-                StepInput::LlmResponse(llm_program("const v = null; v.x;")),
-            )
-            .unwrap();
-        drain(&mut state, &mut tree, out);
-        let handback = state
-            .agent_segment(&tree)
-            .iter()
-            .find(|e| matches!(e.payload, EventPayload::Handback { .. }))
-            .expect("the trap")
-            .id;
+        let mut c = Conversation::new();
+        let r = c.reply("```js\nconst v = null; v.x;\n```\n");
 
-        let fetched = state
-            .fetch_history(&tree, &[Value::PosInt(handback.as_u64())])
-            .unwrap();
+        let fetched = c.fetch(r.handback.expect("the trap"));
         // Indexable: a handler can branch on `resumable` without
         // parsing a sentence.
         assert_eq!(fetched["Trapped"]["kind"], json!("TypeError"));
@@ -6412,22 +6277,9 @@ mod tests {
     /// And a terminal one is still just the fact that it happened.
     #[test]
     fn a_completed_handback_fetches_as_a_bare_name() {
-        let (mut tree, mut state) = setup();
-        state.kickoff(&mut tree).unwrap();
-        let out = state
-            .step(&mut tree, StepInput::LlmResponse(llm_program("finish(\"ok\");")))
-            .unwrap();
-        drain(&mut state, &mut tree, out);
-        let handback = state
-            .agent_segment(&tree)
-            .iter()
-            .find(|e| matches!(e.payload, EventPayload::Handback { .. }))
-            .expect("the handback")
-            .id;
-        let fetched = state
-            .fetch_history(&tree, &[Value::PosInt(handback.as_u64())])
-            .unwrap();
-        assert_eq!(fetched, json!("Completed"));
+        let mut c = Conversation::new();
+        let r = c.reply("```js\nfinish(\"ok\");\n```\n");
+        assert_eq!(c.fetch(r.handback.expect("the handback")), json!("Completed"));
     }
 
     /// A `Note` and a program's own source come back too — the three
@@ -6435,49 +6287,21 @@ mod tests {
     /// same walk.
     #[test]
     fn fetch_history_reads_a_note_and_a_program_back() {
-        let (mut tree, mut state) = setup();
-        state.kickoff(&mut tree).unwrap();
-        let src = "await append_history(\"the parser drops the last field\"); history.append(1);";
-        let out = state
-            .step(&mut tree, StepInput::LlmResponse(llm_program(src)))
-            .unwrap();
-        drain(&mut state, &mut tree, out);
-        let segment = state.agent_segment(&tree);
-        let note = segment
-            .iter()
-            .find(|e| matches!(e.payload, EventPayload::Note { .. }))
-            .unwrap()
-            .id;
-        let reply = segment
-            .iter()
-            .find(|e| matches!(e.payload, EventPayload::Reply))
-            .unwrap()
-            .id;
+        let mut c = Conversation::new();
+        let src = "```js\nawait append_history(\"the parser drops the last field\");\n\
+                   history.append(1);\n```\n";
+        let first = c.reply(src);
 
-        let fetch = format!(
-            "history.append([await fetch_history({}), await fetch_history({})]);",
-            note.as_u64(),
-            reply.as_u64()
-        );
-        let out = state
-            .step(&mut tree, StepInput::LlmResponse(llm_program(&fetch)))
-            .unwrap();
-        drain(&mut state, &mut tree, out);
-        let returned = tree
-            .path_events(state.spine.leaf_id)
-            .iter()
-            .rev()
-            .find_map(|e| match &e.payload {
-                // A reply has no `return`: what it handed forward is its
-                // last `history.append`.
-                EventPayload::Note { value, .. } => Some(value.clone()),
-                _ => None,
-            })
-            .unwrap();
+        let back = c.reply(&format!(
+            "```js\nhistory.append([await fetch_history({}), await fetch_history({})]);\n```\n",
+            first.rows[0].id.as_u64(),
+            first.reply.as_u64()
+        ));
+        let returned = &back.row().value;
         assert_eq!(returned[0], json!("the parser drops the last field"));
         // A reply comes back as the markdown the model wrote — fences
         // and all, because that is the row (28).
-        assert_eq!(returned[1], json!(format!("```js\n{src}\n```\n")));
+        assert_eq!(returned[1], json!(src));
     }
 
     /// **Nothing a program can write may take the agent down.**
@@ -6580,28 +6404,13 @@ mod tests {
     /// come back as an answer the program can read.
     #[test]
     fn fetching_row_zero_is_an_error_not_a_crash() {
-        let (mut tree, mut state) = setup();
-        state.kickoff(&mut tree).unwrap();
-        let src = "try { await fetch_history(0); history.append(\"no throw\"); } \
-                   catch (e) { history.append(String(e.message || e)); }";
-        let out = state
-            .step(&mut tree, StepInput::LlmResponse(llm_program(src)))
-            .unwrap();
-        drain(&mut state, &mut tree, out);
-        let said = tree
-            .path_events(state.spine.leaf_id)
-            .iter()
-            .rev()
-            .find_map(|e| match &e.payload {
-                EventPayload::Note { value, .. } => Some(value.clone()),
-                _ => None,
-            })
-            .expect("the program got to say something");
-        let said = said.as_str().unwrap_or_default().to_owned();
-        assert!(
-            said.contains("#0"),
-            "the id it asked for is named back to it: {said}"
+        let mut c = Conversation::new();
+        let r = c.reply(
+            "```js\ntry { await fetch_history(0); history.append(\"no throw\"); }\n\
+             catch (e) { history.append(String(e.message || e)); }\n```\n",
         );
+        let said = r.row().value.as_str().unwrap_or_default();
+        assert!(said.contains("#0"), "the id it asked for is named back to it: {said}");
         assert!(said != "no throw", "and it is an error, not a silent pass");
     }
 
@@ -6615,34 +6424,23 @@ mod tests {
     /// wrong.
     #[test]
     fn a_call_with_an_unrepresentable_argument_is_refused_not_stringified() {
-        let (mut tree, mut state) = setup();
-        state.kickoff(&mut tree).unwrap();
+        let mut c = Conversation::new();
         // `parsed.missing` is undefined; the write must not happen.
-        let src = "const parsed = {};\n\
-                   try { await tools.write_file(\"out.py\", parsed.missing); }\n\
-                   catch (e) { tell(`refused: ${e}`); }\n\
-                   finish(\"ok\");";
-        let out = state
-            .step(&mut tree, StepInput::LlmResponse(llm_program(src)))
-            .unwrap();
-        let settled = drain(&mut state, &mut tree, out);
-        assert!(
-            !settled
-                .iter()
-                .any(|o| matches!(o, StepOutput::ToolCalls(_))),
-            "the write was issued anyway"
+        let r = c.reply(
+            "```js\nconst parsed = {};\n\
+             try { await tools.write_file(\"out.py\", parsed.missing); }\n\
+             catch (e) { tell(`refused: ${e}`); }\n\
+             finish(\"ok\");\n```\n",
         );
-        let said: Vec<String> = tree
-            .events
-            .values()
-            .filter_map(|e| match &e.payload {
-                EventPayload::Call(Call::Send { text, .. }) => Some(text.clone()),
-                _ => None,
-            })
-            .collect();
         assert!(
-            said.iter().any(|t| t.contains("argument 2 is `undefined`")),
-            "the program is told which argument, and that nothing ran: {said:?}"
+            r.calls.is_empty(),
+            "the write was issued anyway: {:?}",
+            r.calls
+        );
+        assert!(
+            r.tells.iter().any(|t| t.contains("argument 2 is `undefined`")),
+            "the program is told which argument, and that nothing ran: {:?}",
+            r.tells
         );
     }
 
@@ -8615,35 +8413,11 @@ mod tests {
     /// honest.
     #[test]
     fn a_block_of_a_reply_fetches_back_as_its_own_text() {
-        let (mut tree, mut state) = setup_under();
-        user_post(&mut state, &mut tree, "go");
-        let out = state
-            .step(
-                &mut tree,
-                StepInput::LlmResponse(llm_program(
-                    "Reading it first.\n\n```js\nlet n = 1;\n```\n",
-                )),
-            )
-            .unwrap();
-        drain(&mut state, &mut tree, out);
+        let mut c = Conversation::new();
+        c.user("go");
+        let r = c.reply("Reading it first.\n\n```js\nlet n = 1;\n```\n");
 
-        let blocks: Vec<(u64, Part)> = state
-            .agent_segment(&tree)
-            .iter()
-            .filter_map(|e| match &e.payload {
-                EventPayload::Part { part, .. } => Some((e.id.as_u64(), part.clone())),
-                _ => None,
-            })
-            .collect();
-        let fetched: Vec<serde_json::Value> = blocks
-            .iter()
-            .filter(|(_, p)| !matches!(p, Part::Thinking(_)))
-            .map(|(id, _)| {
-                state
-                    .fetch_history(&tree, &[interp::Value::PosInt(*id)])
-                    .expect("a block the document marks is a block that fetches")
-            })
-            .collect();
+        let fetched: Vec<serde_json::Value> = r.parts.iter().map(|id| c.fetch(*id)).collect();
         assert_eq!(
             fetched,
             vec![

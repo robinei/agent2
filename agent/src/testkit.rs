@@ -194,6 +194,14 @@ pub struct Said {
     /// [`Invariant::PartsConcatenate`] checks; what a test wants to
     /// read is what was said.
     pub prose: Vec<String>,
+    /// This reply's own `Reply` event — the id `history.fetch` takes to
+    /// read the whole reply back as the markdown the model wrote.
+    pub reply: EventId,
+    /// Each part of the reply, prose and cells alike, in source order.
+    /// Thinking is not one: it is not a piece of the reply.
+    pub parts: Vec<EventId>,
+    /// The outcome, when the program reached one.
+    pub handback: Option<EventId>,
     /// The source of each ```js cell, fences included — what `Part::Cell`
     /// carries, so a test can assert on what ran as well as on what it
     /// did.
@@ -480,6 +488,55 @@ impl Conversation {
         self.project(before)
     }
 
+    /// The menu row the model is shown for `id` — what the *document*
+    /// says about a row, as distinct from what `history.fetch` would
+    /// hand a program.
+    ///
+    /// Those two diverging is the whole design of the history bound: a
+    /// long row renders clipped and fetches whole, and a window moves
+    /// what is rendered without touching what is stored. A test about
+    /// that reads both sides, and this is the rendered one.
+    ///
+    /// Panics if `id` is not a row of this branch, or if it does not
+    /// render as a self-contained value — both are the test being
+    /// wrong about what it appended.
+    pub fn row_shown(&self, id: EventId) -> String {
+        let segment = self.runner.agent_segment(&self.tree);
+        let compacted = self.tree.compacted_lookup(self.runner.spine.leaf_id);
+        let rows = crate::machine::menu_rows(&segment, 0, &compacted);
+        let found: Vec<&crate::report::Artifact> =
+            rows.iter().filter(|a| a.id == id.as_u64()).collect();
+        match found.as_slice() {
+            [a] => match &a.state {
+                crate::report::ArtifactState::Whole(t) => t.clone(),
+                other => panic!("#{} does not render whole: {other:?}", id.as_u64()),
+            },
+            [] => panic!("#{} is not a row of this branch", id.as_u64()),
+            many => panic!("#{} renders as {} rows, not one", id.as_u64(), many.len()),
+        }
+    }
+
+    /// How many menu rows name `id` — one, normally. A window or a
+    /// replacement *moves* a row; it never adds one, and that is worth
+    /// saying out loud in the tests about paging.
+    pub fn rows_named(&self, id: EventId) -> usize {
+        let segment = self.runner.agent_segment(&self.tree);
+        let compacted = self.tree.compacted_lookup(self.runner.spine.leaf_id);
+        crate::machine::menu_rows(&segment, 0, &compacted)
+            .iter()
+            .filter(|a| a.id == id.as_u64())
+            .count()
+    }
+
+    /// `history.fetch(id)` as a program would see it — the value
+    /// behind a row, which is a different thing from what the document
+    /// renders for it (see [`row_shown`](Self::row_shown)).
+    pub fn fetch(&self, id: EventId) -> serde_json::Value {
+        self.runner
+            .fetch_history(&self.tree, &[interp::Value::PosInt(id.as_u64())])
+            .unwrap_or_else(|e| panic!("fetch #{} : {e}", id.as_u64()))
+    }
+
     /// The document the next request would carry — what the model is
     /// about to be looking at. Renders without advancing anything, so a
     /// test may read it as often as it likes.
@@ -609,6 +666,9 @@ impl Conversation {
     fn project(&self, before: u64) -> Said {
         let events = self.scope(before);
         let mut s = Said {
+            reply: self.runner.reply_id,
+            parts: Vec::new(),
+            handback: None,
             prose: Vec::new(),
             cells: Vec::new(),
             tells: Vec::new(),
@@ -631,6 +691,15 @@ impl Conversation {
         };
         for e in &events {
             s.kinds.push(kind_of(&e.payload));
+            match &e.payload {
+                EventPayload::Part { part, .. } => match part {
+                    crate::types::Part::Prose(_) | crate::types::Part::Cell(_) => {
+                        s.parts.push(e.id)
+                    }
+                    crate::types::Part::Thinking(_) => {}
+                },
+                _ => {}
+            }
             match &e.payload {
                 EventPayload::Part { part, .. } => match part {
                     crate::types::Part::Cell(t) => s.cells.push(t.clone()),
@@ -670,7 +739,10 @@ impl Conversation {
                 EventPayload::Compacted { of, .. } => s.compacted.push(*of),
                 EventPayload::Console { lines } => s.printed.extend(lines.iter().cloned()),
                 EventPayload::Result { call, outcome } => s.settled.push((*call, outcome.clone())),
-                EventPayload::Handback { how, .. } => s.ended = ending_of(how),
+                EventPayload::Handback { how, .. } => {
+                    s.ended = ending_of(how);
+                    s.handback = Some(e.id);
+                }
                 _ => {}
             }
         }
