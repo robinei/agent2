@@ -43,6 +43,14 @@
 //! something else breaks underneath it. That is where the doubled reply
 //! would have been caught in eighty tests instead of one.
 //!
+//! **Three places hold replies to these rules, and they are the same
+//! rules.** This file checks them on a reply a test wrote;
+//! [`crate::replay`] checks them on a reply a live run wrote, fed back
+//! through the harness; and `evals/invariants.py` checks them on a log
+//! without running anything, which is what still works after a schema
+//! change stops `agent` opening the file at all. A rule worth adding
+//! here is usually worth adding there.
+//!
 //! **It pays on the way in, not only afterwards.** Porting the existing
 //! tests to this shape found two live bugs on the first afternoon, both
 //! because the harness drives what the host drives rather than what the
