@@ -10,12 +10,14 @@ finding, so it is first.
 Everything below is done and measured. Three things are not, and each
 is a judgement rather than a repair:
 
-1. **The large sweeps.** `sweep-40` and `sweep-200` are the only tasks
-   that got worse (6/6 → 6/9, 4/4 → 7/9, p = 0.25 overall). The
-   mechanism looks like bigger programs — HEAD's cells average 726
-   bytes against 472 — which is the same batching that bought a third
-   of the cost. Trade, not defect. Re-run those two at n≥10 a side
-   before doing anything about it.
+1. **The large sweeps — probably resolved, worth one more look.**
+   `sweep-40` and `sweep-200` were the only tasks that got worse (6/6 →
+   6/9, 4/4 → 7/9). After `outline` was made to say it lists what a
+   file defines and never what uses it, a fresh arm of ten runs came
+   back **10/10** — matching the baseline's 10/10, at 5 programs
+   against 11 for `sweep-200` and 171 KB against 395. Against the
+   earlier HEAD arms that is p = 0.13, so it is a good sign rather than
+   a proof, and the overall 56/63 below predates it.
 2. **Whether the document should shrink a duplicated `history.append`.**
    72% of appended bytes copy a result. The report now names it, which
    costs nothing and acts a turn late; rendering it as a pointer would
@@ -52,6 +54,11 @@ either. What can be said about it:
   `ambiguous-config` and `skipped-tests` all held or improved.
 - Every failure is the same task judgement: a definition deleted that
   something still reached without naming it. None is a harness fault.
+- **It may already be gone.** Ten fresh runs of these two tasks, after
+  `outline` was made to say what it does not know, came back 10/10 —
+  the baseline's own number, at half the programs. p = 0.13 against the
+  earlier HEAD arms: a good sign, not a proof, and everything below was
+  measured before it.
 - Fewer *programs* is not the mechanism: within HEAD the failing runs
   average 5.6 programs against 5.4 for the passing ones.
 - **Bigger programs may be.** On the sweep tasks, HEAD's cells average
@@ -72,10 +79,8 @@ either. What can be said about it:
 `outline` now says it lists what a file defines and never what uses it,
 and names the mechanisms — `getattr`, string tables, registries — to
 look for instead of the names. That is aimed squarely at these
-failures and landed after every run above, so it is untested.
-
-**If one thing is worth re-running first, it is `sweep-40` and
-`sweep-200` at n≥10 a side.**
+failures, landed after every run in the table above, and the ten-run
+arm that followed it went 10/10.
 
 Per task: `sweep-200` 11 → 5 programs and 395 → 146 KB, `sweep-8` 4 → 2
 and 107 → 53 KB, `skipped-tests` 5.5 → 3 and 146 → 82 KB,
