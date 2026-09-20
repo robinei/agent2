@@ -307,6 +307,61 @@ fn foreign_tool_call(text: &str) -> bool {
     SHAPES.iter().any(|shape| text.contains(shape))
 }
 
+/// Woken after a reply that was a program with the fence left off —
+/// see [`unfenced_program`].
+const UNFENCED_PROGRAM_NOTICE: &str = "Your last reply was a program with no fence around it, so \
+     nothing ran — the text went to the person as their answer instead. **Code runs only inside \
+     a fenced ```js block.** Write the same lines again inside one; the work you meant to do is \
+     still undone.";
+
+/// **A reply that is a program with no fence around it.**
+///
+/// Not a misunderstanding — a lapse. `delegate-direct` produced this
+/// as its entire reply, twice, on 2026-09-20:
+///
+/// ```text
+/// tell("The closing balance in notes/ledger.md is 1200.");
+/// finish();
+/// ```
+///
+/// Nothing ran, the text went to the person as their answer, and the
+/// branch rested reporting success. The tail says ```js is what runs
+/// and it was on that very request; instructions do not catch lapses,
+/// which is what this branch of `stopped_short` is for.
+///
+/// **Bounded hard to keep it a lapse-catcher, not a prose classifier.**
+/// Every non-blank line must be a statement in this dialect, and there
+/// must be no fence anywhere — a reply with a ```js block in it has
+/// already run something, and a sentence that merely mentions `tell(`
+/// keeps its other lines. That is why this reads whole lines rather
+/// than searching for a substring: 1 prose segment in 1,686 across the
+/// kept corpus matches, and it is the one this was written for.
+fn unfenced_program(text: &str) -> bool {
+    if text.contains("```") {
+        return false;
+    }
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    if lines.is_empty() {
+        return false;
+    }
+    lines.iter().all(|l| {
+        l.ends_with(';')
+            && (l.starts_with("tell(")
+                || l.starts_with("finish(")
+                || l.starts_with("ask(")
+                || l.starts_with("return ")
+                || l.starts_with("const ")
+                || l.starts_with("let ")
+                || l.starts_with("await tools.")
+                || l.starts_with("history.")
+                || l.starts_with("console.log("))
+    })
+}
+
 const INTERRUPT_NOTICE: &str = "The user interrupted your program. It is paused at its last fuel slice — nothing \
      is lost, every completed call is already an artifact — and what happens next is \
      whatever program you write.";
@@ -1260,6 +1315,9 @@ impl Runner {
         }
         if foreign_tool_call(&last.text) {
             return Some(FOREIGN_TOOL_CALL_NOTICE.to_owned());
+        }
+        if unfenced_program(&last.text) {
+            return Some(UNFENCED_PROGRAM_NOTICE.to_owned());
         }
         // **Off by default, and the code stays.** Of the thirteen times
         // this last branch fired across 382 kept runs, twelve woke a
@@ -6200,6 +6258,51 @@ mod tests {
             json!(n),
             "fetch hands back all {n} characters"
         );
+    }
+
+    /// **A program with the fence left off is caught, and prose is
+    /// not.** The reply `delegate-direct` actually produced twice on
+    /// 2026-09-20 was two statements and nothing else; it ran nothing,
+    /// went to the person as their answer, and rested the branch
+    /// reporting success.
+    #[test]
+    fn a_program_without_its_fence_is_noticed() {
+        let mut c = Conversation::new();
+        c.user("what is the closing balance?");
+        let r = c.reply("tell(\"The closing balance is 1200.\");\nfinish();\n");
+
+        assert!(r.cells.is_empty(), "nothing was fenced, so nothing ran");
+        assert!(
+            c.runner()
+                .request_tail(c.tree())
+                .is_some_and(|t| !t.contains("program with no fence")),
+            "the notice is a post, not a tail line"
+        );
+        assert!(
+            c.tree().events.values().any(|e| matches!(
+                &e.payload,
+                EventPayload::Post { origin, .. }
+                    if format!("{origin:?}").contains("no fence around it")
+            )),
+            "the branch is woken and told why"
+        );
+    }
+
+    /// And ordinary prose that merely mentions a verb is left alone —
+    /// the cost of a false positive is a wasted turn, so the bar is
+    /// every line, not any line.
+    #[test]
+    fn prose_that_mentions_a_verb_is_not_mistaken_for_a_program() {
+        for text in [
+            "I will tell(…) you once the check passes.",
+            "Reading it first.\n\nThen I will summarise.",
+            "```js\ntell(\"hi\");\n```\n",
+        ] {
+            assert!(
+                !unfenced_program(text),
+                "{text:?} should not read as a program"
+            );
+        }
     }
 
     /// **A `return` skips the rest of the reply, blocks and prose
