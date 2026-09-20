@@ -150,11 +150,18 @@ const OPEN_NOTE_MAX_IDS: usize = 8;
 /// **And the wording has to hold that line too.** "No one is attached"
 /// reads as "nobody is there", which is the inference the paragraph
 /// above refuses to license — in a headless eval it is always false in
-/// that sense, since a person reads the transcript afterwards. So it
-/// says what is known (a client) and what follows from it (whether an
-/// `ask` is worth the wait), and nothing about who is reading.
+/// that sense, since a person reads the transcript afterwards.
+///
+/// **It states the fact and stops.** "may wait hours for an answer"
+/// was a fact phrased as advice, and the advice was against asking —
+/// against three card paragraphs arguing that a written-down ambiguity
+/// is a question addressed to you, from the last line of the request,
+/// which is the strongest position there is. `ambiguous-config` failed
+/// 2 of 3 on 2026-09-20 with "never asked". Whether the wait is worth
+/// it is the model's to weigh; that the question stays open is ours to
+/// report.
 const PRESENT: &str = "- A client is attached; an ask() may be answered promptly.";
-const ABSENT: &str = "- No client is attached; an ask() may wait hours for an answer.";
+const ABSENT: &str = "- No client is attached; an ask() stays open until someone answers it.";
 
 /// What the harness says when the user interrupts a running program and
 /// has nothing else to add. It is a `tell` — the branch owes no answer —
