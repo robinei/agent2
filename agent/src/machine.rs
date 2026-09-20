@@ -1714,6 +1714,31 @@ impl Runner {
         if self.halted() {
             return Ok(out);
         }
+        // **A VM parked at the end of the code it has is between cells,
+        // not finished.** Stepping it once more runs off the end and
+        // reports `Done`, which ends the reply — while the reply is
+        // still arriving.
+        //
+        // `drive_notebook` has always checked this, because text
+        // arriving is the obvious way to reach a parked VM. It is not
+        // the only way: a cell that *ends* with a fire-and-forget call
+        // — `tell("…")` as the last statement, which is the shape three
+        // exemplars teach — reaches its `Pause` with that call still
+        // outstanding, and the settlement the host hands back a moment
+        // later arrives here through `on_tool_results`, which pumps
+        // unguarded. The run then completed mid-reply, and every cell
+        // still streaming was dropped in silence by `notebook_feed`,
+        // which finds no run to feed.
+        //
+        // The guard belongs here rather than at each caller: being
+        // parked between cells is a fact about the VM, and every path
+        // that steps it has to respect it.
+        if let Phase::Running(run) = &self.phase
+            && run.vm.ip as usize >= run.vm.code.len()
+            && run.notebook.as_ref().is_some_and(|n| !n.is_ended())
+        {
+            return Ok(out);
+        }
         for _ in 0..MAX_PUMP_ROUNDS {
             let Phase::Running(run) = &mut self.phase else {
                 unreachable!("pump outside Running");
@@ -7235,45 +7260,27 @@ mod tests {
     /// offset, and nothing has to work out which cell first.
     #[test]
     fn every_call_site_resolves_into_the_reply() {
-        let (mut tree, mut state) = setup_under();
-        user_post(&mut state, &mut tree, "go");
+        let mut c = Conversation::new();
+        c.user("go");
         let reply = "First I speak.\n\n\
                      ```js\ntell(\"from the first cell\");\n```\n\n\
                      Then again, further down.\n\n\
                      ```js\nconst x = 1;\ntell(\"from the second cell\");\n```\n";
-        let out = state
-            .step(&mut tree, StepInput::LlmResponse(llm_program(reply)))
-            .unwrap();
-        drain(&mut state, &mut tree, out);
+        let r = c.reply(reply);
 
-        // The reply, rebuilt from its parts exactly as a reader would:
-        // that is the string a site indexes into.
-        let mut rebuilt = String::new();
-        let mut checked = 0;
-        for event in state.agent_segment(&tree) {
-            match &event.payload {
-                EventPayload::Part { part, .. } => match part {
-                    crate::types::Part::Prose(t) | crate::types::Part::Cell(t) => {
-                        rebuilt.push_str(t)
-                    }
-                    crate::types::Part::Thinking(_) => {}
-                },
-                EventPayload::Call(Call::Send { site, site_end, .. }) => {
-                    if (*site, *site_end) == (0, 0) {
-                        continue; // a prose segment: synthetic, zero-width
-                    }
-                    let sliced = &rebuilt[*site as usize..*site_end as usize];
-                    assert!(
-                        sliced.starts_with("tell(") && sliced.contains("cell"),
-                        "site sliced {sliced:?} out of {rebuilt:?}"
-                    );
-                    checked += 1;
-                }
-                _ => {}
-            }
+        // That every span lands inside the reply, on a boundary, is
+        // `Invariant::SitesAreReplyAbsolute`, checked on every reply;
+        // and that the parts *are* the reply is `PartsConcatenate`.
+        // What is left is that a span names the call it belongs to.
+        assert_eq!(r.told.len(), 2, "two tells");
+        for told in &r.told {
+            let (site, site_end) = c.site_of(*told);
+            let sliced = &reply[site as usize..site_end as usize];
+            assert!(
+                sliced.starts_with("tell(") && sliced.contains("cell"),
+                "site sliced {sliced:?} out of the reply"
+            );
         }
-        assert_eq!(rebuilt, reply, "and the parts are the reply");
-        assert_eq!(checked, 2, "two tells, two sites resolved");
     }
 
     /// And the subtraction is real work, not a no-op in the other
@@ -7453,37 +7460,20 @@ mod tests {
     /// sitting in the transcript.
     #[test]
     fn a_reply_that_wrote_a_foreign_tool_call_is_told_so_and_asked_again() {
-        let (mut tree, mut state) = setup_under();
-        user_post(&mut state, &mut tree, "go");
-        let out = state
-            .step(
-                &mut tree,
-                StepInput::LlmResponse(crate::host::scripted_markdown(
-                    "Let me look at what's here.\n\n                     <tool_call>\n<function=bash>\n<parameter=command>\nls -la\n                     </parameter>\n</function>\n</tool_call>",
-                )),
-            )
-            .unwrap();
-        let settled = drain(&mut state, &mut tree, out);
-        assert!(
-            settled
-                .iter()
-                .any(|o| matches!(o, StepOutput::LlmRequest(_))),
-            "the work is not finished: {settled:?}"
+        let mut c = Conversation::new();
+        c.user("go");
+        let r = c.reply(
+            "Let me look at what's here.\n\n<tool_call>\n<function=bash>\n\
+             <parameter=command>\nls -la\n</parameter>\n</function>\n</tool_call>",
         );
+
+        assert!(!r.rests, "the work is not finished");
         // And it is *told* why, in the channel it demonstrably reads.
-        let notice = state
-            .agent_segment(&tree)
-            .iter()
-            .filter_map(|e| match &e.payload {
-                EventPayload::Post {
-                    from: Author::Harness,
-                    origin,
-                } => origin.direct().map(|(t, _, _)| t.to_owned()),
-                _ => None,
-            })
-            .next_back()
-            .expect("a harness notice");
-        assert!(notice.contains("```js"), "{notice}");
+        assert!(
+            r.notices.last().is_some_and(|n| n.contains("```js")),
+            "the notice names the one channel that runs: {:?}",
+            r.notices
+        );
     }
 
     /// **But a prose answer is still an answer.** A reply that ran
@@ -7735,53 +7725,26 @@ mod tests {
     /// 1's text has been written at all.
     #[test]
     fn a_cell_runs_before_the_next_ones_fence_arrives() {
-        let (mut tree, mut state) = setup_under();
-        user_post(&mut state, &mut tree, "go");
-        state.phase = Phase::AwaitingLlm;
+        let mut c = Conversation::new();
+        c.user("go");
 
-        stream_chunks(
-            &mut state,
-            &mut tree,
-            &["Looking now.\n\n```js\ntell(\"cell 0 ran\");\n```\n"],
-        );
+        let so_far = c.chunk("Looking now.\n\n```js\ntell(\"cell 0 ran\");\n```\n");
 
         // Cell 0 has run, and nothing of cell 1 exists yet. A `tell` is
         // logged at dispatch, so it is the effect that shows mid-reply;
         // the console is a diagnostic stream drained at the run's end.
-        let kinds = payload_kinds(&state, &tree);
         assert_eq!(
-            kinds,
-            ["Agent", "Post", "Reply", "Part", "Part", "Call", "Call"],
-            "cell 0 ran while the reply was still open"
+            so_far.kinds,
+            ["Reply", "Part", "Part", "Call", "Call", "Result", "Result"],
+            "cell 0 ran, and was delivered, while the reply was still open"
         );
-        assert!(
-            !kinds.contains(&"Handback"),
-            "but the run has not ended: {kinds:?}"
-        );
-        assert!(matches!(state.phase, Phase::Running(_)));
+        assert_eq!(so_far.ended, Ending::Running, "but the run has not ended");
+        assert_eq!(c.status(), "running");
 
         // Now the rest arrives.
-        stream_chunks(
-            &mut state,
-            &mut tree,
-            &["\nAnd the second.\n\n```js\ntell(\"cell 1 ran\");\n```\n"],
-        );
-        let out = state
-            .step(&mut tree, StepInput::LlmResponse(llm_program("")))
-            .unwrap();
-        drain(&mut state, &mut tree, out);
-
-        let said: Vec<String> = state
-            .agent_segment(&tree)
-            .iter()
-            .filter_map(|e| match &e.payload {
-                EventPayload::Call(Call::Send { text, site_end, .. }) if *site_end > 0 => {
-                    Some(text.clone())
-                }
-                _ => None,
-            })
-            .collect();
-        assert_eq!(said, vec!["cell 0 ran", "cell 1 ran"]);
+        c.chunk("\nAnd the second.\n\n```js\ntell(\"cell 1 ran\");\n```\n");
+        let whole = c.end_reply();
+        assert_eq!(whole.tells, ["cell 0 ran", "cell 1 ran"]);
     }
 
     /// Prose lands as its own `Send` as the reply streams, so the person
@@ -7964,66 +7927,26 @@ mod tests {
     /// the next completion knows it was cut off.
     #[test]
     fn a_mid_stream_truncation_keeps_what_ran_and_reports_partial() {
-        let (mut tree, mut state) = setup_under();
-        user_post(&mut state, &mut tree, "go");
-        state.phase = Phase::AwaitingLlm;
-
-        stream_chunks(
-            &mut state,
-            &mut tree,
-            &["```js\ntell(\"cell 0 ran\");\n```\n\nNext I will\n\n```js\nawait tools.read_fi"],
+        let mut c = Conversation::new();
+        c.user("go");
+        c.chunk(
+            "```js\ntell(\"cell 0 ran\");\n```\n\nNext I will\n\n```js\nawait tools.read_fi",
         );
         // The token budget ran out here.
-        let out = state
-            .step(
-                &mut tree,
-                StepInput::LlmResponse(LlmTurn {
-                    source: String::new(),
-                    thinking: None,
-                    truncated: true,
-                    usage: None,
-                    reply: None,
-                }),
-            )
-            .unwrap();
-        drain(&mut state, &mut tree, out);
+        let r = c.truncate_reply();
 
-        let said = state.agent_segment(&tree).iter().any(|e| {
-            matches!(&e.payload, EventPayload::Call(Call::Send { text, .. })
-                if text == "cell 0 ran")
-        });
-        assert!(said, "cell 0's effects stand");
-        let causes: Vec<&crate::types::Handback> = state
-            .agent_segment(&tree)
-            .iter()
-            .filter_map(|e| match &e.payload {
-                EventPayload::Handback { how, .. } => Some(how),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            causes.len(),
-            1,
-            "one run, one terminal, even truncated: {causes:?}"
-        );
+        assert_eq!(r.tells, ["cell 0 ran"], "cell 0's effects stand");
         // Truncation is a fact about the *text*, not about the program
         // (28). Every cell that arrived ran to the end, so the run
         // completed; it is `ReplyEnd` that says the reply was cut off,
         // and the document renders that marker where the text stops so
         // the model can see why it seems to end mid-sentence.
-        assert!(
-            matches!(causes[0], crate::types::Handback::Completed),
-            "the cells that arrived all ran: {causes:?}"
-        );
-        assert!(
-            tree.events.values().any(|e| matches!(
-                &e.payload,
-                EventPayload::ReplyEnd {
-                    how: crate::types::ReplyEnd::Truncated,
-                    ..
-                }
-            )),
-            "and the reply says it was cut off"
+        assert_eq!(r.ended, Ending::Completed, "the cells that arrived all ran");
+        assert_eq!(
+            r.reply_ended,
+            Some(crate::types::ReplyEnd::Truncated),
+            "and the reply says it was cut off: kinds {:?}",
+            r.kinds
         );
     }
 

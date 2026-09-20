@@ -239,12 +239,20 @@ pub struct Said {
     pub calls: Vec<(String, serde_json::Value)>,
     /// Lines the program printed.
     pub printed: Vec<String>,
+    /// Harness notices logged on this branch during the reply — the
+    /// channel the model demonstrably reads, used to tell it that its
+    /// last reply stopped short or wrote a call in a channel that does
+    /// not exist.
+    pub notices: Vec<String>,
     /// Rows this reply compacted — `history.remove`/`replace`/`slice`.
     pub compacted: Vec<EventId>,
     /// Settlements logged in this reply's scope, `(call, outcome)`.
     pub settled: Vec<(EventId, Outcome)>,
     /// How the program ended.
     pub ended: Ending,
+    /// How the *reply* ended, which is a fact about the text and not
+    /// about the program: `Finished`, `Truncated`, `Interrupted`.
+    pub reply_ended: Option<crate::types::ReplyEnd>,
     /// Whether the branch rested: no further request went out after
     /// this reply. The other half of `finish`'s contract, and the one
     /// no scan of the log can see — resting is the *absence* of an
@@ -317,6 +325,9 @@ pub struct Conversation {
     /// A fresh generation per reply — what tells `notebook_stream` that
     /// the last reply is over and a new one is arriving.
     epoch: u64,
+    /// The reply being streamed a chunk at a time, if one is open:
+    /// where its scope starts, and the text fed so far.
+    open_reply: Option<(u64, String)>,
     /// Whether the reply just fed woke a program suspended beneath it,
     /// in which case two replies were producing events at once — see
     /// [`Invariant::SitesAreReplyAbsolute`].
@@ -348,6 +359,7 @@ impl Conversation {
             requests: 0,
             open_asks: Vec::new(),
             epoch: 0,
+            open_reply: None,
             resumed: false,
         }
     }
@@ -445,6 +457,77 @@ impl Conversation {
         self.settle(end);
         let said = self.project(before);
         self.check(&said, &chunks.concat());
+        said
+    }
+
+    /// Feed one chunk of a reply and stop there, leaving the
+    /// completion open. What came of *that* chunk comes back.
+    ///
+    /// For the tests that are about a reply being acted on while it is
+    /// still being written — a cell running before the next one's fence
+    /// has arrived, which is the whole point of the transport and is
+    /// invisible to any test that hands the reply over whole. End it
+    /// with [`end_reply`](Self::end_reply) or
+    /// [`truncate_reply`](Self::truncate_reply).
+    ///
+    /// No invariants: the reply is not over, so most of them are not
+    /// yet true of it. [`end_reply`] checks them against the whole
+    /// text.
+    pub fn chunk(&mut self, text: &str) -> Said {
+        if self.open_reply.is_none() {
+            self.resumed = self.runner.status() == "suspended";
+            self.requests = 0;
+            self.epoch += 1;
+            self.open_reply = Some((self.tree.id_counter, String::new()));
+        }
+        let before = self.tree.id_counter;
+        let out = self
+            .runner
+            .notebook_stream(&mut self.tree, self.epoch, text)
+            .expect("stream");
+        self.settle(out);
+        if let Some((_, written)) = self.open_reply.as_mut() {
+            written.push_str(text);
+        }
+        self.project(before)
+    }
+
+    /// The completion is over. Returns the whole reply's [`Said`], not
+    /// just the tail — what the reply did, all of it.
+    pub fn end_reply(&mut self) -> Said {
+        self.close_reply(false)
+    }
+
+    /// The completion is over because the token budget ran out: the
+    /// cells that closed stand, the half-written one after them was
+    /// never a cell.
+    pub fn truncate_reply(&mut self) -> Said {
+        self.close_reply(true)
+    }
+
+    fn close_reply(&mut self, truncated: bool) -> Said {
+        let (before, written) = self
+            .open_reply
+            .take()
+            .expect("end_reply with no reply open — call chunk() first");
+        let out = self
+            .runner
+            .step(
+                &mut self.tree,
+                StepInput::LlmResponse(crate::machine::LlmTurn {
+                    truncated,
+                    ..crate::host::scripted_markdown("")
+                }),
+            )
+            .expect("stream end");
+        self.settle(out);
+        let said = self.project(before);
+        // A truncated reply is one the log cannot put back together by
+        // construction: the text stops mid-token and the half-cell is
+        // dropped. Everything else still holds.
+        if !truncated {
+            self.check(&said, &written);
+        }
         said
     }
 
@@ -725,9 +808,11 @@ impl Conversation {
             rows: Vec::new(),
             calls: Vec::new(),
             printed: Vec::new(),
+            notices: Vec::new(),
             compacted: Vec::new(),
             settled: Vec::new(),
             ended: Ending::Running,
+            reply_ended: None,
             // **Rested, not merely quiet.** A reply that parked — on a
             // raise, on a `stop` — also leaves no request behind at
             // this layer, because the one that wakes it is the host's
@@ -783,9 +868,15 @@ impl Conversation {
                     value: value.clone(),
                     site: (*site, *site_end),
                 }),
+                EventPayload::Post { from: Author::Harness, origin } => {
+                    if let Some((text, _, _)) = self.tree.resolve(origin).direct() {
+                        s.notices.push(text.to_owned());
+                    }
+                }
                 EventPayload::Compacted { of, .. } => s.compacted.push(*of),
                 EventPayload::Console { lines } => s.printed.extend(lines.iter().cloned()),
                 EventPayload::Result { call, outcome } => s.settled.push((*call, outcome.clone())),
+                EventPayload::ReplyEnd { how, .. } => s.reply_ended = Some(how.clone()),
                 EventPayload::Handback { how, site, .. } => {
                     s.ended = ending_of(how, *site);
                     s.handback = Some(e.id);
@@ -1218,6 +1309,39 @@ mod tests {
         c.user("go");
         let r = c.reply("The count ↓ history[3] is the one I want.\n\n```js\nfinish(\"ok\");\n```\n");
         assert_eq!(r.prose, ["The count ↓ history[3] is the one I want."]);
+    }
+
+    /// **A cell that ends with a fire-and-forget call does not end the
+    /// reply.** The VM reaches that cell's `Pause` with the call still
+    /// outstanding; the settlement the host hands back a moment later
+    /// used to pump the VM off the end of the code it had, report
+    /// `Done`, and hand the run back — while the reply was still
+    /// arriving. Every cell after it was then dropped in silence,
+    /// because `notebook_feed` finds no run to feed.
+    ///
+    /// `tell("…")` as the last statement of a cell is the shape three
+    /// exemplars teach, so this was reachable by the most ordinary
+    /// reply there is. Found on 2026-09-20 by porting a streaming test
+    /// to this harness: the old one drove ticks but never handed back
+    /// the settlements, so the reply never reached the state that
+    /// breaks.
+    #[test]
+    fn settling_a_cells_last_tell_does_not_end_the_reply() {
+        let mut c = Conversation::new();
+        c.user("go");
+
+        let so_far = c.chunk("```js\ntell(\"cell 0 ran\");\n```\n");
+        assert_eq!(so_far.tells, ["cell 0 ran"]);
+        assert_eq!(so_far.ended, Ending::Running, "the reply is still arriving");
+        assert_eq!(c.status(), "running");
+
+        c.chunk("\n```js\ntell(\"cell 1 ran\");\n```\n");
+        let whole = c.end_reply();
+        assert_eq!(
+            whole.tells,
+            ["cell 0 ran", "cell 1 ran"],
+            "the cell after it ran too"
+        );
     }
 
     // ── the harness's own guarantees ────────────────────────────────
