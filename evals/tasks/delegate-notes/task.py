@@ -58,9 +58,24 @@ def _settings(text: str) -> dict:
     return found
 
 
+def _same(written: str, want: str) -> bool:
+    """`7`, `7.0` and `007` are the same answer.
+
+    The reviews settle on a number, not on a spelling, and a checker
+    that fails a correct value for its formatting is measuring nothing
+    anyone meant to ask about.
+    """
+    if written == want:
+        return True
+    try:
+        return float(written) == float(want)
+    except (TypeError, ValueError):
+        return False
+
+
 def check(env):
     got = _settings(env.read("config.py"))
-    right = [k for k, v in WANT.items() if got.get(k) == v]
+    right = [k for k, v in WANT.items() if _same(got.get(k, ""), v)]
 
     # Graded before the gates: two of three is most of the work, and a
     # run that reads two reviews and runs out of room has earned it.
@@ -79,7 +94,7 @@ def check(env):
             f"`{name}` is gone from config.py — it was to be set, not removed",
         )
         env.require(
-            got[name] == want,
+            _same(got[name], want),
             f"`{name}` is {got[name]}, and the review settles it at {want}"
             + (
                 " (the decision names a figure from the thread rather than "
