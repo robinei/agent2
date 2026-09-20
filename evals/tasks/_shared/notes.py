@@ -20,6 +20,15 @@ import random
 
 # Each: the file, the setting it settles, the answer, and the sentence
 # that settles it — which names earlier figures instead of the value.
+#
+# **The referent has to survive every reading.** The first one said
+# "Ana's second figure", and Ana's line "That is what we had" points at
+# Raj's 3 — so her figures read as either (5, 7) or (3, 5, 7) and her
+# second is either 7 or 5. A live run took the second reading and was
+# not wrong to. "The last figure Ana named" is 7 under both. A task that
+# fails a good answer on a counting quirk produces noise, not signal,
+# and the comprehension it means to ask for — attribute the figures to a
+# speaker — is untouched.
 NOTES = [
     {
         "file": "incident-2031.md",
@@ -33,7 +42,7 @@ NOTES = [
             ("Mia", "5 covers the median but not the p99 we actually paged on."),
             ("Ana", "Then 7. That covers the p99 with one retry to spare."),
         ],
-        "decision": "Ana's second figure is what we are going with.",
+        "decision": "The last figure Ana named is what we are going with.",
     },
     {
         "file": "incident-2044.md",
