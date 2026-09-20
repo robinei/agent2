@@ -281,6 +281,12 @@ The reasoning in the comment was half right: a cell that would not
 compile built no VM, so *that cell* has no console, no rows and no
 stack. The reply is not that cell.
 
+I looked for a behavioural signal afterwards — whether the next reply
+re-reads a file the failed one had already read — and found none: 0 of
+6 on both sides. So this one rests on the report being true rather than
+on a measured change, which is a weaker footing than the rest of the
+night and worth saying.
+
 ### What one turn looks like now
 
 A real report from the closing runs, and four of the night's fixes are
