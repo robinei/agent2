@@ -723,6 +723,12 @@ impl Conversation {
             .unwrap_or_else(|e| panic!("fetch #{} : {e}", id.as_u64()))
     }
 
+    /// The question this branch is waiting on a person to answer, if
+    /// it is waiting on one. A branch holds at most one at a time.
+    pub fn open_ask(&self) -> Option<EventId> {
+        self.open_asks.last().copied()
+    }
+
     /// The posts on this branch still owed an answer — what a program
     /// names to `answer(id, …)`.
     pub fn open(&self) -> &[EventId] {

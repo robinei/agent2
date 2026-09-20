@@ -11,6 +11,8 @@ mod score;
 #[cfg(test)]
 mod scripted;
 #[cfg(test)]
+mod replay;
+#[cfg(test)]
 mod testkit;
 mod transcript;
 mod tree;
