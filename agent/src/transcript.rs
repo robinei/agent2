@@ -25,6 +25,11 @@ use crate::types::{
 /// should not be the whole transcript.
 const LINE_MAX: usize = 400;
 
+/// Console lines shown per block, and how many of them come from the
+/// end rather than the start.
+const CONSOLE_ROWS: usize = 12;
+const CONSOLE_TAIL_ROWS: usize = 3;
+
 /// Render the branch that `leaf` sits on, oldest event first.
 pub fn render(tree: &Tree, leaf: EventId) -> String {
     let path = tree.path_events(leaf);
@@ -103,11 +108,7 @@ fn line_for(tree: &Tree, path: &[&Event], event: &Event) -> Option<String> {
         EventPayload::Note { value, .. } => {
             format!("#{id}    ▸ {}", clip(&crate::machine::note_text(value)))
         }
-        EventPayload::Console { lines } if !lines.is_empty() => lines
-            .iter()
-            .map(|l| format!("       · {}", clip(l)))
-            .collect::<Vec<_>>()
-            .join("\n"),
+        EventPayload::Console { lines } if !lines.is_empty() => console_block(lines),
         EventPayload::Answer { question, value } => {
             format!("#{id}    ✓ answered #{}: {}", question.as_u64(), clip(&value.to_string()))
         }
@@ -185,6 +186,34 @@ fn finished_here(path: &[&Event], at: EventId) -> bool {
                 })
             )
         })
+}
+
+/// What a program printed, bounded by **rows** as well as by width.
+///
+/// `cap_console` already bounds what the *model* is shown, and the log
+/// holds that bounded version — but "bounded" there is two hundred
+/// lines, which is the right budget for a model reading a report and
+/// the wrong one for a person scanning a conversation. A run that
+/// cats a file puts the whole file here, and a transcript that scrolls
+/// for a screen and a half has stopped being the readable view it
+/// exists to be.
+///
+/// Head and tail, because both ends carry: the first lines say what
+/// the program set out to print and the last ones usually say how it
+/// went.
+fn console_block(lines: &[String]) -> String {
+    let render = |l: &String| format!("       · {}", clip(l));
+    if lines.len() <= CONSOLE_ROWS {
+        return lines.iter().map(render).collect::<Vec<_>>().join("\n");
+    }
+    let head = CONSOLE_ROWS - CONSOLE_TAIL_ROWS;
+    let mut out: Vec<String> = lines[..head].iter().map(render).collect();
+    out.push(format!(
+        "       ·   … {} more lines",
+        lines.len() - CONSOLE_ROWS
+    ));
+    out.extend(lines[lines.len() - CONSOLE_TAIL_ROWS..].iter().map(render));
+    out.join("\n")
 }
 
 /// The closing line, and the only one a driver has to read: whether
@@ -397,6 +426,32 @@ mod tests {
         assert!(out.contains("→ bash(\"make check\") status 1"), "{out}");
         assert!(out.contains("⏹ stopped: CHECK fails:"), "{out}");
         assert!(out.contains("it stopped itself and will carry on"), "{out}");
+    }
+
+    /// **A program that cats a file does not take the transcript with
+    /// it.** The log holds what the model was shown, which is two
+    /// hundred lines — the right budget for a model reading a report
+    /// and the wrong one for a person scanning a conversation.
+    #[test]
+    fn a_long_print_is_bounded_at_both_ends() {
+        let mut c = Conversation::new();
+        c.user("go");
+        c.reply("```js\nfor (let i = 1; i <= 60; i++) console.log(`line ${i}`);\n```\n");
+
+        let out = render(c.tree(), c.runner().spine.leaf_id);
+        let printed: Vec<&str> = out.lines().filter(|l| l.contains(" · ")).collect();
+        assert_eq!(printed.len(), CONSOLE_ROWS + 1, "{printed:#?}");
+        assert!(printed[0].contains("line 1"), "the start is kept: {}", printed[0]);
+        assert!(
+            printed[CONSOLE_ROWS - CONSOLE_TAIL_ROWS].contains("… 48 more lines"),
+            "and it says how much is missing: {}",
+            printed[CONSOLE_ROWS - CONSOLE_TAIL_ROWS]
+        );
+        assert!(
+            printed.last().is_some_and(|l| l.contains("line 60")),
+            "and the end, which is usually how it went: {:?}",
+            printed.last()
+        );
     }
 
     /// A value that would take the screen is one line with an id beside
