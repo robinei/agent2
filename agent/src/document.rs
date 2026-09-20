@@ -403,7 +403,11 @@ fn annotate_history_calls(
                 // example it imitates next turn. A `↓` it wrote is
                 // just as wrong and just as copyable.
                 let end = imitated_block_marker(&out, at).unwrap_or(at);
-                out.replace_range(at..end, &format!("{lead}{BLOCK_ARROW} history[{row}]\n"));
+                let (start, lead) = match imitated_block_marker_above(&out, at) {
+                    Some(above) => (above, ""),
+                    None => (at, lead),
+                };
+                out.replace_range(start..end, &format!("{lead}{BLOCK_ARROW} history[{row}]\n"));
                 continue;
             }
             Edit::Call(c) => c,
@@ -486,6 +490,65 @@ fn imitated_block_marker(text: &str, at: usize) -> Option<usize> {
         return None;
     }
     Some(at + lead + BLOCK_ARROW.len() + " history[".len() + close + 1 + line_end)
+}
+
+/// Whether a prose part says nothing except a marker the model copied.
+///
+/// **It happens, and it compounds.** The model reads `↓ history[N]`
+/// above each of its own blocks and writes them back; usually at the
+/// head of a paragraph, where the replacement pass swaps its guessed
+/// id for the real one and nobody is any the wiser. Sometimes the
+/// paragraph is *only* that line. The part then rendered as a bare
+/// marker with nothing under it, directly above the next part's
+/// marker:
+///
+/// ```text
+/// ↓ history[38]
+/// ↓ history[39]
+/// ```js
+/// ```
+///
+/// — an invitation to `fetch` a row whose whole content is a copy of
+/// an annotation, sitting in the model's own turn as an example of a
+/// shape to imitate. 17 of them across 291 kept runs.
+/// The start of a marker the model wrote on the line(s) *above* `at`,
+/// so this pass replaces it instead of adding a second one below it.
+///
+/// **Above the fence is where ours goes, so it is where the model puts
+/// its guess.** [`imitated_block_marker`] only looks forward from the
+/// block's own start, which catches a marker at the head of a
+/// paragraph and misses one at the tail of the paragraph before —
+/// and those are the same line, one byte either side of a boundary
+/// this reader cannot see. The turn then carried both, usually with
+/// different ids:
+///
+/// ```text
+/// ↓ history[77]
+/// Let me get the full source with line numbers.
+///
+/// ↓ history[78]
+/// ↓ history[78]
+/// ```js
+/// ```
+///
+/// Safe to reach backwards because only a cell carries call spans and
+/// a cell's last bytes are its closing fence: prose is logged with
+/// `site: 0`, which `push_cut` refuses, so nothing indexes the region
+/// this absorbs.
+fn imitated_block_marker_above(text: &str, at: usize) -> Option<usize> {
+    let before = text.get(..at)?;
+    let trimmed = before.trim_end_matches(['\n', ' ', '\t']);
+    let line_start = trimmed.rfind('\n').map_or(0, |i| i + 1);
+    // It has to be a whole line of its own, and the whole of one.
+    let end = imitated_block_marker(text, line_start)?;
+    (end >= trimmed.len()).then_some(line_start)
+}
+
+fn is_only_an_imitated_marker(text: &str) -> bool {
+    match imitated_block_marker(text, 0) {
+        Some(end) => text[end..].trim().is_empty(),
+        None => false,
+    }
 }
 
 /// The span of an annotation the model wrote itself, immediately after
@@ -908,6 +971,15 @@ pub(crate) fn render_with_lookup(
                                         ));
                                     }
                                 }
+                                // A part that is nothing but a copied
+                                // marker renders as nothing: no marker
+                                // of its own, no text, no invitation to
+                                // fetch a row that holds an annotation.
+                                // It stays on the log and `fetch` still
+                                // answers for it — what changes is only
+                                // what the model is shown of its own
+                                // turn.
+                                None if is_only_an_imitated_marker(t) => {}
                                 None => {
                                     blocks.push((text.len(), ev.id.as_u64()));
                                     part_spans.push((sent_len, t.len(), text.len()));
@@ -1663,6 +1735,49 @@ mod tests {
         let source = "history.append(arg); /* ← history[13] */\n";
         let out = annotate_history_calls(source, Some(&cuts), &[]);
         assert_eq!(out, "history.append(arg) /* ← history[30] */;\n");
+    }
+
+    /// **A part that is nothing but a copied marker renders as
+    /// nothing.**
+    ///
+    /// The model writes `↓ history[N]` back because it reads it above
+    /// every block of its own; usually at the head of a paragraph,
+    /// where the replacement pass swaps the guessed id for the real
+    /// one. Sometimes the paragraph is only that line, and the turn
+    /// then showed two markers in a row with nothing between them —
+    /// the first naming a row whose entire content is a copy of an
+    /// annotation, in the model's own turn, as an example to imitate.
+    #[test]
+    fn a_part_that_is_only_a_copied_marker_is_not_shown() {
+        assert!(is_only_an_imitated_marker("\n↓ history[36]\n"));
+        assert!(is_only_an_imitated_marker("↓ history[7]"));
+        // A marker with something under it is an ordinary paragraph
+        // that happens to start with one — the pass fixes its id and
+        // the prose is kept.
+        assert!(!is_only_an_imitated_marker("↓ history[7]\nNow the file."));
+        // And prose that merely mentions a row is not a marker at all.
+        assert!(!is_only_an_imitated_marker("see history[9] for it"));
+        assert!(!is_only_an_imitated_marker("Now the file."));
+    }
+
+    /// **A marker written above the fence is replaced, not joined.**
+    ///
+    /// Above the block is where the harness's own marker goes, so it
+    /// is where the model puts its guess — and that line is the tail
+    /// of the paragraph before, which the forward-looking check cannot
+    /// see. The turn carried both, usually with different ids.
+    #[test]
+    fn a_marker_the_model_wrote_above_the_block_is_absorbed() {
+        let source = "Let me look.\n\n↓ history[78]\n```js\nx();\n```\n";
+        let at = source.find("```js").unwrap();
+        let out = annotate_history_calls(source, None, &[(at, 91)]);
+        assert_eq!(out.matches("↓ history[").count(), 1, "one marker: {out}");
+        assert!(
+            out.contains("↓ history[91]\n```js"),
+            "and it is ours: {out}"
+        );
+        assert!(!out.contains("78"), "the guess is gone: {out}");
+        assert!(out.starts_with("Let me look.\n\n"), "prose intact: {out}");
     }
 
     /// **Compaction moves the text out from under the call offsets.**
