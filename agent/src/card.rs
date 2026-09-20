@@ -1659,13 +1659,17 @@ mod tests {
         // it is larger than the 400 it was when an exemplar was bare
         // JavaScript; the code inside is no longer than it was.
         //
-        // Moved once, from 700, when `stop(reason)` arrived: the longest
-        // exemplar gained the branch where the check fails, which is the
-        // shape the verb exists for. A cap that squeezes the failure
-        // path back out is guarding the wrong thing.
+        // It moved to 740 for an afternoon, when `stop(reason)` arrived
+        // and the longest exemplar gained the branch where the check
+        // fails. That was the wrong fix for the right instinct: the
+        // exemplar was long because its loop was written out by hand,
+        // and `hits.entries()` — which the dialect has always had, and
+        // which a live model reached for unprompted — says the same
+        // thing shorter. A measured guard is not the thing to move when
+        // the code under it can be better instead.
         for e in &ex {
             assert!(
-                e.assistant.len() < 740,
+                e.assistant.len() < 700,
                 "an exemplar long enough to copy: {} bytes",
                 e.assistant.len()
             );
