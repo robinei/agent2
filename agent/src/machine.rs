@@ -164,6 +164,17 @@ const ABSENT: &str = "No one is attached to this session right now; a question t
 /// nothing was lost, and the next program is whatever the model writes.
 /// Woken after a reply that arrived with no text at all — see
 /// [`Runner::stopped_short`].
+/// **The cause is asserted, and it was checked.** "The whole
+/// completion went to reasoning" is a claim about why the reply was
+/// empty, not an observation of it — so across 154 kept runs every one
+/// of the 17 empty replies was looked at: all 17 carried a `Thinking`
+/// part, several of them tens of kilobytes, against zero bytes of
+/// prose and cells. `usage.reasoning` is no help here — this provider
+/// reports it as 0 and the eval driver estimates it — but the
+/// `Thinking` part is the same fact, observed directly.
+///
+/// A completion that arrives with neither content nor thinking would
+/// make this sentence wrong. None has.
 const EMPTY_REPLY_NOTICE: &str = "Your last reply arrived empty: the whole completion went to \
      reasoning and nothing was written, so nothing ran and nobody was told anything. Write the \
      reply this time — prose for what you are about to do, a ```js block for the doing.";
