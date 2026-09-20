@@ -269,6 +269,8 @@ pub struct Said {
     pub rows: Vec<Row>,
     /// `tools.*` calls, in dispatch order, as `(name, args)`.
     pub calls: Vec<(String, serde_json::Value)>,
+    /// The `Call::Invoke` behind each of `calls`, same order.
+    pub calls_issued: Vec<EventId>,
     /// Lines the program printed.
     pub printed: Vec<String>,
     /// What another agent said to this branch — a `Send` from
@@ -496,7 +498,7 @@ impl Conversation {
             .runner
             .deliver(&mut self.tree, from, origin)
             .expect("deliver");
-        self.settle(out);
+        self.settle_outputs(out);
         post
     }
 
@@ -525,7 +527,7 @@ impl Conversation {
                 .runner
                 .notebook_stream(&mut self.tree, self.epoch, chunk)
                 .expect("stream");
-            out.extend(self.settle(more));
+            out.extend(self.settle_outputs(more));
         }
         let end = self
             .runner
@@ -534,7 +536,7 @@ impl Conversation {
                 StepInput::LlmResponse(crate::host::scripted_program("")),
             )
             .expect("stream end");
-        self.settle(end);
+        self.settle_outputs(end);
         let said = self.project(before);
         self.check(&said, &chunks.concat());
         said
@@ -565,7 +567,7 @@ impl Conversation {
             .runner
             .notebook_stream(&mut self.tree, self.epoch, text)
             .expect("stream");
-        self.settle(out);
+        self.settle_outputs(out);
         if let Some((_, written)) = self.open_reply.as_mut() {
             written.push_str(text);
         }
@@ -625,7 +627,7 @@ impl Conversation {
                 }),
             )
             .expect("stream end");
-        self.settle(out);
+        self.settle_outputs(out);
         let said = self.project(before);
         // A truncated reply is one the log cannot put back together by
         // construction: the text stops mid-token and the half-cell is
@@ -679,10 +681,30 @@ impl Conversation {
                 )
                 .expect("reply")
         };
-        self.settle(out);
+        self.settle_outputs(out);
         let said = self.project(before);
         self.check(&said, markdown);
         said
+    }
+
+    /// Settle a call left outstanding by
+    /// [`never_answers`](Self::never_answers) — what the host does when
+    /// a slow tool finally comes back, which may be long after the
+    /// program that issued it has parked.
+    pub fn settle(&mut self, call: EventId, result: Result<serde_json::Value, &str>) -> Said {
+        let before = self.tree.id_counter;
+        let out = self
+            .runner
+            .step(
+                &mut self.tree,
+                StepInput::ToolResults(vec![ToolResult {
+                    call,
+                    result: result.map_err(str::to_owned),
+                }]),
+            )
+            .expect("settle");
+        self.settle_outputs(out);
+        self.project(before)
     }
 
     /// Answer an open `ask` — what a person, or another branch, would
@@ -705,7 +727,7 @@ impl Conversation {
                 }]),
             )
             .expect("answer");
-        self.settle(out);
+        self.settle_outputs(out);
         self.project(before)
     }
 
@@ -714,7 +736,7 @@ impl Conversation {
     pub fn resume(&mut self, value: serde_json::Value) -> Said {
         let before = self.tree.id_counter;
         let out = self.runner.resume(&mut self.tree, value).expect("resume");
-        self.settle(out);
+        self.settle_outputs(out);
         self.project(before)
     }
 
@@ -727,20 +749,16 @@ impl Conversation {
     /// what is rendered without touching what is stored. A test about
     /// that reads both sides, and this is the rendered one.
     ///
-    /// Panics if `id` is not a row of this branch, or if it does not
-    /// render as a self-contained value — both are the test being
+    /// Panics if `id` is not a row of this branch — the test being
     /// wrong about what it appended.
     pub fn row_shown(&self, id: EventId) -> String {
         let segment = self.runner.agent_segment(&self.tree);
         let compacted = self.tree.compacted_lookup(self.runner.spine.leaf_id);
-        let rows = crate::machine::menu_rows(&segment, 0, &compacted);
+        let rows = crate::machine::menu_rows(&segment, 0, &compacted, &segment);
         let found: Vec<&crate::report::Artifact> =
             rows.iter().filter(|a| a.id == id.as_u64()).collect();
         match found.as_slice() {
-            [a] => match &a.state {
-                crate::report::ArtifactState::Whole(t) => t.clone(),
-                other => panic!("#{} does not render whole: {other:?}", id.as_u64()),
-            },
+            [a] => crate::report::render_row(a),
             [] => panic!("#{} is not a row of this branch", id.as_u64()),
             many => panic!("#{} renders as {} rows, not one", id.as_u64(), many.len()),
         }
@@ -752,7 +770,7 @@ impl Conversation {
     pub fn rows_named(&self, id: EventId) -> usize {
         let segment = self.runner.agent_segment(&self.tree);
         let compacted = self.tree.compacted_lookup(self.runner.spine.leaf_id);
-        crate::machine::menu_rows(&segment, 0, &compacted)
+        crate::machine::menu_rows(&segment, 0, &compacted, &segment)
             .iter()
             .filter(|a| a.id == id.as_u64())
             .count()
@@ -836,7 +854,7 @@ impl Conversation {
     /// landed post produces, a `spawn` with the child's id. What it
     /// does *not* answer is an `ask`, because an answer is someone
     /// else's to give; those wait for [`Conversation::answer`].
-    fn settle(&mut self, out: Vec<StepOutput>) -> Vec<StepOutput> {
+    fn settle_outputs(&mut self, out: Vec<StepOutput>) -> Vec<StepOutput> {
         let mut seen = Vec::new();
         let mut queue = out;
         for _ in 0..MAX_ROUNDS {
@@ -974,6 +992,7 @@ fn fold(tree: &Tree, events: &[&Event], span: (u64, u64)) -> Said {
         asks: Vec::new(),
         rows: Vec::new(),
         calls: Vec::new(),
+        calls_issued: Vec::new(),
         printed: Vec::new(),
         heard: Vec::new(),
         notices: Vec::new(),
@@ -1045,7 +1064,8 @@ fn fold(tree: &Tree, events: &[&Event], span: (u64, u64)) -> Said {
                 }
             }
             EventPayload::Call(Call::Invoke { name, args, .. }) => {
-                s.calls.push((name.clone(), args.clone()))
+                s.calls.push((name.clone(), args.clone()));
+                s.calls_issued.push(e.id);
             }
             EventPayload::Note {
                 value,
@@ -1611,6 +1631,50 @@ mod tests {
             ["cell 0 ran", "cell 1 ran"],
             "the cell after it ran too"
         );
+    }
+
+    /// **A call that settles while the program is parked is reported
+    /// as settled.** Which rows a report lists is decided by the events
+    /// between one outcome and the next; what each row's *state* is
+    /// cannot be, because a call still in flight when the program parks
+    /// settles afterwards and its `Result` lands past that boundary.
+    ///
+    /// Reading state from the narrower slice told the model "issued;
+    /// may have happened" about a call the log recorded as `Failed` —
+    /// the opposite claim, and the one the card draws a line between: a
+    /// pending call is not re-attachable and whether it ran is
+    /// unknowable, a failed one definitively did not work.
+    ///
+    /// Seen live on 2026-09-20: a `bash` killed at its 30-second
+    /// ceiling while the program was suspended on an arriving message.
+    #[test]
+    fn a_call_that_settles_while_parked_is_not_reported_as_pending() {
+        let mut c = Conversation::new();
+        c.never_answers("scan");
+        c.allow(Invariant::CallsSettle);
+        c.user("go");
+        c.chunk("```js\nconst out = await tools.scan();\nfinish(out);\n```\n");
+        c.harness("stop what you are doing");
+        let r = c.end_reply();
+
+        let call = *r
+            .calls_issued
+            .first()
+            .unwrap_or_else(|| panic!("the scan was issued: {:?}", r.kinds));
+        assert!(
+            c.row_shown(call).contains("may have happened"),
+            "while it really is in flight: {}",
+            c.row_shown(call)
+        );
+
+        // It comes back failed, after the program has already parked.
+        c.settle(call, Err("command timed out after 30s and was killed"));
+        let shown = c.row_shown(call);
+        assert!(
+            !shown.contains("may have happened"),
+            "the log knows it failed: {shown}"
+        );
+        assert!(shown.contains("timed out"), "and says why: {shown}");
     }
 
     // ── the harness's own guarantees ────────────────────────────────

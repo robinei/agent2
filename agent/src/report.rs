@@ -611,6 +611,25 @@ fn render_rows(artifacts: &[&Artifact]) -> Option<String> {
 /// a branch's rows so far under one of its own, and the two must format
 /// a row identically or the same fact reads as two different kinds of
 /// thing depending on which report carried it.
+/// One row of the menu as the model reads it — the label, then what is
+/// known about how it turned out.
+///
+/// Split out of [`render_row_list`] so a test can ask what the model is
+/// told about a single row without rebuilding the heading around it;
+/// the two must not drift, so there is one of them.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn render_row(a: &Artifact) -> String {
+    const PREAMBLE: &str = "`history.fetch(id)` for any of them.\n";
+    let whole = render_row_list("", std::slice::from_ref(&a)).unwrap_or_default();
+    // Everything after the heading the list puts above it — a row can
+    // be several lines (a clipped one carries a footer saying how much
+    // is left), so this is not "the last line".
+    match whole.split_once(PREAMBLE) {
+        Some((_, rows)) => rows.trim_start_matches('\n').trim_end().to_owned(),
+        None => whole.trim().to_owned(),
+    }
+}
+
 fn render_row_list(heading: &str, artifacts: &[&Artifact]) -> Option<String> {
     if artifacts.is_empty() {
         return None;
@@ -1634,7 +1653,7 @@ fn menu_since(h: &Handback<'_>, since: u64) -> Vec<Artifact> {
     // The whole path, not the segment: a row is compacted *after* it is
     // logged, so the `Compacted` event that removes it routinely sits
     // past `outcome_at`.
-    crate::machine::menu_rows(&segment, since, &compacted_rows(&h.path))
+    crate::machine::menu_rows(&segment, since, &compacted_rows(&h.path), &h.path)
 }
 
 /// What a `Compacted` event did to each row it names: `None` removed it
@@ -1832,7 +1851,7 @@ pub fn render_fork(tree: &Tree, leaf: EventId, fork: EventId) -> String {
         .rposition(|e| matches!(e.payload, EventPayload::Agent { .. }))
         .unwrap_or(0);
     let segment: Vec<&Event> = path[start..fork_at].to_vec();
-    let artifacts = crate::machine::menu_rows(&segment, 0, &compacted_rows(&path));
+    let artifacts = crate::machine::menu_rows(&segment, 0, &compacted_rows(&path), &path);
     let menu: Vec<&Artifact> = artifacts.iter().collect();
     let head = format!(
         "program {program} is running on branch {branch}, not here. This fork inherited \
@@ -2879,7 +2898,7 @@ mod tests {
         let shadows = compacted_rows(&path);
         assert_eq!(shadows.len(), 2, "both kinds are carried: {shadows:?}");
 
-        let rows = crate::machine::menu_rows(&path, 0, &shadows);
+        let rows = crate::machine::menu_rows(&path, 0, &shadows, &path);
         let ids: Vec<u64> = rows.iter().map(|a| a.id).collect();
         assert!(!ids.contains(&5), "the removed row is gone: {ids:?}");
         assert!(ids.contains(&6), "a replaced row stays fetchable: {ids:?}");

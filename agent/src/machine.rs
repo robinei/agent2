@@ -4040,10 +4040,25 @@ pub(crate) fn settlement_of<'e>(segment: &[&'e Event], call: EventId) -> Option<
 ///
 /// Rows are named by the **call** id, which is what a program reuses:
 /// `fetch_history(id)` resolves a call id through to its `Result`.
+///
+/// **`settlements` is a wider slice than `segment`, and has to be.**
+/// Which rows are *in* this menu is decided by the segment — the
+/// events between one outcome and the next. What each row's state *is*
+/// cannot be: a call still in flight when the program parks settles
+/// afterwards, so its `Result` sits past the segment's end. Reading
+/// state from the segment reported it as `PendingInvoke` — "issued;
+/// may have happened" — when the log said `Failed`, which is the
+/// opposite claim and the one the card draws a line between. Seen live
+/// on 2026-09-20: a `bash` killed at its 30s ceiling while the program
+/// was suspended, reported to the model as possibly having happened.
+///
+/// The `Compacted` lookup one argument along is the same shape for the
+/// same reason, and was already right.
 pub(crate) fn menu_rows(
     segment: &[&Event],
     since: u64,
     compacted: &std::collections::HashMap<EventId, crate::tree::CompactedView>,
+    settlements: &[&Event],
 ) -> Vec<Artifact> {
     segment
         .iter()
@@ -4184,7 +4199,7 @@ pub(crate) fn menu_rows(
                 EventPayload::Call(call) => Some(Artifact {
                     id,
                     label: call_label(call),
-                    state: match settlement_of(segment, event.id) {
+                    state: match settlement_of(settlements, event.id) {
                         Some(Outcome::Delivered(v)) => ArtifactState::Delivered(v.clone()),
                         Some(Outcome::Failed(msg)) => ArtifactState::Failed(msg.clone()),
                         // Only one pending kind can be re-attached: an
@@ -5875,7 +5890,7 @@ mod tests {
         // The JSON head survives, so the row still says what kind of
         // thing `fetch` will return.
         assert!(
-            shown.starts_with("appended: \"x"),
+            shown.contains("appended: \"x"),
             "a string still looks like a string: {shown}"
         );
 
@@ -6015,7 +6030,11 @@ mod tests {
     fn a_short_appended_row_is_untouched_by_the_bound() {
         let mut c = Conversation::new();
         let r = c.reply("```js\nhistory.append({ dead: 3 });\n```\n");
-        assert_eq!(c.row_shown(r.row().id), r#"appended: {"dead":3}"#);
+        // What the model reads, verbatim: the row's id and its value.
+        assert_eq!(
+            c.row_shown(r.row().id),
+            format!("- `[{}]` appended: {{\"dead\":3}}", r.row().id.as_u64())
+        );
     }
 
     /// **And the row says which it will be.** A note is shown whole,
