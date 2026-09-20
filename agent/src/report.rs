@@ -1058,9 +1058,13 @@ fn copied_rows(h: &Handback<'_>) -> Vec<(u64, u64)> {
             _ => {}
         }
     }
-    // Everything a result on this branch has already delivered, by the
-    // *call* id — which is the id a row advertises and a program reuses.
-    let mut delivered: Vec<(u64, Vec<String>)> = Vec::new();
+    // Everything a result on this branch has already delivered, keyed
+    // by the bytes and valued by the *call* id — which is the id a row
+    // advertises and a program reuses. A map rather than a scan: this
+    // runs on every completed program, and comparing every note's
+    // strings against every result's is quadratic in a conversation's
+    // length for no reason.
+    let mut delivered: std::collections::HashMap<String, u64> = Default::default();
     for ev in h.path.iter() {
         if let EventPayload::Result {
             call,
@@ -1069,8 +1073,10 @@ fn copied_rows(h: &Handback<'_>) -> Vec<(u64, u64)> {
         {
             let mut found = Vec::new();
             strings(v, &mut found);
-            if !found.is_empty() {
-                delivered.push((call.as_u64(), found));
+            for s in found {
+                // The earliest delivery of these bytes is the id the
+                // program should have kept.
+                delivered.entry(s).or_insert(call.as_u64());
             }
         }
     }
@@ -1085,8 +1091,12 @@ fn copied_rows(h: &Handback<'_>) -> Vec<(u64, u64)> {
         // holds four results, and naming one of them understates what
         // it cost — seen on `sweep-8` at HEAD, where `[18]` carried
         // `[9]`, `[10]`, `[11]` and `[12]` and the report said `[10]`.
-        for (src, theirs) in &delivered {
-            if mine.iter().any(|m| theirs.contains(m)) {
+        let mut seen = Vec::new();
+        for m in &mine {
+            if let Some(src) = delivered.get(m)
+                && !seen.contains(src)
+            {
+                seen.push(*src);
                 out.push((ev.id.as_u64(), *src));
             }
         }
