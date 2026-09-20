@@ -105,9 +105,9 @@ declare namespace history {
   function fetch(id: number): unknown;
   /** Stop showing these entries — one id, or an inclusive range. For what you have finished with and will not need again: the listing you have already picked the four paths out of, the file you read one number from. Nothing is lost — `fetch` still answers for them — and the conversation stops carrying them. */
   function remove(from: number, to?: number): void;
-  /** Show `text` in place of that entry — for when the entry is worth something in one line but not in eighty. Spend the words on what you concluded, not on saying something was removed.
+  /** Set what that entry shows. Two things want this, and they are the same operation: an entry worth something in one line but not in eighty — spend the words on what you concluded, not on saying something was removed — and a long row you are reading a window at a time, where the next window takes the place of the last instead of piling up beside it.
 
-  An entry already showing as `[id] … text` is standing in for something longer. Replacing that one summarises a summary, and the detail that made it useful is what goes. `fetch` the original and write from that instead. */
+  Either way the row is a view and the log is not. `fetch(id)` still hands back what was appended, so write the replacement from *that*, never from the text the row happens to be showing now: a summary of a summary loses the detail that made it worth keeping, and a window cut from a window cannot reach the rest. */
   function replace(id: number, text: string): void;
 }
 
