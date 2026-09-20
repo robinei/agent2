@@ -402,7 +402,7 @@ pub fn parse_errors_def() -> ToolDef {
     }
 }
 
-fn run_parse_errors(source: &str, lang: &str) -> Result<Value, String> {
+pub(crate) fn run_parse_errors(source: &str, lang: &str) -> Result<Value, String> {
     let mut parser = Parser::new();
     parser
         .set_language(&language_for(lang)?)

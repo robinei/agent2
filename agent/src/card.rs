@@ -282,6 +282,37 @@ fn every_worked_example_compiles() {
     }
 }
 
+/// **The card's TypeScript parses.**
+///
+/// The declaration block is the largest single thing the model reads —
+/// half the card — and nothing has ever checked that it is valid
+/// TypeScript. A stray brace in it would reach every prompt as text
+/// that looks authoritative and parses as nothing, and the reader most
+/// likely to be confused by it is the one that treats declarations as
+/// the contract.
+///
+/// The harness already carries a TypeScript parser for `parse_errors`,
+/// so this costs one call.
+#[test]
+fn the_cards_declarations_are_valid_typescript() {
+    let card = &active().text;
+    let mut blocks = 0;
+    for rest in card.split("```ts").skip(1) {
+        let Some((code, _)) = rest.split_once("```") else {
+            continue;
+        };
+        blocks += 1;
+        let out = crate::host::structural::run_parse_errors(code, "typescript")
+            .expect("the parser runs");
+        assert_eq!(
+            out["ok"], true,
+            "the card's TypeScript does not parse: {}",
+            out["errors"]
+        );
+    }
+    assert!(blocks >= 1, "the card should carry a ```ts block");
+}
+
 /// Every shipped tool's description fits inside the clip above.
 ///
 /// The doc there says they all "fit comfortably", and `bash` did not:

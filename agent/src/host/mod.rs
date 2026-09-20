@@ -36,7 +36,7 @@ mod demo;
 mod llm;
 mod protocol;
 mod registry;
-mod structural;
+pub(crate) mod structural;
 pub(crate) mod tools;
 
 pub use deepseek::*;
