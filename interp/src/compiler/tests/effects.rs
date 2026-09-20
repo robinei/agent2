@@ -274,6 +274,9 @@ fn settle_at_dispatch_verbs_yield_settle_with_or_without_await() {
     // must keep working, while a model that leaves it off must get the
     // value and not a promise. `Await` passing a non-promise straight
     // through is what makes the two identical.
+    //
+    // `done` used to be on this list. It is not answered into anything
+    // now — it halts, so there is no frame left to answer into.
     for (call, expected_name, expected_args) in [
         (
             "spawn(\"reviewer\")",
@@ -282,7 +285,6 @@ fn settle_at_dispatch_verbs_yield_settle_with_or_without_await() {
         ),
         ("fork()", "fork", vec![]),
         ("list_agents()", "list_agents", vec![]),
-        ("done()", "done", vec![]),
         ("fetch_history(7)", "fetch_history", vec![Value::PosInt(7)]),
         (
             "append_history(1)",
@@ -459,12 +461,25 @@ fn abandon_takes_no_arguments() {
 }
 
 #[test]
-fn done_takes_no_arguments() {
-    // Same fixed-arity shape as `abandon` above: `done()` is the only
-    // thing that stops the loop (`agent/src/machine.rs`'s `TOOL_DONE`),
-    // and no argument would mean anything here.
-    let errs = crate::testutil::compile_errs("done(1);");
-    assert!(!errs.is_empty(), "should be a compile error");
+fn the_endings_each_take_exactly_one_argument() {
+    // **The pairing is the arity.** `done(text)` and `stop(reason)` both
+    // halt, and both are the last thing anyone hears from this reply —
+    // so neither may be silent. Requiring the argument is what makes
+    // "whatever finishes, speaks" a property of the language rather
+    // than a habit the card has to keep teaching: a bare `done()` is
+    // the accident that used to end a run without a word to anybody.
+    for verb in ["done", "stop"] {
+        assert!(
+            !crate::testutil::compile_errs(&format!("{verb}();")).is_empty(),
+            "{verb}() should not compile — it has nothing to say"
+        );
+        assert!(
+            !crate::testutil::compile_errs(&format!("{verb}(\"a\", \"b\");")).is_empty(),
+            "{verb}(a, b) should not compile"
+        );
+        compile(&format!("{verb}(\"the one thing it says\");"))
+            .unwrap_or_else(|e| panic!("{verb}(text) should compile: {e:?}"));
+    }
 }
 
 #[test]
@@ -757,16 +772,25 @@ fn every_harness_verb_lowers_to_a_host_call() {
     for verb in crate::HARNESS_VERBS {
         // Enough arguments for the arity-checked ones; the rest ignore
         // the extras, and none of this runs past the first call.
-        let src = if *verb == "done" || *verb == "fork" {
-            format!("{verb}();")
-        } else {
-            format!("{verb}(1, 2, 3);")
+        let src = match *verb {
+            "done" | "stop" => format!("{verb}(\"x\");"),
+            "fork" => format!("{verb}();"),
+            _ => format!("{verb}(1, 2, 3);"),
         };
         let prog = compile(&src).unwrap_or_else(|e| panic!("{verb} failed to compile: {e:?}"));
-        let emitted = prog.code.iter().any(|i| {
-            matches!(i, Instr::Invoke(n, _) | Instr::Notify(n, _) | Instr::Settle(n, _)
-                if n.as_str() == *verb)
-        });
+        // **Two of them are not host calls, and the difference is the
+        // point.** `done` and `stop` halt the VM where they stand, so
+        // they lower to their own instructions rather than to something
+        // the host answers: there is no answer, and nothing after them
+        // to give one to. Everything else is a call.
+        let emitted = match *verb {
+            "done" => prog.code.iter().any(|i| matches!(i, Instr::Done)),
+            "stop" => prog.code.iter().any(|i| matches!(i, Instr::Stop)),
+            _ => prog.code.iter().any(|i| {
+                matches!(i, Instr::Invoke(n, _) | Instr::Notify(n, _) | Instr::Settle(n, _)
+                    if n.as_str() == *verb)
+            }),
+        };
         assert!(emitted, "`{verb}` does not lower to a host call");
     }
 }

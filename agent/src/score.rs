@@ -424,7 +424,7 @@ mod tests {
             ),
             (
                 5_030,
-                r#"{"Part":{"reply":3,"part":{"Cell":"```js\ndone();\n```\n"}}}"#,
+                r#"{"Part":{"reply":3,"part":{"Cell":"```js\ndone(\"ok\");\n```\n"}}}"#,
             ),
             (
                 5_040,

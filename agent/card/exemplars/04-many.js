@@ -1,4 +1,4 @@
-Every call site at once rather than one per reply: enumerate, then read in parallel.
+All the call sites at once, not one per reply: enumerate, then read in parallel.
 
 ```js
 const hits = (await tools.bash("grep -rl OLD .")).stdout.split("\n").filter(Boolean);
@@ -14,6 +14,6 @@ for (let i = 0; i < hits.length; i++) {
   console.log(`${hits[i]} ${e.count}\n${w.diff}`);
 }
 const c = await tools.bash("CHECK 2>&1");
-tell(c.status === 0 ? `${hits.length} files, CHECK passes.` : `CHECK fails:\n${c.stdout}`);
-done();
+if (c.status !== 0) stop(`${hits.length} changed, but CHECK fails:\n${c.stdout}`);
+done(`${hits.length} changed, CHECK passes.`);
 ```

@@ -640,7 +640,7 @@ fn a_top_level_return_is_allowed_unless_the_caller_rejects_it() {
 fn a_rejected_top_level_return_carries_the_callers_message() {
     let unit = Unit::new(&["let a = 1;", "return { a };"]);
     let mut repl = Repl::new(serde_json::Value::Null, serde_json::Value::Null).unwrap();
-    repl.reject_top_level_return("use `history.append` and `done()` instead");
+    repl.reject_top_level_return("use `history.append` and `done(text)` instead");
     repl.push(&unit.buffer(0)).unwrap();
     repl.vm.step(u64::MAX).unwrap();
     let errs = repl
@@ -650,7 +650,7 @@ fn a_rejected_top_level_return_carries_the_callers_message() {
     assert!(
         rendered
             .iter()
-            .any(|e| e.contains("use `history.append` and `done()` instead")),
+            .any(|e| e.contains("use `history.append` and `done(text)` instead")),
         "{rendered:?}"
     );
 }
@@ -665,7 +665,7 @@ fn a_return_inside_a_function_in_a_fragment_is_left_alone() {
         "console.log(pick([1, 2, 3]), arrow(1));",
     ]);
     let mut repl = Repl::new(serde_json::Value::Null, serde_json::Value::Null).unwrap();
-    repl.reject_top_level_return("use `history.append` and `done()` instead");
+    repl.reject_top_level_return("use `history.append` and `done(text)` instead");
     for i in 0..unit.len() {
         repl.push(&unit.buffer(i)).expect("a function may return");
         repl.vm.step(u64::MAX).unwrap();

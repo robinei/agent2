@@ -7,4 +7,4 @@ if (pick === "leave it") {
   await tools.replace_file("PATH", Edit.replaceOnce(f.content, "OLD", pick), f.version);
   tell(`PATH says ${pick} now.`);
 }
-done();
+done("done.");

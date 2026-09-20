@@ -450,17 +450,17 @@ fn prose_between(reply: &str, start: usize, end: usize) -> Option<String> {
 /// **The rule lives in `interp`; this sentence lives here** (D16). `interp`
 /// carries a flag — the inverse of `oxc`'s `allow_return_outside_function` —
 /// and `Repl::reject_top_level_return` takes the message from whoever set it,
-/// because `history.append` and `done()` are this harness's vocabulary and not
+/// because `history.append` and `done(text)` are this harness's vocabulary and not
 /// the language's.
 ///
 /// **The diagnostic matters more than the rule**, because ending a program
 /// with `return {…}` is the *trained* habit — exemplar 02 teaches it — so this
 /// has to say what to write instead rather than merely that it is disallowed.
 /// Under this transport `return` did two things and something else already
-/// does each: falling off the last cell ends the run, `done()` rests the
+/// does each: falling off the last cell ends the run, `done(text)` rests the
 /// branch, and `history.append` is what leaves a row the next turn reads.
 pub const NO_TOP_LEVEL_RETURN: &str = "a cell cannot `return`: use `history.append(...)` to leave a row the next \
-     turn reads, and `done()` to rest once the work is finished";
+     turn reads, and `done(text)` to rest once the work is finished";
 
 /// One executable cell, as a byte range into the markdown it came from.
 ///
@@ -955,7 +955,7 @@ mod tests {
     /// a markdown sample is quoted.
     #[test]
     fn a_four_backtick_markdown_fence_hides_its_inner_cell() {
-        let md = "````markdown\n```js\ndone();\n```\n````\n";
+        let md = "````markdown\n```js\ndone(\"ok\");\n```\n````\n";
         assert!(split_cells(md).is_empty());
     }
 
@@ -1043,8 +1043,8 @@ three\n";
     /// newline still closes.
     #[test]
     fn a_closing_fence_at_eof_without_a_newline_closes() {
-        let md = "```js\ndone();\n```";
-        assert_eq!(cells_of(md), vec!["done();\n"]);
+        let md = "```js\ndone(\"ok\");\n```";
+        assert_eq!(cells_of(md), vec!["done(\"ok\");\n"]);
     }
 
     // --- the streaming splitter (D11, D15) ---
@@ -1067,7 +1067,7 @@ three\n";
         let reply = "Both files claim to own the retry policy.\n\n\
                      ```js\nconst a = 1;\n```\n\n\
                      `retry.rs` is the newer of the two.\n\n\
-                     ```js\ndone();\n```\n";
+                     ```js\ndone(\"ok\");\n```\n";
         let mut stream = Stream::new();
         let pieces = stream.finish(reply);
         assert_eq!(
@@ -1110,7 +1110,7 @@ three\n";
     /// model may still be mid-sentence, or about to open another fence.
     #[test]
     fn trailing_prose_waits_for_the_end_of_the_reply() {
-        let reply = "```js\ndone();\n```\n\nThat is everything.\n";
+        let reply = "```js\ndone(\"ok\");\n```\n\nThat is everything.\n";
         let mut stream = Stream::new();
         assert_eq!(stream.advance(reply), vec![Piece::Cell(0)]);
         assert_eq!(
@@ -1288,7 +1288,7 @@ three\n";
             "the message must name what leaves a row for the next turn"
         );
         assert!(
-            NO_TOP_LEVEL_RETURN.contains("done()"),
+            NO_TOP_LEVEL_RETURN.contains("done("),
             "the message must name what rests the branch"
         );
         assert!(

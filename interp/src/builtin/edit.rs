@@ -116,7 +116,7 @@ fn ambiguous(n: usize, needle: &str, lines: &[usize]) -> String {
 /// and its body was no longer indented relative to it —
 /// `IndentationError: expected an indented block after function
 /// definition on line 7`. The run read the failure, told the person
-/// the suite was broken, and called `done()`.
+/// the suite was broken, and called `done(text)`.
 fn doubles_indentation(text: &str, start: usize, old: &str, new: &str) -> Option<String> {
     let line_start = text[..start].rfind('\n').map(|i| i + 1).unwrap_or(0);
     let pre = &text[line_start..start];

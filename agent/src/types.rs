@@ -467,6 +467,18 @@ pub enum Handback {
     Posted {
         ids: Vec<EventId>,
     },
+    /// The program stopped itself with `stop("reason")` — it found out
+    /// it could not finish correctly and said so.
+    ///
+    /// **Not a fault.** A `Trapped` is something going wrong that the
+    /// program did not foresee; this is the program foreseeing it. They
+    /// render differently for that reason, and the reply is paused
+    /// rather than over: the reason goes in front of the next one,
+    /// which carries on with every row and every printed line still in
+    /// hand.
+    Stopped {
+        reason: String,
+    },
     /// A cell that would not compile. The reply is paused, not over: the
     /// next one repairs it and the run carries on in the same frame.
     CellFailed {

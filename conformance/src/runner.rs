@@ -403,6 +403,20 @@ fn run_work_item(item: WorkItem) -> TestResult {
     };
 
     match vm.step(STEP_FUEL) {
+        // `stop("…")` is a harness verb; test262 never calls it, and a
+        // conformance case that somehow did has not run to completion.
+        Ok(StepResult::Finished { text, .. }) => TestResult {
+            path: item.path.clone(),
+            outcome: TestOutcome::Fail,
+            detail: format!("the program called done(): {text}"),
+            features: item.features.clone(),
+        },
+        Ok(StepResult::Stopped { reason, .. }) => TestResult {
+            path: item.path,
+            outcome: TestOutcome::Fail,
+            detail: format!("the program stopped itself: {reason}"),
+            features: item.features,
+        },
         Ok(StepResult::Done { .. }) => {
             if item.negative.is_some() {
                 return TestResult {

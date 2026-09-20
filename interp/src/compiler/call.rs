@@ -600,6 +600,39 @@ impl super::Compiler {
                 // After ToNum: coerce to Number.isFinite.
                 self.emit(Instr::CallBuiltin(Builtin::NumberIsFinite, 1), span);
             }
+            // **`stop` is an effect, like `raise` and unlike `done`.**
+            // `done` only sets a flag — the blocks after it still run —
+            // which is the right shape for "the task is over" and the
+            // wrong one for "this cannot finish". So `stop` halts, and
+            // nothing it leaves behind can be caught.
+            "done" => {
+                if argv.len() != 1 {
+                    return self.error(
+                        span,
+                        "`done(text)` takes the answer you are finishing with — what you \
+                         concluded, in a sentence, which is what the person reads. If the \
+                         work cannot finish, `stop(reason)` instead.",
+                    );
+                }
+                self.compile_args(argv);
+                self.emit(Instr::Done, span);
+                self.emit(Instr::PushUndefined, span);
+            }
+            "stop" => {
+                if argv.len() != 1 {
+                    return self.error(
+                        span,
+                        "`stop(reason)` takes the reason you cannot finish — one string, \
+                         which the next reply reads. To end the task instead, `done(text)`.",
+                    );
+                }
+                self.compile_args(argv);
+                self.emit(Instr::Stop, span);
+                // Nothing comes back, but the statement position expects
+                // a value to pop; pushing one keeps the stack discipline
+                // the rest of the compiler relies on.
+                self.emit(Instr::PushUndefined, span);
+            }
             "raise" => {
                 // `raise("name")` → `Raise(name, 0)`, no payload.
                 // `raise("name", expr)` → `Raise(name, 1)`, payload = expr.
@@ -646,7 +679,7 @@ impl super::Compiler {
                 self.compile_args(argv);
                 self.emit(Instr::Notify(name.into(), argv.len() as u32), span);
             }
-            "spawn" | "fork" | "list_agents" | "done" | "fetch_history" | "answer"
+            "spawn" | "fork" | "list_agents" | "fetch_history" | "answer"
             | "append_history" | "remove_history" | "replace_history" | "slice_history" => {
                 // **The settle-at-dispatch verbs.** None of these leaves
                 // the frame that called it: the host answers each from
@@ -694,8 +727,18 @@ impl super::Compiler {
                 // here. Nothing else would mean anything, so a wrong
                 // count is a clear mistake worth a compile error rather
                 // than silently ignored args (same shape as `abandon`).
-                if name == "done" && !argv.is_empty() {
-                    self.error(span, "`done` takes no arguments");
+                // **`done` carries the last word.** Ending without one
+                // was writable, and 20 of 283 runs that finished did it
+                // — the person got nothing. The card already said the
+                // reply that finishes owes them the answer; this is
+                // that sentence as a signature.
+                if name == "done" && argv.len() != 1 {
+                    self.error(
+                        span,
+                        "`done(text)` takes the answer you are finishing with — what you \
+                         concluded, in a sentence, which is what the person reads. If the \
+                         work cannot finish, `stop(reason)` instead.",
+                    );
                     return;
                 }
                 // `ask` is deliberately NOT in this set: it is the one

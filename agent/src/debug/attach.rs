@@ -2589,6 +2589,7 @@ fn condition_line(cause: &crate::types::Handback) -> String {
     match cause {
         crate::types::Handback::Raised { name, .. } => format!("raised `{name}`"),
         crate::types::Handback::Trapped { message, .. } => message.clone(),
+        crate::types::Handback::Stopped { reason } => format!("stopped: {reason}"),
         crate::types::Handback::Posted { .. } => "a message arrived".to_owned(),
         crate::types::Handback::CellFailed { .. } => "compile error".to_owned(),
         crate::types::Handback::Completed => "completed".to_owned(),

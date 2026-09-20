@@ -769,6 +769,33 @@ pub enum StepResult {
     /// host with nothing new to hand over — rather than re-issuing the
     /// call.
     Settle { call: SettleCall },
+    /// The program stopped itself: `stop("reason")`. The VM halts where
+    /// it stands and nothing after it runs.
+    ///
+    /// **An effect, not an exception.** A `throw` unwinds, which means
+    /// a `try` the program wrote for something else can swallow the one
+    /// decision it most needs to survive. This never enters that path,
+    /// so it cannot be caught, and the host learns the stop was
+    /// deliberate structurally rather than by inspecting an error kind.
+    ///
+    /// Unlike `Raise` there is nothing to answer: the reply ends, the
+    /// reason goes in front of the next one, and the work carries on.
+    Stopped {
+        reason: String,
+        /// The drained outbox, exactly as `Done` carries it: calls this
+        /// program issued and never awaited. They were issued *before*
+        /// the stop, so they still go out — "nothing after it runs" is
+        /// about what is left to execute, not about undoing what was.
+        unstarted: Vec<InvokeCall>,
+    },
+    /// `done("text")`: the task is finished and `text` is the answer.
+    /// The VM halts, exactly as `Stopped` does; the difference is what
+    /// the host does next — rest the branch rather than continue it.
+    Finished {
+        text: String,
+        /// The drained outbox — see [`StepResult::Stopped::unstarted`].
+        unstarted: Vec<InvokeCall>,
+    },
     /// A condition was raised; host (LLM) decides how to proceed.
     /// The payload (if any) is the value passed to `raise("name", expr)`.
     /// ip has already advanced past the Raise instruction; the host may

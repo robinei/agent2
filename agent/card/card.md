@@ -122,19 +122,23 @@ declare namespace history {
 /** Suspend for a judgement and carry on from this expression with the answer, every variable still alive. The blocks after this one do not run until it is answered. */
 declare function raise(name: string, payload?: unknown): unknown;
 
-/** The whole task is finished — not this block, and not this reply.
+/** The whole task is finished, and `text` is the answer the person reads — what you concluded, in a sentence. The two used to be separate and nearly always written together; this is that pair.
 
-  It stops nothing. The blocks after it still run, exactly as the statements after it do. It is a decision, recorded now and read when the reply ends, that the branch should rest rather than write another. A branch you mean to *skip* is guarded with `else`, not with `done()`:
+  It ends the task, not the program. The blocks after it still run, exactly as the statements after it do — it is a decision, recorded now and read when the reply ends, that the branch should rest rather than write another. To stop *here*, that is `stop`.
 
-    if (bail) { tell("left it alone"); done(); }
-    await tools.replace_file(…);          // runs anyway — this is the bug
-
-  Nothing is written after the reply ends, so anything still undone stays undone — and a check you ran and watched fail is something undone. Reporting a failure is not finishing: say what is wrong, then keep going and fix it.
-
-  A check you never watched is no better. The report carrying this block's console is the one that is never sent, so `console.log` in the block that ends the task prints into nothing, and a verification written that way has told you as little as not running it. Make it `throw` when the answer is wrong — that is what reaches you — and put what you actually established in the `tell`.
+  Nothing is written after the reply ends, so anything still undone stays undone — and a check you ran and watched fail is something undone. **Finishing on a failure is the one thing this is not for.** Say what is wrong with `stop` and the next reply fixes it; say it with `done` and nobody ever does.
 
   Stopping short is allowed; stopping short quietly is not. The task turns out to be the wrong thing to attempt, or you asked and were told to leave it — say plainly what you did not do and why, so nobody has to find out later. If what you need is a decision rather than an ending, `ask` first; this is for after the answer. */
-declare function done(): void;
+declare function done(text: string): void;
+
+/** This reply cannot finish correctly, and `reason` says why.
+
+  **It stops where it stands.** Nothing after it runs — not the rest of the block, not the blocks below, not the prose between them — because a program that has just found out it is wrong should not go on to write the file it was about to write. That is the difference from `done`, which decides how the branch ends and stops nothing.
+
+  The reason reaches *you*, at the top of the next reply, with every row this program added and everything it printed still in hand. So write what your next reply could act on: the count that disagreed, the command that failed and its output. It is not a report to a person — if a person has to decide, that is `ask` — and it is not a way to give up, because the work carries straight on.
+
+  Use it the moment a check comes back wrong, rather than describing the wrong answer and finishing. */
+declare function stop(reason: string): void;
 
 /** Continue the suspended reply, `value` becoming the result of its `raise(...)`. Appending it is the decision; calling it is not. */
 declare function resume(value: unknown): Decision;
