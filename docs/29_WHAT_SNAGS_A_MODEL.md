@@ -504,6 +504,14 @@ written from two live incidents and generalised from exactly those
 two. The third incident was the same mistake with one detail changed.
 A guard written from examples covers the examples.
 
+**Untested in the wild, and the arm that should have tested it did
+not.** Four fresh `skipped-tests` runs at the fixed HEAD came back 4/4
+at two programs each — and not one of them hit the new refusal. They
+all wrote `applyEdits` with the indentation included, which is the
+correct form. So the 4/4 is the task going well, not the guard
+catching anything: its unit tests prove it fires on the exact input
+that broke a file, and no live run has yet asked it to.
+
 ## Rows that said the same thing whichever way it went
 
 The narrow-channel shape has a mirror image, and it took a second pass
