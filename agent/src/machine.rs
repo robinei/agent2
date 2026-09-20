@@ -731,6 +731,17 @@ pub struct Runner {
     /// single moment that fact becomes true; `finish_program`'s own
     /// comment is where the polarity this exists to flip is explained.
     finished: bool,
+    /// Whether a reply that ran nothing and answered nobody wakes the
+    /// branch — the third branch of [`stopped_short`](Self::stopped_short),
+    /// which is where the measurement behind this lives.
+    ///
+    /// **A field, not an `env::var` at the point of use.** The same
+    /// mistake was made once with the transport and undone for the
+    /// reason stated there: a process-global read cannot be set two
+    /// ways at once, so the tests for on and off could not run beside
+    /// each other. Read from `AGENT2_STOPPED_SHORT_NOTICE` when the
+    /// runner is built, and settable directly in a test.
+    nudge_when_nothing_ran: bool,
     /// Runs suspended **beneath** the one currently in `phase`, each
     /// frozen exactly where it stopped, oldest first popped last (a
     /// stack) — see `Phase::Suspended`'s own doc for why this, and not
@@ -859,6 +870,11 @@ impl Runner {
             compaction_requested: false,
             pending_edits: Vec::new(),
             finished: false,
+            // Off unless asked for: of the thirteen times this fired
+            // across 382 kept runs, twelve woke a branch whose next
+            // reply was `done();`. See `stopped_short`.
+            nudge_when_nothing_ran: std::env::var("AGENT2_STOPPED_SHORT_NOTICE")
+                .is_ok_and(|v| v != "0"),
             spine,
             agent,
             branch,
@@ -1134,6 +1150,34 @@ impl Runner {
         }
         if foreign_tool_call(&last.text) {
             return Some(FOREIGN_TOOL_CALL_NOTICE.to_owned());
+        }
+        // **Off by default, and the code stays.** Of the thirteen times
+        // this last branch fired across 382 kept runs, twelve woke a
+        // branch whose next reply was, verbatim, `done();` — a model
+        // that had finished the work and had not said so in the one
+        // syntax that rests a branch. One round trip each, and those
+        // runs would have rested with the task complete and passed
+        // anyway. The thirteenth was a genuine rescue
+        // (`head3/sweep-40-020719`: the woken reply went on to
+        // `read_file → parse_errors → replace_file → bash`).
+        //
+        // So the branch is right about what it does and wrong about
+        // what it is for. What it mostly catches is a gap in the
+        // *ending vocabulary* — every exemplar that finishes does so
+        // after doing work, and none finishes after simply concluding —
+        // and prodding is the wrong place to fix that.
+        //
+        // `AGENT2_STOPPED_SHORT_NOTICE=1` brings it back, because one
+        // rescue in thirteen is not nothing and this is a number to
+        // re-measure rather than a question to settle by comment. The
+        // two branches above are untouched: an empty completion
+        // (2026-09-19: the whole completion went to reasoning, the
+        // branch rested, the harness exited 0 with the task untouched)
+        // and a tool call in a foreign syntax (4 runs in 4 on
+        // qwen3.8-flash, one carrying the task's whole answer) are real
+        // strandings, and both were measured as such.
+        if !self.nudge_when_nothing_ran {
+            return None;
         }
         (!last.answering).then(|| STOPPED_SHORT_NOTICE.to_owned())
     }
@@ -7454,12 +7498,55 @@ mod tests {
         assert!(state.is_idle());
     }
 
-    /// **A continuation that ran nothing did stop short.** Nobody asked
+    /// **A continuation that ran nothing did stop short** — nobody asked
     /// it anything; it was carrying on its own work and ended without a
-    /// `finish(text)`.
+    /// `finish(text)`. Off by default now, so the branch has to be asked
+    /// for it.
+    ///
+    /// Kept because the measurement that turned it off is a *ratio*,
+    /// not a refutation: one rescue in thirteen. If that ratio is ever
+    /// worth having back, this is the test that says it still works.
+    /// **And by default it is not asked again.** Twelve of the thirteen
+    /// times this notice fired across 382 kept runs, the reply it woke
+    /// was `done();` — a model that had finished the work and had not
+    /// said so in the syntax that rests a branch. Those runs would have
+    /// rested with the task complete and passed anyway, so the prod
+    /// bought a round trip and changed nothing.
+    ///
+    /// The other two branches of `stopped_short` are untouched and have
+    /// their own measurements: an empty completion, and a tool call in
+    /// a syntax this harness does not read.
+    #[test]
+    fn a_continuation_that_ran_nothing_rests_by_default() {
+        let (mut tree, mut state) = setup_under();
+        user_post(&mut state, &mut tree, "go");
+        let out = state
+            .step(&mut tree, StepInput::LlmResponse(llm_program("let a = 1;")))
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::LlmResponse(crate::host::scripted_markdown(
+                    "That is the lay of the land.\n",
+                )),
+            )
+            .unwrap();
+        let settled = drain(&mut state, &mut tree, out);
+        assert!(
+            !settled
+                .iter()
+                .any(|o| matches!(o, StepOutput::LlmRequest(_))),
+            "the branch rests: {settled:?}"
+        );
+        assert!(!state.needs_prompt(&tree));
+    }
+
     #[test]
     fn a_continuation_that_ran_nothing_is_asked_again() {
         let (mut tree, mut state) = setup_under();
+        state.nudge_when_nothing_ran = true;
         user_post(&mut state, &mut tree, "go");
         let out = state
             .step(&mut tree, StepInput::LlmResponse(llm_program("let a = 1;")))
