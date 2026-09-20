@@ -11,18 +11,24 @@ The whole suite, `deepseek-v4-flash`, `--repeat 3` both sides — the
 same shape as the 2026-09-19 baseline. Each arm from a worktree pinned
 to one commit, so no run straddles a build.
 
-| | baseline | after |
+| | baseline (18 runs) | HEAD (63 runs) |
 |---|---|---|
-| passed | 17/18 (94%) | 20/21 (95%), **38/42 (90%) pooled** |
-| prompt bytes | 1,052 KB | **640 KB (−39%)** |
-| programs per run | 4.8 | **3.3 (−31%)** |
+| passed | 17/18 (94%) | 56/63 (89%) |
+| prompt bytes | 1,052 KB | **684 KB (−35%)** |
+| programs per run | 4.8 | **3.3 (−30%)** |
 
-Two suites were run at HEAD. Pooled they are 38/42 against 17/18, which
-at these sizes says the pass rate did not move; the cost did, by about
-two fifths. All four failures are task judgement — a test un-skipped
-that still fails, dead helpers left behind, a helper removed that was
-still reached through `getattr`, and one run that took four programs to
-ask its question. None is a harness fault.
+**The cost numbers are solid and the pass rate is not yet settled.**
+Three suites were run at HEAD, and 89% against a baseline measured once
+over 18 runs is a difference those 18 runs cannot resolve — the
+baseline's own interval is about 73–99%. A matching 21-run arm at the
+baseline commit is running to close that, and until it lands the honest
+claim is "cost down by a third, pass rate unresolved", not "pass rate
+held".
+
+The seven failures are task judgement: tests un-skipped that still
+fail, dead helpers left behind, a helper removed that was still reached
+through `getattr`, and one run that took four programs to ask its
+question. None is a harness fault.
 
 Per task: `sweep-200` 11 → 5 programs and 395 → 146 KB, `sweep-8` 4 → 2
 and 107 → 53 KB, `skipped-tests` 5.5 → 3 and 146 → 82 KB,
