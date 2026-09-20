@@ -849,6 +849,19 @@ impl EventId {
         Self(NonZeroU64::try_from(value).expect("expected non-zero EventId!"))
     }
 
+    /// The same, for a number that came from a program rather than from
+    /// the log — `None` where [`EventId::new`] would panic.
+    ///
+    /// Ids reach us as whatever the model's arithmetic produced, and 0
+    /// is both easy to produce and impossible as an id. Every id-taking
+    /// entry point filters `> 0` before converting; one did not, and
+    /// `history.fetch(0)` killed the agent mid-task in 2 of 294 kept
+    /// runs. A constructor that cannot panic is a better guard than
+    /// remembering the filter.
+    pub fn checked(value: u64) -> Option<Self> {
+        NonZeroU64::new(value).map(Self)
+    }
+
     pub fn as_u64(self) -> u64 {
         let EventId(val) = self;
         val.get()

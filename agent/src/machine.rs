@@ -2469,7 +2469,17 @@ impl Runner {
         let Some(Value::PosInt(id)) = args.first() else {
             return None;
         };
-        let id = EventId::new(*id);
+        // **Zero is a number the model can write, and an id it cannot
+        // have.** `EventId` is a `NonZeroU64`, so building one from a
+        // program's own argument panics — and this was the one place
+        // in the live path that built one without the `> 0` filter
+        // every other site has. `history.fetch(0)` — or any expression
+        // that arrived at 0, which is how it actually happened — took
+        // the whole agent down with `expected non-zero EventId!`,
+        // twice in 294 kept runs. Declining to re-attach hands the
+        // call to the ordinary fetch path below, which already answers
+        // a bad id with a message instead of a corpse.
+        let id = EventId::checked(*id)?;
         // Scoped to this branch's own path, like every other fetch.
         let segment = self.agent_segment(tree);
         if !segment.iter().any(|e| e.id == id) {
@@ -5922,6 +5932,41 @@ mod tests {
         // A reply comes back as the markdown the model wrote — fences
         // and all, because that is the row (28).
         assert_eq!(returned[1], json!(format!("```js\n{src}\n```\n")));
+    }
+
+    /// **Zero is a number a program can arrive at, and never an id.**
+    ///
+    /// `EventId` is a `NonZeroU64`. Every id-taking entry point filters
+    /// `> 0` before converting — except the re-attach check, which ran
+    /// first and built one straight from the argument, so
+    /// `history.fetch(0)` panicked the agent out of the run: `expected
+    /// non-zero EventId!`, `exit=101`, twice in 294 kept runs. It must
+    /// come back as an answer the program can read.
+    #[test]
+    fn fetching_row_zero_is_an_error_not_a_crash() {
+        let (mut tree, mut state) = setup();
+        state.kickoff(&mut tree).unwrap();
+        let src = "try { await fetch_history(0); history.append(\"no throw\"); } \
+                   catch (e) { history.append(String(e.message || e)); }";
+        let out = state
+            .step(&mut tree, StepInput::LlmResponse(llm_program(src)))
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+        let said = tree
+            .path_events(state.spine.leaf_id)
+            .iter()
+            .rev()
+            .find_map(|e| match &e.payload {
+                EventPayload::Note { value, .. } => Some(value.clone()),
+                _ => None,
+            })
+            .expect("the program got to say something");
+        let said = said.as_str().unwrap_or_default().to_owned();
+        assert!(
+            said.contains("#0"),
+            "the id it asked for is named back to it: {said}"
+        );
+        assert!(said != "no throw", "and it is an error, not a silent pass");
     }
 
     /// **A call whose arguments cannot be represented does not happen.**

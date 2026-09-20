@@ -277,7 +277,7 @@ fn push_cut(
 }
 
 /// A call in a program's source and the history row it produced.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct Cut {
     start: usize,
     end: usize,
@@ -311,6 +311,50 @@ struct Cut {
 /// here — a scan would have to get string literals right and would get
 /// them wrong on the first `tell(")")`. Rows written before those
 /// fields existed carry zero and are left exactly as they were.
+/// Where a surviving part landed: its start in the reply as the
+/// provider sent it, its length, and its start in the reply as the
+/// document renders it.
+type PartSpan = (usize, usize, usize);
+
+/// Move call spans from the reply the provider sent to the reply the
+/// document renders.
+///
+/// **Compaction moves the text out from under the offsets.**
+/// [`told_literal_cuts`] concatenates every `Prose`/`Cell` part to get
+/// the string a `site` indexes, and the render loop concatenates the
+/// same parts — except that a compacted one contributes a one-line
+/// `↓ history[N] … summary` marker instead of its bytes, or nothing at
+/// all. From the first shadow onward the two strings disagree, and
+/// every later cut points somewhere else in a string that is now
+/// shorter.
+///
+/// It crashed the agent, not just the rendering. A live `sweep-200` on
+/// 2026-09-20 compacted 54,651 bytes mid-run, then panicked in
+/// `annotate_history_calls` with `start=5596 end=5620` against a
+/// 369-byte reply — `exit=101`, the run over, the task unfinished.
+/// Nothing downstream was wrong; the offsets were simply measured
+/// against a different string.
+///
+/// A cut inside a part that got shadowed is dropped: the call it
+/// annotates is not in the rendered text at all. With nothing
+/// compacted every part is present at its own offset, so this is the
+/// identity.
+fn remap_cuts(cuts: &[Cut], parts: &[PartSpan]) -> Vec<Cut> {
+    cuts.iter()
+        .filter_map(|c| {
+            let (from, len, to) = *parts
+                .iter()
+                .find(|(from, len, _)| c.start >= *from && c.end <= from + len)?;
+            let _ = len;
+            Some(Cut {
+                start: to + (c.start - from),
+                end: to + (c.end - from),
+                ..c.clone()
+            })
+        })
+        .collect()
+}
+
 fn annotate_history_calls(source: &str, cuts: Option<&Vec<Cut>>, blocks: &[(usize, u64)]) -> String {
     // **One pass, because there is one source.** A block marker is
     // computed against the reply as the model wrote it and so is a
@@ -763,6 +807,11 @@ pub(crate) fn render_with_lookup(
     // moment the offsets are known; spent in `annotate_history_calls`,
     // which is where every offset edit to a reply happens.
     let mut blocks: Vec<(usize, u64)> = Vec::new();
+    // Where each surviving part of the open reply sits in the string
+    // the provider sent and in the string this renders.
+    let mut part_spans: Vec<PartSpan> = Vec::new();
+    // How long the open reply is in the string the provider sent.
+    let mut sent_len = 0usize;
     // Lines that arrived before the open reply — see the `Reply` arm.
     let mut before: Vec<String> = Vec::new();
     let mut cur_agent: Option<EventId> = None;
@@ -816,6 +865,8 @@ pub(crate) fn render_with_lookup(
                 before = std::mem::take(&mut pending);
                 reply = Some((ev.id, String::new()));
                 blocks.clear();
+                part_spans.clear();
+                sent_len = 0;
             }
             EventPayload::Part { part, .. } => {
                 if let Part::Cell(_) = part {
@@ -828,8 +879,16 @@ pub(crate) fn render_with_lookup(
                         // is not what the model said, so it is not
                         // replayed as what the model said.
                         Part::Thinking(_) => {}
-                        Part::Prose(t) | Part::Cell(t) => {
+                        Part::Prose(raw) | Part::Cell(raw) => {
                             had_blocks = true;
+                            // **Both strings, in step.** `sent_len`
+                            // tracks the reply as the provider sent it,
+                            // which is what a call's `site` indexes;
+                            // `text.len()` tracks the reply as this
+                            // renders it. They part company at the
+                            // first compacted block, and `remap_cuts`
+                            // carries the offsets across.
+                            let t = raw;
                             // **A compacted block is its marker and
                             // nothing else.** The marker already names
                             // the row and already sits on its own line,
@@ -849,9 +908,11 @@ pub(crate) fn render_with_lookup(
                                 }
                                 None => {
                                     blocks.push((text.len(), ev.id.as_u64()));
+                                    part_spans.push((sent_len, t.len(), text.len()));
                                     text.push_str(t);
                                 }
                             }
+                            sent_len += t.len();
                         }
                     }
                 }
@@ -883,8 +944,12 @@ pub(crate) fn render_with_lookup(
                     None if text.is_empty() && had_blocks => None,
                     None if text.is_empty() => Some(EMPTY_REPLY_NOTE.to_owned()),
                     None => {
-                        let mut text =
-                            annotate_history_calls(&text, cuts.get(&id), &std::mem::take(&mut blocks));
+                        let moved = cuts.get(&id).map(|cs| remap_cuts(cs, &part_spans));
+                        let mut text = annotate_history_calls(
+                            &text,
+                            moved.as_ref(),
+                            &std::mem::take(&mut blocks),
+                        );
                         // **And why it stops, when it stopped early.**
                         // A reply cut off used to trail away with no
                         // marker, so the model saw itself break off
@@ -1594,6 +1659,58 @@ mod tests {
         let source = "history.append(arg); /* ← history[13] */\n";
         let out = annotate_history_calls(source, Some(&cuts), &[]);
         assert_eq!(out, "history.append(arg) /* ← history[30] */;\n");
+    }
+
+    /// **Compaction moves the text out from under the call offsets.**
+    ///
+    /// A `site` indexes the reply the provider sent; the document
+    /// renders a compacted block as a one-line marker instead of its
+    /// bytes, so from the first shadow onward the two strings disagree.
+    /// Unremapped this was not a cosmetic slip — a live `sweep-200` on
+    /// 2026-09-20 compacted mid-run and the agent panicked inside
+    /// `annotate_history_calls`, `start=5596 end=5620` against a
+    /// 369-byte reply, `exit=101` with the task half done.
+    #[test]
+    fn a_cut_moves_with_the_block_compaction_shortened() {
+        let cut = |start, end, row| Cut {
+            start,
+            end,
+            row,
+            literal: false,
+        };
+        // Part A: 100 bytes sent, shadowed, so it is not here at all.
+        // Part B: 50 bytes sent from 100, rendered at 20 behind A's
+        // 20-byte marker.
+        let parts: Vec<PartSpan> = vec![(100, 50, 20)];
+
+        let moved = remap_cuts(&[cut(110, 130, 7)], &parts);
+        assert_eq!(
+            (moved[0].start, moved[0].end),
+            (30, 50),
+            "the cut follows its own block: {moved:?}"
+        );
+
+        // A call inside the part that was shadowed has no text left to
+        // annotate, so it goes rather than landing on someone else.
+        assert!(
+            remap_cuts(&[cut(10, 20, 7)], &parts).is_empty(),
+            "a cut inside a shadowed block is dropped"
+        );
+
+        // A span crossing the boundary belongs to neither block.
+        assert!(
+            remap_cuts(&[cut(90, 120, 7)], &parts).is_empty(),
+            "a cut spanning two blocks is dropped"
+        );
+
+        // With nothing compacted every part is at its own offset, and
+        // this is the identity — the path almost every render takes.
+        let whole: Vec<PartSpan> = vec![(0, 100, 0), (100, 50, 100)];
+        let moved = remap_cuts(&[cut(10, 20, 7), cut(110, 130, 8)], &whole);
+        assert_eq!(
+            moved.iter().map(|c| (c.start, c.end)).collect::<Vec<_>>(),
+            vec![(10, 20), (110, 130)]
+        );
     }
 
     /// But a comment the model wrote *meaning* something is left
