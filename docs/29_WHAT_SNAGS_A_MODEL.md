@@ -91,11 +91,17 @@ took them.)
 
 A third off the cost, and rather more than a third on the tasks with
 room to move: `skipped-tests` and `sweep-200` each lost roughly two
-thirds of their prompt. Most of it came off one change — telling the
-model what is in the working directory, so it stops spending its first
-program finding out — and the shape of the win is that a model which
-can see the tree plans the whole job in one program instead of
-discovering it three files at a time.
+thirds of their prompt.
+
+**Which change bought it is not attributable from these runs.** The
+arms in between are 5 and 6 runs each on differing task mixes, which
+resolves nothing; only the 37-vs-63 endpoints are solid. One mechanism
+*is* directly measured, though: **runs that spend their whole first
+program on `ls`, `find` or `pwd` went from 6 of 15 to 0 of 6 and 1 of
+5** once the opening context said what was in the directory. The shape
+of the win is a model that can see the tree planning the whole job in
+one program instead of discovering it three files at a time — and the
+cell sizes bear that out, 726 bytes against 472 on the sweeps.
 
 One change moved a pass rate outright: refusing an edit that would
 double a line's indentation took `skipped-tests` from 2/4 to 6/6. The
