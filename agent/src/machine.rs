@@ -3721,6 +3721,14 @@ pub(crate) fn note_display(value: &serde_json::Value) -> String {
 ///
 /// Clipped *before* escaping, so the byte counts it quotes are the
 /// value's own — the thing `fetch` returns — rather than the rendering's.
+///
+/// **And it names `replace`, not `append`, for the next window.**
+/// Appending each page would put every window in the document at once,
+/// which is the cost this bound exists to avoid; replacing moves the
+/// one row's view and leaves the context flat. `fetch` still returns
+/// the original whole afterwards, so the bytes to slice the next window
+/// from are always in reach — see
+/// `paging_a_row_moves_its_window_and_leaves_the_value_whole`.
 fn note_row(id: u64, value: &serde_json::Value) -> String {
     let full = note_display(value);
     if full.len() <= crate::report::NOTE_ROW_MAX_BYTES {
@@ -3731,8 +3739,8 @@ fn note_row(id: u64, value: &serde_json::Value) -> String {
         end -= 1;
     }
     format!(
-        "appended: {}\n  … {} of {} bytes — `history.fetch({id})` for all of it, \
-         or append a slice of what you already hold",
+        "appended: {}\n  … {} of {} bytes — `history.fetch({id})` has all of it, and \
+         `history.replace({id}, …)` moves this window without adding a row",
         crate::document::escape_untrusted(&full[..end]),
         end,
         full.len(),
@@ -5772,6 +5780,76 @@ mod tests {
             })
             .unwrap();
         assert_eq!(back, json!(n), "fetch hands back all {n} characters");
+    }
+
+    /// **Paging moves one row's window; it does not add rows.**
+    ///
+    /// Appending each page would put every window in the document at
+    /// once, which is the cost the bound exists to avoid. `replace`
+    /// shadows the row's rendering, and `fetch` still returns the
+    /// original whole — so the bytes to cut the next window from are
+    /// always in reach without re-reading anything.
+    #[test]
+    fn paging_a_row_moves_its_window_and_leaves_the_value_whole() {
+        let (mut tree, mut state) = setup();
+        state.kickoff(&mut tree).unwrap();
+        let n = crate::report::NOTE_ROW_MAX_BYTES * 2;
+        let src = format!("history.append(\"a\".repeat({n}) + \"TAIL\");");
+        let out = state
+            .step(&mut tree, StepInput::LlmResponse(llm_program(&src)))
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+        let id = state
+            .agent_segment(&tree)
+            .iter()
+            .find(|e| matches!(e.payload, EventPayload::Note { .. }))
+            .unwrap()
+            .id
+            .as_u64();
+
+        // Move the window to the end of the value, from the value itself.
+        let page = format!(
+            "const all = await fetch_history({id});              await replace_history({id}, all.slice(all.length - 12));"
+        );
+        let out = state
+            .step(&mut tree, StepInput::LlmResponse(llm_program(&page)))
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+
+        let segment = state.agent_segment(&tree);
+        let compacted: std::collections::HashMap<EventId, Option<String>> = segment
+            .iter()
+            .filter_map(|e| match &e.payload {
+                EventPayload::Compacted { of, text } => Some((*of, text.clone())),
+                _ => None,
+            })
+            .collect();
+        let rows = menu_rows(&segment, 0, &compacted);
+        let note_rows: Vec<&Artifact> = rows.iter().filter(|a| a.id == id).collect();
+        assert_eq!(note_rows.len(), 1, "one row, not two");
+        let shown = match &note_rows[0].state {
+            ArtifactState::Whole(t) => t.clone(),
+            _ => panic!("renders whole"),
+        };
+        assert!(shown.contains("TAIL"), "the window moved: {shown}");
+        assert!(shown.len() < 100, "and it is small: {} bytes", shown.len());
+
+        // And the value behind it is still all of it.
+        let check = format!("history.append((await fetch_history({id})).length);");
+        let out = state
+            .step(&mut tree, StepInput::LlmResponse(llm_program(&check)))
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+        let back = tree
+            .path_events(state.spine.leaf_id)
+            .iter()
+            .rev()
+            .find_map(|e| match &e.payload {
+                EventPayload::Note { value, .. } => Some(value.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(back, json!(n + 4), "fetch still hands back the whole value");
     }
 
     /// A row under the bound renders exactly as it always did — which
