@@ -106,6 +106,13 @@ pub enum Invariant {
     /// and "completed ⇒ a terminal `Handback`" is what makes recovery
     /// decidable from the log alone.
     HandbackNamesTheReply,
+    /// **A prose send is synthetic.** No instruction issued it — the
+    /// model wrote a paragraph, not a call — so there is no source
+    /// expression to point a cursor at, and zero width is the
+    /// convention `span.rs` names for exactly that. A real-looking
+    /// site here would send the debugger to an offset that means
+    /// nothing.
+    ProseIsSynthetic,
     /// **Every call settles**, or is still honestly waiting. A `tell`
     /// gets its delivery receipt, a tool call gets its result; an `ask`
     /// may sit open, because an answer is someone else's to give, and a
@@ -144,6 +151,27 @@ pub enum Ending {
     Running,
 }
 
+/// A row this reply appended.
+#[derive(Debug, Clone)]
+pub struct Row {
+    /// The `Note`'s own id — what a later `history.fetch(id)` names.
+    pub id: EventId,
+    pub value: serde_json::Value,
+    /// Where in the reply the `history.append(...)` call was written.
+    /// Half-open, reply-absolute (not cell-local), which is what lets
+    /// the debugger put a cursor on it.
+    pub site: (u32, u32),
+}
+
+impl Row {
+    /// The source that wrote this row, cut out of `reply` by its own
+    /// span — how a test says "the site is the whole call" without
+    /// counting characters.
+    pub fn source_in<'a>(&self, reply: &'a str) -> &'a str {
+        &reply[self.site.0 as usize..self.site.1 as usize]
+    }
+}
+
 /// An `ask` this reply issued and nobody has answered.
 #[derive(Debug, Clone)]
 #[allow(dead_code, reason = "a harness's shape is its API; `to` is read by tests not yet written")]
@@ -160,7 +188,11 @@ pub struct Ask {
 /// nothing else in the log.
 #[derive(Debug, Clone)]
 pub struct Said {
-    /// Prose segments, in order, as they reached the person.
+    /// Prose segments, in order, **as they reached the person** — the
+    /// `Send` each one became, so trimmed of the blank lines that
+    /// separated it from the fences. The verbatim bytes are what
+    /// [`Invariant::PartsConcatenate`] checks; what a test wants to
+    /// read is what was said.
     pub prose: Vec<String>,
     /// The source of each ```js cell, fences included — what `Part::Cell`
     /// carries, so a test can assert on what ran as well as on what it
@@ -171,8 +203,8 @@ pub struct Said {
     pub tells: Vec<String>,
     /// `ask` / `choose` — the sends still waiting on someone.
     pub asks: Vec<Ask>,
-    /// `history.append(value)`, in order, with the id each row got.
-    pub rows: Vec<(EventId, serde_json::Value)>,
+    /// `history.append(value)`, in order.
+    pub rows: Vec<Row>,
     /// `tools.*` calls, in dispatch order, as `(name, args)`.
     pub calls: Vec<(String, serde_json::Value)>,
     /// Lines the program printed.
@@ -212,11 +244,17 @@ impl Said {
     /// The single row this reply appended. Panics naming what it found
     /// instead, because "the row" is the commonest thing to want and
     /// `rows[0]` on an empty vector says nothing about why.
-    pub fn row(&self) -> &serde_json::Value {
+    pub fn row(&self) -> &Row {
         match self.rows.as_slice() {
-            [(_, v)] => v,
+            [r] => r,
             other => panic!("expected exactly one appended row, got {}: {other:?}", other.len()),
         }
+    }
+
+    /// The values this reply appended, in order — the commonest thing
+    /// to compare a whole run against.
+    pub fn values(&self) -> Vec<&serde_json::Value> {
+        self.rows.iter().map(|r| &r.value).collect()
     }
 
     /// The single `ask` still open, same bargain as [`Said::row`].
@@ -402,7 +440,7 @@ impl Conversation {
             self.runner
                 .step(
                     &mut self.tree,
-                    StepInput::LlmResponse(crate::host::scripted_program(markdown)),
+                    StepInput::LlmResponse(crate::host::scripted_markdown(markdown)),
                 )
                 .expect("reply")
         };
@@ -595,16 +633,20 @@ impl Conversation {
             s.kinds.push(kind_of(&e.payload));
             match &e.payload {
                 EventPayload::Part { part, .. } => match part {
-                    crate::types::Part::Prose(t) => s.prose.push(t.clone()),
                     crate::types::Part::Cell(t) => s.cells.push(t.clone()),
-                    crate::types::Part::Thinking(_) => {}
+                    // The verbatim prose is the invariant's business,
+                    // not a test's: what a test reads is the `Send`
+                    // below, which is what the person actually got.
+                    crate::types::Part::Prose(_) | crate::types::Part::Thinking(_) => {}
                 },
-                // **Prose is a `Send` too.** A paragraph between cells
-                // reaches the person as a message like any other, and
-                // it is already in `prose` — counting it again as a
-                // `tell` would make every narrating reply look like it
-                // said everything twice.
-                EventPayload::Call(Call::Send { prose: true, .. }) => {}
+                // **Prose is a `Send` too** — a paragraph between cells
+                // reaches the person as a message like any other. It is
+                // its own field rather than a `tell`, because counting
+                // it as one would make every narrating reply look like
+                // it said everything twice.
+                EventPayload::Call(Call::Send { prose: true, text, .. }) => {
+                    s.prose.push(text.clone())
+                }
                 EventPayload::Call(Call::Send { text, expects_reply, to, options, .. }) => {
                     if *expects_reply {
                         s.asks.push(Ask {
@@ -620,7 +662,11 @@ impl Conversation {
                 EventPayload::Call(Call::Invoke { name, args, .. }) => {
                     s.calls.push((name.clone(), args.clone()))
                 }
-                EventPayload::Note { value, .. } => s.rows.push((e.id, value.clone())),
+                EventPayload::Note { value, site, site_end, .. } => s.rows.push(Row {
+                    id: e.id,
+                    value: value.clone(),
+                    site: (*site, *site_end),
+                }),
                 EventPayload::Compacted { of, .. } => s.compacted.push(*of),
                 EventPayload::Console { lines } => s.printed.extend(lines.iter().cloned()),
                 EventPayload::Result { call, outcome } => s.settled.push((*call, outcome.clone())),
@@ -684,6 +730,19 @@ impl Conversation {
                         Some(*named),
                         reply,
                         "a Handback names a reply that is not this one: {named:?}"
+                    );
+                }
+            }
+        }
+        if self.enforced(Invariant::ProseIsSynthetic) {
+            for e in &events {
+                if let EventPayload::Call(Call::Send { prose: true, site, site_end, text, .. }) =
+                    &e.payload
+                {
+                    assert_eq!(
+                        (*site, *site_end),
+                        (0, 0),
+                        "prose {text:?} was given a real site"
                     );
                 }
             }
@@ -766,7 +825,7 @@ mod tests {
             "Reading it.\n\n```js\nconst f = await tools.read_file(\"PATH\");\nfinish(`PATH says ${f.content}.`);\n```\n",
         );
 
-        assert_eq!(r.prose, ["Reading it.\n\n"]);
+        assert_eq!(r.prose, ["Reading it."]);
         assert_eq!(r.calls.len(), 1);
         assert_eq!(r.calls[0].0, "read_file");
         assert_eq!(r.tells, ["PATH says NEW."]);
@@ -843,7 +902,7 @@ mod tests {
             "```js\nconst hits = (await tools.bash(\"grep -rl OLD .\")).stdout.split(\"\\n\").filter(Boolean);\nhistory.append({ hits });\n```\n",
         );
 
-        assert_eq!(r.row(), &json!({ "hits": ["a.rs", "b.rs"] }));
+        assert_eq!(r.row().value, json!({ "hits": ["a.rs", "b.rs"] }));
         assert_eq!(r.ended, Ending::Completed);
         assert!(!r.rests, "completing is not, by itself, a reason to rest");
     }

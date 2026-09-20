@@ -4831,6 +4831,7 @@ fn asker_of(tree: &Tree, question: EventId) -> Option<Author> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testkit::{Conversation, Ending};
     use serde_json::json;
 
     const FUEL: u64 = 100_000;
@@ -5187,40 +5188,20 @@ mod tests {
     /// because that plumbing is the part with nothing else watching it.
     #[test]
     fn an_append_is_cross_referenced_to_the_note_it_wrote() {
-        let (mut tree, mut state) = setup();
-        user_post(&mut state, &mut tree, "go");
-        let source = "history.append({ found: 3 });";
-        let out = state
-            .step(&mut tree, StepInput::LlmResponse(llm_program(source)))
-            .unwrap();
-        drain(&mut state, &mut tree, out);
+        let mut c = Conversation::new();
+        c.user("go");
+        let reply = "```js\nhistory.append({ found: 3 });\n```\n";
+        let r = c.reply(reply);
 
-        let note = tree
-            .events
-            .values()
-            .find(|e| matches!(e.payload, EventPayload::Note { .. }))
-            .expect("append writes a note");
-        let EventPayload::Note { site, site_end, .. } = &note.payload else {
-            unreachable!()
-        };
-        let reply = format!("```js\n{source}\n```\n");
         assert_eq!(
-            &reply[*site as usize..*site_end as usize],
+            r.row().source_in(reply),
             "history.append({ found: 3 })",
             "the span is the whole call"
         );
-
-        let doc = crate::document::render(&tree, &state.spine, 64 * 1024);
-        let program = doc
-            .conversation()
-            .iter()
-            .find(|m| m.role == crate::document::ChatRole::Assistant)
-            .expect("the program renders")
-            .content
-            .clone();
         assert!(
-            program.contains(&format!("/* ← history[{}] */", note.id.as_u64())),
-            "and the call points at the row it wrote: {program}"
+            c.document().contains(&format!("/* ← history[{}] */", r.row().id.as_u64())),
+            "and the call points at the row it wrote: {}",
+            c.document()
         );
     }
 
@@ -5918,47 +5899,16 @@ mod tests {
     /// through from the other side.
     #[test]
     fn what_was_appended_comes_back_as_what_was_appended() {
-        let (mut tree, mut state) = setup();
-        state.kickoff(&mut tree).unwrap();
-        let out = state
-            .step(
-                &mut tree,
-                StepInput::LlmResponse(llm_program(
-                    "history.append({ dead: [\"a\", \"b\"], kept: 3 });",
-                )),
-            )
-            .unwrap();
-        drain(&mut state, &mut tree, out);
-        let note = state
-            .agent_segment(&tree)
-            .iter()
-            .find(|e| matches!(e.payload, EventPayload::Note { .. }))
-            .unwrap()
-            .id;
+        let mut c = Conversation::new();
+        let first = c.reply("```js\nhistory.append({ dead: [\"a\", \"b\"], kept: 3 });\n```\n");
+        let row = first.row().id.as_u64();
 
-        let out = state
-            .step(
-                &mut tree,
-                StepInput::LlmResponse(llm_program(&format!(
-                    "const row = history.fetch({}); \
-                     history.append([typeof row, row.kept, row.dead[1]]);",
-                    note.as_u64()
-                ))),
-            )
-            .unwrap();
-        drain(&mut state, &mut tree, out);
-
-        let back = state
-            .agent_segment(&tree)
-            .iter()
-            .rev()
-            .find_map(|e| match &e.payload {
-                EventPayload::Note { value, .. } if value.is_array() => Some(value.clone()),
-                _ => None,
-            })
-            .expect("the second append");
+        let back = c.reply(&format!(
+            "```js\nconst row = history.fetch({row});\n\
+             history.append([typeof row, row.kept, row.dead[1]]);\n```\n"
+        ));
         // An object, indexable — not a string anyone has to parse.
-        assert_eq!(back, json!(["object", 3, "b"]));
+        assert_eq!(back.row().value, json!(["object", 3, "b"]));
     }
 
     /// **The row is the view; `fetch` is the value.**
@@ -6049,60 +5999,25 @@ mod tests {
     /// not go on to write the file it was about to write.
     #[test]
     fn stopping_skips_every_block_after_it() {
-        let (mut tree, mut state) = setup();
-        state.kickoff(&mut tree).unwrap();
-        let reply = "Checking first.\n\n```js\nhistory.append(\"before\");\nstop(\"the check disagrees\");\n```\n\nAnd now the part that must not happen.\n\n```js\nhistory.append(\"after\");\n```\n";
-        let out = state
-            .step(
-                &mut tree,
-                StepInput::LlmResponse(crate::host::scripted_markdown(reply)),
-            )
-            .unwrap();
-        drain(&mut state, &mut tree, out);
+        let mut c = Conversation::new();
+        let r = c.reply(
+            "Checking first.\n\n```js\nhistory.append(\"before\");\nstop(\"the check disagrees\");\n```\n\nAnd now the part that must not happen.\n\n```js\nhistory.append(\"after\");\n```\n",
+        );
 
-        let notes: Vec<String> = tree
-            .path_events(state.spine.leaf_id)
-            .iter()
-            .filter_map(|e| match &e.payload {
-                EventPayload::Note { value, .. } => value.as_str().map(str::to_owned),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(notes, vec!["before"], "the block after the stop must not run");
-
+        assert_eq!(
+            r.values(),
+            [&json!("before")],
+            "the block after the stop must not run"
+        );
         // The prose after it is not sent either: it was written on the
         // assumption the work carried on, and it did not.
-        let said: Vec<String> = tree
-            .path_events(state.spine.leaf_id)
-            .iter()
-            .filter_map(|e| match &e.payload {
-                EventPayload::Call(Call::Send { text, .. }) => Some(text.clone()),
-                _ => None,
-            })
-            .collect();
-        assert!(
-            said.iter().any(|t| t.contains("Checking first")),
-            "prose before the stop still reaches the person: {said:?}"
+        assert_eq!(
+            r.prose,
+            ["Checking first."],
+            "prose before the stop reaches the person, prose after it does not"
         );
-        assert!(
-            !said.iter().any(|t| t.contains("must not happen")),
-            "prose after it does not: {said:?}"
-        );
-
         // And the reason is handed back as a decision, not a fault.
-        let how = tree
-            .path_events(state.spine.leaf_id)
-            .iter()
-            .rev()
-            .find_map(|e| match &e.payload {
-                EventPayload::Handback { how, .. } => Some(how.clone()),
-                _ => None,
-            })
-            .expect("a handback");
-        match how {
-            Handback::Stopped { reason } => assert_eq!(reason, "the check disagrees"),
-            other => panic!("expected Stopped, got {other:?}"),
-        }
+        assert_eq!(r.ended, Ending::Stopped("the check disagrees".into()));
     }
 
     /// **`slice` pages a row and writes no bytes to do it.**
@@ -6835,34 +6750,23 @@ mod tests {
 
     #[test]
     fn a_failed_call_settles_with_its_reason() {
-        let (mut tree, mut state) = setup();
-        state.kickoff(&mut tree).unwrap();
-        let src = r#"try { history.append(await tools.fetch("a")); } catch (e) { history.append("caught: " + e); }"#;
-        let out = state
-            .step(&mut tree, StepInput::LlmResponse(llm_program(src)))
-            .unwrap();
-        let settled = drain(&mut state, &mut tree, out);
-        let id = expect_tool_calls(&settled)[0].call;
-        let out = state
-            .step(
-                &mut tree,
-                StepInput::ToolResults(vec![ToolResult {
-                    call: id,
-                    result: Err("host is down".into()),
-                }]),
-            )
-            .unwrap();
-        drain(&mut state, &mut tree, out);
+        let mut c = Conversation::new();
+        c.rejects("fetch", "host is down");
+        let r = c.reply(
+            "```js\ntry { history.append(await tools.fetch(\"a\")); }\n\
+             catch (e) { history.append(\"caught: \" + e); }\n```\n",
+        );
 
-        let outcome = state
-            .agent_segment(&tree)
-            .iter()
-            .find_map(|e| match &e.payload {
-                EventPayload::Result { outcome, .. } => Some(outcome.clone()),
-                _ => None,
-            })
-            .expect("a Result");
-        assert!(matches!(&outcome, Outcome::Failed(m) if m == "host is down"));
+        assert!(
+            matches!(&r.settled[0].1, Outcome::Failed(m) if m == "host is down"),
+            "{:?}",
+            r.settled
+        );
+        assert!(
+            r.row().value.as_str().is_some_and(|t| t.contains("host is down")),
+            "and the reason reaches the program that catches it: {:?}",
+            r.row().value
+        );
     }
 
     #[test]
@@ -7391,9 +7295,10 @@ mod tests {
     /// unwinds between them.
     #[test]
     fn a_three_cell_reply_is_three_cells_one_run_and_one_handback() {
-        let (mut tree, mut state) = setup_under();
-        user_post(&mut state, &mut tree, "go");
-        let reply = "Reading the two files first.\n\n\
+        let mut c = Conversation::new();
+        c.user("go");
+        let r = c.reply_whole(
+            "Reading the two files first.\n\n\
              ```js\n\
              let total = 1;\n\
              ```\n\n\
@@ -7404,45 +7309,30 @@ mod tests {
              And the answer.\n\n\
              ```js\n\
              console.log(`total is ${total}`);\n\
-             ```\n";
-        let out = state
-            .step(&mut tree, StepInput::LlmResponse(llm_program(reply)))
-            .unwrap();
-        drain(&mut state, &mut tree, out);
+             ```\n",
+        );
 
-        // Each `Part::Cell` holds the block the model wrote, fences
-        // included — that is what makes the parts concatenate back to
-        // the reply byte for byte.
-        let sources: Vec<&str> = state
-            .agent_segment(&tree)
-            .iter()
-            .filter_map(|e| match &e.payload {
-                EventPayload::Part {
-                    part: crate::types::Part::Cell(source),
-                    ..
-                } => Some(source.as_str()),
-                _ => None,
-            })
-            .collect();
+        // Each cell holds the block the model wrote, fences included —
+        // that is what makes the parts concatenate back to the reply
+        // byte for byte, which the harness now checks on every reply
+        // (`Invariant::PartsConcatenate`).
         assert_eq!(
-            sources,
-            vec![
+            r.cells,
+            [
                 "```js\nlet total = 1;\n```\n",
                 "```js\ntotal = total + 41;\n```\n",
                 "```js\nconsole.log(`total is ${total}`);\n```\n",
             ]
         );
 
-        // Prose and cells interleave in source order: a paragraph, a
-        // cell, a paragraph, a cell, a paragraph, a cell. The whole
-        // reply arrived in one piece here, so every part is on the log
-        // before the first cell runs — see
-        // `chunk_boundaries_do_not_change_the_reply` for what that
-        // does and does not guarantee.
+        // Prose and cells interleave in source order. The whole reply
+        // arrived in one piece here, so every part is on the log before
+        // the first cell runs — see
+        // `chunk_boundaries_do_not_change_the_reply` for what that does
+        // and does not guarantee.
         assert_eq!(
-            payload_kinds(&state, &tree),
+            r.kinds,
             [
-                "Agent", "Post", //
                 "Reply", "Part", // "Reading the two files first."
                 "Part", // cell 0
                 "Part", // "Now the adjustment."
@@ -7452,14 +7342,13 @@ mod tests {
                 // The reply's cost, once. The whole text arrived
                 // before anything ran, so this is where it stopped.
                 "ReplyEnd", "Call", // the three prose segments, as sends to the user
-                "Call", "Call", "Handback", "Console",
+                "Call", "Call", "Handback", "Console", "Result", "Result", "Result",
             ],
             "three cells, six parts, one ReplyEnd, one Handback"
         );
 
         // And they really shared a scope.
-        let report = last_report(&state, &tree);
-        assert!(report.contains("total is 42"), "{report}");
+        assert_eq!(r.printed, ["total is 42"]);
     }
 
     /// The prose reaches the person as a `Call::Send { to: User }` —
@@ -7467,39 +7356,15 @@ mod tests {
     /// reply in a form it already knows (D15).
     #[test]
     fn prose_segments_are_sends_to_the_user_in_source_order() {
-        let (mut tree, mut state) = setup_under();
-        user_post(&mut state, &mut tree, "go");
-        let reply = "First I look.\n\n```js\nlet a = 1;\n```\n\n\
-                     Then I decide.\n\n```js\na = 2;\n```\n\nThat is all.\n";
-        let out = state
-            .step(&mut tree, StepInput::LlmResponse(llm_program(reply)))
-            .unwrap();
-        drain(&mut state, &mut tree, out);
-
-        let sends: Vec<(String, u32, u32)> = state
-            .agent_segment(&tree)
-            .iter()
-            .filter_map(|e| match &e.payload {
-                EventPayload::Call(Call::Send {
-                    to: Address::User,
-                    text,
-                    expects_reply: false,
-                    site,
-                    site_end,
-                    ..
-                }) => Some((text.clone(), *site, *site_end)),
-                _ => None,
-            })
-            .collect();
-        let texts: Vec<&str> = sends.iter().map(|(t, _, _)| t.as_str()).collect();
-        assert_eq!(texts, ["First I look.", "Then I decide.", "That is all."]);
-
-        // **Synthetic sites.** No instruction issued these, so there is
-        // no source expression to point at; zero width is the
-        // convention `span.rs` already names for exactly that.
-        for (text, site, site_end) in &sends {
-            assert_eq!((*site, *site_end), (0, 0), "prose {text:?} has a real site");
-        }
+        let mut c = Conversation::new();
+        c.user("go");
+        let r = c.reply_whole(
+            "First I look.\n\n```js\nlet a = 1;\n```\n\n\
+             Then I decide.\n\n```js\na = 2;\n```\n\nThat is all.\n",
+        );
+        assert_eq!(r.prose, ["First I look.", "Then I decide.", "That is all."]);
+        // Their sites are synthetic — checked on every reply now, by
+        // `Invariant::ProseIsSynthetic`, which is where that rule went.
     }
 
     /// **A prose send gets exactly one `Result` and leaves no dangling
@@ -7559,33 +7424,19 @@ mod tests {
     /// one send per line.
     #[test]
     fn a_multi_paragraph_report_is_one_send() {
-        let (mut tree, mut state) = setup_under();
-        user_post(&mut state, &mut tree, "go");
-        let reply = "# What I found\n\n\
-                     The retry policy lives in two places.\n\n\
-                     - `client.rs` sets the ceiling\n\
-                     - `retry.rs` sets the backoff\n\n\
-                     I would keep the second.\n";
-        let out = state
-            .step(
-                &mut tree,
-                StepInput::LlmResponse(crate::host::scripted_markdown(reply)),
-            )
-            .unwrap();
-        drain(&mut state, &mut tree, out);
-
-        let texts: Vec<String> = state
-            .agent_segment(&tree)
-            .iter()
-            .filter_map(|e| match &e.payload {
-                EventPayload::Call(Call::Send { text, .. }) => Some(text.clone()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(texts.len(), 1, "one report, one message");
-        assert!(texts[0].starts_with("# What I found"));
-        assert!(texts[0].contains("- `client.rs` sets the ceiling\n- `retry.rs`"));
-        assert!(texts[0].ends_with("I would keep the second."));
+        let mut c = Conversation::new();
+        c.user("go");
+        let r = c.reply(
+            "# What I found\n\n\
+             The retry policy lives in two places.\n\n\
+             - `client.rs` sets the ceiling\n\
+             - `retry.rs` sets the backoff\n\n\
+             I would keep the second.\n",
+        );
+        assert_eq!(r.prose.len(), 1, "one report, one message");
+        assert!(r.prose[0].starts_with("# What I found"));
+        assert!(r.prose[0].contains("- `client.rs` sets the ceiling\n- `retry.rs`"));
+        assert!(r.prose[0].ends_with("I would keep the second."));
     }
 
     /// One report and one next completion for a three-cell reply, not
@@ -7751,42 +7602,27 @@ mod tests {
     /// nothing, and this one produced an answer.
     #[test]
     fn a_reply_with_no_cells_speaks_and_rests_the_branch() {
-        let (mut tree, mut state) = setup_under();
-        user_post(&mut state, &mut tree, "go");
-        let reply = "The retry policy already lives in `retry.rs`, so there is \
-                     nothing to change.\n\n```text\njust a quote, not a cell\n```\n";
-        let out = state
-            .step(&mut tree, StepInput::LlmResponse(llm_program(reply)))
-            .unwrap();
-        drain(&mut state, &mut tree, out);
-
-        assert!(matches!(state.phase, Phase::Idle));
-        assert!(
-            !state.needs_prompt(&tree),
-            "the model spoke and stopped: that is a finished turn"
+        let mut c = Conversation::new();
+        c.user("go");
+        let r = c.reply(
+            "The retry policy already lives in `retry.rs`, so there is \
+             nothing to change.\n\n```text\njust a quote, not a cell\n```\n",
         );
+
+        assert!(r.rests, "the model spoke and stopped: that is a finished turn");
+        assert!(r.cells.is_empty(), "a ```text block is a quote, not a cell");
+        assert!(r.prose[0].contains("already lives in `retry.rs`"), "{:?}", r.prose);
         assert_eq!(
-            payload_kinds(&state, &tree),
+            r.kinds,
             // A cell-less reply is still a completion, and still what
             // the model must be shown as its own past turn. It runs an
-            // empty program — there is no separate "nothing to run" path
-            // any more — so it closes with an outcome like any other
-            // reply, and rests because no `Turn` of its own was ever
-            // logged for `last_turn_outcome` to find.
-            [
-                "Agent", "Post", "Reply", "Part", "ReplyEnd", "Call", "Handback", "Console"
-            ],
+            // empty program — there is no separate "nothing to run"
+            // path any more — so it closes with an outcome like any
+            // other reply, and rests because no cell of its own was
+            // ever logged for `last_turn_outcome` to find.
+            ["Reply", "Part", "ReplyEnd", "Call", "Handback", "Console", "Result"],
             "the prose is delivered and nothing ran"
         );
-        let said = state
-            .agent_segment(&tree)
-            .iter()
-            .find_map(|e| match &e.payload {
-                EventPayload::Call(Call::Send { text, .. }) => Some(text.clone()),
-                _ => None,
-            })
-            .expect("the person hears it");
-        assert!(said.contains("already lives in `retry.rs`"), "{said}");
     }
 
     /// **A prose-only reply still rests.** This is the `plain-question`
@@ -8735,36 +8571,14 @@ mod tests {
     /// invented an identifier rather than do without, and died on it.
     #[test]
     fn appending_to_history_returns_the_row_it_made() {
-        let (mut tree, mut state) = setup_under();
-        user_post(&mut state, &mut tree, "go");
-        let out = state
-            .step(
-                &mut tree,
-                StepInput::LlmResponse(llm_program(
-                    "```js\nconst id = history.append({ a: 1 });\nconsole.log(typeof id, id);\n```\n",
-                )),
-            )
-            .unwrap();
-        drain(&mut state, &mut tree, out);
-        let note = state
-            .agent_segment(&tree)
-            .iter()
-            .find(|e| matches!(e.payload, EventPayload::Note { .. }))
-            .expect("the note landed")
-            .id
-            .as_u64();
-        let printed: Vec<String> = state
-            .agent_segment(&tree)
-            .iter()
-            .filter_map(|e| match &e.payload {
-                EventPayload::Console { lines } => Some(lines.clone()),
-                _ => None,
-            })
-            .flatten()
-            .collect();
+        let mut c = Conversation::new();
+        c.user("go");
+        let r = c.reply(
+            "```js\nconst id = history.append({ a: 1 });\nconsole.log(typeof id, id);\n```\n",
+        );
         assert_eq!(
-            printed,
-            vec![format!("number {note}")],
+            r.printed,
+            [format!("number {}", r.row().id.as_u64())],
             "the id of the row it just wrote, as a number it can pass to fetch"
         );
     }
