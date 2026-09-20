@@ -13,9 +13,16 @@ to one commit, so no run straddles a build.
 
 | | baseline | after |
 |---|---|---|
-| passed | 17/18 (94%) | **20/21 (95%)** |
-| prompt bytes | 1,052 KB | **655 KB (−38%)** |
+| passed | 17/18 (94%) | 20/21 (95%), **38/42 (90%) pooled** |
+| prompt bytes | 1,052 KB | **640 KB (−39%)** |
 | programs per run | 4.8 | **3.3 (−31%)** |
+
+Two suites were run at HEAD. Pooled they are 38/42 against 17/18, which
+at these sizes says the pass rate did not move; the cost did, by about
+two fifths. All four failures are task judgement — a test un-skipped
+that still fails, dead helpers left behind, a helper removed that was
+still reached through `getattr`, and one run that took four programs to
+ask its question. None is a harness fault.
 
 Per task: `sweep-200` 11 → 5 programs and 395 → 146 KB, `sweep-8` 4 → 2
 and 107 → 53 KB, `skipped-tests` 5.5 → 3 and 146 → 82 KB,
