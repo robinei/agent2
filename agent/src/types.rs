@@ -467,43 +467,37 @@ pub enum Handback {
     Posted {
         ids: Vec<EventId>,
     },
-    /// The program stopped itself with `stop("reason")` — it found out
-    /// it could not finish correctly and said so.
-    ///
-    /// **Not a fault.** A `Trapped` is something going wrong that the
-    /// program did not foresee; this is the program foreseeing it. They
-    /// render differently for that reason, and the reply is paused
-    /// rather than over: the reason goes in front of the next one,
-    /// which carries on with every row and every printed line still in
-    /// hand.
-    Stopped {
-        reason: String,
-    },
     /// A cell that would not compile. The reply is paused, not over: the
     /// next one repairs it and the run carries on in the same frame.
     CellFailed {
         message: String,
     },
 
-    Completed,
-    /// The program called `finish(text)`: the task is done and the
-    /// branch is at rest.
+    /// The program ended: it ran off the end of its last cell, or ran
+    /// a top-level `return`.
     ///
-    /// **Not the same thing as `Completed`**, which is a program that
-    /// ran off its end — the branch carries on from there by default
-    /// (`26_RETURN_CONTINUES`). Both used to be logged as `Completed`,
-    /// and the difference was only recoverable by guessing: a `Send`
-    /// with a zero-width site is what `finish` emits, so two readers
-    /// were inferring "this branch finished" from the shape of a call
-    /// beside the handback.
-    ///
-    /// Reopening a log is where that mattered. Recovery asks the log
-    /// which outcome was owed a request and found no way to tell a
-    /// branch that rested on purpose from one that stopped mid-task,
-    /// so every reopen of a finished session woke it for one more
-    /// reply — seen live in `try21.jsonl` (#50 finished, #61 replied
-    /// "the task was already finished").
-    Finished,
+    /// **Both facts about the ending live here**, because they are
+    /// facts about the same event and neither is the *kind* of ending
+    /// it was. `finish()` in particular is a flag the program sets, not
+    /// a way of ending — it can be called anywhere and the program
+    /// carries on — so encoding it as its own variant said something
+    /// false about control flow.
+    Completed {
+        /// What a top-level `return` handed back, if anything. `None`
+        /// when the program ran off its end, and when it returned
+        /// `undefined`: neither said anything.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        value: Option<serde_json::Value>,
+        /// `finish()` ran and was honoured: the branch rests, and the
+        /// next thing to happen is whatever the person says.
+        ///
+        /// Recovery reads this. Without it, a branch that finished on
+        /// purpose and one whose report a crash swallowed were the same
+        /// event, so reopening a finished log woke it for one more
+        /// reply (`try21.jsonl`).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        rested: bool,
+    },
     Abandoned,
     Interrupted,
 }
@@ -514,7 +508,7 @@ impl Handback {
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,
-            Handback::Completed | Handback::Finished | Handback::Abandoned | Handback::Interrupted
+            Handback::Completed { .. } | Handback::Abandoned | Handback::Interrupted
         )
     }
 }

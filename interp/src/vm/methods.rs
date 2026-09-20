@@ -32,6 +32,7 @@ fn is_object_for_instanceof(val: &Value) -> bool {
 impl VM {
     pub fn new(code: Vec<Instr>) -> Self {
         VM {
+            finished: false,
             code,
             arrays: Vec::new(),
             objects: Vec::new(),

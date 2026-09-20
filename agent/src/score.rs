@@ -79,18 +79,19 @@ pub struct Score {
     /// `next_program` went: a handover is a `Return` the next program
     /// reads, and `programs` counts those.
     pub raises: usize,
-    /// Every `stop(reason)` a program wrote, deduplicated, in
+    /// Every value a top-level `return` handed back, deduplicated, in
     /// first-seen order.
     ///
-    /// **Not a trap, and counted apart from one.** A stop is the model
-    /// deciding its own check came back wrong and saying so — the
-    /// harness working, not the agent failing — where a trap is a bug
-    /// in the program or a gap in the dialect. Folding the two together
-    /// would read every correct stop as a defect, which is exactly
-    /// backwards for the behaviour this verb exists to encourage. It
-    /// still has to be *visible*: a run that stops on every reply and a
-    /// run that sails through look identical without this.
-    pub stops: Vec<String>,
+    /// **Not a trap, and counted apart from one.** A program that ends
+    /// itself with a value is the model deciding its own check came
+    /// back wrong and saying so — the harness working, not the agent
+    /// failing — where a trap is a bug in the program or a gap in the
+    /// dialect. Folding the two together would read every correct
+    /// ending as a defect, which is exactly backwards for the
+    /// behaviour this verb exists to encourage. It still has to be
+    /// *visible*: a run that ends itself on every reply and a run that
+    /// sails through look identical without this.
+    pub returns: Vec<String>,
     pub traps: usize,
     /// Every trap's `kind: message`, deduplicated, in first-seen order.
     pub trap_messages: Vec<String>,
@@ -188,7 +189,7 @@ pub fn score(tree: &Tree) -> Score {
         program_lengths: Vec::new(),
         raises: 0,
         traps: 0,
-        stops: Vec::new(),
+        returns: Vec::new(),
         trap_messages: Vec::new(),
         compile_failures: Vec::new(),
         abandons: 0,
@@ -308,16 +309,20 @@ pub fn score(tree: &Tree) -> Score {
                     // a handover is a `Return` the next program reads,
                     // and `programs` already counts those.
                     crate::types::Handback::Raised { .. } => s.raises += 1,
+                    crate::types::Handback::Completed { value: Some(v), .. } => {
+                        let line = match v {
+                            serde_json::Value::String(t) => t.clone(),
+                            other => other.to_string(),
+                        };
+                        if !s.returns.contains(&line) {
+                            s.returns.push(line);
+                        }
+                    }
                     crate::types::Handback::Trapped { kind, message, .. } => {
                         s.traps += 1;
                         let line = format!("{kind}: {message}");
                         if !s.trap_messages.contains(&line) {
                             s.trap_messages.push(line);
-                        }
-                    }
-                    crate::types::Handback::Stopped { reason } => {
-                        if !s.stops.contains(reason) {
-                            s.stops.push(reason.clone());
                         }
                     }
                     crate::types::Handback::Abandoned => s.abandons += 1,
@@ -442,7 +447,7 @@ mod tests {
             ),
             (
                 5_030,
-                r#"{"Part":{"reply":3,"part":{"Cell":"```js\nfinish(\"ok\");\n```\n"}}}"#,
+                r#"{"Part":{"reply":3,"part":{"Cell":"```js\ntell(\"ok\"); finish();\n```\n"}}}"#,
             ),
             (
                 5_040,
@@ -450,7 +455,7 @@ mod tests {
             ),
             (
                 5_050,
-                r#"{"Handback":{"reply":3,"how":"Completed","site":0,"stack":[]}}"#,
+                r#"{"Handback":{"reply":3,"how":{"Completed":{}},"site":0,"stack":[]}}"#,
             ),
         ]);
         let tree = crate::open_tree_read_only(log.path().to_str().unwrap()).unwrap();
@@ -473,13 +478,13 @@ mod tests {
     }
 
     /// Write a log with chosen timestamps and hand back the file.
-    /// **A stop is counted, and it is not counted as a trap.** The two
+    /// **A self-ending `return` is counted, and never as a trap.** The two
     /// read as opposite verdicts — one says the agent noticed its own
     /// check failing, the other says the program was wrong — so a fold
     /// that quietly put a stop in the trap bucket, or in no bucket at
     /// all, would make the verb either look like a defect or vanish.
     #[test]
-    fn a_stop_is_its_own_line_and_never_a_trap() {
+    fn a_return_is_its_own_line_and_never_a_trap() {
         let log = synthetic_log(&[
             (0, r#"{"Agent":{"charter":"c","system":"s"}}"#),
             (
@@ -489,13 +494,13 @@ mod tests {
             (20, r#""Reply""#),
             (
                 30,
-                r#"{"Handback":{"reply":3,"how":{"Stopped":{"reason":"CHECK still fails"}},"site":0,"stack":[]}}"#,
+                r#"{"Handback":{"reply":3,"how":{"Completed":{"value":"CHECK still fails"}},"site":0,"stack":[]}}"#,
             ),
         ]);
         let tree = crate::open_tree_read_only(log.path().to_str().unwrap()).unwrap();
         let s = score(&tree);
-        assert_eq!(s.stops, ["CHECK still fails"]);
-        assert_eq!(s.traps, 0, "a stop is not a trap");
+        assert_eq!(s.returns, ["CHECK still fails"]);
+        assert_eq!(s.traps, 0, "an ending is not a trap");
         assert!(s.trap_messages.is_empty());
     }
 

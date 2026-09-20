@@ -19,7 +19,7 @@ engages with the question rather than offering to go and look.
 
 **And whether it spent a program saying it.**  `programs` counts
 completions, not cells, so a run that answers in prose and one that
-answers by running `tell("…"); finish("…")` score identically on every
+answers by running `tell("…"); tell("…"); finish()` score identically on every
 gate below — and the second is the shape the card calls wrong ("a reply
 with no code blocks in it rests the branch… the right shape for
 answering a question").  `cells` is the number that tells them apart,

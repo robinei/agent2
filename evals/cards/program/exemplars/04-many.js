@@ -5,4 +5,5 @@ for (let i = 0; i < hits.length; i++) {
   console.log(`${hits[i]}: ${e.count}`);
   await tools.replace_file(hits[i], e.result, fs[i].version);
 }
-finish(`${hits.length} files`);
+tell(`${hits.length} files`);
+finish();

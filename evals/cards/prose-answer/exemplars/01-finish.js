@@ -5,6 +5,7 @@ const f = await tools.read_file("PATH");
 const fixed = Edit.replaceOnce(f.content, "OLD", "NEW");
 await tools.replace_file("PATH", fixed, f.version);
 const check = await tools.bash("CHECK");
-if (check.status !== 0) stop(`changed PATH, but CHECK fails:\n${check.stdout}`);
-finish("PATH says NEW now, and CHECK passes.");
+if (check.status !== 0) return `changed PATH, but CHECK fails:\n${check.stdout}`;
+tell("PATH says NEW now, and CHECK passes.");
+finish();
 ```

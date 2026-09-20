@@ -73,7 +73,7 @@ impl ProgramView {
             // A raise or a trap is a suspension the LLM can restart.
             // A pause the next reply can answer.
             Some(h) if !h.is_terminal() => ProgramStatus::Suspended,
-            Some(crate::types::Handback::Completed) => ProgramStatus::Completed,
+            Some(crate::types::Handback::Completed { .. }) => ProgramStatus::Completed,
             // The VM is gone.
             Some(_) => ProgramStatus::Failed,
         }
@@ -809,7 +809,7 @@ impl Tree {
                         let p = &mut programs[idx];
                         p.outcome = Some(ev.id);
                         p.condition = Some(how.clone());
-                        if matches!(how, crate::types::Handback::Completed) {
+                        if matches!(how, crate::types::Handback::Completed { .. }) {
                             p.result = Some(serde_json::Value::Null);
                         }
                         last_outcome_idx = Some(idx);
@@ -1196,7 +1196,10 @@ mod tests {
     fn returned(_value: serde_json::Value) -> EventPayload {
         EventPayload::Handback {
             reply: EventId::new(1),
-            how: crate::types::Handback::Completed,
+            how: crate::types::Handback::Completed {
+                value: None,
+                rested: false,
+            },
             site: 0,
             stack: Vec::new(),
         }
@@ -1546,7 +1549,10 @@ mod tests {
             &mut spine,
             EventPayload::Handback {
                 reply: EventId::new(1),
-                how: crate::types::Handback::Completed,
+                how: crate::types::Handback::Completed {
+                    value: None,
+                    rested: false,
+                },
                 site: 0,
                 stack: Vec::new(),
             },

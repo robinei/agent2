@@ -1345,7 +1345,7 @@ mod tests {
         let mut tree = Tree::new(None);
         let snapshotted = vec![Exemplar {
             user: "the user turn this branch was born with".into(),
-            assistant: "finish(\"ok\");".into(),
+            assistant: "tell(\"ok\"); finish();".into(),
         }];
         let mut spine = tree
             .start_agent(None, None, "root", None, "CARD OF THE DAY", snapshotted)
@@ -1502,7 +1502,10 @@ mod tests {
             &mut spine,
             EventPayload::Handback {
                 reply: EventId::new(1),
-                how: crate::types::Handback::Completed,
+                how: crate::types::Handback::Completed {
+                    value: None,
+                    rested: false,
+                },
                 site: 0,
                 stack: Vec::new(),
             },
@@ -1591,7 +1594,10 @@ mod tests {
             &mut spine,
             EventPayload::Handback {
                 reply: EventId::new(1),
-                how: crate::types::Handback::Completed,
+                how: crate::types::Handback::Completed {
+                    value: None,
+                    rested: false,
+                },
                 site: 0,
                 stack: Vec::new(),
             },
@@ -1602,7 +1608,10 @@ mod tests {
             &mut spine,
             EventPayload::Handback {
                 reply: EventId::new(1),
-                how: crate::types::Handback::Completed,
+                how: crate::types::Handback::Completed {
+                    value: None,
+                    rested: false,
+                },
                 site: 0,
                 stack: Vec::new(),
             },
@@ -1667,7 +1676,10 @@ mod tests {
             &mut spine,
             EventPayload::Handback {
                 reply: EventId::new(1),
-                how: crate::types::Handback::Completed,
+                how: crate::types::Handback::Completed {
+                    value: None,
+                    rested: false,
+                },
                 site: 0,
                 stack: Vec::new(),
             },
@@ -2005,7 +2017,10 @@ mod tests {
             &mut spine,
             EventPayload::Handback {
                 reply: EventId::new(1),
-                how: crate::types::Handback::Completed,
+                how: crate::types::Handback::Completed {
+                    value: None,
+                    rested: false,
+                },
                 site: 0,
                 stack: Vec::new(),
             },
@@ -2057,7 +2072,10 @@ mod tests {
             &mut spine,
             EventPayload::Handback {
                 reply: EventId::new(1),
-                how: crate::types::Handback::Completed,
+                how: crate::types::Handback::Completed {
+                    value: None,
+                    rested: false,
+                },
                 site: 0,
                 stack: Vec::new(),
             },
@@ -2149,7 +2167,10 @@ mod tests {
                 &mut spine,
                 EventPayload::Handback {
                     reply: EventId::new(1),
-                    how: crate::types::Handback::Completed,
+                    how: crate::types::Handback::Completed {
+                        value: None,
+                        rested: false,
+                    },
                     site: 0,
                     stack: Vec::new(),
                 },
@@ -2219,7 +2240,10 @@ mod tests {
             &mut spine,
             EventPayload::Handback {
                 reply: EventId::new(1),
-                how: crate::types::Handback::Completed,
+                how: crate::types::Handback::Completed {
+                    value: None,
+                    rested: false,
+                },
                 site: 0,
                 stack: Vec::new(),
             },

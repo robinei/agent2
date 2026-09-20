@@ -439,9 +439,8 @@ fn asks_of(s: &Said) -> Vec<&str> {
 /// moved; that it trapped at all does.
 fn ending_shape(e: &Ending) -> &'static str {
     match e {
-        Ending::Finished => "finished",
-        Ending::Completed => "handed on",
-        Ending::Stopped(_) => "stopped",
+        Ending::Finished(_) => "finished",
+        Ending::Completed(_) => "handed on",
         Ending::Raised { .. } => "raised",
         Ending::Trapped { .. } => "trapped",
         Ending::CellFailed(_) => "would not compile",
@@ -523,7 +522,7 @@ mod tests {
         );
         c.reply(
             "Now the check.\n\n```js\nconst r = await tools.bash(\"make check\");\n\
-             console.log(r.stdout);\nfinish(`PATH says NEW and the check ${r.status === 0 ? \"passes\" : \"fails\"}.`);\n```\n",
+             console.log(r.stdout);\ntell(`PATH says NEW and the check ${r.status === 0 ? \"passes\" : \"fails\"}.`); finish();\n```\n",
         );
 
         let leaf = c.runner().spine.leaf_id;
@@ -540,7 +539,7 @@ mod tests {
             compare(&was, &now.said)
         );
         assert_eq!(now.said.tells, ["PATH says NEW and the check passes."]);
-        assert_eq!(now.said.ended, Ending::Finished);
+        assert_eq!(now.said.ended, Ending::Finished(None));
     }
 
     /// A question to the person is an input like any other, and the
@@ -551,7 +550,7 @@ mod tests {
         c.user("A or B?");
         let r = c.reply(
             "```js\nconst pick = await choose(\"user\", \"which?\", [\"A\", \"B\"]);\n\
-             finish(`picked ${pick}.`);\n```\n",
+             tell(`picked ${pick}.`); finish();\n```\n",
         );
         c.answer(r.ask().call, serde_json::json!("B"));
 
@@ -581,10 +580,10 @@ mod tests {
     fn a_difference_is_reported_with_both_sides() {
         let mut a = Conversation::new();
         a.user("go");
-        a.reply("```js\nfinish(\"one\");\n```\n");
+        a.reply("```js\ntell(\"one\"); finish();\n```\n");
         let mut b = Conversation::new();
         b.user("go");
-        b.reply("```js\nfinish(\"two\");\n```\n");
+        b.reply("```js\ntell(\"two\"); finish();\n```\n");
 
         let was = Said::of_branch(a.tree(), a.runner().spine.leaf_id);
         let now = Said::of_branch(b.tree(), b.runner().spine.leaf_id);

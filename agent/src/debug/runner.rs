@@ -165,17 +165,6 @@ impl Runner {
             Ok(StepResult::Paused { .. }) => {
                 unreachable!("the debugger does not compile incrementally")
             }
-            // The debugger has no harness behind it, so a program that
-            // stops itself simply ends — with its reason as the result,
-            // which is the useful thing to show.
-            Ok(StepResult::Finished { text, .. }) => {
-                self.state = RunState::Done { value: text };
-            }
-            Ok(StepResult::Stopped { reason, .. }) => {
-                self.state = RunState::Done {
-                    value: format!("stopped: {reason}"),
-                };
-            }
             Ok(StepResult::Done { value, .. }) => {
                 let rendered = self
                     .vm

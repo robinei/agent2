@@ -172,9 +172,11 @@ pub fn scripted_answer(
 #[allow(dead_code)] // used only from test modules, which the non-test
 // build does not compile; not dead.
 pub fn scripted_text(text: &str) -> LlmTurn {
-    // `finish(text)` is the pair this used to write out longhand: the
-    // answer goes to the person and the task ends, in one call.
-    scripted_program(&format!("finish({});", serde_json::json!(text)))
+    // Two verbs, one job each: `tell` puts the answer in front of the
+    // person, `finish()` says the task is over. A reply that rests
+    // having told nobody anything is not honoured, so the pairing is
+    // not optional.
+    scripted_program(&format!("tell({}); finish();", serde_json::json!(text)))
 }
 
 /// A scripted client that answers by **which agent asked**, not by

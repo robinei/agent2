@@ -4,9 +4,10 @@ Which way this should go is not mine to guess, and it is a closed choice — the
 const f = await tools.read_file("PATH");
 const pick = await choose("user", "QUESTION?", ["A", "B", "leave it"]);
 if (pick === "leave it") {
-  finish("left PATH alone.");
+  tell("left PATH alone.");
 } else {
   await tools.replace_file("PATH", Edit.replaceOnce(f.content, "OLD", pick), f.version);
-  finish(`PATH says ${pick} now.`);
+  tell(`PATH says ${pick} now.`);
 }
+finish();
 ```

@@ -364,7 +364,10 @@ mod tests {
             &mut spine,
             EventPayload::Handback {
                 reply: EventId::new(1),
-                how: crate::types::Handback::Completed,
+                how: crate::types::Handback::Completed {
+                    value: None,
+                    rested: false,
+                },
                 site: 0,
                 stack: Vec::new(),
             },
@@ -441,7 +444,10 @@ mod tests {
                 &mut spine,
                 EventPayload::Handback {
                     reply,
-                    how: crate::types::Handback::Completed,
+                    how: crate::types::Handback::Completed {
+                        value: None,
+                        rested: false,
+                    },
                     site: 0,
                     stack: Vec::new(),
                 },

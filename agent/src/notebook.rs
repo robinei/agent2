@@ -85,8 +85,14 @@ impl Notebook {
     /// Begin a reply. Compiles the prelude into `vm` as the unit's first
     /// fragment, which is what lets the reply's own region grow afterwards.
     pub fn new(vm: &mut interp::VM) -> Result<Self, String> {
+        // **A top-level `return` ends the program**, which under this
+        // transport is the whole reply: the cells share one scope and
+        // one frame, so returning from that frame is the least
+        // surprising reading of the primitive and is what `stop(reason)`
+        // used to spell. The rejection that stood here sent a model
+        // writing `return` to `history.append` and `finish(text)`,
+        // neither of which ends anything.
         let mut core = interp::ReplCore::new();
-        core.reject_top_level_return(NO_TOP_LEVEL_RETURN);
         core.prime_prelude(vm)
             .map_err(|diags| render_cell_diags("", &diags))?;
         let base = core.source_base();
@@ -444,32 +450,6 @@ impl Stream {
 fn prose_between(reply: &str, start: usize, end: usize) -> Option<String> {
     (start < end).then(|| reply[start..end].to_owned())
 }
-
-/// What a cell should write instead of a top-level `return` (D5, 25.3).
-///
-/// **The rule lives in `interp`; this sentence lives here** (D16). `interp`
-/// carries a flag — the inverse of `oxc`'s `allow_return_outside_function` —
-/// and `Repl::reject_top_level_return` takes the message from whoever set it,
-/// because `history.append` and `finish(text)` are this harness's vocabulary and not
-/// the language's.
-///
-/// **The diagnostic matters more than the rule**, because ending a program
-/// with `return {…}` is the *trained* habit — exemplar 02 teaches it — so this
-/// has to say what to write instead rather than merely that it is disallowed.
-/// Under this transport `return` did three things and something else already
-/// does each: falling off the last cell ends the run, `finish(text)` rests the
-/// branch, `history.append` leaves a row the next turn reads — and
-/// `stop(reason)` ends the reply *here*, which is what a `return` in the
-/// middle of a cell was reaching for.
-///
-/// **`stop` used to be missing from it**, so a model that wrote `return`
-/// meaning "not this, not now" was sent to the two verbs that do not mean
-/// that. Nothing has hit this message in 478 kept logs — models write no
-/// top-level `return` at all — but the one thing it exists for is being
-/// right when one does.
-pub const NO_TOP_LEVEL_RETURN: &str = "a cell cannot `return`: `history.append(...)` leaves a row the next turn \
-     reads, `stop(reason)` ends the reply here and says why, and `finish(text)` rests the branch once the work \
-     is finished";
 
 /// One executable cell, as a byte range into the markdown it came from.
 ///
@@ -964,7 +944,7 @@ mod tests {
     /// a markdown sample is quoted.
     #[test]
     fn a_four_backtick_markdown_fence_hides_its_inner_cell() {
-        let md = "````markdown\n```js\nfinish(\"ok\");\n```\n````\n";
+        let md = "````markdown\n```js\ntell(\"ok\"); finish();\n```\n````\n";
         assert!(split_cells(md).is_empty());
     }
 
@@ -1052,8 +1032,8 @@ three\n";
     /// newline still closes.
     #[test]
     fn a_closing_fence_at_eof_without_a_newline_closes() {
-        let md = "```js\nfinish(\"ok\");\n```";
-        assert_eq!(cells_of(md), vec!["finish(\"ok\");\n"]);
+        let md = "```js\ntell(\"ok\"); finish();\n```";
+        assert_eq!(cells_of(md), vec!["tell(\"ok\"); finish();\n"]);
     }
 
     // --- the streaming splitter (D11, D15) ---
@@ -1076,7 +1056,7 @@ three\n";
         let reply = "Both files claim to own the retry policy.\n\n\
                      ```js\nconst a = 1;\n```\n\n\
                      `retry.rs` is the newer of the two.\n\n\
-                     ```js\nfinish(\"ok\");\n```\n";
+                     ```js\ntell(\"ok\"); finish();\n```\n";
         let mut stream = Stream::new();
         let pieces = stream.finish(reply);
         assert_eq!(
@@ -1119,7 +1099,7 @@ three\n";
     /// model may still be mid-sentence, or about to open another fence.
     #[test]
     fn trailing_prose_waits_for_the_end_of_the_reply() {
-        let reply = "```js\nfinish(\"ok\");\n```\n\nThat is everything.\n";
+        let reply = "```js\ntell(\"ok\"); finish();\n```\n\nThat is everything.\n";
         let mut stream = Stream::new();
         assert_eq!(stream.advance(reply), vec![Piece::Cell(0)]);
         assert_eq!(
@@ -1284,38 +1264,14 @@ three\n";
         assert_eq!(pieces.len(), 1);
     }
 
-    // --- the `return` diagnostic (D5, 25.3) ---
-
-    /// The gate: the message names every replacement, because a model that is
-    /// only told `return` is disallowed has nowhere to go. It is carried into
-    /// `interp` by `Repl::reject_top_level_return`, which supplies no wording
-    /// of its own.
+    /// **A cell's top-level `return` ends the program**, and a
+    /// function inside a cell returns from itself as it always did.
+    /// The reply is one program across its cells — one scope, one
+    /// frame — so returning from that frame ends the reply, which is
+    /// the least surprising reading of the primitive and what
+    /// `stop(reason)` used to spell.
     #[test]
-    fn the_return_diagnostic_names_what_to_use_instead() {
-        assert!(
-            NO_TOP_LEVEL_RETURN.contains("history.append"),
-            "the message must name what leaves a row for the next turn"
-        );
-        assert!(
-            NO_TOP_LEVEL_RETURN.contains("finish("),
-            "the message must name what rests the branch"
-        );
-        assert!(
-            NO_TOP_LEVEL_RETURN.contains("stop("),
-            "and what ends the reply here, which is what a `return` in the \
-             middle of a cell is reaching for"
-        );
-        assert!(
-            NO_TOP_LEVEL_RETURN.contains("return"),
-            "and it must name the thing being refused"
-        );
-    }
-
-    /// End to end through the REPL: a cell's top-level `return` is refused
-    /// with this harness's sentence, while a `return` inside a function in a
-    /// cell is left alone.
-    #[test]
-    fn a_cell_cannot_return_but_a_function_in_one_can() {
+    fn a_cell_can_return_and_so_can_a_function_in_one() {
         let md = "```js\nfunction f() { return 1; }\nconsole.log(f());\n```\n\n\
                   ```js\nreturn { done: true };\n```\n";
         let cells = split_cells(md);
@@ -1323,19 +1279,17 @@ three\n";
 
         let mut pb = ParseBuffer::new(md);
         let mut repl = interp::Repl::new(serde_json::Value::Null, serde_json::Value::Null).unwrap();
-        repl.reject_top_level_return(NO_TOP_LEVEL_RETURN);
 
         repl.push(pb.focus(cells[0]))
             .expect("a function inside a cell may return");
         repl.vm.step(u64::MAX).unwrap();
         assert_eq!(repl.vm.console_lines, vec!["1"]);
 
-        let errs = repl
-            .push(pb.focus(cells[1]))
-            .expect_err("the cell's own `return` is refused");
+        repl.push(pb.focus(cells[1]))
+            .expect("and so may the cell itself");
         assert!(
-            errs.iter().any(|d| d.message == NO_TOP_LEVEL_RETURN),
-            "expected this harness's message, got {errs:?}"
+            matches!(repl.vm.step(u64::MAX), Ok(interp::StepResult::Done { .. })),
+            "a top-level return ends the program"
         );
     }
 

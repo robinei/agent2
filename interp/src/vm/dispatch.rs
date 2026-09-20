@@ -3033,39 +3033,15 @@ impl VM {
                     });
                 }
 
+                // **A flag, and nothing else happens.** The task is
+                // finished; the branch should not be prompted again
+                // once this program ends. Execution continues — the
+                // host reads `finished` when the program actually ends,
+                // so a `finish()` written before the last `tell` still
+                // rests the branch and the `tell` still goes out.
                 Instr::Finish => {
-                    let v = self.pop()?;
-                    let text = match &v {
-                        Value::String(s) => s.as_str().to_owned(),
-                        other => self.to_js_string(other, 0).as_str().to_owned(),
-                    };
+                    self.finished = true;
                     self.ip += 1;
-                    // The outbox drains the same way an ordinary
-                    // ending drains it. **Nothing after `finish` runs,
-                    // but everything before it did**: a `tell` the
-                    // program issued and never awaited was issued, and
-                    // dropping it here would make the verb quietly
-                    // destructive rather than merely final.
-                    return Ok(StepResult::Finished {
-                        text,
-                        unstarted: std::mem::take(&mut self.outbox),
-                    });
-                }
-
-                Instr::Stop => {
-                    // The reason is rendered the way a `tell` would
-                    // render it, so a stop reads as a sentence rather
-                    // than as a debug dump of whatever was passed.
-                    let v = self.pop()?;
-                    let reason = match &v {
-                        Value::String(s) => s.as_str().to_owned(),
-                        other => self.to_js_string(other, 0).as_str().to_owned(),
-                    };
-                    self.ip += 1;
-                    return Ok(StepResult::Stopped {
-                        reason,
-                        unstarted: std::mem::take(&mut self.outbox),
-                    });
                 }
 
                 // ── exceptions (6_LANGUAGE Part B) ──────────────

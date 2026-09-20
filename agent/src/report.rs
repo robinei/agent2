@@ -340,6 +340,12 @@ mod bare_stack_tests {
 /// a result is a size, and what a program hands on it hands on through
 /// `history.append` — which is a row of its own and compacts like one.
 pub struct CompletionReport {
+    /// What a top-level `return` handed back, if anything.
+    ///
+    /// **The one thing a program says to its own next reply.** It is
+    /// the channel `stop(reason)` used to be: a check came back wrong,
+    /// the program ended there, and this is what it said about it.
+    pub returned: Option<serde_json::Value>,
     /// Full console log (the renderer tails it).
     pub console: Vec<String>,
     /// The `Console` event the tail comes from, named when it clips.
@@ -379,11 +385,22 @@ pub struct CompletionReport {
 
 impl CompletionReport {
     pub fn render(&self) -> String {
-        // **A reply that finished says so and no more.** It has no
-        // `return` (D5), so there is no value to show — and the line
-        // that used to carry one said `returned: null` on 68 handbacks
-        // out of 68.
-        let mut sections = vec![RUN_HEADING.to_owned(), "It completed.".to_owned()];
+        // **A reply that ended says so, and says what it returned.**
+        // A program that ran off its end returned nothing and this is
+        // one line; one that ended itself on a failed check put the
+        // reason here, which is the whole of what it said to this
+        // reply.
+        let ended = match &self.returned {
+            Some(v) => format!(
+                "It ended with `return`, and this is what it returned:\n\n{}",
+                clip(
+                    &serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string()),
+                    PAYLOAD_MAX_BYTES
+                )
+            ),
+            None => "It completed.".to_owned(),
+        };
+        let mut sections = vec![RUN_HEADING.to_owned(), ended];
         let rows: Vec<&Artifact> = self.new_artifacts.iter().collect();
         sections.extend(render_rows(&rows));
         sections.extend(render_console(&self.console, self.console_id));
@@ -1255,11 +1272,12 @@ fn render_handback(h: &Handback<'_>, budget: usize) -> String {
         return "(not an outcome)".to_owned();
     };
     match how {
-        // A `finish` reports like any other completion: the branch
-        // rested, and this is only reached when something later woke
-        // it — a new question from the person, which the report is
-        // there to hand the previous program's rows to.
-        HandbackHow::Completed | HandbackHow::Finished => CompletionReport {
+        // A rested program reports like any other completion: this is
+        // only reached when something later woke the branch — a new
+        // question from the person, which the report is there to hand
+        // the previous program's rows to.
+        HandbackHow::Completed { value, .. } => CompletionReport {
+            returned: value.clone(),
             console: h.console.clone(),
             console_id: h.console_id,
             new_artifacts: menu_since(h, h.previous_outcome),
@@ -1520,13 +1538,8 @@ fn what_happened(h: &Handback<'_>, cause: &HandbackHow, site: u32) -> String {
         // wrong that the program did not foresee; this is the program
         // foreseeing it and saying so. Rendering them alike taught that
         // stopping yourself is a kind of failure, which is the opposite
-        // of what it is — and it is why `tell(…); finish("done.")` on a failed
+        // of what it is — and it is why `tell(…); tell("done."); finish()` on a failed
         // check looked like the tidier option.
-        HandbackHow::Stopped { reason } => format!(
-            "Your program stopped itself:\n\n{reason}\n\nNothing after that ran. \
-             Everything it did before it is above — the rows it added, what it printed — \
-             so carry on from here."
-        ),
         HandbackHow::Trapped {
             message, resumable, ..
         } => {
@@ -1609,7 +1622,7 @@ fn what_happened(h: &Handback<'_>, cause: &HandbackHow, site: u32) -> String {
         // same reply did run and have rows to show. Kept so this match
         // stays exhaustive over `Handback` rather than letting a
         // wildcard hide a variant added later.
-        HandbackHow::Completed | HandbackHow::Finished => String::new(),
+        HandbackHow::Completed { .. } => String::new(),
         HandbackHow::CellFailed { message } => message.clone(),
     }
 }
@@ -2053,7 +2066,10 @@ mod tests {
             &mut spine,
             EventPayload::Handback {
                 reply: first,
-                how: crate::types::Handback::Completed,
+                how: crate::types::Handback::Completed {
+                    value: None,
+                    rested: false,
+                },
                 site: 0,
                 stack: Vec::new(),
             },
@@ -2139,7 +2155,10 @@ mod tests {
             "return 1;",
             EventPayload::Handback {
                 reply: EventId::new(1),
-                how: crate::types::Handback::Completed,
+                how: crate::types::Handback::Completed {
+                    value: None,
+                    rested: false,
+                },
                 site: 0,
                 stack: Vec::new(),
             },
@@ -2242,7 +2261,10 @@ mod tests {
                 &mut spine,
                 EventPayload::Handback {
                     reply,
-                    how: crate::types::Handback::Completed,
+                    how: crate::types::Handback::Completed {
+                        value: None,
+                        rested: false,
+                    },
                     site: 0,
                     stack: Vec::new(),
                 },
@@ -2386,7 +2408,10 @@ mod tests {
                     &mut spine,
                     EventPayload::Handback {
                         reply: EventId::new(1),
-                        how: crate::types::Handback::Completed,
+                        how: crate::types::Handback::Completed {
+                            value: None,
+                            rested: false,
+                        },
                         site: 0,
                         stack: Vec::new(),
                     },
@@ -2600,6 +2625,7 @@ mod tests {
     fn an_appended_row_reaches_the_next_reply_whole() {
         let long = "z".repeat(5_000);
         let rendered = CompletionReport {
+            returned: None,
             console: Vec::new(),
             console_id: None,
             new_artifacts: vec![Artifact {
@@ -2771,6 +2797,7 @@ mod tests {
 
     fn completion(artifacts: Vec<Artifact>) -> String {
         CompletionReport {
+            returned: None,
             console: Vec::new(),
             console_id: None,
             new_artifacts: artifacts,
@@ -2885,6 +2912,7 @@ mod tests {
     #[test]
     fn a_finished_reply_prints_no_value() {
         let rendered = CompletionReport {
+            returned: None,
             console: Vec::new(),
             console_id: None,
             new_artifacts: Vec::new(),

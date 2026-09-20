@@ -651,19 +651,17 @@ pub enum Instr {
     /// NOT catchable by `try`: conditions are addressed to the LLM, and a
     /// program must not be able to swallow them (6_LANGUAGE Part B).
     Raise(RcStr, ArgCount), // (payload?) -> result
-    /// `stop("reason")` — halt here, nothing after it runs. An effect,
-    /// not an exception: it never reaches the handler search, so a
-    /// `try` the program wrote for something else cannot swallow it.
-    Stop, // (reason) -> !
-    /// `finish("text")` — the task is finished; halt here too.
+    /// `finish()` — **a flag, not an ending**: the task is finished, so
+    /// the branch should not be prompted again once this program ends.
+    /// Nothing about control flow changes; the instructions after it
+    /// run exactly as they would have. `return` is what ends a program.
     ///
-    /// **Both endings halt.** This was `finish`, which set a flag and let
-    /// the blocks after it run — a shape that needed a paragraph of
-    /// card and a worked bug to explain, and that 51 programs in the
-    /// kept corpus wrote real statements after, including writes made
-    /// after the program had decided it was finished. The two verbs now
-    /// differ in one thing only: whether the branch rests afterwards.
-    Finish, // (text) -> !
+    /// The verb used to halt *and* speak *and* rest, and the halting
+    /// half cost a card paragraph and a worked bug to explain — 51
+    /// programs in the kept corpus wrote real statements after it,
+    /// including writes made after the program had decided it was
+    /// finished.
+    Finish, // () -> ()
 
     /// Enter a `try` block: push an entry onto the VM's handler stack,
     /// snapshotting the current stack height, call depth, and frame pointer.

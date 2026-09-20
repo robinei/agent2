@@ -1,8 +1,0 @@
-## program completed
-returned [#18]: {"question":"decide which of these still matter and deal with those","hits":["src/a.rs:14:MARKER","src/b.rs:31:MARKER","src/b.rs:52:MARKER"]}
-
-console: (no output)
-
-## new rows — fetch any of them with fetch_history(id)
-[#15] tell(user, "finding the marked sites.") → ok
-[#16] bash("grep -rn MARKER .") → ok, 214 bytes

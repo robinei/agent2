@@ -159,15 +159,22 @@ fn line_for(tree: &Tree, path: &[&Event], event: &Event) -> Option<String> {
             };
             format!("#{id}    ✂ #{} {how}", of.as_u64())
         }
-        // **Finishing and handing on are two terminals** and two very
-        // different things to read: one says the task is over, the
-        // other says the next reply carries on. They were one
-        // `Completed` on the log once, and this had to ask after the
-        // fact whether the branch had rested.
+        // **Finishing and handing on are one ending with a flag on
+        // it** — `finish()` says the task is done, and says nothing
+        // about how the program ended. What it returned, if anything,
+        // is the other half and reads on the same line.
         EventPayload::Handback { how, .. } => match how {
-            Handback::Finished => "       ✓ finished".to_owned(),
-            Handback::Completed => "       ⏎ handed on".to_owned(),
-            Handback::Stopped { reason } => format!("       ⏹ stopped: {}", clip(reason)),
+            Handback::Completed { value, rested } => {
+                let mark = if *rested {
+                    "✓ finished"
+                } else {
+                    "⏎ handed on"
+                };
+                match value {
+                    Some(v) => format!("       {mark} → {}", clip_args(v)),
+                    None => format!("       {mark}"),
+                }
+            }
             Handback::Raised { name, .. } => format!("#{id}    ⏸ raised «{name}»"),
             Handback::Trapped { kind, message, .. } => {
                 format!("#{id}    ✗ trapped {kind}: {}", clip(message))
@@ -249,9 +256,6 @@ fn waiting_on(path: &[&Event]) -> String {
         EventPayload::Handback { how, .. } => Some(how),
         _ => None,
     }) {
-        Some(Handback::Stopped { .. }) => {
-            "waiting on: nothing — it stopped itself and will carry on when prompted".to_owned()
-        }
         Some(Handback::Raised { name, .. }) => {
             format!("waiting on: a handler for «{name}»")
         }
@@ -381,7 +385,7 @@ mod tests {
         c.user("is it green?");
         c.reply(
             "Running the check.\n\n```js\nconst r = await tools.bash(\"make check\");\n\
-             finish(r.status === 0 ? \"green.\" : \"not green.\");\n```\n",
+             tell(r.status === 0 ? \"green.\" : \"not green.\"); finish();\n```\n",
         );
 
         let out = render(c.tree(), c.runner().spine.leaf_id);
@@ -407,7 +411,7 @@ mod tests {
         c.user("A or B?");
         let r = c.reply(
             "```js\nconst pick = await choose(\"user\", \"which one?\", [\"A\", \"B\"]);\n\
-             finish(`picked ${pick}.`);\n```\n",
+             tell(`picked ${pick}.`); finish();\n```\n",
         );
 
         let out = render(c.tree(), c.runner().spine.leaf_id);
@@ -440,7 +444,7 @@ mod tests {
         // A cell that blocks on a tool, so a post can land mid-run.
         c.never_answers("scan");
         c.allow(crate::testkit::Invariant::CallsSettle);
-        c.chunk("```js\nconst r = await tools.scan();\nfinish(r.out);\n```\n");
+        c.chunk("```js\nconst r = await tools.scan();\ntell(r.out); finish();\n```\n");
         c.harness("something arrived");
         c.end_reply();
 
@@ -452,11 +456,12 @@ mod tests {
         );
     }
 
-    /// A stop reads as a decision, not as a fault, and the closing line
-    /// says the work carries on — which is the distinction the verb
-    /// exists to make.
+    /// **A program that ends itself reads as a decision, not a fault**,
+    /// and what it returned is on the same line — which is the whole of
+    /// what it said to the next reply. A trap renders as `✗`; this is
+    /// the model noticing its own check fail and saying so.
     #[test]
-    fn a_stop_reads_as_a_decision() {
+    fn a_return_reads_as_a_decision() {
         let mut c = Conversation::new();
         c.answers(
             "bash",
@@ -465,13 +470,13 @@ mod tests {
         c.user("is it green?");
         c.reply(
             "```js\nconst r = await tools.bash(\"make check\");\n\
-             if (r.status !== 0) stop(`CHECK fails: ${r.stdout}`);\nfinish(\"green.\");\n```\n",
+             if (r.status !== 0) return `CHECK fails: ${r.stdout}`;\ntell(\"green.\"); finish();\n```\n",
         );
 
         let out = render(c.tree(), c.runner().spine.leaf_id);
         assert!(out.contains("→ bash(\"make check\") status 1"), "{out}");
-        assert!(out.contains("⏹ stopped: CHECK fails:"), "{out}");
-        assert!(out.contains("it stopped itself and will carry on"), "{out}");
+        assert!(out.contains("⏎ handed on → \"CHECK fails:"), "{out}");
+        assert!(!out.contains("✗"), "a decision is not a fault: {out}");
     }
 
     /// **A program that cats a file does not take the transcript with

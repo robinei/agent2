@@ -171,13 +171,12 @@ pub enum Invariant {
 /// says which ending *and* rules out the others in one line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Ending {
-    /// `finish(text)` — the task is over and the branch rests.
-    Finished,
-    /// The program ran off the end. Under this transport that is a
-    /// handover, not an ending: the next reply carries on.
-    Completed,
-    /// `stop(reason)` — this reply cannot finish, and says why.
-    Stopped(String),
+    /// `finish()` ran and was honoured: the branch rests. Carries what
+    /// a top-level `return` handed back, if anything.
+    Finished(Option<serde_json::Value>),
+    /// The program ended and the branch carries on — it ran off the end
+    /// of its last cell, or `return`ed the value carried here.
+    Completed(Option<serde_json::Value>),
     /// `raise(name, payload)` — parked for a judgement.
     Raised {
         name: String,
@@ -983,7 +982,8 @@ impl Said {
             .find(|e| matches!(e.payload, EventPayload::Reply | EventPayload::Restart))
             .map(|e| e.id)
             .unwrap_or(leaf);
-        s.rests = s.asks.is_empty() && matches!(s.ended, Ending::Finished | Ending::Completed);
+        s.rests =
+            s.asks.is_empty() && matches!(s.ended, Ending::Finished(_) | Ending::Completed(_));
         s
     }
 }
@@ -1220,10 +1220,7 @@ impl Conversation {
         if self.enforced(Invariant::CallsSettle) {
             // Not while something is parked: a suspended or abandoned
             // run leaves calls open by design.
-            let parked = !matches!(
-                s.ended,
-                Ending::Completed | Ending::Finished | Ending::Stopped(_)
-            );
+            let parked = !matches!(s.ended, Ending::Completed(_) | Ending::Finished(_));
             if !parked {
                 for e in &events {
                     let EventPayload::Call(call) = &e.payload else {
@@ -1255,9 +1252,11 @@ impl Conversation {
 
 fn ending_of(how: &Handback, site: u32) -> Ending {
     match how {
-        Handback::Completed => Ending::Completed,
-        Handback::Finished => Ending::Finished,
-        Handback::Stopped { reason } => Ending::Stopped(reason.clone()),
+        Handback::Completed {
+            value,
+            rested: true,
+        } => Ending::Finished(value.clone()),
+        Handback::Completed { value, .. } => Ending::Completed(value.clone()),
         Handback::Raised { name, payload, .. } => Ending::Raised {
             name: name.clone(),
             payload: payload.clone(),
@@ -1308,44 +1307,47 @@ mod tests {
         c.user("what does PATH say?");
 
         let r = c.reply(
-            "Reading it.\n\n```js\nconst f = await tools.read_file(\"PATH\");\nfinish(`PATH says ${f.content}.`);\n```\n",
+            "Reading it.\n\n```js\nconst f = await tools.read_file(\"PATH\");\ntell(`PATH says ${f.content}.`); finish();\n```\n",
         );
 
         assert_eq!(r.prose, ["Reading it."]);
         assert_eq!(r.calls.len(), 1);
         assert_eq!(r.calls[0].0, "read_file");
         assert_eq!(r.tells, ["PATH says NEW."]);
-        assert_eq!(r.ended, Ending::Finished);
+        assert_eq!(r.ended, Ending::Finished(None));
         assert!(r.rests, "finish rests the branch");
     }
 
-    /// The other ending. `stop` halts and does **not** rest: the reason
-    /// goes in front of the next reply, which is the whole point of it
-    /// being a separate verb.
+    /// The other ending. A `return` ends the program and does **not**
+    /// rest the branch: what it returned goes in front of the next
+    /// reply, which carries on.
     #[test]
-    fn a_reply_that_stops_says_why_and_does_not_rest() {
+    fn a_reply_that_returns_says_why_and_does_not_rest() {
         let mut c = Conversation::new();
         c.answers("bash", json!({ "status": 1, "stdout": "2 failed" }));
         c.user("is it green?");
 
         let r = c.reply(
-            "```js\nconst check = await tools.bash(\"make check\");\nif (check.status !== 0) stop(`CHECK fails:\\n${check.stdout}`);\nfinish(\"green.\");\n```\n",
+            "```js\nconst check = await tools.bash(\"make check\");\nif (check.status !== 0) return `CHECK fails:\\n${check.stdout}`;\ntell(\"green.\");\nfinish();\n```\n",
         );
 
-        assert_eq!(r.ended, Ending::Stopped("CHECK fails:\n2 failed".into()));
+        assert_eq!(
+            r.ended,
+            Ending::Completed(Some(json!("CHECK fails:\n2 failed")))
+        );
         assert!(
             r.tells.is_empty(),
-            "it stopped before it could claim success"
+            "it returned before it could claim success"
         );
         assert!(
             !r.rests,
-            "a stop is not an ending — the branch is asked again"
+            "a `return` rests nothing — the branch is asked again"
         );
     }
 
-    /// **`finish(text)` halts, and the cells after it never run** (D8,
-    /// D11) — which is the whole difference from the verb that used to
-    /// settle and carry on. What it does *not* do is cancel the
+    /// **`return` ends the program, and the cells after it never run**
+    /// (D8, D11) — the cells share one frame, so returning from it
+    /// ends the reply. What it does *not* do is cancel the
     /// generation: the reply keeps arriving, every part of it is logged
     /// (28 — the record of what was written stays whole), and the turn
     /// closes on the `ReplyEnd` that carries what the completion cost.
@@ -1354,23 +1356,23 @@ mod tests {
     /// Chunked deliberately: the halt has to happen while the second
     /// cell is still being written, which is the case that broke.
     #[test]
-    fn finish_in_a_cell_skips_the_cells_after_it() {
+    fn a_return_in_a_cell_skips_the_cells_after_it() {
         let mut c = Conversation::new();
         c.user("go");
 
         let r = c.reply_in_chunks(&[
-            "```js\nfinish(\"ok\");\n```\n",
-            "\n```js\ntell(\"after finish\");\n```\n",
+            "```js\ntell(\"ok\");\nreturn;\n```\n",
+            "\n```js\ntell(\"after the return\");\n```\n",
         ]);
 
         assert_eq!(
             r.cells.len(),
             2,
-            "the cell it wrote after `finish` is on the log"
+            "the cell it wrote after the `return` is on the log"
         );
-        assert_eq!(r.tells, ["ok"], "and nothing after `finish(text)` ran");
-        assert_eq!(r.ended, Ending::Finished);
-        assert!(r.rests, "`finish(text)` rests the branch");
+        assert_eq!(r.tells, ["ok"], "and nothing after the `return` ran");
+        assert_eq!(r.ended, Ending::Completed(None));
+        assert!(!r.rests, "a `return` rests nothing — the branch carries on");
         // The turn is a whole one. `ReplyEnds` and `OneReply` already
         // hold — they are checked on every reply — so this only has to
         // say where the end sits: after the word `finish` sent, because
@@ -1399,7 +1401,7 @@ mod tests {
         );
 
         assert_eq!(r.row().value, json!({ "hits": ["a.rs", "b.rs"] }));
-        assert_eq!(r.ended, Ending::Completed);
+        assert_eq!(r.ended, Ending::Completed(None));
         assert!(!r.rests, "completing is not, by itself, a reason to rest");
     }
 
@@ -1412,7 +1414,7 @@ mod tests {
         c.user("set it to whatever I say");
 
         let r = c.reply(
-            "```js\nconst n = await ask(\"user\", \"how many?\");\nfinish(`set to ${n}.`);\n```\n",
+            "```js\nconst n = await ask(\"user\", \"how many?\");\ntell(`set to ${n}.`); finish();\n```\n",
         );
 
         assert_eq!(r.ask().text, "how many?");
@@ -1425,7 +1427,7 @@ mod tests {
             ["set to 7."],
             "the answer reached the expression that asked"
         );
-        assert_eq!(after.ended, Ending::Finished);
+        assert_eq!(after.ended, Ending::Finished(None));
     }
 
     /// The history verbs work in any program, not only a compaction
@@ -1478,7 +1480,7 @@ mod tests {
         c.rejects("bash", "no such command");
         c.user("run it");
 
-        let r = c.reply("```js\nawait tools.bash(\"nope\");\nfinish(\"ran it.\");\n```\n");
+        let r = c.reply("```js\nawait tools.bash(\"nope\");\ntell(\"ran it.\"); finish();\n```\n");
 
         assert!(
             matches!(&r.ended, Ending::Trapped { message, .. } if message.contains("no such command")),
@@ -1497,7 +1499,7 @@ mod tests {
         c.user("A or B?");
 
         let r = c.reply(
-            "```js\nconst pick = await choose(\"user\", \"which?\", [\"A\", \"B\"]);\nfinish(`picked ${pick}.`);\n```\n",
+            "```js\nconst pick = await choose(\"user\", \"which?\", [\"A\", \"B\"]);\ntell(`picked ${pick}.`); finish();\n```\n",
         );
 
         assert_eq!(r.ask().options, ["A", "B"]);
@@ -1513,7 +1515,7 @@ mod tests {
         c.user("go");
 
         let r = c.reply(
-            "```js\nconst n = 41;\nconst which = raise(\"pick_one\", { n });\nfinish(`took ${which}, n was ${n}.`);\n```\n",
+            "```js\nconst n = 41;\nconst which = raise(\"pick_one\", { n });\ntell(`took ${which}, n was ${n}.`); finish();\n```\n",
         );
 
         assert_eq!(
@@ -1565,7 +1567,7 @@ mod tests {
         c.user("go");
         let r = c.reply(
             "↓ history[17]\nThe check is simple, so I will just run it.\n\n\
-             ↓ history[18]\n```js\nfinish(\"ran it.\");\n```\n",
+             ↓ history[18]\n```js\ntell(\"ran it.\"); finish();\n```\n",
         );
 
         assert_eq!(
@@ -1589,8 +1591,9 @@ mod tests {
     fn only_a_bare_marker_line_is_dropped() {
         let mut c = Conversation::new();
         c.user("go");
-        let r =
-            c.reply("The count ↓ history[3] is the one I want.\n\n```js\nfinish(\"ok\");\n```\n");
+        let r = c.reply(
+            "The count ↓ history[3] is the one I want.\n\n```js\ntell(\"ok\"); finish();\n```\n",
+        );
         assert_eq!(r.prose, ["The count ↓ history[3] is the one I want."]);
     }
 
@@ -1647,7 +1650,7 @@ mod tests {
         c.never_answers("scan");
         c.allow(Invariant::CallsSettle);
         c.user("go");
-        c.chunk("```js\nconst out = await tools.scan();\nfinish(out);\n```\n");
+        c.chunk("```js\nconst out = await tools.scan();\ntell(out); finish();\n```\n");
         c.harness("stop what you are doing");
         let r = c.end_reply();
 

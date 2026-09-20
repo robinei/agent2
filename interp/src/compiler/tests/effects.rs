@@ -460,43 +460,20 @@ fn abandon_takes_no_arguments() {
     assert!(!errs.is_empty(), "should be a compile error");
 }
 
+/// **`finish()` takes nothing.** It says the task is finished and says
+/// nothing else — `tell(text)` is what reaches the person, and `return`
+/// is what ends the program. The verb carried the answer itself for a
+/// while, which made "whatever finishes, speaks" a property of its
+/// arity; the pairing is a habit the card teaches again now, and the
+/// harness refuses to rest a reply that told nobody anything.
 #[test]
-fn the_endings_each_take_exactly_one_argument() {
-    // **The pairing is the arity.** `finish(text)` and `stop(reason)` both
-    // halt, and both are the last thing anyone hears from this reply —
-    // so neither may be silent. Requiring the argument is what makes
-    // "whatever finishes, speaks" a property of the language rather
-    // than a habit the card has to keep teaching: a bare `finish()` is
-    // the accident that used to end a run without a word to anybody.
-    for verb in ["finish", "stop"] {
+fn finish_takes_nothing() {
+    compile("finish();").expect("`finish()` is the whole call");
+    for bad in ["finish(\"done\");", "finish(1);", "finish(a, b);"] {
         assert!(
-            !crate::testutil::compile_errs(&format!("{verb}();")).is_empty(),
-            "{verb}() should not compile — it has nothing to say"
+            !crate::testutil::compile_errs(bad).is_empty(),
+            "{bad} should not compile — `finish` says nothing"
         );
-        assert!(
-            !crate::testutil::compile_errs(&format!("{verb}(\"a\", \"b\");")).is_empty(),
-            "{verb}(a, b) should not compile"
-        );
-        compile(&format!("{verb}(\"the one thing it says\");"))
-            .unwrap_or_else(|e| panic!("{verb}(text) should compile: {e:?}"));
-
-        // **And an argument is not the same as an answer.** `finish("")`
-        // satisfies the arity and leaves the person with an empty
-        // message, which is the silence the argument was added to
-        // prevent — the loophole a model reaches for when it has
-        // nothing to say and something to satisfy. Seen to be reachable
-        // on 2026-09-20: it compiled, sent an empty message, and rested
-        // the branch.
-        for empty in ["\"\"", "\"   \"", "``", "`\\n`"] {
-            assert!(
-                !crate::testutil::compile_errs(&format!("{verb}({empty});")).is_empty(),
-                "{verb}({empty}) should not compile — it says nothing"
-            );
-        }
-        // A computed empty is a runtime fact the compiler cannot see,
-        // and refusing the shape would refuse programs that are fine.
-        compile(&format!("const s = \"\"; {verb}(s);"))
-            .unwrap_or_else(|e| panic!("{verb}(name) should compile: {e:?}"));
     }
 }
 
@@ -791,8 +768,7 @@ fn every_harness_verb_lowers_to_a_host_call() {
         // Enough arguments for the arity-checked ones; the rest ignore
         // the extras, and none of this runs past the first call.
         let src = match *verb {
-            "finish" | "stop" => format!("{verb}(\"x\");"),
-            "fork" => format!("{verb}();"),
+            "finish" | "fork" => format!("{verb}();"),
             _ => format!("{verb}(1, 2, 3);"),
         };
         let prog = compile(&src).unwrap_or_else(|e| panic!("{verb} failed to compile: {e:?}"));
@@ -803,7 +779,6 @@ fn every_harness_verb_lowers_to_a_host_call() {
         // to give one to. Everything else is a call.
         let emitted = match *verb {
             "finish" => prog.code.iter().any(|i| matches!(i, Instr::Finish)),
-            "stop" => prog.code.iter().any(|i| matches!(i, Instr::Stop)),
             _ => prog.code.iter().any(|i| {
                 matches!(i, Instr::Invoke(n, _) | Instr::Notify(n, _) | Instr::Settle(n, _)
                     if n.as_str() == *verb)

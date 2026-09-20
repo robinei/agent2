@@ -1668,7 +1668,10 @@ mod tests {
             5,
             EventPayload::Handback {
                 reply: EventId::new(1),
-                how: crate::types::Handback::Completed,
+                how: crate::types::Handback::Completed {
+                    value: None,
+                    rested: false,
+                },
                 site: 0,
                 stack: Vec::new(),
             },
@@ -3131,10 +3134,13 @@ mod tests {
         let mut chat = ChatState::new();
         chat.apply(&agent_event());
         chat.set_show_cells(true);
-        for e in cell(2, "tell(\"hi\");\nfinish(\"ok\");\n") {
+        for e in cell(2, "tell(\"hi\");\ntell(\"ok\"); finish();\n") {
             chat.apply(&e);
         }
-        assert_eq!(code_rows(&chat), vec!["tell(\"hi\");", "finish(\"ok\");"]);
+        assert_eq!(
+            code_rows(&chat),
+            vec!["tell(\"hi\");", "tell(\"ok\"); finish();"]
+        );
     }
 
     /// **Selecting a block opens it, and selecting another shuts it.**

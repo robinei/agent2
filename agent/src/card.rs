@@ -1069,7 +1069,7 @@ mod tests {
         // `card()` shows up as a diff review must look at, not a byte
         // count that silently drifts. Comparing full text (not just a
         // hash) so the diff itself is legible in a failure message.
-        const EXPECTED_LEN: usize = 21992;
+        const EXPECTED_LEN: usize = 21792;
         assert_eq!(
             card().len(),
             EXPECTED_LEN,
@@ -1271,13 +1271,19 @@ mod tests {
         let program = interp::compile(src).map_err(|e| format!("{e:?}"))?;
         let mut vm = VM::for_program(program, serde_json::Value::Null)
             .map_err(|e| format!("could not start: {e:?}"))?;
-        // An exemplar that ends the task does it by halting
-        // (`StepResult::Finished`); one that hands on simply runs out.
-        let finished = false;
+        // `finish()` sets a flag and lets the program run on, so the
+        // fact is read off the VM when the program ends rather than
+        // from a `StepResult` — which is the whole point of it being a
+        // flag.
         let mut appended = false;
         loop {
             match vm.step(u64::MAX).map_err(|e| format!("{e:?}"))? {
-                StepResult::Done { .. } => return Ok(Ending { finished, appended }),
+                StepResult::Done { .. } => {
+                    return Ok(Ending {
+                        finished: vm.finished,
+                        appended,
+                    });
+                }
                 StepResult::Pending { calls } => {
                     for call in calls {
                         let result = stub_result(&call.name, &call.args);
@@ -1291,8 +1297,7 @@ mod tests {
                 // The settle-at-dispatch verbs come back here instead of
                 // through the outbox: they answer into the frame that
                 // called them, so the stub pushes the value rather than
-                // settling a promise. `finish` is not among them — it
-                // halts, and arrives as `Finished` below.
+                // settling a promise.
                 StepResult::Settle { call } => {
                     if call.name == crate::machine::TOOL_APPEND_HISTORY {
                         appended = true;
@@ -1308,17 +1313,6 @@ mod tests {
                         .json_to_stack_value(&json!("backup-2.txt"), 0)
                         .map_err(|e| format!("{e:?}"))?;
                     vm.resume_raise(value);
-                }
-                // Unreachable with `u64::MAX` fuel, and there is
-                // nothing to do about it but step again.
-                StepResult::Stopped { reason, .. } => return Err(format!("stopped: {reason}")),
-                // `finish(text)` halts now, so this is how an exemplar
-                // that finishes ends — the flag is set by the verb.
-                StepResult::Finished { .. } => {
-                    return Ok(Ending {
-                        finished: true,
-                        appended,
-                    });
                 }
                 StepResult::OutOfFuel => {}
                 // An exemplar is one whole program compiled one-shot, so
@@ -1561,13 +1555,13 @@ mod tests {
         let ex = exemplars();
         assert_eq!(ex.len(), 5, "five, and each earns its place");
         assert!(
-            ex[0].assistant.contains("finish(") && !ex[0].assistant.contains("return"),
-            "the first ends a finished task: {}",
+            ex[0].assistant.contains("finish()") && ex[0].assistant.contains("tell("),
+            "the first ends a finished task, and says the answer on its way out: {}",
             ex[0].assistant
         );
-        // **`history.append`, not `return`.** A reply has no return
-        // (D5): what the second exemplar demonstrates is handing a
-        // finding on to the next reply and *not* ending the task.
+        // **`history.append`, not `finish()`.** What the second
+        // exemplar demonstrates is handing a finding on to the next
+        // reply and *not* ending the task.
         assert!(
             ex[1].assistant.contains("history.append") && !ex[1].assistant.contains("finish("),
             "the second hands on and does not stop: {}",
@@ -1648,41 +1642,37 @@ mod tests {
             "the first edits and then runs the thing that would fail: {}",
             ex[0].assistant
         );
-        // **Whatever finishes, speaks — and the verb no longer lets it
-        // do otherwise.** This used to pin the pairing by hand: every
-        // exemplar calling `finish()` had to `tell()` first, because a
-        // finish with nothing said is a run that ended without a word
-        // to anybody (1 in 12 runs, and 4 in 12 once a crossing-table
-        // line talked the models out of `tell`). `finish(text)` carries
-        // the words itself now, so the pairing is the verb's arity
-        // (`call.rs` requires the argument) rather than a habit three
-        // exemplars have to teach.
-        //
-        // What is left to demonstrate is that the text is worth
-        // saying — a literal written for the person, not a bare name
-        // whose value the reader cannot see. Same for `stop`: the
-        // reason is the whole point of stopping there.
+        // **Whatever finishes, speaks.** A reply that rests having told
+        // nobody anything is a run that ended without a word (measured
+        // at 1 in 12 runs, and 4 in 12 once a crossing-table line
+        // talked the models out of `tell`). The verb carried the words
+        // itself for a while, which made the pairing its arity; now it
+        // carries nothing and the pairing is back to being a habit the
+        // exemplars teach — so every exemplar that finishes says
+        // something first, and the harness refuses a silent rest.
         for e in &ex {
-            for verb in ["finish(", "stop("] {
-                for rest in e.assistant.split(verb).skip(1) {
-                    assert!(
-                        rest.starts_with('"') || rest.starts_with('`'),
-                        "`{verb}` is given something to say, not a bare name: {}",
-                        e.assistant
-                    );
-                }
+            if e.assistant.contains("finish()") {
+                assert!(
+                    e.assistant.contains("tell("),
+                    "an exemplar that finishes says the answer on its way out: {}",
+                    e.assistant
+                );
             }
         }
-        // **And both endings are shown, not just the good one.** A
-        // check that failed is the commonest thing a reply has to say,
-        // and the exemplars are the only place the model sees what to
-        // do about it: `stop(reason)`, not a `finish()` claiming the
+        // **And a failed check is shown, not just the good path.** It
+        // is the commonest thing a reply has to say, and the exemplars
+        // are the only place the model sees what to do about it:
+        // `return` the reason, rather than a `finish()` claiming the
         // change landed. Two of the five demonstrate it, on the branch
-        // right before the `finish` they would otherwise have reached.
-        let stopping = ex.iter().filter(|e| e.assistant.contains("stop(")).count();
+        // right before the `tell` they would otherwise have reached.
+        let returning = ex
+            .iter()
+            .filter(|e| e.assistant.contains("if (") && e.assistant.contains("return "))
+            .count();
         assert!(
-            stopping >= 2,
-            "the exemplars stop on a failed check in {stopping} of {} —              the finishing shape is the only one demonstrated",
+            returning >= 2,
+            "the exemplars return on a failed check in {returning} of {} — \
+             the finishing shape is the only one demonstrated",
             ex.len()
         );
         // Short enough to be a shape rather than a technique to copy —
@@ -1906,7 +1896,6 @@ mod tests {
         let mut vm = VM::for_incremental(serde_json::Value::Null, serde_json::Value::Null)
             .map_err(|e| format!("{e:?}"))?;
         let mut core = interp::ReplCore::new();
-        core.reject_top_level_return(crate::notebook::NO_TOP_LEVEL_RETURN);
 
         let mut fed = 0usize;
         loop {
@@ -1950,8 +1939,6 @@ mod tests {
                         .map_err(|e| format!("{e:?}"))?;
                     vm.resume_raise(value);
                 }
-                StepResult::Stopped { reason, .. } => return Err(format!("stopped: {reason}")),
-                StepResult::Finished { .. } => return Ok(()),
                 StepResult::OutOfFuel => {}
             }
         }

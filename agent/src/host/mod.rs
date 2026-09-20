@@ -2161,11 +2161,10 @@ fn cause_label(how: &crate::types::Handback) -> &'static str {
     match how {
         H::Raised { .. } => "raised",
         H::Trapped { .. } => "trapped",
-        H::Stopped { .. } => "stopped itself",
         H::Posted { .. } => "posted",
         H::CellFailed { .. } => "cell failed",
-        H::Completed => "completed",
-        H::Finished => "finished",
+        H::Completed { rested: true, .. } => "finished",
+        H::Completed { .. } => "completed",
         H::Interrupted => "interrupted",
         H::Abandoned => "abandoned",
     }
@@ -2329,7 +2328,7 @@ mod tests {
     /// `on_llm_response`, so that layer is covered by something.
     #[test]
     fn a_notebook_reply_survives_the_real_session_loop() {
-        let reply = "Opening the file.\n\n```js\nlet n = 1;\n```\n\nNow the sum.\n\n```js\ntell(`n is ${n + 41}`);\nfinish(`n is ${n + 41}`);\n```\n";
+        let reply = "Opening the file.\n\n```js\nlet n = 1;\n```\n\nNow the sum.\n\n```js\ntell(`n is ${n + 41}`);\ntell(`n is ${n + 41}`); finish();\n```\n";
         let (tx, rx) = channel();
         let mut session = Session::new(
             Tree::new(None),
@@ -2430,7 +2429,9 @@ mod tests {
             ToolRegistry::new(),
             Box::new(ScriptedLlm::new(vec![
                 scripted_program("Working on it.\n\n```js\nundefined_thing_here();\n```\n"),
-                scripted_program("Recovering.\n\n```js\ntell(\"done\");\nfinish(\"ok\");\n```\n"),
+                scripted_program(
+                    "Recovering.\n\n```js\ntell(\"done\");\ntell(\"ok\"); finish();\n```\n",
+                ),
             ])),
             tx,
         )
@@ -2516,7 +2517,11 @@ mod tests {
             .rev()
             .find_map(|e| match &e.payload {
                 EventPayload::Handback {
-                    how: crate::types::Handback::Completed,
+                    how:
+                        crate::types::Handback::Completed {
+                            value: None,
+                            rested: false,
+                        },
                     ..
                 } => Some(serde_json::Value::Null),
                 _ => None,
@@ -2785,7 +2790,7 @@ mod tests {
         let script = vec![
             scripted_program(
                 "const s = tools.slow(); const f = tools.fast(); \
-                 const r = [await s, await f]; history.append(r); finish(\"done.\");",
+                 const r = [await s, await f]; history.append(r); tell(\"done.\"); finish();",
             ),
             scripted_text("done"),
         ];
@@ -2913,8 +2918,8 @@ mod tests {
         // logs a second row and breaks the lookup below.
         let script = vec![
             scripted_program(
-                r#"try { const r = await tools.big(); history.append(r); finish("done."); }
-                   catch (e) { history.append("rejected: " + e); finish("done."); }"#,
+                r#"try { const r = await tools.big(); history.append(r); tell("done."); finish(); }
+                   catch (e) { history.append("rejected: " + e); tell("done."); finish(); }"#,
             ),
             scripted_text("done"),
         ];
@@ -3838,7 +3843,10 @@ mod tests {
             spine,
             EventPayload::Handback {
                 reply,
-                how: crate::types::Handback::Completed,
+                how: crate::types::Handback::Completed {
+                    value: None,
+                    rested: false,
+                },
                 site: 0,
                 stack: Vec::new(),
             },
@@ -4499,7 +4507,7 @@ mod tests {
                             r#"const w = await spawn("reads files");
                                const value = await ask(w.agent, "which file?");
                                history.append(value);
-                               finish("done.");"#,
+                               tell("done."); finish();"#,
                         ),
                         scripted_text("done"),
                     ],
@@ -5043,7 +5051,7 @@ mod tests {
             // no caller here wants (`broadcast_is_promise_all_over_
             // agents`'s own comment: "one program, not two").
             Ok(scripted_program(&format!(
-                "answer({}, {}, {}); finish(\"ok\");\n",
+                "answer({}, {}, {}); tell(\"ok\"); finish();\n",
                 id,
                 json!("answer"),
                 json!(value)
@@ -5146,16 +5154,21 @@ mod tests {
                         scripted_program(
                             r#"const child = spawn("worker");
                                tell(child, "make one of your own");
-                               finish("done.");"#,
+                               tell("done."); finish();"#,
                         ),
                         scripted_program("history.append(list_agents());"),
                     ],
                 ),
                 (
                     "worker",
-                    vec![scripted_program("spawn(\"grandchild\"); finish(\"ok\");\n")],
+                    vec![scripted_program(
+                        "spawn(\"grandchild\"); tell(\"ok\"); finish();\n",
+                    )],
                 ),
-                ("grandchild", vec![scripted_program("finish(\"ok\");\n")]),
+                (
+                    "grandchild",
+                    vec![scripted_program("tell(\"ok\"); finish();\n")],
+                ),
             ],
         );
         let h = session.handle();
@@ -5254,14 +5267,14 @@ mod tests {
         for charter in ["worker a", "worker b", "worker c"] {
             let w = said(&session, agent_by_charter(tree, charter));
             assert_eq!(w.answered.len(), 1, "one question, one answer");
-            assert_eq!(w.tells, ["ok"], "and `finish(\"ok\")` said it");
-            assert_eq!(w.ended, crate::testkit::Ending::Finished);
+            assert_eq!(w.tells, ["ok"], "and `tell(\"ok\"); finish()` said it");
+            assert_eq!(w.ended, crate::testkit::Ending::Finished(None));
         }
         // One question each, one turn each: `answer(...)` settles
         // synchronously and does not end the turn on its own
         // (`structured_answer_reaches_the_program`'s doc), so each
         // worker's single program answers and then ends itself with
-        // `finish("ok")` — nothing forces, or needs, a second completion.
+        // `tell("ok"); finish()` — nothing forces, or needs, a second completion.
         //
         // The `Call`/`Result` pair between them is that `finish`: the verb
         // carries what it says, so finishing is a `Send` like any other.
@@ -5507,7 +5520,7 @@ mod tests {
                         scripted_program(&format!(r#"answer({question}, "w1", "maybe");"#)),
                         scripted_program(&format!(
                             r#"answer({question}, "w1", "big");
-                               finish("done.");"#
+                               tell("done."); finish();"#
                         )),
                     ],
                 ),
@@ -5518,7 +5531,7 @@ mod tests {
                             r#"const w = await spawn("counts things");
                                const v = await choose(w.agent, "how many?", ["small", "big"]);
                                history.append(v);
-                               finish("done.");"#,
+                               tell("done."); finish();"#,
                         ),
                         scripted_text("done"),
                     ],
@@ -5584,7 +5597,7 @@ mod tests {
                     // instead of assumed.
                     vec![scripted_program(&format!(
                         r#"answer({question}, "w1", {});
-                           finish("done.");"#,
+                           tell("done."); finish();"#,
                         json!({ "files": 3, "bytes": 1200 }),
                     ))],
                 ),
@@ -5595,7 +5608,7 @@ mod tests {
                             r#"const w = await spawn("counts things");
                                const v = await ask(w.agent, "how many?");
                                history.append([typeof v, v.files, v.bytes]);
-                               finish("done.");"#,
+                               tell("done."); finish();"#,
                         ),
                         scripted_text("structured"),
                     ],
@@ -6869,7 +6882,10 @@ mod tests {
             &mut root,
             EventPayload::Handback {
                 reply,
-                how: crate::types::Handback::Completed,
+                how: crate::types::Handback::Completed {
+                    value: None,
+                    rested: false,
+                },
                 site: 0,
                 stack: Vec::new(),
             },

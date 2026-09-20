@@ -192,6 +192,25 @@ const STOPPED_SHORT_NOTICE: &str = "Your last reply ran nothing, and nobody had 
      done, say so with `finish(text)` inside a ```js block. Otherwise carry on from where you left \
      off.";
 
+/// **A `finish()` that told nobody anything is not honoured**, and this
+/// is the request that says so.
+///
+/// A branch that rests having said nothing to anybody is a run that
+/// ended without a word — measured at 1 in 12 runs, and 4 in 12 once a
+/// crossing-table line talked the models out of `tell`. The verb
+/// carried the answer itself for a while, which made the pairing its
+/// arity; now it carries nothing, so the pairing is enforced here
+/// instead: the reply is simply not rested, and the branch gets one
+/// more turn with this in front of it.
+///
+/// **In the tail, not as a `Post`.** It is true of exactly one request
+/// and false the moment the next reply speaks, so it should not be on
+/// the log forever — which is what `stopped_short`'s notice does, and
+/// is why that one is re-read on every request after it fires.
+const SILENT_FINISH: &str = "Your last reply called `finish()` without saying anything — no prose, \
+     no `tell()`. Nothing reached the person, so the branch was not rested. Say what you found, \
+     then `finish()`.";
+
 /// **The reply-shape line**, for the request where someone has just
 /// asked something and the branch has no work of its own outstanding.
 ///
@@ -413,19 +432,21 @@ struct Run {
     /// drops entries makes any stored index approximate. It says so
     /// itself with `[… N lines dropped]`.
     console_logged: usize,
-    /// Set once the program has halted itself with `finish` or `stop`.
+    /// Set once the program has ended itself with a top-level
+    /// `return`, holding the value it returned.
     ///
-    /// **The program is over before the reply is.** Both verbs halt
-    /// where they stand, part-way through a notebook that may still be
-    /// arriving — so the ending cannot be logged at that instant: the
-    /// reply's own `ReplyEnd`, carrying what the completion cost, is
-    /// still in the future. Instead the ending is *remembered* here and
-    /// applied when the reply closes (`halt_if_ready`), which is also
-    /// what makes "nothing after it runs" true of the cells that have
-    /// not arrived yet as well as the instructions that have: while
-    /// this is `Some`, the VM is never stepped again and every
-    /// remaining piece is logged but not executed.
-    halted: Option<Halt>,
+    /// **The program is over before the reply is.** `return` ends the
+    /// program where it stands, part-way through a notebook that may
+    /// still be arriving — so the ending cannot be logged at that
+    /// instant: the reply's own `ReplyEnd`, carrying what the
+    /// completion cost, is still in the future. Instead the ending is
+    /// *remembered* here and applied when the reply closes
+    /// (`halt_if_ready`), which is also what makes "nothing after it
+    /// runs" true of the cells that have not arrived yet as well as the
+    /// instructions that have: while this is `Some`, the VM is never
+    /// stepped again and every remaining piece is logged but not
+    /// executed.
+    returned: Option<Value>,
     /// The outbox that drained when the program halted — calls it
     /// issued and never awaited, held until the ending is applied and
     /// then classified exactly as an ordinary completion's are.
@@ -436,15 +457,6 @@ struct Run {
 /// already accounted for by the time this is recorded — `finish`'s text
 /// is a logged `Call::Send`, `stop`'s reason rides the `Handback` —
 /// so this only has to say which of the two it was.
-#[derive(Debug, Clone)]
-enum Halt {
-    /// `stop(reason)`: the reply stops here and the branch is prompted
-    /// again with the reason in front of it.
-    Stopped(String),
-    /// `finish(text)`: the task is finished and the branch rests.
-    Finished,
-}
-
 /// Fuel for a slice driven by an arriving chunk rather than a `Tick`.
 const TICK_FUEL: u64 = 100_000;
 
@@ -771,6 +783,10 @@ pub struct Runner {
     /// is answering a post. A field for the same reason as the line
     /// above: an arm has to be settable per-runner, not per-process.
     reply_shape_tail: bool,
+    /// The last reply called `finish()` and told nobody anything, so it
+    /// was not rested. The next request's tail says so — see
+    /// [`SILENT_FINISH`].
+    finish_ignored: bool,
     /// Runs suspended **beneath** the one currently in `phase`, each
     /// frozen exactly where it stopped, oldest first popped last (a
     /// stack) — see `Phase::Suspended`'s own doc for why this, and not
@@ -796,10 +812,6 @@ enum SuspendCause {
         payload: Option<Value>,
     },
     Trapped(VMError),
-    /// `stop("reason")`: the program found out it could not finish.
-    Stopped {
-        reason: String,
-    },
     /// Someone spoke to the running program.
     Posted(Vec<EventId>),
     /// `Transport::Notebook` only: a cell after the first did not compile.
@@ -908,6 +920,7 @@ impl Runner {
             nudge_when_nothing_ran: std::env::var("AGENT2_STOPPED_SHORT_NOTICE")
                 .is_ok_and(|v| v != "0"),
             reply_shape_tail: std::env::var("AGENT2_REPLY_SHAPE_TAIL").is_ok_and(|v| v != "0"),
+            finish_ignored: false,
             spine,
             agent,
             branch,
@@ -1112,7 +1125,8 @@ impl Runner {
                 EventPayload::Handback { how, .. } => {
                     if let Some(last) = out.last_mut() {
                         last.handed_back = true;
-                        last.finished |= matches!(how, crate::types::Handback::Finished);
+                        last.finished |=
+                            matches!(how, crate::types::Handback::Completed { rested: true, .. });
                     }
                 }
                 _ => {}
@@ -1559,7 +1573,7 @@ impl Runner {
         // program still open. Found 2026-09-20 by resuming one: reply
         // #8 ran `history.append(resume(null))` and logged nothing at
         // all.
-        run.halted = None;
+        run.returned = None;
         match &suspension {
             // Nothing to push: the VM was parked between slices, not
             // stopped at a raise or an error.
@@ -1864,8 +1878,16 @@ impl Runner {
                         return Ok(out);
                     }
                 }
+                // **The program ended.** Either it ran off the end of
+                // its last cell — the ordinary way, and the reply is
+                // over by then — or it ran a top-level `return`, which
+                // can land while the provider is still writing the
+                // cells after it. `halt` is the same ending, deferred
+                // until the reply closes so `ReplyEnd` can carry what
+                // the completion cost; it also stops the cells still to
+                // come from running, which is what `return` means.
                 Ok(StepResult::Done { value, unstarted }) => {
-                    return self.finish_program(tree, value, unstarted, out);
+                    return self.halt(tree, value, unstarted, out);
                 }
                 // **A cell ended — the run did not** (D7). The frame is
                 // still standing with every binding the cell declared, so
@@ -1917,44 +1939,6 @@ impl Runner {
                 Ok(StepResult::Raise { condition, payload }) => {
                     return self.suspend(tree, SuspendCause::Raise { condition, payload }, out);
                 }
-                // **The program said it could not finish.** Not an
-                // error and not an ending: the reply stops here, the
-                // reason goes in front of the next one, and everything
-                // this program did stays in hand.
-                Ok(StepResult::Stopped { reason, unstarted }) => {
-                    return self.halt(tree, Halt::Stopped(reason), unstarted, out);
-                }
-                // **The other ending, and the only difference.** Both
-                // halt where they stand; this one rests the branch
-                // afterwards, and says something on the way out.
-                Ok(StepResult::Finished { text, unstarted }) => {
-                    // Addressed the way a bare `tell(text)` is — to
-                    // whoever this branch owes its oldest open post to,
-                    // the user when it owes nobody. A delegated child
-                    // finishing reports to its parent without having to
-                    // name it, which is the whole reason `finish` takes
-                    // the text rather than leaving a `tell` beside it.
-                    let to = self.resolve_address(tree, None).unwrap_or(Address::User);
-                    let send = tree.append(
-                        &mut self.spine,
-                        EventPayload::Call(Call::Send {
-                            to,
-                            prose: false,
-                            text,
-                            input: serde_json::Value::Null,
-                            options: Vec::new(),
-                            expects_reply: false,
-                            // Synthetic, like prose's own send: the
-                            // verb is an effect, not a call with a
-                            // promise, so there is no call expression
-                            // in the source to point a cursor at.
-                            site: 0,
-                            site_end: 0,
-                        }),
-                    )?;
-                    out.push(StepOutput::Sends(vec![send]));
-                    return self.halt(tree, Halt::Finished, unstarted, out);
-                }
                 Err(e) => {
                     return self.suspend(tree, SuspendCause::Trapped(e), out);
                 }
@@ -1967,14 +1951,14 @@ impl Runner {
     /// Record that the program ended itself, and end the turn if the
     /// reply has already finished arriving.
     ///
-    /// `finish` and `stop` halt **where they stand**, which is usually
+    /// `return` ends the program **where it stands**, which is usually
     /// somewhere in the middle of a notebook the provider is still
     /// writing. Two things follow, and this is the one place both are
     /// arranged:
     ///
     /// - **Nothing after it runs** — not the instructions after it in
     ///   this cell, and not the cells that have not arrived yet. The
-    ///   `halted` flag is what enforces the second half: the pieces
+    ///   `returned` field is what enforces the second half: the pieces
     ///   still to come are logged as they arrive (28: the record of
     ///   what was written stays whole) and then dropped unrun.
     /// - **The turn still ends properly.** `ReplyEnd` carries what the
@@ -1986,15 +1970,23 @@ impl Runner {
     fn halt(
         &mut self,
         tree: &mut Tree,
-        halt: Halt,
+        value: Value,
         unstarted: Vec<InvokeCall>,
         out: Vec<StepOutput>,
     ) -> io::Result<Vec<StepOutput>> {
         let Phase::Running(run) = &mut self.phase else {
             unreachable!("halt outside Running");
         };
-        run.halted = Some(halt);
-        run.unstarted = unstarted;
+        run.returned = Some(value);
+        // **Issued before the return, so they go out now** — not when
+        // the reply eventually closes. A `tell` the program wrote and
+        // never awaited reaches the person as the program runs, which
+        // is what the card promises of it; deferring it with the
+        // ending would log it after the reply's own `ReplyEnd` and
+        // delay the words by however long the rest of the completion
+        // takes to arrive.
+        let mut out = out;
+        self.dispatch_calls(tree, unstarted, &mut out)?;
         self.halt_if_ready(tree, out)
     }
 
@@ -2011,7 +2003,7 @@ impl Runner {
         let Phase::Running(run) = &self.phase else {
             return Ok(out);
         };
-        let Some(halt) = run.halted.clone() else {
+        let Some(value) = run.returned.clone() else {
             return Ok(out);
         };
 
@@ -2024,27 +2016,14 @@ impl Runner {
             unreachable!("checked Running above");
         };
         let unstarted = std::mem::take(&mut run.unstarted);
-        match halt {
-            Halt::Stopped(reason) => {
-                // Issued before the halt, so they go out — the same
-                // classification `finish_program` gives an ordinary
-                // ending's, done here because a stop never reaches it.
-                let mut out = out;
-                self.dispatch_calls(tree, unstarted, &mut out)?;
-                self.suspend(tree, SuspendCause::Stopped { reason }, out)
-            }
-            Halt::Finished => {
-                self.finished = true;
-                self.finish_program(tree, Value::Undefined, unstarted, out)
-            }
-        }
+        self.finish_program(tree, value, unstarted, out)
     }
 
     /// Whether the program has halted itself and is only waiting for
     /// its reply to finish arriving — the state in which the VM must
     /// not be stepped and no further cell may be fed in.
     fn halted(&self) -> bool {
-        matches!(&self.phase, Phase::Running(run) if run.halted.is_some())
+        matches!(&self.phase, Phase::Running(run) if run.returned.is_some())
     }
 
     /// Classify one `Pending` batch — the calls that hold a **promise**
@@ -2986,6 +2965,12 @@ impl Runner {
         // Falling through to the debug-repr fallback logged the string
         // `"Undefined"` instead, indistinguishable from a program that
         // really did return that text.
+        // **`finish()` is a flag on the VM**, not a halt the host was
+        // handed — so it is read here, while the run is still in hand,
+        // rather than arriving as a `StepResult`. That is what lets a
+        // `finish()` written before the last `tell` rest the branch and
+        // still let the `tell` go out.
+        self.finished = run.vm.finished;
         let value_json = if matches!(value, interp::Value::Undefined) {
             serde_json::Value::Null
         } else {
@@ -3106,24 +3091,34 @@ impl Runner {
         }
 
         // "Completed ⇒ a terminal `Handback`" holds without exception,
-        // which is what makes recovery decidable from the log alone. It
-        // carries no value: a reply has no `return` (D5), and the field
-        // was null 68 times out of 68 before it was removed.
+        // which is what makes recovery decidable from the log alone.
         //
-        // **Which terminal it is, is the difference between a branch
-        // that rested and one that merely stopped running.** `finish`
-        // says the task is over; running off the end says nothing and
-        // the branch carries on. See `Handback::Finished`.
-        let how = if self.finished {
-            Handback::Finished
-        } else {
-            Handback::Completed
+        // Two facts ride it. **What the program returned**, if it ran a
+        // top-level `return` with a value — `undefined` says nothing
+        // and is not recorded. And **whether it rested**: `finish()`
+        // sets a flag, and the flag is honoured only if this reply put
+        // something in front of the person. A branch that rests having
+        // said nothing to anybody is the failure the argument on the
+        // old `finish(text)` existed to prevent (measured at 1 in 12
+        // runs, and 4 in 12 once a card line talked the models out of
+        // `tell`); here the reply is simply not rested and the tail
+        // says why, which costs a round trip instead of the answer.
+        // Already rendered above, and `Null` for a program that ran off
+        // its end or returned `undefined` — neither said anything, so
+        // neither is recorded.
+        let returned = match &value_json {
+            serde_json::Value::Null => None,
+            v => Some(v.clone()),
         };
+        let rested = self.finished && self.said_something(tree);
         let outcome = tree.append(
             &mut self.spine,
             EventPayload::Handback {
                 reply: self.reply_id,
-                how,
+                how: Handback::Completed {
+                    value: returned,
+                    rested,
+                },
                 site: 0,
                 stack: Vec::new(),
             },
@@ -3184,7 +3179,11 @@ impl Runner {
         // `render_request` (called from `prompt_if_needed`, below)
         // advances `shown` itself the moment that request actually goes
         // out, exactly as it always has.
-        if self.finished {
+        // **Only an honoured `finish()` rests.** One from a reply that
+        // told nobody anything is remembered instead, so the next
+        // request's tail can say why the branch is still going.
+        self.finish_ignored = self.finished && !rested;
+        if rested {
             // Matches `suspend`'s own depth>0 branch precedent: `shown`
             // advances here, marking this outcome accounted-for so
             // `needs_prompt`'s crash-recovery clause doesn't spuriously
@@ -3193,8 +3192,8 @@ impl Runner {
             // genuinely stale `shown`, not for "immediately after I
             // logged this myself").
             self.shown = self.spine.leaf_id.as_u64();
-            self.finished = false;
         }
+        self.finished = false;
         self.phase = Phase::Idle;
         out.extend(self.prompt_if_needed(tree)?);
         Ok(out)
@@ -3229,9 +3228,6 @@ impl Runner {
                     site,
                     ResumeWith::Raise,
                 )
-            }
-            SuspendCause::Stopped { reason } => {
-                (Handback::Stopped { reason }, 0, ResumeWith::Continue)
             }
             SuspendCause::Trapped(e) => {
                 let site = span_at(&run.vm, e.ip as usize);
@@ -3787,11 +3783,37 @@ impl Runner {
                  history.fetch(id)."
             ));
         }
+        if self.finish_ignored {
+            lines.push(SILENT_FINISH.to_owned());
+        }
         if self.reply_shape_tail && self.answering_a_post(tree) {
             lines.push(REPLY_SHAPE_TAIL.to_owned());
         }
         lines.push(if self.attached { PRESENT } else { ABSENT }.to_owned());
         Some(lines.join("\n"))
+    }
+
+    /// **Did this reply put anything in front of anybody?** Prose and
+    /// `tell` both count — the card says so ("your prose reaches the
+    /// person as its own row as well") — and a `Send` is what either
+    /// leaves on the log, so one fold answers for both. So does an
+    /// `answer`: a worker whose whole job was the question has said
+    /// what it had to say, to the branch that asked.
+    ///
+    /// `finish()` is honoured only when this is true. A branch that
+    /// rests having said nothing to anybody is the failure the old
+    /// `finish(text)` argument existed to prevent.
+    fn said_something(&self, tree: &Tree) -> bool {
+        let reply = self.reply_id.as_u64();
+        self.agent_segment(tree)
+            .iter()
+            .filter(|e| e.id.as_u64() > reply)
+            .any(|e| {
+                matches!(
+                    &e.payload,
+                    EventPayload::Call(Call::Send { .. }) | EventPayload::Answer { .. }
+                )
+            })
     }
 
     /// **Somebody just asked, and nothing of the branch's own is
@@ -4734,7 +4756,7 @@ impl Runner {
             _ => tree.append(&mut self.spine, EventPayload::Reply)?,
         };
         self.phase = Phase::Running(Run {
-            halted: None,
+            returned: None,
             unstarted: Vec::new(),
             console_logged: 0,
             program_id: self.reply_id,
@@ -5171,7 +5193,7 @@ mod tests {
             match vm.step(FUEL).unwrap() {
                 StepResult::Settle { call } => {
                     state.phase = Phase::Running(Run {
-                        halted: None,
+                        returned: None,
                         unstarted: Vec::new(),
                         console_logged: 0,
                         program_id: state.spine.leaf_id,
@@ -5533,7 +5555,7 @@ mod tests {
         let out = state
             .step(
                 &mut tree,
-                StepInput::LlmResponse(llm_program("finish(\"ok\");\n")),
+                StepInput::LlmResponse(llm_program("tell(\"ok\"); finish();\n")),
             )
             .unwrap();
         let settled = drain(&mut state, &mut tree, out);
@@ -5557,7 +5579,9 @@ mod tests {
         let out = state
             .step(
                 &mut tree,
-                StepInput::LlmResponse(llm_program("finish(\"ok\"); tell(\"wrapping up now\");")),
+                StepInput::LlmResponse(llm_program(
+                    "tell(\"ok\"); finish(); tell(\"wrapping up now\");",
+                )),
             )
             .unwrap();
         let settled = drain(&mut state, &mut tree, out);
@@ -6084,33 +6108,39 @@ mod tests {
         );
     }
 
-    /// **A stop skips the rest of the reply, blocks and prose alike.**
+    /// **A `return` skips the rest of the reply, blocks and prose
+    /// alike.**
     ///
-    /// This is the whole difference from `finish(text)`, which sets a flag and
-    /// lets everything after it run — the card has a worked bug about
-    /// exactly that. A program that has found out it cannot finish must
-    /// not go on to write the file it was about to write.
+    /// The cells share one scope and one frame, so returning from that
+    /// frame ends the reply — and that is the point: a program that has
+    /// found out it cannot finish must not go on to write the file it
+    /// was about to write. `finish()` is the opposite kind of thing, a
+    /// flag that lets everything after it run.
     #[test]
-    fn stopping_skips_every_block_after_it() {
+    fn returning_skips_every_block_after_it() {
         let mut c = Conversation::new();
         let r = c.reply(
-            "Checking first.\n\n```js\nhistory.append(\"before\");\nstop(\"the check disagrees\");\n```\n\nAnd now the part that must not happen.\n\n```js\nhistory.append(\"after\");\n```\n",
+            "Checking first.\n\n```js\nhistory.append(\"before\");\nreturn \"the check disagrees\";\n```\n\nAnd now the part that must not happen.\n\n```js\nhistory.append(\"after\");\n```\n",
         );
 
         assert_eq!(
             r.values(),
             [&json!("before")],
-            "the block after the stop must not run"
+            "the block after the return must not run"
         );
         // The prose after it is not sent either: it was written on the
         // assumption the work carried on, and it did not.
         assert_eq!(
             r.prose,
             ["Checking first."],
-            "prose before the stop reaches the person, prose after it does not"
+            "prose before the return reaches the person, prose after it does not"
         );
-        // And the reason is handed back as a decision, not a fault.
-        assert_eq!(r.ended, Ending::Stopped("the check disagrees".into()));
+        // And what it returned is handed back, not lost: that value is
+        // the whole of what a `return` says to the next reply.
+        assert_eq!(
+            r.ended,
+            Ending::Completed(Some(json!("the check disagrees")))
+        );
     }
 
     /// **`slice` pages a row and writes no bytes to do it.**
@@ -6407,10 +6437,10 @@ mod tests {
     #[test]
     fn a_completed_handback_fetches_as_a_bare_name() {
         let mut c = Conversation::new();
-        let r = c.reply("```js\nfinish(\"ok\");\n```\n");
+        let r = c.reply("```js\ntell(\"ok\"); finish();\n```\n");
         assert_eq!(
             c.fetch(r.handback.expect("the handback")),
-            json!("Finished")
+            json!({ "Completed": { "rested": true } })
         );
 
         let mut c = Conversation::new();
@@ -6418,7 +6448,7 @@ mod tests {
         let r = c.reply("```js\ntell(\"one step done\");\n```\n");
         assert_eq!(
             c.fetch(r.handback.expect("the handback")),
-            json!("Completed"),
+            json!({ "Completed": {} }),
             "a program that ran off its end handed on; it did not finish"
         );
     }
@@ -6565,7 +6595,7 @@ mod tests {
             "```js\nconst parsed = {};\n\
              try { await tools.write_file(\"out.py\", parsed.missing); }\n\
              catch (e) { tell(`refused: ${e}`); }\n\
-             finish(\"ok\");\n```\n",
+             tell(\"ok\"); finish();\n```\n",
         );
         assert!(
             r.calls.is_empty(),
@@ -7301,24 +7331,25 @@ mod tests {
     fn a_prose_send_settles_exactly_once() {
         let mut c = Conversation::new();
         c.user("go");
-        let r = c.reply("Just a sentence.\n\n```js\nfinish(\"ok\");\n```\n");
+        let r = c.reply("Just a sentence.\n\n```js\ntell(\"ok\"); finish();\n```\n");
 
-        // Two sends leave this reply — the prose and the `finish("ok")`
-        // that ends it. The prose one settles the way the host settles
-        // it, through the same unwaited-`tell` path, with no program
-        // awaiting it and no complaint. That every call in a reply
-        // settles exactly once is `Invariant::CallsSettle`, checked on
-        // every reply; this one names the prose send in particular.
+        // Two sends leave this reply — the prose, and the `tell` the
+        // program wrote. Only the prose has no source behind it, which
+        // is what the zero-width site means: `finish()` sends nothing
+        // now, so it is the one send in the reply with no expression of
+        // its own. It settles the way the host settles any unwaited
+        // `tell`, with no program awaiting it and no complaint. That
+        // every call in a reply settles exactly once is
+        // `Invariant::CallsSettle`, checked on every reply; this one
+        // names the prose send in particular.
         assert_eq!(r.prose, ["Just a sentence."], "one prose segment");
         let settlements = r
             .settled
             .iter()
             .filter(|(call, _)| c.site_of(*call) == (0, 0))
             .count();
-        assert_eq!(
-            settlements, 2,
-            "one delivery each, for the prose and the finish"
-        );
+        assert_eq!(settlements, 1, "exactly one delivery for the prose");
+        assert_eq!(r.tells, ["ok"], "and the program's own `tell` went too");
     }
 
     /// A multi-paragraph report — the case this whole phase exists for —
@@ -7640,7 +7671,7 @@ mod tests {
         let out = state
             .step(
                 &mut tree,
-                StepInput::LlmResponse(llm_program("let a = 1; finish(\"ok\");")),
+                StepInput::LlmResponse(llm_program("let a = 1; tell(\"ok\"); finish();")),
             )
             .unwrap();
         drain(&mut state, &mut tree, out);
@@ -7709,6 +7740,37 @@ mod tests {
             "the branch rests: {settled:?}"
         );
         assert!(!state.needs_prompt(&tree));
+    }
+
+    /// **A `finish()` that said nothing is not honoured**, and the next
+    /// request says why. The pairing used to be the verb's arity —
+    /// `finish(text)` could not be silent — and with the answer moved
+    /// back to `tell` it is enforced here instead.
+    #[test]
+    fn a_silent_finish_does_not_rest_the_branch() {
+        let mut c = Conversation::new();
+        c.user("is it green?");
+        let r = c.reply("```js\nfinish();\n```\n");
+        assert!(
+            !r.rests,
+            "it told nobody anything, so the branch carries on"
+        );
+        assert!(
+            c.runner()
+                .request_tail(c.tree())
+                .is_some_and(|t| t.contains("without saying anything")),
+            "and the next request says why"
+        );
+
+        // Say something and it is honoured.
+        let r = c.reply("```js\ntell(\"green.\");\nfinish();\n```\n");
+        assert!(r.rests, "whatever finishes, speaks — and this one did");
+        assert!(
+            !c.runner()
+                .request_tail(c.tree())
+                .is_some_and(|t| t.contains("without saying anything")),
+            "the note is true of one request and gone the next"
+        );
     }
 
     /// **The reply-shape line rides the tail, and only where it is
@@ -7898,10 +7960,11 @@ mod tests {
         );
     }
 
-    /// A top-level `return` in a cell is refused, with the message that
-    /// says what to write instead (D5, 25.3) — carried end to end.
+    /// **A top-level `return` ends the reply, and what it returned is
+    /// what the next one is told** — carried end to end, from the cell
+    /// to the report the next request renders.
     #[test]
-    fn a_cell_that_returns_is_refused_with_the_harness_message() {
+    fn a_cell_that_returns_hands_the_value_to_the_next_reply() {
         let (mut tree, mut state) = setup_under();
         user_post(&mut state, &mut tree, "go");
         let reply = "```js\nreturn { done: true };\n```\n";
@@ -7911,33 +7974,35 @@ mod tests {
         drain(&mut state, &mut tree, out);
 
         let report = last_report(&state, &tree);
-        assert!(report.contains("history.append"), "{report}");
-        assert!(report.contains("finish("), "{report}");
+        assert!(report.contains("done"), "{report}");
     }
 
     /// `finish(text)` does not stop anything (D8): the cells after it still
-    /// **`finish` halts, and that is the whole difference from before.**
+    /// **`finish()` stops nothing, and `return` stops everything.**
     ///
-    /// It used to set a flag and let every block after it run, which
-    /// needed a card paragraph and a worked bug to explain — and 51
-    /// programs in the kept corpus wrote real statements after it,
-    /// including a `replace_file` that happened once the program had
-    /// already decided it was finished.
+    /// The verb halted for a while, which needed a card paragraph and
+    /// a worked bug to explain; before that it was a flag that let
+    /// every block after it run, and 51 programs in the kept corpus
+    /// wrote real statements after it, including a `replace_file` made
+    /// once the program had already decided it was finished. It is a
+    /// flag again — but now there is a verb whose whole job is
+    /// stopping, so "say it is finished" and "stop here" are written
+    /// separately and neither has to explain the other.
     #[test]
-    fn finish_in_cell_0_stops_the_later_cells() {
+    fn finish_in_cell_0_does_not_stop_the_later_cells() {
         let mut c = Conversation::new();
         c.user("go");
         let r = c.reply(
-            "```js\nfinish(\"ok\");\n```\n\n\
-             ```js\nconsole.log(\"must not run\");\n```\n",
+            "```js\ntell(\"ok\"); finish();\n```\n\n\
+             ```js\nconsole.log(\"still runs\");\n```\n",
         );
-        assert!(
-            r.printed.is_empty(),
-            "the block after finish() must not run: {:?}",
-            r.printed
+        assert_eq!(
+            r.printed,
+            ["still runs"],
+            "a flag stops nothing: the block after it runs"
         );
+        assert!(r.rests, "and the branch still rests, because it spoke");
         assert_eq!(r.tells, ["ok"], "and the answer reached the person");
-        assert!(r.rests, "finish's text goes out as the last word");
     }
 
     /// The existing transport is untouched: a plain program under
@@ -8075,7 +8140,7 @@ mod tests {
         user_post(&mut state, &mut tree, "go");
         state.phase = Phase::AwaitingLlm;
 
-        let reply = "Here is the answer.\n\n```js\nfinish(\"ok\");\n```\n";
+        let reply = "Here is the answer.\n\n```js\ntell(\"ok\"); finish();\n```\n";
         stream_chunks(&mut state, &mut tree, &[reply]);
         // Stand in for the run having already ended, which is what the
         // real ordering does — every one of the twelve empty-text
@@ -8186,7 +8251,11 @@ mod tests {
         // completed; it is `ReplyEnd` that says the reply was cut off,
         // and the document renders that marker where the text stops so
         // the model can see why it seems to end mid-sentence.
-        assert_eq!(r.ended, Ending::Completed, "the cells that arrived all ran");
+        assert_eq!(
+            r.ended,
+            Ending::Completed(None),
+            "the cells that arrived all ran"
+        );
         assert_eq!(
             r.reply_ended,
             Some(crate::types::ReplyEnd::Truncated),
@@ -8377,7 +8446,7 @@ mod tests {
         let out = state
             .step(
                 &mut tree,
-                StepInput::LlmResponse(llm_program("finish(\"ok\");\n")),
+                StepInput::LlmResponse(llm_program("tell(\"ok\"); finish();\n")),
             )
             .unwrap();
         drain(&mut state, &mut tree, out);
@@ -8753,7 +8822,7 @@ mod tests {
             .step(
                 &mut tree,
                 StepInput::LlmResponse(llm_program_thinking(
-                    "finish(\"ok\");\n",
+                    "tell(\"ok\"); finish();\n",
                     "still thinking",
                     55,
                 )),

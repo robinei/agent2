@@ -509,7 +509,7 @@ fn fold(session: host::Session, errors: Vec<String>) -> Outcome {
                 // close it by giving up.
                 if cause.is_terminal() {
                     if open_scopes.pop().is_some()
-                        && matches!(cause, crate::types::Handback::Completed)
+                        && matches!(cause, crate::types::Handback::Completed { .. })
                     {
                         resume_count += 1;
                     }
@@ -1939,77 +1939,6 @@ pub(crate) mod tests {
         assert!((DESTRUCTIVE_MIGRATION_GATE.check)(&outcome, sandbox.path()).is_err());
     }
 
-    /// **Resuming a `stop` carries the program on past it.**
-    ///
-    /// `stop` parks the frame with `ResumeWith::Continue` — the reply
-    /// is paused rather than over, and the next one can let it carry on
-    /// with every binding still in hand. That contract was false:
-    /// `stop` marks the run halted, `suspend` carried the flag into
-    /// `Phase::Suspended`, and `pump` refuses to step a halted run, so
-    /// the resumed frame produced no rows, no terminal handback and no
-    /// error — a branch that went quiet with a program still open.
-    ///
-    /// Never seen in the wild because nobody has resumed one: 0 across
-    /// 478 kept logs, against 3 `Stopped` handbacks in all. Reachable
-    /// all the same, and silence is the one answer a verb must not
-    /// give.
-    #[test]
-    fn resuming_a_stop_continues_the_program() {
-        let llm = host::ScriptedLlm::new([
-            host::scripted_program(concat!(
-                "```js\n",
-                "const n = 41;\n",
-                "stop(`only ${n} of 50 rows parsed`);\n",
-                "tell(`carried on, n was ${n}`);\n",
-                "```\n",
-            )),
-            host::scripted_program("history.append(resume(null));"),
-        ]);
-        let (tx, rx) = std::sync::mpsc::channel();
-        let mut session = host::Session::new(
-            Tree::new(None),
-            crate::REAL_PROMPT,
-            host::real_registry(),
-            Box::new(llm),
-            tx,
-        )
-        .expect("opens");
-        let handle = session.handle();
-        let branch = session.conversation_branch();
-        handle.send(host::SessionCommand::UserTurn {
-            branch,
-            text: "sum the ledger".to_owned(),
-            expects_reply: false,
-        });
-        session = session.run();
-        let events: Vec<host::SessionEvent> = rx.try_iter().collect();
-        let outcome = fold(session, collect_errors(&events));
-        let tree = outcome.tree();
-
-        // What came after the `stop` ran, with `n` still bound — which
-        // is the whole of what "the reply is paused, not over" means.
-        assert!(
-            tree.events.values().any(|e| matches!(
-                &e.payload,
-                EventPayload::Call(crate::types::Call::Send { text, .. })
-                    if text == "carried on, n was 41"
-            )),
-            "the resumed frame never ran what followed the stop"
-        );
-        // And it ended: a resumed frame that finishes is a terminal
-        // handback like any other, never silence.
-        assert!(
-            tree.events.values().any(|e| matches!(
-                &e.payload,
-                EventPayload::Handback {
-                    how: crate::types::Handback::Completed,
-                    ..
-                }
-            )),
-            "the resumed program never handed back"
-        );
-    }
-
     /// **A finished branch stays finished across a reopen.**
     ///
     /// Recovery asks the log which outcome was owed a request it never
@@ -2031,7 +1960,7 @@ pub(crate) mod tests {
             "I answered already, landing it as the last word.\n",
             "\n",
             "```js\n",
-            "finish(\"It is a Rust workspace.\");\n",
+            "tell(\"It is a Rust workspace.\"); finish();\n",
             "```\n",
         ))]);
         let (tx, rx) = std::sync::mpsc::channel();
