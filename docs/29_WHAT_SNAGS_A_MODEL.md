@@ -122,6 +122,20 @@ path**, and not one cell in 96 runs mentioned `.diff`. The menu row had
 been printing `→ ok, {version, diff}` the whole time, so the
 declaration was contradicting the document around it.
 
+### `read_file` declared a field it cannot produce
+
+`{ content, version, truncated? }`, against a handler that returns
+`{ content, version }` on every path. `bash` does have a `truncated`,
+fired by its 4 MB stream cap — and it has never appeared in a result
+across 154 runs, because nothing has produced 4 MB. A field a program
+can branch on and never see is a dead branch in every program that
+checks it.
+
+That is four declarations in one night describing something other than
+what the tool does. **All seven tools and all four `history` verbs have
+since been checked against their handlers**, and a test holds the
+manifest's claims now rather than a reading of it.
+
 ### `bash`'s description was cut mid-word
 
 `DESCRIPTION_MAX_BYTES` is 400 and the doc beside it claimed "every
