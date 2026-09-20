@@ -566,17 +566,33 @@ It also produced the loop that led to the floor guard, and the
 repeat-yourself behaviour that led to a spent compaction program
 removing itself. A model slow enough to watch is worth having.
 
-## Where the bytes are
+## Where the bytes are, and where they went
 
-Measured over 20 rendered documents:
+A rendered document, by role, over twelve of each:
 
-| | |
-|---|---|
-| card + worked examples | **66.8%** |
-| assistant turns | 16.8% |
-| `### it printed` | 6.9% |
-| `### rows it added` | 6.1% |
-| everything else in a user turn | 3.5% |
+| | baseline | HEAD |
+|---|---|---|
+| card + worked examples | 72.7% | 73.9% |
+| assistant turns | 15.9% | 15.0% |
+| user turns | 11.4% | 11.1% |
 
-Compaction operates on the third of the document that is not the card.
-Worth knowing before optimising any of it.
+Within a user turn at baseline, `### it printed` and `### rows it
+added` are about 7% and 6% of the whole document; everything else is
+3%.
+
+**The composition barely moved, and that is the finding.** A document
+is about the same size as it was; there are fewer of them. Prompt bytes
+fell 36% and programs per run fell 33%, which is the same number twice:
+the savings are round trips, not smaller prompts.
+
+Two consequences worth carrying:
+
+- **Compaction operates on the quarter of a document that is not the
+  card**, and the card is a floor no handler can reach. That is what
+  the floor guard is about, and why a byte budget near 26 KB is
+  meaningless.
+- **Shaving the conversation is the small lever; not needing the turn
+  is the large one.** Everything measured tonight that mattered
+  removed a round trip — the orientation program, the re-read, the
+  compaction that could not help, the reply spent on a trap. Nothing
+  that shaved bytes off a turn showed up in the totals at all.
