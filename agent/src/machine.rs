@@ -123,6 +123,14 @@ const COMPACTION_ATTEMPTS: u32 = 2;
 
 pub const TOOL_REMOVE_HISTORY: &str = "remove_history";
 pub const TOOL_REPLACE_HISTORY: &str = "replace_history";
+/// `history.slice(id, from, to?)` — show a window of an entry's own
+/// value rather than something standing in for it.
+///
+/// **The one compaction op that writes no bytes.** Reading a long row
+/// a window at a time through `replace` puts the same text on the log
+/// once per window; this puts two numbers there, and leaves `replace`
+/// meaning one thing — say something else here.
+pub const TOOL_SLICE_HISTORY: &str = "slice_history";
 /// `done()` — the only thing that stops the loop. See `finish_program`'s
 /// own comment for the polarity this inverts: completing a program is,
 /// by itself, never enough to rest a branch anymore (on either
@@ -2228,7 +2236,7 @@ impl Runner {
                 self.settle(Ok(serde_json::Value::Null));
                 Ok(true)
             }
-            TOOL_REMOVE_HISTORY | TOOL_REPLACE_HISTORY => {
+            TOOL_REMOVE_HISTORY | TOOL_REPLACE_HISTORY | TOOL_SLICE_HISTORY => {
                 // Nothing leaves the process and nothing settles later.
                 // The op joins the batch this handler is building and
                 // the value lands at once, so a compaction program reads
@@ -2310,6 +2318,26 @@ impl Runner {
             CompactionOp::Remove {
                 from: first.min(last),
                 to: first.max(last),
+            }
+        } else if name == TOOL_SLICE_HISTORY {
+            // A window is half-open and in bytes, so the numbers a
+            // program passes here are the ones it would pass to
+            // `content.slice(a, b)` — `.length` counts UTF-8 bytes in
+            // this dialect, and two units for one idea is how an
+            // off-by-one becomes a mystery.
+            let num = |n: usize| args.get(n).and_then(|v| v.as_u64());
+            let from = num(1).unwrap_or(0);
+            let to = num(2).unwrap_or(from + crate::report::NOTE_ROW_MAX_BYTES as u64);
+            if to <= from {
+                return Err(format!(
+                    "{TOOL_SLICE_HISTORY}(id, from, to): `to` is {to} and `from` is {from}, \
+                     so the window is empty. It is half-open, like `content.slice(a, b)`."
+                ));
+            }
+            CompactionOp::Slice {
+                id: first,
+                from: from.min(u32::MAX as u64) as u32,
+                to: to.min(u32::MAX as u64) as u32,
             }
         } else {
             let Some(text) = args.get(1).and_then(|v| v.as_str()) else {
@@ -3326,7 +3354,14 @@ impl Runner {
             .map(|e| e.id)
             .collect();
         for of in blocks {
-            tree.append(&mut self.spine, EventPayload::Compacted { of, text: None })?;
+            tree.append(
+                &mut self.spine,
+                EventPayload::Compacted {
+                    of,
+                    text: None,
+                    window: None,
+                },
+            )?;
         }
         Ok(())
     }
@@ -3729,20 +3764,35 @@ pub(crate) fn note_display(value: &serde_json::Value) -> String {
 /// the original whole afterwards, so the bytes to slice the next window
 /// from are always in reach — see
 /// `paging_a_row_moves_its_window_and_leaves_the_value_whole`.
-fn note_row(id: u64, value: &serde_json::Value) -> String {
+fn note_row_windowed(
+    id: u64,
+    value: &serde_json::Value,
+    window: Option<crate::types::Window>,
+) -> String {
     let full = note_display(value);
-    if full.len() <= crate::report::NOTE_ROW_MAX_BYTES {
-        return format!("appended: {}", crate::document::escape_untrusted(&full));
+    let cap = crate::report::NOTE_ROW_MAX_BYTES;
+    let (from, to) = match window {
+        Some(w) => (w.from as usize, (w.to as usize).min(full.len())),
+        None => (0, cap.min(full.len())),
+    };
+    // A window past the end, or one the value shrank out from under,
+    // shows nothing rather than panicking on a slice.
+    let from = from.min(full.len());
+    let to = to.max(from).min(from + cap);
+    let (mut a, mut b) = (from, to);
+    while !full.is_char_boundary(a) {
+        a -= 1;
     }
-    let mut end = crate::report::NOTE_ROW_MAX_BYTES;
-    while !full.is_char_boundary(end) {
-        end -= 1;
+    while !full.is_char_boundary(b) {
+        b -= 1;
+    }
+    let shown = crate::document::escape_untrusted(&full[a..b]);
+    if a == 0 && b == full.len() {
+        return format!("appended: {shown}");
     }
     format!(
-        "appended: {}\n  … {} of {} bytes — `history.fetch({id})` has all of it, and \
-         `history.replace({id}, …)` moves this window without adding a row",
-        crate::document::escape_untrusted(&full[..end]),
-        end,
+        "appended: {shown}\n  … bytes {a}–{b} of {} — `history.fetch({id})` has all of it, \
+         and `history.slice({id}, {b})` moves this window without writing anything",
         full.len(),
     )
 }
@@ -3826,7 +3876,7 @@ pub(crate) fn settlement_of<'e>(segment: &[&'e Event], call: EventId) -> Option<
 pub(crate) fn menu_rows(
     segment: &[&Event],
     since: u64,
-    compacted: &std::collections::HashMap<EventId, Option<String>>,
+    compacted: &std::collections::HashMap<EventId, crate::tree::CompactedView>,
 ) -> Vec<Artifact> {
     segment
         .iter()
@@ -3837,7 +3887,15 @@ pub(crate) fn menu_rows(
         // a row the model deleted with `history.remove` vanished from
         // the log and went on being advertised beside it, which is the
         // one place the card promises removal means removal.
-        .filter(|e| !matches!(compacted.get(&e.id), Some(None)))
+        .filter(|e| {
+            !matches!(
+                compacted.get(&e.id),
+                Some(crate::tree::CompactedView {
+                    text: None,
+                    window: None
+                })
+            )
+        })
         .filter_map(|event| {
             let id = event.id.as_u64();
             // **And a replaced row renders as its replacement.** It did
@@ -3847,12 +3905,31 @@ pub(crate) fn menu_rows(
             // had tried to shorten. Now that they are one list, a
             // `history.replace` that did not shrink the thing it named
             // would be the same broken promise a `history.remove` was.
-            if let Some(Some(text)) = compacted.get(&event.id) {
-                return Some(Artifact {
-                    id,
-                    label: String::new(),
-                    state: ArtifactState::Whole(format!("… {text}")),
-                });
+            match compacted.get(&event.id) {
+                // Something else stands here.
+                Some(crate::tree::CompactedView {
+                    text: Some(text), ..
+                }) => {
+                    return Some(Artifact {
+                        id,
+                        label: String::new(),
+                        state: ArtifactState::Whole(format!("… {text}")),
+                    });
+                }
+                // A window of what is already here — no text was
+                // written to say so, which is the whole point.
+                Some(crate::tree::CompactedView {
+                    window: Some(w), ..
+                }) => {
+                    if let EventPayload::Note { value, .. } = &event.payload {
+                        return Some(Artifact {
+                            id,
+                            label: String::new(),
+                            state: ArtifactState::Whole(note_row_windowed(id, value, Some(*w))),
+                        });
+                    }
+                }
+                _ => {}
             }
             match &event.payload {
                 // **A `tell` gets no row.** Its text is already in the
@@ -3985,7 +4062,7 @@ pub(crate) fn menu_rows(
                 EventPayload::Note { value, .. } => Some(Artifact {
                     id,
                     label: String::new(),
-                    state: ArtifactState::Whole(note_row(id, value)),
+                    state: ArtifactState::Whole(note_row_windowed(id, value, None)),
                 }),
                 _ => None,
             }
@@ -5607,6 +5684,7 @@ mod tests {
             EventPayload::Compacted {
                 of: post,
                 text: None,
+                window: None,
             },
         )
         .unwrap();
@@ -5749,7 +5827,7 @@ mod tests {
             &shown[shown.len().saturating_sub(200)..]
         );
         assert!(
-            shown.contains(&format!("of {} bytes", n + 2)),
+            shown.contains(&format!("of {}", n + 2)),
             "and how much there is (+2 for the JSON quotes): {}",
             &shown[shown.len().saturating_sub(200)..]
         );
@@ -5780,6 +5858,104 @@ mod tests {
             })
             .unwrap();
         assert_eq!(back, json!(n), "fetch hands back all {n} characters");
+    }
+
+    /// **`slice` pages a row and writes no bytes to do it.**
+    ///
+    /// That is the difference from `replace`, which would put the same
+    /// text on the log once per window. Two numbers instead, and
+    /// `replace` goes on meaning one thing — say something else here.
+    #[test]
+    fn slicing_a_row_moves_its_window_without_writing_any_bytes() {
+        let (mut tree, mut state) = setup();
+        state.kickoff(&mut tree).unwrap();
+        let n = crate::report::NOTE_ROW_MAX_BYTES * 2;
+        let src = format!("history.append(\"a\".repeat({n}) + \"TAIL\");");
+        let out = state
+            .step(&mut tree, StepInput::LlmResponse(llm_program(&src)))
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+        let id = state
+            .agent_segment(&tree)
+            .iter()
+            .find(|e| matches!(e.payload, EventPayload::Note { .. }))
+            .unwrap()
+            .id
+            .as_u64();
+
+        // The last window of the value, named by offset alone.
+        let page = format!("history.slice({id}, {}, {});", n - 8, n + 6);
+        let out = state
+            .step(&mut tree, StepInput::LlmResponse(llm_program(&page)))
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+
+        let segment = state.agent_segment(&tree);
+        let shadow = segment
+            .iter()
+            .find_map(|e| match &e.payload {
+                EventPayload::Compacted { of, text, window } if of.as_u64() == id => {
+                    Some((text.clone(), *window))
+                }
+                _ => None,
+            })
+            .expect("a shadow was written");
+        assert_eq!(shadow.0, None, "no text was written — that is the point");
+        assert!(shadow.1.is_some(), "a window was");
+
+        let compacted = tree.compacted_lookup(state.spine.leaf_id);
+        let rows = menu_rows(&segment, 0, &compacted);
+        let shown = rows
+            .iter()
+            .find(|a| a.id == id)
+            .map(|a| match &a.state {
+                ArtifactState::Whole(t) => t.clone(),
+                _ => panic!("renders whole"),
+            })
+            .expect("one row");
+        assert!(shown.contains("TAIL"), "the window moved: {shown}");
+        assert!(shown.len() < 200, "and it is small: {} bytes", shown.len());
+        assert_eq!(rows.iter().filter(|a| a.id == id).count(), 1, "one row");
+
+        // The value behind it is untouched.
+        let check = format!("history.append((await fetch_history({id})).length);");
+        let out = state
+            .step(&mut tree, StepInput::LlmResponse(llm_program(&check)))
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+        let back = tree
+            .path_events(state.spine.leaf_id)
+            .iter()
+            .rev()
+            .find_map(|e| match &e.payload {
+                EventPayload::Note { value, .. } => Some(value.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(back, json!(n + 4), "fetch still hands back the whole value");
+    }
+
+    /// An empty window is a mistake with an obvious cause, so it says
+    /// which way round the arguments go rather than showing nothing.
+    #[test]
+    fn an_empty_window_is_refused_by_name() {
+        let (mut tree, mut state) = setup();
+        state.kickoff(&mut tree).unwrap();
+        let src = "history.append(\"hello there\");\n                   try { history.slice(4, 8, 2); } catch (e) { history.append(String(e)); }";
+        let out = state
+            .step(&mut tree, StepInput::LlmResponse(llm_program(src)))
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+        let said = tree
+            .path_events(state.spine.leaf_id)
+            .iter()
+            .rev()
+            .find_map(|e| match &e.payload {
+                EventPayload::Note { value, .. } => value.as_str().map(str::to_owned),
+                _ => None,
+            })
+            .unwrap_or_default();
+        assert!(said.contains("half-open"), "names the convention: {said}");
     }
 
     /// **Paging moves one row's window; it does not add rows.**
@@ -5817,13 +5993,7 @@ mod tests {
         drain(&mut state, &mut tree, out);
 
         let segment = state.agent_segment(&tree);
-        let compacted: std::collections::HashMap<EventId, Option<String>> = segment
-            .iter()
-            .filter_map(|e| match &e.payload {
-                EventPayload::Compacted { of, text } => Some((*of, text.clone())),
-                _ => None,
-            })
-            .collect();
+        let compacted = tree.compacted_lookup(state.spine.leaf_id);
         let rows = menu_rows(&segment, 0, &compacted);
         let note_rows: Vec<&Artifact> = rows.iter().filter(|a| a.id == id).collect();
         assert_eq!(note_rows.len(), 1, "one row, not two");
@@ -6968,7 +7138,7 @@ mod tests {
         assert!(
             tree.events.values().any(|e| matches!(
                 &e.payload,
-                EventPayload::Compacted { of, text: None } if *of == post
+                EventPayload::Compacted { of, text: None, .. } if *of == post
             )),
             "and the edit landed when the program finished"
         );

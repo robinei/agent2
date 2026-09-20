@@ -2143,7 +2143,7 @@ fn leaf_summary(tree: &Tree, leaf: EventId) -> String {
         EventPayload::Note { value, .. } => {
             format!("Note: {}", crate::machine::note_text(value))
         }
-        EventPayload::Compacted { of, text } => match text {
+        EventPayload::Compacted { of, text, .. } => match text {
             Some(t) => format!("Compacted #{}: {t}", of.as_u64()),
             None => format!("Compacted #{}: removed", of.as_u64()),
         },

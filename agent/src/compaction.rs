@@ -69,6 +69,14 @@ pub enum CompactionOp {
     Remove { from: EventId, to: EventId },
     /// Show `text` in place of this entry's content.
     Replace { id: EventId, text: String },
+    /// Show a window of this entry's own value, in bytes.
+    ///
+    /// **It carries no bytes.** Paging a long row with `Replace` writes
+    /// the same text to the log once per window; this writes two
+    /// numbers. That is the whole difference, and it is also what keeps
+    /// `Replace` meaning one thing — say something else here — rather
+    /// than two.
+    Slice { id: EventId, from: u32, to: u32 },
 }
 
 impl CompactionOp {
@@ -87,6 +95,7 @@ impl CompactionOp {
                 .map(|id| EventPayload::Compacted {
                     of: *id,
                     text: None,
+                    window: None,
                 })
                 .collect(),
             CompactionOp::Replace { id, text } => present
@@ -95,6 +104,16 @@ impl CompactionOp {
                 .map(|id| EventPayload::Compacted {
                     of: *id,
                     text: Some(text.clone()),
+                    window: None,
+                })
+                .collect(),
+            CompactionOp::Slice { id, from, to } => present
+                .iter()
+                .filter(|p| **p == id)
+                .map(|id| EventPayload::Compacted {
+                    of: *id,
+                    text: None,
+                    window: Some(crate::types::Window { from, to }),
                 })
                 .collect(),
         }
@@ -257,7 +276,15 @@ pub fn floor_size(tree: &Tree, spine: &Spine, budget: usize) -> usize {
         .path_events(spine.leaf_id)
         .iter()
         .filter(|e| renders_a_line(&e.payload))
-        .map(|e| (e.id, crate::tree::CompactedView { text: None }))
+        .map(|e| {
+            (
+                e.id,
+                crate::tree::CompactedView {
+                    text: None,
+                    window: None,
+                },
+            )
+        })
         .collect();
     let leaf = spine.leaf_id;
     let Some(agent) = tree.enclosing_agent(leaf) else {
@@ -594,6 +621,7 @@ mod tests {
             EventPayload::Compacted {
                 of: note,
                 text: None,
+                window: None,
             }
         );
     }
@@ -611,6 +639,7 @@ mod tests {
             EventPayload::Compacted {
                 of: note,
                 text: Some("note was long".into()),
+                window: None,
             }
         );
     }

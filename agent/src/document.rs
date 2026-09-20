@@ -2053,6 +2053,7 @@ mod tests {
             EventPayload::Compacted {
                 of: note,
                 text: Some("the finding, in one line".into()),
+                window: None,
             },
         )
         .unwrap();
@@ -2093,8 +2094,15 @@ mod tests {
                 },
             )
             .unwrap();
-            tree.append(&mut spine, EventPayload::Compacted { of: program, text })
-                .unwrap();
+            tree.append(
+                &mut spine,
+                EventPayload::Compacted {
+                    of: program,
+                    text,
+                    window: None,
+                },
+            )
+            .unwrap();
             render(&tree, &spine, 64 * 1024)
         };
 

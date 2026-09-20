@@ -130,8 +130,9 @@ impl super::Compiler {
                                 "fetch" => "fetch_history",
                                 "remove" => "remove_history",
                                 "replace" => "replace_history",
+                                "slice" => "slice_history",
                                 _ => {
-                                    let known = "append, fetch, remove and replace";
+                                    let known = "append, fetch, remove, replace and slice";
                                     return self.error(
                                         span,
                                         format!("`history.{method}` is not a thing — history has {known}"),
@@ -646,7 +647,7 @@ impl super::Compiler {
                 self.emit(Instr::Notify(name.into(), argv.len() as u32), span);
             }
             "spawn" | "fork" | "list_agents" | "done" | "fetch_history" | "answer"
-            | "append_history" | "remove_history" | "replace_history" => {
+            | "append_history" | "remove_history" | "replace_history" | "slice_history" => {
                 // **The settle-at-dispatch verbs.** None of these leaves
                 // the frame that called it: the host answers each from
                 // the log or the tree it already has — `fetch_history`

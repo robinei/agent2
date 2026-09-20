@@ -93,7 +93,9 @@ declare namespace history {
 
   **And this is how you read something.** A call's result is on the record but not in front of you — the row names the call and its shape, and nothing more. Appending the bytes is what puts them where you can read them: `history.append(f.content)` after a `read_file`, and the next reply has the file in front of it. **Append what you will read; fetch what you will compute with.** A program that only needs to search or edit those bytes calls `history.fetch(id)` and never pays to look at them.
 
-  **A row shows its first 4 KB.** More than that and it says how many bytes there are and which id holds them all, because a file you cannot see the end of is still a file you can page through — and the program is the pager. **`replace` moves the window; `append` opens another one.** To read further into a row you already have, `history.replace(id, (await history.fetch(id)).slice(4096, 8192))`: one row, a new view, and `fetch` still hands back the whole thing next time. Append a second row only when you mean to keep both — the section a regex found, say, beside the conclusion you drew from it. Slicing by what the thing *is* beats slicing by where you stopped.
+  **A row shows its first 4 KB.** More than that and it says how many bytes there are and which id holds them all — and `history.slice(id, 4096)` moves that window onto the next stretch, as often as you like, writing nothing each time. The bytes are already on the record; a window is two numbers.
+
+  So there are two ways to read on, and they are for different things. `slice` when you want to *keep going* through one row. `append` a second row when you mean to **keep both** — the section a regex found beside the conclusion you drew from it, `f.content.match(/## Decision[\s\S]+/)[0]`, or `f.content.split("\n").slice(200, 400)`. Cutting by what the thing *is* beats cutting by where you stopped, and it is usually much smaller than a windowful.
 
   `console.log` is for tracing, not for reading: a value you want to check, a count, what a loop saw. It shows you its tail, which is right for a trace and wrong for a document.
 

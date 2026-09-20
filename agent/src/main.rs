@@ -644,7 +644,7 @@ fn print_session_event(event: &SessionEvent) {
                 EventPayload::Note { value, .. } => {
                     println!("{head} note: {}", crate::machine::note_text(value))
                 }
-                EventPayload::Compacted { of, text } => match text {
+                EventPayload::Compacted { of, text, .. } => match text {
                     Some(t) => println!("{head} compacted #{}: {t}", of.as_u64()),
                     None => println!("{head} compacted #{}: removed", of.as_u64()),
                 },

@@ -1627,10 +1627,18 @@ fn menu_since(h: &Handback<'_>, since: u64) -> Vec<Artifact> {
 /// are honoured by [`crate::machine::menu_rows`] — a removed row is not
 /// listed, a replaced one lists its replacement — so the one place the
 /// card promises removal means removal is the same list it advertises.
-fn compacted_rows(path: &[&Event]) -> std::collections::HashMap<EventId, Option<String>> {
+fn compacted_rows(
+    path: &[&Event],
+) -> std::collections::HashMap<EventId, crate::tree::CompactedView> {
     path.iter()
         .filter_map(|e| match &e.payload {
-            EventPayload::Compacted { of, text } => Some((*of, text.clone())),
+            EventPayload::Compacted { of, text, window } => Some((
+                *of,
+                crate::tree::CompactedView {
+                    text: text.clone(),
+                    window: *window,
+                },
+            )),
             _ => None,
         })
         .collect()
@@ -2840,6 +2848,7 @@ mod tests {
                 EventPayload::Compacted {
                     of: EventId::new(5),
                     text: None,
+                    window: None,
                 },
             ),
             ev(
@@ -2847,6 +2856,7 @@ mod tests {
                 EventPayload::Compacted {
                     of: EventId::new(6),
                     text: Some("kept, shortened".into()),
+                    window: None,
                 },
             ),
         ];

@@ -164,6 +164,11 @@ pub struct CompactedView {
     /// `None` ⇒ the entry renders nothing at all; `Some` ⇒ this is shown
     /// in its place.
     pub text: Option<String>,
+    /// Set instead of `text` when the entry shows a window of its own
+    /// value rather than something standing in for it. The two are
+    /// exclusive: `replace` says something else, `slice` shows part of
+    /// what is there.
+    pub window: Option<crate::types::Window>,
 }
 
 impl Tree {
@@ -843,8 +848,14 @@ impl Tree {
     pub fn compacted_lookup(&self, leaf: EventId) -> HashMap<EventId, CompactedView> {
         let mut lookup = HashMap::new();
         for event in self.path_events(leaf) {
-            if let EventPayload::Compacted { of, text } = &event.payload {
-                lookup.insert(*of, CompactedView { text: text.clone() });
+            if let EventPayload::Compacted { of, text, window } = &event.payload {
+                lookup.insert(
+                    *of,
+                    CompactedView {
+                        text: text.clone(),
+                        window: *window,
+                    },
+                );
             }
         }
         lookup

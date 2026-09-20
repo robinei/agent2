@@ -7,6 +7,18 @@ use serde::{Deserialize, Serialize};
 #[derive(Serialize, Deserialize, Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct EventId(NonZeroU64);
 
+/// A half-open byte range of a row's value, as `history.slice` names it.
+///
+/// Bytes rather than lines, so the offsets a program computes with
+/// `content.slice(a, b)` are the offsets it passes here — `.length` in
+/// this dialect counts UTF-8 bytes, and two units for one idea is how
+/// an off-by-one becomes a mystery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Window {
+    pub from: u32,
+    pub to: u32,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Event {
     pub id: EventId,
@@ -329,6 +341,14 @@ pub enum EventPayload {
         of: EventId,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         text: Option<String>,
+        /// A window into the entry's own value, in bytes, instead of
+        /// text standing in for it. Carries no bytes of its own —
+        /// which is the point: paging a long row by `replace` writes
+        /// the same text to the log once per window, and the log is
+        /// the one thing in this system that is never rationed but
+        /// also never wrong.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        window: Option<Window>,
     },
 
     /// Execution event; the full, unclipped console output of one program
