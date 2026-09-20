@@ -213,8 +213,11 @@ the claim.
 
 `history.append`'s doc says in bold **"Not the bytes of something you
 read"**. The fifth exemplar did exactly that, with prose defending it.
-Measured: **72% of all appended bytes echo a result already on the
-log** — 79 KB carried twice across 19 runs.
+Measured over 42 baseline runs, by exact string match against what a
+result delivered: **72% of all appended bytes are a copy** — 77 KB of
+107 KB. The advisory's 400-byte floor sees 52 of those 72 points, which
+is the part worth a sentence in a report; the rest is small strings
+that are not worth naming.
 
 The fourth wrote every file in a loop and then told the person how
 many, with nothing run in between — the exact shape
