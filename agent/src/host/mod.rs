@@ -494,14 +494,29 @@ impl Session {
                 Unmatched::InterruptedRun {
                     branch,
                     leaf: _,
-                    turn: _,
+                    turn,
                 } => {
                     if self.open_branch(branch) {
                         let state = self.states.get_mut(&branch).expect("opened");
                         self.tree.append(
                             &mut state.spine,
                             EventPayload::Handback {
-                                reply: EventId::new(1),
+                                // **The reply it belonged to**, which
+                                // `unmatched()` went to the trouble of
+                                // finding and this threw away: it wrote
+                                // `EventId::new(1)`, a `Runner`'s
+                                // starting sentinel, which on a real log
+                                // is the `Agent` event. So the one rule
+                                // that makes recovery decidable from the
+                                // log — a terminal handback names its
+                                // reply — was false of exactly the
+                                // events recovery writes.
+                                //
+                                // Seen live on 2026-09-20: a session
+                                // parked on `choose()` was reopened by
+                                // the next process, and the repair it
+                                // logged read `reply: 1`.
+                                reply: turn,
                                 how: crate::types::Handback::Interrupted,
                                 site: 0,
                                 stack: Vec::new(),
@@ -4318,15 +4333,32 @@ mod tests {
         // The repair is one event — `Condition{Interrupted}` — and the
         // report is *derived* from it, so "the report was lost" is not a
         // case that can exist.
-        assert!(
-            session.tree().events.values().any(|e| matches!(
-                &e.payload,
+        let repair = session
+            .tree()
+            .events
+            .values()
+            .find_map(|e| match &e.payload {
                 EventPayload::Handback {
                     how: crate::types::Handback::Interrupted,
+                    reply,
                     ..
-                }
-            )),
-            "the interrupted run was given an outcome"
+                } => Some(*reply),
+                _ => None,
+            })
+            .expect("the interrupted run was given an outcome");
+        // **And it names the reply it belonged to.** A terminal
+        // handback naming its reply is what makes recovery decidable
+        // from the log alone, and this used to write `EventId::new(1)`
+        // — a `Runner`'s starting sentinel, which on a real log is the
+        // `Agent` event — so the rule was false of exactly the events
+        // recovery writes.
+        assert!(
+            matches!(
+                session.tree().events.get(&repair).map(|e| &e.payload),
+                Some(EventPayload::Reply | EventPayload::Restart)
+            ),
+            "the repair names #{}, which is not a reply",
+            repair.as_u64()
         );
         let tools = tool_texts(&session);
         let interrupted_report = tools

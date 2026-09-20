@@ -755,10 +755,11 @@ impl Conversation {
             for o in queue {
                 match o {
                     StepOutput::Working => working = true,
-                    StepOutput::LlmRequest(_) => {
-                        self.requests += 1;
-                        seen.push(StepOutput::Working); // placeholder, kind kept below
-                    }
+                    // **Counted, not answered.** A test says what the
+                    // model replies; the harness never invents one. The
+                    // count is how `Said::rests` knows whether the
+                    // branch was asked again.
+                    StepOutput::LlmRequest(_) => self.requests += 1,
                     StepOutput::ToolCalls(calls) => {
                         for OutCall { call, name, args } in calls {
                             let result = match self.tools.get(&name) {
@@ -1015,24 +1016,18 @@ impl Conversation {
             );
         }
         if self.enforced(Invariant::PartsConcatenate) {
-            let rebuilt: String = s.prose.iter().chain(&s.cells).map(String::as_str).collect();
-            let rebuilt_in_order: String = events
+            let rebuilt: String = events
                 .iter()
                 .filter_map(|e| match &e.payload {
                     EventPayload::Part {
-                        part: crate::types::Part::Prose(t),
-                        ..
-                    } => Some(t.as_str()),
-                    EventPayload::Part {
-                        part: crate::types::Part::Cell(t),
+                        part: crate::types::Part::Prose(t) | crate::types::Part::Cell(t),
                         ..
                     } => Some(t.as_str()),
                     _ => None,
                 })
                 .collect();
-            let _ = rebuilt;
             assert_eq!(
-                rebuilt_in_order, markdown,
+                rebuilt, markdown,
                 "the parts must put the reply back together (docs/28)"
             );
         }
