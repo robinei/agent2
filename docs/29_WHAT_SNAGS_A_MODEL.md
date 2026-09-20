@@ -393,6 +393,47 @@ a version mismatch that names the current version and the last-write
 route, a missing path, a `create_file` on an existing file that names
 `replace_file` instead. No silent nulls.
 
+## The one that destroyed a file
+
+`outline`'s `kind` was the tree-sitter node kind. The same concept has
+four names across the four languages it parses — `function_item`,
+`function_declaration`, `function_definition` — and the word every
+model reaches for matches none of them. Across the kept corpus:
+
+| programs compare `kind` against | uses | runs |
+|---|---|---|
+| `"function"` | 26 | 17 |
+| `"function_definition"` | 17 | 15 |
+| `"def"`, `"class"` | 2 | 2 |
+
+**The wrong guess was the commoner one.** And it fails in the worst
+available way: `items.filter(i => i.kind === "function")` is an empty
+array, not an error. A run gets no signal that it asked the wrong
+question — it gets an answer meaning "none of them", which on this
+task shape reads as "nothing here is live".
+
+One `sweep-8` run followed that all the way:
+
+    const newContent = '"""Assorted helpers."""\n';
+    await tools.replace_file("helpers.py", newContent, version);
+
+The whole file replaced by its docstring, every live function with it.
+The verdict was "the tests no longer pass — something still in use was
+removed".
+
+`kind` is now a word a reader would guess, the same word in every
+language, with the grammars' real distinctions kept — a Rust struct
+and an enum do not both become "type". The declaration lists the
+fourteen values instead of saying `string`, so there is nothing left
+to guess.
+
+This is the fourth declaration in this document that described
+something other than what the tool did, and the only one that cost a
+file. The lesson is narrower than "check your declarations": an enum
+rendered as `string` is an invitation to guess, and a filter is the
+one place where a wrong guess returns a plausible answer instead of an
+error.
+
 ## Rows that said the same thing whichever way it went
 
 The narrow-channel shape has a mirror image, and it took a second pass
