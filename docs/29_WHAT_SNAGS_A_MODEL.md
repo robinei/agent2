@@ -339,12 +339,17 @@ thing it guards:
 | `every_tool_description_fits_the_clip` | a description cut where the model reads it |
 | `the_shipped_manifest_tells_the_truth_about_itself` | a `returns` that names a field the handler cannot produce |
 | `every_worked_example_compiles` | an exemplar teaching a construct this dialect does not have |
+| `every_tool_example_compiles` | a typo in a one-line `@example`, copied verbatim |
 | `the_cards_declarations_are_valid_typescript` | a stray brace in half the card |
 | `the_card_teaches_the_markers_the_document_uses` | a glyph renamed in the renderer and not in the card |
 
-The two largest imitated surfaces in the prompt — the declarations and
-the worked examples — are checked mechanically rather than by reading.
-That is the part of tonight most likely to still be paying next month.
+Everything the model is given to imitate — the declarations, the worked
+examples, the one-line `@example`s — is now checked mechanically rather
+than by reading. That is the part of tonight most likely to still be
+paying next month, because the failures it prevents are the ones
+nobody notices: a claim in a prompt has no compiler, no reviewer and no
+user to complain, and the only reader it misleads writes code for a
+living.
 
 ## What was rejected
 
