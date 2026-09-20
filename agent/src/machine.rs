@@ -7739,6 +7739,47 @@ mod tests {
         );
     }
 
+    /// **The tail is ephemeral: it rides whichever message is last and
+    /// is never baked into one.** It is the only part of a request that
+    /// is not recoverable from the log, so a copy left behind in a
+    /// message would be invisible until it started contradicting a
+    /// later one — and the whole reason it can carry a right-now fact
+    /// is that next request re-emits it at the new end.
+    #[test]
+    fn the_tail_moves_and_leaves_nothing_behind() {
+        let (mut tree, mut state) = setup_under();
+        user_post(&mut state, &mut tree, "what is in this directory?");
+
+        let first = state.render_messages_for_test(&tree);
+        let asked = first.messages.last().expect("a request").content.clone();
+        assert!(asked.contains("## RIGHT NOW"), "{asked}");
+
+        // A reply, then a second question — so the message that carried
+        // the tail is no longer the last one.
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::LlmResponse(llm_program("tell(\"three\");")),
+            )
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+        user_post(&mut state, &mut tree, "present as a table");
+
+        let second = state.render_messages_for_test(&tree);
+        assert_eq!(
+            second
+                .messages
+                .iter()
+                .filter(|m| m.content.contains("## RIGHT NOW"))
+                .count(),
+            1,
+            "exactly one tail in the request, at its end"
+        );
+        let last = second.messages.last().expect("a request");
+        assert!(last.content.contains("## RIGHT NOW"), "{}", last.content);
+        assert_eq!(last.role, crate::document::ChatRole::User);
+    }
+
     /// And it is off unless asked for.
     #[test]
     fn the_reply_shape_line_is_off_by_default() {
