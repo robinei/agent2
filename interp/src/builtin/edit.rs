@@ -95,22 +95,56 @@ fn ambiguous(n: usize, needle: &str, lines: &[usize]) -> String {
 /// "throw rather than landing somewhere you did not mean", and because
 /// a program that *wants* doubled indentation writes it in `new`
 /// against an `old` that starts at the line's beginning.
-fn doubles_indentation(text: &str, start: usize, new: &str) -> Option<String> {
+/// **And the other half: `new` that ends the line instead of starting
+/// it.** The check above wanted `new` to begin with the same
+/// indentation, which is the case where the two collide. A `new` that
+/// is *empty* — deleting the decorator outright — slips past it, and
+/// the indentation is orphaned rather than doubled: it sits at the
+/// head of the line with the next line's content pulled up behind it.
+/// Same corruption, one branch further on.
+///
+/// Live on 2026-09-20 at current HEAD, `skipped-tests` again:
+///
+/// ```text
+/// old: '@unittest.skip("rates were in flux")\n'
+/// new: ''
+/// ```
+///
+/// against `    @unittest.skip("rates were in flux")\n    def
+/// test_base_rate(self):`. The four spaces before the `@` survived and
+/// the `def` kept its own, so the method was defined eight columns in
+/// and its body was no longer indented relative to it —
+/// `IndentationError: expected an indented block after function
+/// definition on line 7`. The run read the failure, told the person
+/// the suite was broken, and called `done()`.
+fn doubles_indentation(text: &str, start: usize, old: &str, new: &str) -> Option<String> {
     let line_start = text[..start].rfind('\n').map(|i| i + 1).unwrap_or(0);
     let pre = &text[line_start..start];
     if pre.is_empty() || !pre.chars().all(|c| c == ' ' || c == '\t') {
         return None;
     }
-    if !new.starts_with(pre) {
-        return None;
+    if new.starts_with(pre) {
+        return Some(format!(
+            "the match starts {} column(s) into its line, after indentation that `old` does not \
+             include, and `new` begins with that same indentation — applying it would leave the \
+             line indented twice over. Put the leading whitespace in `old` as well, or take it \
+             off the front of `new`.",
+            pre.len()
+        ));
     }
-    Some(format!(
-        "the match starts {} column(s) into its line, after indentation that `old` does not \
-         include, and `new` begins with that same indentation — applying it would leave the \
-         line indented twice over. Put the leading whitespace in `old` as well, or take it \
-         off the front of `new`.",
-        pre.len()
-    ))
+    // The line is being ended here — by a `new` that closes it, or by
+    // one that is not there at all — so nothing follows `pre` on it and
+    // the next line's content comes up behind that indentation.
+    if old.ends_with('\n') && (new.is_empty() || new.ends_with('\n')) {
+        return Some(format!(
+            "the match starts {} column(s) into its line, after indentation that `old` does not \
+             include, and `old` ends the line — so that indentation would be left with nothing \
+             on the line and the next line pulled up behind it. Put the leading whitespace in \
+             `old` as well, so the whole line goes.",
+            pre.len()
+        ));
+    }
+    None
 }
 
 /// The 1-based line each byte offset falls on.
@@ -217,7 +251,7 @@ pub fn edit_replace_once(vm: &mut VM, args: Args) -> Result<Value, VMError> {
             return Err(vm.fail(ErrorKind::ValueError, ambiguous(n, old, &lines)));
         }
         let (pos, _) = indices[0];
-        if let Some(why) = doubles_indentation(text, pos, replacement.as_str()) {
+        if let Some(why) = doubles_indentation(text, pos, old, replacement.as_str()) {
             return Err(vm.fail(
                 ErrorKind::ValueError,
                 format!("replaceOnce: {why}").as_str(),
@@ -268,6 +302,17 @@ pub fn edit_replace_count(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let mut last = 0;
     let mut count: u64 = 0;
     for (pos, _) in text.match_indices(old) {
+        // **Every match, because `replaceCount` applies to every
+        // match.** Its siblings check one site; this one had no check
+        // at all, and it is the verb a program reaches for to strip a
+        // decorator from several methods at once — which is exactly
+        // the edit that orphans indentation, once per method.
+        if let Some(why) = doubles_indentation(text, pos, old, replacement.as_str()) {
+            return Err(vm.fail(
+                ErrorKind::ValueError,
+                format!("replaceCount: {why}").as_str(),
+            ));
+        }
         out.push_str(&text[last..pos]);
         out.push_str(replacement.as_str());
         last = pos + old.len();
@@ -699,7 +744,7 @@ pub fn edit_apply_edits(vm: &mut VM, args: Args) -> Result<Value, VMError> {
                 ),
             ));
         }
-        if let Some(why) = doubles_indentation(text, matches[0], new_s.as_str()) {
+        if let Some(why) = doubles_indentation(text, matches[0], old, new_s.as_str()) {
             return Err(vm.fail(
                 ErrorKind::ValueError,
                 format!("applyEdits edit[{i}]: {why}").as_str(),
@@ -957,6 +1002,68 @@ mod match_count_tests {
         let msg = match_count_error("replaceOnce", 0, &"x".repeat(400), &[]);
         assert!(msg.contains('…'), "{msg}");
         assert!(msg.len() < 300, "{} bytes", msg.len());
+    }
+}
+
+#[cfg(test)]
+mod orphaned_indentation_tests {
+    use crate::testutil;
+
+    fn msg(src: &str) -> String {
+        testutil::run_ret(&format!(
+            "try {{ {src} }} catch (e) {{ return e.message; }}"
+        ))
+        .as_str()
+        .unwrap_or_default()
+        .to_owned()
+    }
+
+    /// **The edit that broke a file at current HEAD.** Deleting a
+    /// decorator with a needle that starts after its indentation leaves
+    /// that indentation on a line of its own, and the next line comes
+    /// up behind it: the method ends up defined eight columns in with
+    /// a body no longer indented relative to it. Python calls that
+    /// `IndentationError: expected an indented block`; the run that
+    /// wrote it read the failure, said the suite was broken and
+    /// stopped.
+    ///
+    /// The sibling check wanted `new` to *begin* with the indentation,
+    /// so an empty `new` slipped past it.
+    #[test]
+    fn deleting_a_line_without_its_indentation_is_refused() {
+        let file = r#"'class T:\n    @skip("x")\n    def a(self):\n        pass\n'"#;
+        for call in [
+            format!(r#"Edit.replaceCount({file}, '@skip("x")\n', "")"#),
+            format!(r#"Edit.replaceOnce({file}, '@skip("x")\n', "")"#),
+            format!(r#"Edit.applyEdits({file}, [{{ old: '@skip("x")\n', new: "" }}])"#),
+        ] {
+            let m = msg(&call);
+            assert!(
+                m.contains("ends the line") && m.contains("pulled up behind it"),
+                "{call}\n  got: {m}"
+            );
+            assert!(m.contains("4 column(s)"), "names the column: {m}");
+        }
+    }
+
+    /// Written with the indentation included, it is an ordinary edit.
+    #[test]
+    fn deleting_the_whole_line_is_fine() {
+        let out = testutil::run_ret(
+            r#"return Edit.replaceCount('class T:\n    @skip("x")\n    def a(self):\n', '    @skip("x")\n', "").result;"#,
+        );
+        assert_eq!(out.as_str().unwrap(), "class T:\n    def a(self):\n");
+    }
+
+    /// And a replacement that keeps the line is untouched by either
+    /// branch — the check is about a line being *ended*, not about
+    /// every mid-line match.
+    #[test]
+    fn a_mid_line_replacement_that_keeps_the_line_is_allowed() {
+        let out = testutil::run_ret(
+            r#"return Edit.replaceOnce('class T:\n    foo = 1\n', 'foo = 1', 'bar = 2');"#,
+        );
+        assert_eq!(out.as_str().unwrap(), "class T:\n    bar = 2\n");
     }
 }
 
