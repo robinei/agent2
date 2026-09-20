@@ -615,6 +615,23 @@ impl super::Compiler {
                          work cannot finish, `stop(reason)` instead.",
                     );
                 }
+                // **Requiring the argument is not the same as requiring
+                // an answer.** `finish("")` satisfies the arity and
+                // leaves the person with an empty message, which is the
+                // silence the argument was added to prevent — the
+                // loophole a model reaches for when it has nothing to
+                // say and something to satisfy. A computed empty string
+                // cannot be caught here; the literal is the one that
+                // gets written.
+                if is_empty_literal(argv) {
+                    return self.error(
+                        span,
+                        "`finish(\"\")` says nothing, and the reply that finishes owes the \
+                         person the answer. Put what you concluded in it — or if there is \
+                         nothing to conclude because the work did not come out, \
+                         `stop(reason)` says why.",
+                    );
+                }
                 self.compile_args(argv);
                 self.emit(Instr::Finish, span);
                 self.emit(Instr::PushUndefined, span);
@@ -625,6 +642,17 @@ impl super::Compiler {
                         span,
                         "`stop(reason)` takes the reason you cannot finish — one string, \
                          which the next reply reads. To end the task instead, `finish(text)`.",
+                    );
+                }
+                // Same loophole, and worse: an empty reason renders as
+                // a report with a blank where the reason goes, and the
+                // next reply is handed nothing to act on.
+                if is_empty_literal(argv) {
+                    return self.error(
+                        span,
+                        "`stop(\"\")` gives the next reply nothing to act on. Say what came \
+                         back wrong — the count that disagreed, the command that failed and \
+                         its output.",
                     );
                 }
                 self.compile_args(argv);
@@ -1328,5 +1356,29 @@ impl super::Compiler {
             }
         }
         0
+    }
+}
+
+/// Whether the single argument is a string literal with nothing in it.
+///
+/// Only a literal. `finish(summary)` where `summary` happens to be
+/// empty is a runtime fact this cannot see, and pretending otherwise
+/// would mean refusing programs that are fine. What this catches is the
+/// shape a model writes when it has an arity to satisfy and nothing to
+/// say.
+fn is_empty_literal(argv: &[&ast::Expression<'_>]) -> bool {
+    match argv.first() {
+        Some(ast::Expression::StringLiteral(lit)) => lit.value.as_str().trim().is_empty(),
+        Some(ast::Expression::TemplateLiteral(t)) => {
+            t.expressions.is_empty()
+                && t.quasis.iter().all(|q| {
+                    // Cooked, not raw: in `` `\n` `` the raw text is a
+                    // backslash and an `n`, and the thing the person
+                    // would read is a newline.
+                    let text = q.value.cooked.as_ref().map_or(q.value.raw.as_str(), |c| c.as_str());
+                    text.trim().is_empty()
+                })
+        }
+        _ => false,
     }
 }

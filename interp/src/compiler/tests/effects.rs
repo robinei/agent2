@@ -479,6 +479,24 @@ fn the_endings_each_take_exactly_one_argument() {
         );
         compile(&format!("{verb}(\"the one thing it says\");"))
             .unwrap_or_else(|e| panic!("{verb}(text) should compile: {e:?}"));
+
+        // **And an argument is not the same as an answer.** `finish("")`
+        // satisfies the arity and leaves the person with an empty
+        // message, which is the silence the argument was added to
+        // prevent — the loophole a model reaches for when it has
+        // nothing to say and something to satisfy. Seen to be reachable
+        // on 2026-09-20: it compiled, sent an empty message, and rested
+        // the branch.
+        for empty in ["\"\"", "\"   \"", "``", "`\\n`"] {
+            assert!(
+                !crate::testutil::compile_errs(&format!("{verb}({empty});")).is_empty(),
+                "{verb}({empty}) should not compile — it says nothing"
+            );
+        }
+        // A computed empty is a runtime fact the compiler cannot see,
+        // and refusing the shape would refuse programs that are fine.
+        compile(&format!("const s = \"\"; {verb}(s);"))
+            .unwrap_or_else(|e| panic!("{verb}(name) should compile: {e:?}"));
     }
 }
 
