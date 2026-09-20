@@ -392,7 +392,12 @@ pub fn parse_errors_def() -> ToolDef {
                     "description": "path, or null to check `source` instead"
                 },
                 { "name": "source", "type": "string", "description": "content to check, unwritten" },
-                { "name": "lang", "type": "string", "description": "language name, with `source`" }
+                {
+                    "name": "lang",
+                    "type": "string",
+                    "enum": ["rust", "javascript", "typescript", "python"],
+                    "description": "language name, with `source`"
+                }
             ],
             "minItems": 1,
             "maxItems": 3

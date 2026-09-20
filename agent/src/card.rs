@@ -346,6 +346,27 @@ fn the_dialect_table_says_what_the_interpreter_does() {
     }
 }
 
+/// **A closed value set renders as a union, not as `string`.**
+///
+/// Everything rendered as `string`, so a small fixed vocabulary
+/// reached the reader as "any text". `outline`'s `kind` was exactly
+/// that, and the guess models actually make — `"function"` — was not
+/// one of its values; the filter it appears in returns an empty array
+/// rather than an error, and one run read that emptiness as "nothing
+/// here is live" and replaced a source file with its docstring.
+#[test]
+fn a_parameter_with_a_closed_value_set_names_the_values() {
+    let manifest = tool_manifest(&crate::host::tools::real_registry(), true);
+    assert!(
+        manifest.contains(r#""rust" | "javascript" | "typescript" | "python""#),
+        "parse_errors's `lang` still renders as `string`:\n{manifest}"
+    );
+    assert!(
+        !manifest.contains("lang?: string"),
+        "and not both ways:\n{manifest}"
+    );
+}
+
 /// **The card's TypeScript parses.**
 ///
 /// The declaration block is the largest single thing the model reads —
@@ -445,7 +466,33 @@ fn every_tool_description_fits_the_clip() {
 /// `ToolDef::returns`. A tool that supplies neither still renders — as
 /// `argN: unknown` and `Promise<unknown>` — because a manifest that
 /// omits a live tool is worse than one that describes it thinly.
-fn ts_type(schema: &serde_json::Value) -> &'static str {
+fn ts_type(schema: &serde_json::Value) -> String {
+    // **A parameter with a closed value set says what they are.**
+    // Everything here rendered as `string`, so a small fixed
+    // vocabulary reached the reader as "any text" and had to be
+    // recovered from the prose beside it — or guessed. `outline`'s
+    // `kind` was exactly that, and the guess models actually make,
+    // `"function"`, was not one of the values; the filter it appears
+    // in returns an empty array rather than an error, and one run read
+    // that emptiness as "nothing here is live" and emptied a file.
+    // A union costs a few bytes and removes the guess.
+    if let Some(values) = schema.get("enum").and_then(|e| e.as_array()) {
+        let mut rendered: Vec<String> = values
+            .iter()
+            .filter_map(|v| v.as_str())
+            .map(|v| format!("\"{v}\""))
+            .collect();
+        if !rendered.is_empty() {
+            if schema.get("nullable").and_then(|n| n.as_bool()) == Some(true) {
+                rendered.push("null".into());
+            }
+            return rendered.join(" | ");
+        }
+    }
+    ts_type_plain(schema).to_owned()
+}
+
+fn ts_type_plain(schema: &serde_json::Value) -> &'static str {
     // **A parameter that takes `null` says so.** `parse_errors`'s own
     // `@example` passes `null` for its path — that is the documented
     // way to check unwritten content — while the signature above it
