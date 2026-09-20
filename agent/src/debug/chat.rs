@@ -39,9 +39,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::host::{AgentId, BranchId, ProgramStatus, SessionEvent};
 use crate::tree::depth_after;
-use crate::types::{
-    Address, Call, Event, EventId, EventPayload, Outcome,
-};
+use crate::types::{Address, Call, Event, EventId, EventPayload, Outcome};
 
 /// How many lines of a cell's source show while it is collapsed (D13).
 pub const CELL_COLLAPSED_LINES: usize = 5;
@@ -605,7 +603,11 @@ impl ChatState {
             // literal source of a program it is not part of. Thinking
             // is a line of its own and is not part of what was said.
             EventPayload::Part { part, .. } => {
-                let program = self.program_stack.get(&branch).and_then(|s| s.last()).copied();
+                let program = self
+                    .program_stack
+                    .get(&branch)
+                    .and_then(|s| s.last())
+                    .copied();
                 match part {
                     crate::types::Part::Thinking(t) if !t.is_empty() => {
                         self.push_entry(Entry::Line {
@@ -630,7 +632,6 @@ impl ChatState {
                     }
                 }
             }
-
         }
         self.branch_depth.insert(
             branch,
@@ -1869,12 +1870,7 @@ mod tests {
         chat.apply(&post(2, "shared question"));
         // The fork point: the original branch's program, and the `tell()`
         // it made — the "message" a human actually sees.
-        chat.apply(&ev_on(
-            1,
-            3,
-            Some(2),
-            EventPayload::Restart,
-        ));
+        chat.apply(&ev_on(1, 3, Some(2), EventPayload::Restart));
         chat.apply(&ev_on(
             1,
             4,

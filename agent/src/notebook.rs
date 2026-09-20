@@ -777,7 +777,10 @@ mod tests {
 
     impl Reply {
         fn new() -> Self {
-            Reply { text: String::new(), stream: Stream::new() }
+            Reply {
+                text: String::new(),
+                stream: Stream::new(),
+            }
         }
         fn push(&mut self, chunk: &str) {
             self.text.push_str(chunk);
@@ -785,7 +788,11 @@ mod tests {
             self.stream.advance(&self.text);
         }
         fn cells(&self) -> Vec<&str> {
-            self.stream.cells().iter().map(|c| c.slice(&self.text)).collect()
+            self.stream
+                .cells()
+                .iter()
+                .map(|c| c.slice(&self.text))
+                .collect()
         }
     }
 
@@ -824,9 +831,17 @@ mod tests {
     fn a_matched_pair_is_the_model_quoting_and_is_kept() {
         let mut r = Reply::new();
         r.push("The provider sends this:\n\n```text\n<think>…</think>\n```\n\n");
-        assert!(r.text.contains("</think>"), "quoted, not stripped: {:?}", r.text);
+        assert!(
+            r.text.contains("</think>"),
+            "quoted, not stripped: {:?}",
+            r.text
+        );
         r.push("```js\nconst a = 1;\n```\n");
-        assert_eq!(r.cells(), vec!["const a = 1;\n"], "and the cell after it still runs");
+        assert_eq!(
+            r.cells(),
+            vec!["const a = 1;\n"],
+            "and the cell after it still runs"
+        );
     }
 
     /// Nothing already handed out is taken back. A cell that has been
@@ -1132,8 +1147,9 @@ three\n";
                     .iter()
                     .map(|p| match p {
                         Piece::Prose(t) => t.clone(),
-                        Piece::Cell(i) => reply[cells[*i].outer_start..cells[*i].outer_end]
-                            .to_owned(),
+                        Piece::Cell(i) => {
+                            reply[cells[*i].outer_start..cells[*i].outer_end].to_owned()
+                        }
                     })
                     .collect()
             };
@@ -1252,7 +1268,10 @@ three\n";
         };
         assert!(text.starts_with("# Findings"));
         assert!(text.contains("\n\n- one\n- two\n\n"));
-        assert!(text.ends_with("And the conclusion.\n"), "verbatim: {text:?}");
+        assert!(
+            text.ends_with("And the conclusion.\n"),
+            "verbatim: {text:?}"
+        );
         assert_eq!(pieces.len(), 1);
     }
 

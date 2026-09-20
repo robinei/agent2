@@ -28,10 +28,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::host;
-use crate::types::{
-    Address, Author, Call, EventId, EventPayload,
-    Outcome as CallOutcome, Tree,
-};
+use crate::types::{Address, Author, Call, EventId, EventPayload, Outcome as CallOutcome, Tree};
 
 /// One fixed task: a prompt, the real fixture files it runs against, the
 /// harness's one scripted actor (the human `ask()` might reach), and a
@@ -456,7 +453,7 @@ fn pending_ask(events: &[host::SessionEvent]) -> Option<(host::BranchId, EventId
                 pending = None;
             }
             _ => {}
-            }
+        }
     }
     pending
 }
@@ -1242,12 +1239,7 @@ fn multi_turn_continuity_check(outcome: &Outcome, _dir: &Path) -> Result<(), Str
     let mut agent_turns: Vec<&crate::types::Event> = tree
         .events
         .values()
-        .filter(|e| {
-            matches!(
-                &e.payload,
-                EventPayload::Reply
-            )
-        })
+        .filter(|e| matches!(&e.payload, EventPayload::Reply))
         .collect();
     agent_turns.sort_by_key(|e| e.id.as_u64());
     if agent_turns.len() < 2 {
@@ -1294,11 +1286,7 @@ fn multi_turn_continuity_check(outcome: &Outcome, _dir: &Path) -> Result<(), Str
     // The transport the run itself used: this reconstructs a document a
     // real session already rendered, so it has to fold under the same
     // container that session did.
-    let doc = crate::document::render(
-        tree,
-        &spine,
-        host::DEFAULT_DOCUMENT_BUDGET,
-    );
+    let doc = crate::document::render(tree, &spine, host::DEFAULT_DOCUMENT_BUDGET);
     let seen = doc
         .messages
         .iter()

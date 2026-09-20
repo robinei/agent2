@@ -281,10 +281,7 @@ pub fn floor_size(tree: &Tree, spine: &Spine, budget: usize) -> usize {
 /// threshold check need. Swap for a real count without changing either
 /// function's shape.
 pub fn rendered_size(doc: &document::Document) -> usize {
-    doc.messages
-        .iter()
-        .map(|m| m.content.len())
-        .sum()
+    doc.messages.iter().map(|m| m.content.len()).sum()
 }
 
 /// Fires at a headroom threshold, not at overflow (Part E): the
@@ -335,12 +332,7 @@ mod tests {
             },
         )
         .unwrap();
-        let program = tree
-            .append(
-                &mut spine,
-                EventPayload::Restart,
-            )
-            .unwrap();
+        let program = tree.append(&mut spine, EventPayload::Restart).unwrap();
         tree.append(
             &mut spine,
             EventPayload::Handback {
@@ -752,33 +744,56 @@ mod tests {
     #[test]
     fn a_replaced_row_can_be_replaced_again_but_a_removed_one_is_done() {
         let (mut tree, mut spine, [first, cell, _]) = branch_with_three_blocks();
-        for payload in compact(&tree, &spine, &[CompactionOp::Replace {
-            id: cell,
-            text: "counted the defs".into(),
-        }]) {
+        for payload in compact(
+            &tree,
+            &spine,
+            &[CompactionOp::Replace {
+                id: cell,
+                text: "counted the defs".into(),
+            }],
+        ) {
             tree.append(&mut spine, payload).unwrap();
         }
-        let again = compact(&tree, &spine, &[CompactionOp::Replace {
-            id: cell,
-            text: "counted 200 defs, 107 dead".into(),
-        }]);
+        let again = compact(
+            &tree,
+            &spine,
+            &[CompactionOp::Replace {
+                id: cell,
+                text: "counted 200 defs, 107 dead".into(),
+            }],
+        );
         assert_eq!(again.len(), 1, "a row that still renders is still a target");
         for payload in again {
             tree.append(&mut spine, payload).unwrap();
         }
         let after = rendered(&tree, &spine);
         assert!(after.contains("counted 200 defs, 107 dead"), "{after}");
-        assert!(!after.contains("counted the defs"), "the older stand-in is gone: {after}");
+        assert!(
+            !after.contains("counted the defs"),
+            "the older stand-in is gone: {after}"
+        );
 
         // Removed is the end of it.
-        for payload in compact(&tree, &spine, &[CompactionOp::Remove {
-            from: first,
-            to: first,
-        }]) {
+        for payload in compact(
+            &tree,
+            &spine,
+            &[CompactionOp::Remove {
+                from: first,
+                to: first,
+            }],
+        ) {
             tree.append(&mut spine, payload).unwrap();
         }
         assert!(
-            compact(&tree, &spine, &[CompactionOp::Remove { from: first, to: first }]).is_empty(),
+            compact(
+                &tree,
+                &spine,
+                &[CompactionOp::Remove {
+                    from: first,
+                    to: first
+                }]
+            )
+            .is_empty(),
             "naming a row that renders nothing changes nothing"
         );
     }

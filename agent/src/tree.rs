@@ -1193,14 +1193,14 @@ mod tests {
 
     fn raised(name: &str) -> EventPayload {
         EventPayload::Handback {
-                            reply: EventId::new(1),
-                            how: crate::types::Handback::Raised {
+            reply: EventId::new(1),
+            how: crate::types::Handback::Raised {
                 name: name.into(),
                 payload: None,
             },
-                            site: 0,
-                            stack: Vec::new(),
-                        }
+            site: 0,
+            stack: Vec::new(),
+        }
     }
 
     // --- Log projections (decision 8: reconstructible from the log) ---
@@ -1342,13 +1342,13 @@ mod tests {
         tree.append(
             &mut other,
             EventPayload::Handback {
-                            reply: EventId::new(1),
-                            how: crate::types::Handback::CellFailed {
+                reply: EventId::new(1),
+                how: crate::types::Handback::CellFailed {
                     message: "compile error".into(),
                 },
-                            site: 0,
-                            stack: Vec::new(),
-                        },
+                site: 0,
+                stack: Vec::new(),
+            },
         )?;
         let child_agent = tree.enclosing_agent(other.leaf_id).unwrap();
         assert_eq!(
@@ -1773,11 +1773,11 @@ mod tests {
         tree.append(
             &mut spine,
             EventPayload::Handback {
-                            reply: EventId::new(1),
-                            how: crate::types::Handback::Interrupted,
-                            site: 0,
-                            stack: Vec::new(),
-                        },
+                reply: EventId::new(1),
+                how: crate::types::Handback::Interrupted,
+                site: 0,
+                stack: Vec::new(),
+            },
         )?;
         tree.sync()?;
         assert_eq!(open()?.events.len(), 5);

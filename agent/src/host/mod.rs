@@ -57,10 +57,7 @@ use std::time::Instant;
 use crate::document::Document;
 use crate::machine::{LlmTurn, OutCall, Runner, StepInput, StepOutput, ToolResult};
 use crate::tree::Unmatched;
-use crate::types::{
-    Address, Author, Call, EventId, EventPayload, Origin, Outcome,
-    Tree,
-};
+use crate::types::{Address, Author, Call, EventId, EventPayload, Origin, Outcome, Tree};
 
 /// Instructions per VM slice on the loop thread (9_TUI decision 3).
 pub const FUEL_SLICE: u64 = 100_000;
@@ -182,7 +179,6 @@ pub(crate) fn compaction_headroom() -> f64 {
         .filter(|f| *f > 0.0 && *f < 1.0)
         .unwrap_or(DEFAULT_COMPACTION_HEADROOM)
 }
-
 
 /// A counting semaphore (std-only) bounding concurrent LLM completions.
 /// LLM worker threads block in `acquire` until a permit frees; the
@@ -505,11 +501,11 @@ impl Session {
                         self.tree.append(
                             &mut state.spine,
                             EventPayload::Handback {
-                            reply: EventId::new(1),
-                            how: crate::types::Handback::Interrupted,
-                            site: 0,
-                            stack: Vec::new(),
-                        },
+                                reply: EventId::new(1),
+                                how: crate::types::Handback::Interrupted,
+                                site: 0,
+                                stack: Vec::new(),
+                            },
                         )?;
                     }
                 }
@@ -2332,7 +2328,10 @@ mod tests {
             .events
             .values()
             .filter_map(|e| match &e.payload {
-                EventPayload::Part { part: crate::types::Part::Thinking(t), .. } => Some(t.clone()),
+                EventPayload::Part {
+                    part: crate::types::Part::Thinking(t),
+                    ..
+                } => Some(t.clone()),
                 _ => None,
             })
             .collect();
@@ -2349,11 +2348,7 @@ mod tests {
         let terminals = tree
             .events
             .values()
-            .filter(|e| {
-                matches!(
-                    e.payload,
-                    EventPayload::Handback { .. }                 )
-            })
+            .filter(|e| matches!(e.payload, EventPayload::Handback { .. }))
             .count();
         assert_eq!(terminals, 1, "a reply is one run, however many cells");
     }
@@ -2399,7 +2394,10 @@ mod tests {
         let trapped = tree.events.values().any(|e| {
             matches!(
                 &e.payload,
-                EventPayload::Handback { how: crate::types::Handback::Trapped { .. }, .. }
+                EventPayload::Handback {
+                    how: crate::types::Handback::Trapped { .. },
+                    ..
+                }
             )
         });
         assert!(trapped, "the cell trapped");
@@ -2459,7 +2457,10 @@ mod tests {
             .iter()
             .rev()
             .find_map(|e| match &e.payload {
-                EventPayload::Handback { how: crate::types::Handback::Completed, .. } => Some(serde_json::Value::Null),
+                EventPayload::Handback {
+                    how: crate::types::Handback::Completed,
+                    ..
+                } => Some(serde_json::Value::Null),
                 _ => None,
             })
             .expect("a Return on this branch")
@@ -2869,9 +2870,7 @@ mod tests {
             .events
             .values()
             .find_map(|e| match &e.payload {
-                EventPayload::Note { value, .. } => {
-                    Some(crate::machine::note_text(value))
-                }
+                EventPayload::Note { value, .. } => Some(crate::machine::note_text(value)),
                 _ => None,
             })
             .unwrap();
@@ -2971,7 +2970,10 @@ mod tests {
     /// for its block's id (the `run_program` Assistant event).
     #[test]
     fn program_status_runs_then_completes() {
-        let script = vec![scripted_program("history.append(1 + 1);"), scripted_text("done")];
+        let script = vec![
+            scripted_program("history.append(1 + 1);"),
+            scripted_text("done"),
+        ];
         let (session, events) = run_session(ToolRegistry::new(), script, "go");
         let program = run_program_id(session.tree());
         assert_eq!(
@@ -3077,7 +3079,9 @@ mod tests {
         let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
         let llm = CapturingLlm {
             inner: ScriptedLlm::new([
-                scripted_program(r#"await tools.fetch("expensive"); const v = null; history.append(v.x);"#),
+                scripted_program(
+                    r#"await tools.fetch("expensive"); const v = null; history.append(v.x);"#,
+                ),
                 scripted_program("history.append(await fetch_history(5));"),
             ]),
             seen: std::sync::Arc::clone(&seen),
@@ -3446,7 +3450,10 @@ mod tests {
             .events
             .values()
             .find_map(|e| match &e.payload {
-                EventPayload::Handback { how: crate::types::Handback::Trapped { message, .. }, .. } => Some(message.clone()),
+                EventPayload::Handback {
+                    how: crate::types::Handback::Trapped { message, .. },
+                    ..
+                } => Some(message.clone()),
                 _ => None,
             })
             .expect("the failed read trapped");
@@ -3487,7 +3494,10 @@ mod tests {
         // either, so it never manufactured one here.
         assert_eq!(
             kinds(tree, root_leaf(&session)),
-            ["Agent", "Post", "Reply", "Part", "Call", "ReplyEnd", "Handback", "Console", "Result"]
+            [
+                "Agent", "Post", "Reply", "Part", "Call", "ReplyEnd", "Handback", "Console",
+                "Result"
+            ]
         );
 
         // The one `Post` on this branch is the user's own kickoff.
@@ -3681,7 +3691,10 @@ mod tests {
             .events
             .values()
             .find_map(|e| match &e.payload {
-                EventPayload::Handback { how: crate::types::Handback::Posted { ids }, .. } => Some(ids.clone()),
+                EventPayload::Handback {
+                    how: crate::types::Handback::Posted { ids },
+                    ..
+                } => Some(ids.clone()),
                 _ => None,
             })
             .expect("the run suspended into Condition::Posted");
@@ -3956,7 +3969,9 @@ mod tests {
         let kinds = kinds(session.tree(), root_leaf(&session));
         assert_eq!(
             kinds,
-            ["Agent", "Post", "Reply", "Part", "ReplyEnd", "Handback", "Answer", "Rename"],
+            [
+                "Agent", "Post", "Reply", "Part", "ReplyEnd", "Handback", "Answer", "Rename"
+            ],
             "{kinds:?}"
         );
     }
@@ -4237,11 +4252,7 @@ mod tests {
             },
         )
         .unwrap();
-        tree.append(
-            &mut spine,
-            EventPayload::Restart,
-        )
-        .unwrap();
+        tree.append(&mut spine, EventPayload::Restart).unwrap();
         // No outcome at all — the VM was lost with the process.
 
         // Open the log; pick_resume_leaf finds leaf #3.
@@ -4250,7 +4261,9 @@ mod tests {
             tree,
             "ignored",
             ToolRegistry::new(),
-            Box::new(ScriptedLlm::new(vec![scripted_program("history.append(999);")])),
+            Box::new(ScriptedLlm::new(vec![scripted_program(
+                "history.append(999);",
+            )])),
             tx,
         )
         .expect("opens the interrupted log");
@@ -4261,7 +4274,10 @@ mod tests {
         assert!(
             session.tree().events.values().any(|e| matches!(
                 &e.payload,
-                EventPayload::Handback { how: crate::types::Handback::Interrupted, .. }
+                EventPayload::Handback {
+                    how: crate::types::Handback::Interrupted,
+                    ..
+                }
             )),
             "the interrupted run was given an outcome"
         );
@@ -4515,7 +4531,10 @@ mod tests {
         // surprise.
         assert_eq!(
             kinds(tree, worker_leaf),
-            ["Agent", "Post", "Reply", "Part", "Call", "ReplyEnd", "Handback", "Console", "Result"]
+            [
+                "Agent", "Post", "Reply", "Part", "Call", "ReplyEnd", "Handback", "Console",
+                "Result"
+            ]
         );
         assert!(
             tree.spine_at(worker_leaf).context().open.is_empty(),
@@ -5064,7 +5083,9 @@ mod tests {
             let leaf = session.state(agent).unwrap().spine.leaf_id;
             assert_eq!(
                 kinds(tree, leaf),
-                ["Agent", "Post", "Reply", "Part", "ReplyEnd", "Answer", "Handback", "Console"]
+                [
+                    "Agent", "Post", "Reply", "Part", "ReplyEnd", "Answer", "Handback", "Console"
+                ]
             );
         }
     }
@@ -5147,7 +5168,9 @@ mod tests {
             [
                 (
                     "needs guidance",
-                    vec![scripted_program(r#"history.append(await ask(null, "which one?"));"#)],
+                    vec![scripted_program(
+                        r#"history.append(await ask(null, "which one?"));"#,
+                    )],
                 ),
                 (
                     "test agent",
@@ -5191,7 +5214,10 @@ mod tests {
         assert!(
             parent_path.iter().any(|e| matches!(
                 &e.payload,
-                EventPayload::Handback { how: crate::types::Handback::Posted { .. }, .. }
+                EventPayload::Handback {
+                    how: crate::types::Handback::Posted { .. },
+                    ..
+                }
             )),
             "and the running parent suspended on it"
         );
@@ -5432,7 +5458,9 @@ mod tests {
         // pointless completion.
         assert_eq!(
             kinds(tree, worker_leaf),
-            ["Agent", "Post", "Reply", "Part", "Answer", "ReplyEnd", "Handback", "Console"]
+            [
+                "Agent", "Post", "Reply", "Part", "Answer", "ReplyEnd", "Handback", "Console"
+            ]
         );
         assert!(tree.spine_at(worker_leaf).context().open.is_empty());
     }
@@ -5750,11 +5778,7 @@ mod tests {
         let session = drain(session);
 
         let state = session.state(EventId::new(8)).unwrap();
-        let doc = crate::document::render(
-            session.tree(),
-            &state.spine,
-            DEFAULT_DOCUMENT_BUDGET,
-        );
+        let doc = crate::document::render(session.tree(), &state.spine, DEFAULT_DOCUMENT_BUDGET);
         assert_eq!(
             doc.messages.last(),
             Some(&crate::document::ChatMessage {
@@ -5832,7 +5856,10 @@ mod tests {
         let kinds = kinds(session.tree(), root_leaf(&session));
         assert_eq!(
             kinds,
-            ["Agent", "Post", "Post", "Reply", "Part", "Call", "ReplyEnd", "Handback", "Console", "Result"],
+            [
+                "Agent", "Post", "Post", "Reply", "Part", "Call", "ReplyEnd", "Handback",
+                "Console", "Result"
+            ],
             "one turn, a bare reply — it answers neither open post (18_TARGETING), but under \
              code mode that reply is still a real tell() call, not call-free prose; (C0b) its \
              own unawaited settlement is never a rule-C surprise, so nothing trails it: \
@@ -6184,7 +6211,10 @@ mod tests {
         // the only one on the branch.
         assert_eq!(
             kinds(tree, leaf),
-            ["Agent", "Post", "Reply", "Part", "Note", "Call", "ReplyEnd", "Handback", "Console", "Result"]
+            [
+                "Agent", "Post", "Reply", "Part", "Note", "Call", "ReplyEnd", "Handback",
+                "Console", "Result"
+            ]
         );
         assert_eq!(appended(tree, leaf), json!(1));
         assert!(
@@ -6377,11 +6407,7 @@ mod tests {
         if !step(&mut tree, 3) {
             return tree;
         }
-        tree.append(
-            &mut root,
-            EventPayload::Restart,
-        )
-        .unwrap();
+        tree.append(&mut root, EventPayload::Restart).unwrap();
         if !step(&mut tree, 4) {
             return tree;
         }
@@ -6547,7 +6573,9 @@ mod tests {
         // return value ever synthesized.
         assert_eq!(
             kinds(session.tree(), worker.spine.leaf_id),
-            ["Agent", "Post", "Reply", "Part", "Answer", "ReplyEnd", "Handback", "Console"],
+            [
+                "Agent", "Post", "Reply", "Part", "Answer", "ReplyEnd", "Handback", "Console"
+            ],
             "the lost post was appended, and the worker answered it"
         );
         assert_eq!(
@@ -6826,11 +6854,7 @@ mod tests {
             },
         )
         .unwrap();
-        tree.append(
-            &mut worker,
-            EventPayload::Restart,
-        )
-        .unwrap();
+        tree.append(&mut worker, EventPayload::Restart).unwrap();
         let send = tree
             .append(
                 &mut worker,

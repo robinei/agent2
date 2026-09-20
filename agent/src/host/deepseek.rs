@@ -629,26 +629,14 @@ mod tests {
             }],
             preamble: 0,
         };
-        let body = request_body(
-            &request,
-            "deepseek-v4-flash",
-            true,
-            Some("medium"),
-            None,
-        );
+        let body = request_body(&request, "deepseek-v4-flash", true, Some("medium"), None);
         assert_eq!(body["reasoning_effort"], json!("medium"));
         // The level needs the enable flag beside it; alone it is a
         // request the API may answer at whatever default it likes.
         assert_eq!(body["thinking"], json!({ "type": "enabled" }));
 
         // Unpinned: no field at all, and the API picks.
-        let body = request_body(
-            &request,
-            "deepseek-v4-flash",
-            true,
-            None,
-            None,
-        );
+        let body = request_body(&request, "deepseek-v4-flash", true, None, None);
         assert!(body.get("reasoning_effort").is_none());
     }
 
@@ -668,13 +656,7 @@ mod tests {
     #[test]
     fn request_body_disables_thinking_on_request() {
         let request = doc(vec![]);
-        let body = request_body(
-            &request,
-            "deepseek-v4-flash",
-            false,
-            None,
-            None,
-        );
+        let body = request_body(&request, "deepseek-v4-flash", false, None, None);
         assert_eq!(body["thinking"], json!({ "type": "disabled" }));
     }
 
@@ -691,15 +673,15 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let handle = std::thread::spawn(move || {
             for body in replies {
-                let Ok((mut sock, _)) = listener.accept() else { return };
+                let Ok((mut sock, _)) = listener.accept() else {
+                    return;
+                };
                 // Drain the request head so the client's write completes.
                 let mut buf = [0u8; 4096];
                 let _ = sock.read(&mut buf);
                 let _ = sock.write_all(
-                    format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n{body}"
-                    )
-                    .as_bytes(),
+                    format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n{body}")
+                        .as_bytes(),
                 );
                 let _ = sock.flush();
                 // Dropping the socket ends the body — an abrupt close
@@ -717,10 +699,7 @@ mod tests {
     /// `finish_reason` — a connection dropped mid-stream. `sse` always
     /// appends `[DONE]`, so it cannot express this.
     fn sse_cut(events: &[&str]) -> String {
-        events
-            .iter()
-            .map(|e| format!("data: {e}\n\n"))
-            .collect()
+        events.iter().map(|e| format!("data: {e}\n\n")).collect()
     }
 
     /// **A stream that dies before saying anything is retried.** Only
@@ -802,16 +781,12 @@ mod tests {
             r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
         ]);
         let mut chunks = Vec::new();
-        let turn = parse_sse(
-            stream.as_bytes(),
-            &Cancel::new(),
-            &mut |c| {
-                chunks.push(match c {
-                    LlmChunk::Text(t) => format!("T:{t}"),
-                    LlmChunk::Thinking(t) => format!("R:{t}"),
-                });
-            },
-        )
+        let turn = parse_sse(stream.as_bytes(), &Cancel::new(), &mut |c| {
+            chunks.push(match c {
+                LlmChunk::Text(t) => format!("T:{t}"),
+                LlmChunk::Thinking(t) => format!("R:{t}"),
+            });
+        })
         .unwrap();
 
         assert_eq!(turn.source, "const x = 42;");
@@ -829,11 +804,17 @@ mod tests {
         let now = Instant::now();
         // Thirteen wall minutes against no monotonic time at all: the
         // shape of the 2026-09-19 run that slept mid-request.
-        assert!(slept_since(now, SystemTime::now() - Duration::from_secs(13 * 60)));
+        assert!(slept_since(
+            now,
+            SystemTime::now() - Duration::from_secs(13 * 60)
+        ));
         // A slow request that really did run for those minutes is not.
         assert!(!slept_since(now, SystemTime::now()));
         // Nor is a few seconds of drift or an NTP step.
-        assert!(!slept_since(now, SystemTime::now() - Duration::from_secs(20)));
+        assert!(!slept_since(
+            now,
+            SystemTime::now() - Duration::from_secs(20)
+        ));
     }
 
     /// What is worth asking again about, and what is the request's own
@@ -878,12 +859,7 @@ mod tests {
             r#"{"choices":[{"delta":{"content":"const x = "}}]}"#,
             r#"{"choices":[{"delta":{},"finish_reason":"length"}]}"#,
         ]);
-        let turn = parse_sse(
-            stream.as_bytes(),
-            &Cancel::new(),
-            &mut |_| {},
-        )
-        .unwrap();
+        let turn = parse_sse(stream.as_bytes(), &Cancel::new(), &mut |_| {}).unwrap();
         assert!(
             turn.truncated,
             "max_tokens was hit before the model stopped"
@@ -899,27 +875,14 @@ mod tests {
             r#"{"choices":[{"delta":{"content":"1;"}}]}"#,
             r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
         ]);
-        let turn = parse_sse(
-            stream.as_bytes(),
-            &Cancel::new(),
-            &mut |_| {},
-        )
-        .unwrap();
+        let turn = parse_sse(stream.as_bytes(), &Cancel::new(), &mut |_| {}).unwrap();
         assert!(!turn.truncated);
     }
 
     #[test]
     fn parse_sse_surfaces_stream_errors() {
         let stream = "data: {\"error\":{\"message\":\"rate limited\"}}\n\n";
-        let err = parse_sse(
-            stream.as_bytes(),
-            &Cancel::new(),
-            &mut |_| {},
-        )
-        .unwrap_err();
+        let err = parse_sse(stream.as_bytes(), &Cancel::new(), &mut |_| {}).unwrap_err();
         assert!(err.contains("rate limited"), "{err}");
     }
-
-
-
 }

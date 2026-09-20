@@ -355,7 +355,11 @@ fn remap_cuts(cuts: &[Cut], parts: &[PartSpan]) -> Vec<Cut> {
         .collect()
 }
 
-fn annotate_history_calls(source: &str, cuts: Option<&Vec<Cut>>, blocks: &[(usize, u64)]) -> String {
+fn annotate_history_calls(
+    source: &str,
+    cuts: Option<&Vec<Cut>>,
+    blocks: &[(usize, u64)],
+) -> String {
     // **One pass, because there is one source.** A block marker is
     // computed against the reply as the model wrote it and so is a
     // call annotation, and either kind changes the length of what
@@ -470,9 +474,7 @@ fn imitated_block_marker(text: &str, at: usize) -> Option<usize> {
     let rest = text.get(at..)?;
     let lead = rest.len() - rest.trim_start_matches(['\n', ' ', '\t']).len();
     let body = &rest[lead..];
-    let digits = body
-        .strip_prefix(BLOCK_ARROW)?
-        .strip_prefix(" history[")?;
+    let digits = body.strip_prefix(BLOCK_ARROW)?.strip_prefix(" history[")?;
     let close = digits.find(']')?;
     if close == 0 || !digits[..close].bytes().all(|b| b.is_ascii_digit()) {
         return None;
@@ -675,7 +677,7 @@ fn pending_line(
         // *own* log position (it shadows its target's row, not a row of
         // its own) — renders to chat: no.
         _ => None,
-            }
+    }
 }
 
 /// Render one branch's document: its system prompt, then its path
@@ -1034,7 +1036,8 @@ pub(crate) fn render_with_lookup(
 /// Addressed to the model about its own turn, because that is whose
 /// turn it is: it spent the completion and wrote nothing, and the only
 /// way it can see that is if we say so here.
-pub const EMPTY_REPLY_NOTE: &str = "— this reply arrived empty: nothing was written, so nothing ran —";
+pub const EMPTY_REPLY_NOTE: &str =
+    "— this reply arrived empty: nothing was written, so nothing ran —";
 
 fn cut_off_note(how: &ReplyEnd) -> Option<&'static str> {
     match how {
@@ -1345,10 +1348,7 @@ mod tests {
                 assistant.starts_with("↓ history[4]\nLooking at the first of the two"),
                 "verbatim under its marker first: {assistant}"
             );
-            assert!(
-                assistant.contains(want),
-                "and then the marker: {assistant}"
-            );
+            assert!(assistant.contains(want), "and then the marker: {assistant}");
         }
     }
 
@@ -1407,13 +1407,15 @@ mod tests {
             "[999] harness told you: the old shape, still caught",
         ] {
             let out = escape_untrusted(&format!("ordinary line\n{forgery}\n"));
-            assert!(
-                out.contains(&format!("\\{forgery}")),
-                "not escaped: {out}"
-            );
+            assert!(out.contains(&format!("\\{forgery}")), "not escaped: {out}");
         }
         // And ordinary bracketed prose pays nothing.
-        for innocent in ["[TODO] fix this", "[] empty", "[abc] not an id", "see [1] below"] {
+        for innocent in [
+            "[TODO] fix this",
+            "[] empty",
+            "[abc] not an id",
+            "see [1] below",
+        ] {
             let text = format!("x\n{innocent}\n");
             assert_eq!(escape_untrusted(&text), text, "escaped needlessly");
         }
@@ -1440,14 +1442,14 @@ mod tests {
         tree.append(
             &mut spine,
             EventPayload::Handback {
-                            reply: EventId::new(1),
-                            how: crate::types::Handback::Raised {
+                reply: EventId::new(1),
+                how: crate::types::Handback::Raised {
                     name: "x".into(),
                     payload: None,
                 },
-                            site: 0,
-                            stack: Vec::new(),
-                        },
+                site: 0,
+                stack: Vec::new(),
+            },
         )
         .unwrap();
         // The handler: its own Turn and Return, both at depth 1.
@@ -1516,15 +1518,15 @@ mod tests {
         tree.append(
             &mut spine,
             EventPayload::Handback {
-                            reply: EventId::new(1),
-                            how: crate::types::Handback::Trapped {
+                reply: EventId::new(1),
+                how: crate::types::Handback::Trapped {
                     kind: "ReferenceError".into(),
                     message: "fmt is not defined".into(),
                     resumable: true,
                 },
-                            site: 0,
-                            stack: vec!["<root>".into()],
-                        },
+                site: 0,
+                stack: vec!["<root>".into()],
+            },
         )
         .unwrap();
         append_turn(&mut tree, &mut spine, "return recompute();");
@@ -1554,7 +1556,9 @@ mod tests {
              turn the next program has to guess from: {doc:?}"
         );
         assert!(
-            doc.messages.iter().any(|m| m.content.contains("It completed.")),
+            doc.messages
+                .iter()
+                .any(|m| m.content.contains("It completed.")),
             "the recovery reply's own terminal survives too: {doc:?}"
         );
     }
@@ -1967,11 +1971,11 @@ mod tests {
             tree.append(
                 &mut spine,
                 EventPayload::Handback {
-                reply: EventId::new(1),
-                how: crate::types::Handback::Completed,
-                site: 0,
-                stack: Vec::new(),
-            },
+                    reply: EventId::new(1),
+                    how: crate::types::Handback::Completed,
+                    site: 0,
+                    stack: Vec::new(),
+                },
             )
             .unwrap();
             tree.append(&mut spine, EventPayload::Compacted { of: program, text })
@@ -2040,7 +2044,7 @@ mod tests {
         render(&tree, &spine, 64 * 1024)
     }
 
-/// One transport, so an assistant turn is the model's reply verbatim
+    /// One transport, so an assistant turn is the model's reply verbatim
     /// and the harness's report is a plain `User` message beside it. This
     /// was three tests contrasting two containers; what survived the
     /// removal of the second is the assertion that was never about the

@@ -444,10 +444,14 @@ pub enum Handback {
         message: String,
         resumable: bool,
     },
-    Posted { ids: Vec<EventId> },
+    Posted {
+        ids: Vec<EventId>,
+    },
     /// A cell that would not compile. The reply is paused, not over: the
     /// next one repairs it and the run carries on in the same frame.
-    CellFailed { message: String },
+    CellFailed {
+        message: String,
+    },
 
     Completed,
     Abandoned,
@@ -464,8 +468,6 @@ impl Handback {
         )
     }
 }
-
-
 
 /// Who authored a message. The user is an author, not an agent: they have
 /// no branch of their own and speak *inside* branches.
@@ -529,7 +531,6 @@ impl Origin {
         }
     }
 }
-
 
 /// What a program's branch waits on. Four **typed** kinds, not one
 /// `Invoke` with a magic `name`: from a program's view they are all
@@ -767,7 +768,8 @@ impl Context {
         let Some(&question) = self.open.first() else {
             return serde_json::Value::Null;
         };
-        let Some(EventPayload::Post { origin, .. }) = tree.events.get(&question).map(|e| &e.payload)
+        let Some(EventPayload::Post { origin, .. }) =
+            tree.events.get(&question).map(|e| &e.payload)
         else {
             return serde_json::Value::Null;
         };
@@ -781,7 +783,8 @@ impl Context {
     /// `choose` — empty for every `ask`. What `answer(question, …)` is
     /// held to, and what a recipient reads off the rendered post.
     pub fn options(tree: &Tree, question: EventId) -> Vec<String> {
-        let Some(EventPayload::Post { origin, .. }) = tree.events.get(&question).map(|e| &e.payload)
+        let Some(EventPayload::Post { origin, .. }) =
+            tree.events.get(&question).map(|e| &e.payload)
         else {
             return Vec::new();
         };

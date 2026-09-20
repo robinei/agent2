@@ -269,9 +269,7 @@ impl LlmClient for RoutedLlm {
         let conversation: String = request
             .conversation()
             .iter()
-            .flat_map(|m| {
-                std::iter::once(m.content.clone())
-            })
+            .flat_map(|m| std::iter::once(m.content.clone()))
             .collect::<Vec<_>>()
             .join("\n");
         for (charter, queue) in &self.rules {

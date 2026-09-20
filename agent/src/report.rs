@@ -30,8 +30,7 @@
 //! to recent entries, full data always fetchable by id).
 
 use crate::types::{
-    Handback as HandbackHow,
-    Author, Call, Event, EventId, EventPayload, Origin, Outcome, Tree,
+    Author, Call, Event, EventId, EventPayload, Handback as HandbackHow, Origin, Outcome, Tree,
 };
 
 /// Max bytes of the "what happened" section (diagnostic + payload).
@@ -640,7 +639,11 @@ fn delivered_tail(v: &serde_json::Value) -> String {
         // back. Naming the keys is constant-size however big the value
         // is, and it is what the row was already implying.
         serde_json::Value::Object(map) => {
-            let mut keys: Vec<&str> = map.keys().take(SHAPE_MAX_KEYS).map(String::as_str).collect();
+            let mut keys: Vec<&str> = map
+                .keys()
+                .take(SHAPE_MAX_KEYS)
+                .map(String::as_str)
+                .collect();
             if map.len() > SHAPE_MAX_KEYS {
                 keys.push("…");
             }
@@ -1654,8 +1657,11 @@ pub fn render_fork(tree: &Tree, leaf: EventId, fork: EventId) -> String {
         .iter()
         .rposition(|e| matches!(e.payload, EventPayload::Reply));
     // Mid-program iff that turn's outcome had not landed by the fork.
-    let running =
-        turn_at.is_some_and(|ti| !path[ti + 1..fork_at].iter().any(|e| matches!(e.payload, EventPayload::Handback { .. })));
+    let running = turn_at.is_some_and(|ti| {
+        !path[ti + 1..fork_at]
+            .iter()
+            .any(|e| matches!(e.payload, EventPayload::Handback { .. }))
+    });
 
     if !running {
         let point = at
@@ -1761,40 +1767,55 @@ mod tests {
             .start_agent(None, None, "root", None, "SYSTEM", Vec::new())
             .unwrap();
         let reply = tree.append(&mut spine, EventPayload::Reply).unwrap();
-        tree.append(&mut spine, EventPayload::Part {
-            reply,
-            part: crate::types::Part::Cell("await tools.read_file(\"a.rs\");".into()),
-        })
+        tree.append(
+            &mut spine,
+            EventPayload::Part {
+                reply,
+                part: crate::types::Part::Cell("await tools.read_file(\"a.rs\");".into()),
+            },
+        )
         .unwrap();
         let call = tree
-            .append(&mut spine, EventPayload::Call(crate::types::Call::Invoke {
-                name: "read_file".into(),
-                args: json!(["a.rs"]),
-                site: 0,
-            }))
+            .append(
+                &mut spine,
+                EventPayload::Call(crate::types::Call::Invoke {
+                    name: "read_file".into(),
+                    args: json!(["a.rs"]),
+                    site: 0,
+                }),
+            )
             .unwrap();
-        tree.append(&mut spine, EventPayload::Result {
-            call,
-            outcome: crate::types::Outcome::Delivered(
-                json!({"content": "fn main(){}", "version": "v"}),
-            ),
-        })
+        tree.append(
+            &mut spine,
+            EventPayload::Result {
+                call,
+                outcome: crate::types::Outcome::Delivered(
+                    json!({"content": "fn main(){}", "version": "v"}),
+                ),
+            },
+        )
         .unwrap();
         let o = tree
-            .append(&mut spine, EventPayload::Handback {
-                reply,
-                how: HandbackHow::CellFailed {
-                    message: "12:7: `lib` is already declared".into(),
+            .append(
+                &mut spine,
+                EventPayload::Handback {
+                    reply,
+                    how: HandbackHow::CellFailed {
+                        message: "12:7: `lib` is already declared".into(),
+                    },
+                    site: 0,
+                    stack: Vec::new(),
                 },
-                site: 0,
-                stack: Vec::new(),
-            })
+            )
             .unwrap();
         // The console is logged after the outcome it belongs to —
         // `handback` finds it by that position.
-        tree.append(&mut spine, EventPayload::Console {
-            lines: vec!["read it".into()],
-        })
+        tree.append(
+            &mut spine,
+            EventPayload::Console {
+                lines: vec!["read it".into()],
+            },
+        )
         .unwrap();
         let leaf = tree.list_leaves()[0].0;
         let text = derive_report(&tree, leaf, o, 64 * 1024);
@@ -1823,35 +1844,47 @@ mod tests {
             .unwrap();
         // The reply that bound it, then the one that reached for it.
         let first = tree.append(&mut spine, EventPayload::Reply).unwrap();
-        tree.append(&mut spine, EventPayload::Part {
-            reply: first,
-            part: crate::types::Part::Cell("const f = await tools.read_file(\"a\");".into()),
-        })
+        tree.append(
+            &mut spine,
+            EventPayload::Part {
+                reply: first,
+                part: crate::types::Part::Cell("const f = await tools.read_file(\"a\");".into()),
+            },
+        )
         .unwrap();
-        tree.append(&mut spine, EventPayload::Handback {
-            reply: first,
-            how: crate::types::Handback::Completed,
-            site: 0,
-            stack: Vec::new(),
-        })
+        tree.append(
+            &mut spine,
+            EventPayload::Handback {
+                reply: first,
+                how: crate::types::Handback::Completed,
+                site: 0,
+                stack: Vec::new(),
+            },
+        )
         .unwrap();
         let second = tree.append(&mut spine, EventPayload::Reply).unwrap();
-        tree.append(&mut spine, EventPayload::Part {
-            reply: second,
-            part: crate::types::Part::Cell("console.log(f.content);".into()),
-        })
+        tree.append(
+            &mut spine,
+            EventPayload::Part {
+                reply: second,
+                part: crate::types::Part::Cell("console.log(f.content);".into()),
+            },
+        )
         .unwrap();
         let o = tree
-            .append(&mut spine, EventPayload::Handback {
-                reply: second,
-                how: HandbackHow::Trapped {
-                    kind: "ReferenceError".into(),
-                    message: "f is not defined".into(),
-                    resumable: true,
+            .append(
+                &mut spine,
+                EventPayload::Handback {
+                    reply: second,
+                    how: HandbackHow::Trapped {
+                        kind: "ReferenceError".into(),
+                        message: "f is not defined".into(),
+                        resumable: true,
+                    },
+                    site: 12,
+                    stack: Vec::new(),
                 },
-                site: 12,
-                stack: Vec::new(),
-            })
+            )
             .unwrap();
         let leaf = tree.list_leaves()[0].0;
         let text = derive_report(&tree, leaf, o, 64 * 1024);
@@ -1905,12 +1938,15 @@ mod tests {
         // bounded preview — even a tiny one like this — named beside the
         // `program result` artifact id the run itself logs (the `Return`
         // is its own menu row; see `machine::menu_rows`).
-        let (tree, o) = fixture("return 1;", EventPayload::Handback {
+        let (tree, o) = fixture(
+            "return 1;",
+            EventPayload::Handback {
                 reply: EventId::new(1),
                 how: crate::types::Handback::Completed,
                 site: 0,
                 stack: Vec::new(),
-            });
+            },
+        );
         let leaf = tree.list_leaves()[0].0;
         let text = derive_report(&tree, leaf, o, 64 * 1024);
         assert!(text.starts_with(RUN_HEADING), "{text}");
@@ -1968,37 +2004,52 @@ mod tests {
             .start_agent(None, None, "root", None, "SYSTEM", Vec::new())
             .unwrap();
         let reply = tree.append(&mut spine, EventPayload::Reply).unwrap();
-        tree.append(&mut spine, EventPayload::Part {
-            reply,
-            part: crate::types::Part::Cell("…".into()),
-        })
+        tree.append(
+            &mut spine,
+            EventPayload::Part {
+                reply,
+                part: crate::types::Part::Cell("…".into()),
+            },
+        )
         .unwrap();
         let call = tree
-            .append(&mut spine, EventPayload::Call(crate::types::Call::Invoke {
-                name: "read_file".into(),
-                args: json!(["a.rs"]),
-                site: 0,
-            }))
+            .append(
+                &mut spine,
+                EventPayload::Call(crate::types::Call::Invoke {
+                    name: "read_file".into(),
+                    args: json!(["a.rs"]),
+                    site: 0,
+                }),
+            )
             .unwrap();
-        tree.append(&mut spine, EventPayload::Result {
-            call,
-            outcome: crate::types::Outcome::Delivered(json!({"content": big, "version": "v1"})),
-        })
+        tree.append(
+            &mut spine,
+            EventPayload::Result {
+                call,
+                outcome: crate::types::Outcome::Delivered(json!({"content": big, "version": "v1"})),
+            },
+        )
         .unwrap();
         let note = tree
-            .append(&mut spine, EventPayload::Note {
-                value: json!({ "lib": big, "note": "short and mine" }),
-                site: 0,
-                site_end: 0,
-            })
+            .append(
+                &mut spine,
+                EventPayload::Note {
+                    value: json!({ "lib": big, "note": "short and mine" }),
+                    site: 0,
+                    site_end: 0,
+                },
+            )
             .unwrap();
         let o = tree
-            .append(&mut spine, EventPayload::Handback {
-                reply,
-                how: crate::types::Handback::Completed,
-                site: 0,
-                stack: Vec::new(),
-            })
+            .append(
+                &mut spine,
+                EventPayload::Handback {
+                    reply,
+                    how: crate::types::Handback::Completed,
+                    site: 0,
+                    stack: Vec::new(),
+                },
+            )
             .unwrap();
         let leaf = tree.list_leaves()[0].0;
         let text = derive_report(&tree, leaf, o, 64 * 1024);
@@ -2070,8 +2121,6 @@ mod tests {
         let leaf = tree.list_leaves()[0].0;
         let text = derive_report(&tree, leaf, o, 64 * 1024);
         assert!(text.contains("interrupted"), "{text}");
-
-
     }
 
     /// **Every artifact appears in exactly one report**: each menu is
@@ -2090,11 +2139,7 @@ mod tests {
         let mut outcomes = Vec::new();
         // Two handbacks, each with its own call and result.
         for run in 0..2 {
-            tree.append(
-                &mut spine,
-                EventPayload::Restart,
-            )
-            .unwrap();
+            tree.append(&mut spine, EventPayload::Restart).unwrap();
             let call = tree
                 .append(
                     &mut spine,
@@ -2115,13 +2160,16 @@ mod tests {
             )
             .unwrap();
             outcomes.push(
-                tree.append(&mut spine, EventPayload::Handback {
-                reply: EventId::new(1),
-                how: crate::types::Handback::Completed,
-                site: 0,
-                stack: Vec::new(),
-            })
-                    .unwrap(),
+                tree.append(
+                    &mut spine,
+                    EventPayload::Handback {
+                        reply: EventId::new(1),
+                        how: crate::types::Handback::Completed,
+                        site: 0,
+                        stack: Vec::new(),
+                    },
+                )
+                .unwrap(),
             );
         }
         let leaf = spine.leaf_id;
@@ -2219,7 +2267,10 @@ mod tests {
             rendered.contains("of 10 lines; `history.fetch(7)` for all of them"),
             "a clip names the id to fetch: {rendered}"
         );
-        assert!(!rendered.contains("0zzz"), "the oldest goes first: {rendered}");
+        assert!(
+            !rendered.contains("0zzz"),
+            "the oldest goes first: {rendered}"
+        );
         assert!(rendered.contains("9zzz"), "the newest survives: {rendered}");
 
         // Past the budget, the oldest of the tail goes rather than every
@@ -2274,7 +2325,9 @@ mod tests {
         let menu: Vec<&Artifact> = rows.iter().collect();
         let rendered = render_row_list("### artifacts", &menu).expect("three rows");
         assert!(
-            rendered.contains("- `[11]` `ask(#3, \"which file?\")` → pending — await history.fetch(11)"),
+            rendered.contains(
+                "- `[11]` `ask(#3, \"which file?\")` → pending — await history.fetch(11)"
+            ),
             "{rendered}"
         );
         assert!(
@@ -2520,14 +2573,28 @@ mod tests {
     fn the_console_counts_lines_only_when_it_dropped_some() {
         let short: Vec<String> = vec!["one".into(), "two".into()];
         let rendered = render_console(&short, Some(9)).expect("two lines");
-        assert!(rendered.starts_with("### it printed\n```text"), "{rendered}");
-        assert!(!rendered.contains("of 2 lines"), "no phantom clip: {rendered}");
-        assert!(!rendered.contains("history.fetch"), "nothing behind it: {rendered}");
+        assert!(
+            rendered.starts_with("### it printed\n```text"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("of 2 lines"),
+            "no phantom clip: {rendered}"
+        );
+        assert!(
+            !rendered.contains("history.fetch"),
+            "nothing behind it: {rendered}"
+        );
 
         // Enough bytes to force a drop.
-        let long: Vec<String> = (0..400).map(|i| format!("line {i} {}", "x".repeat(200))).collect();
+        let long: Vec<String> = (0..400)
+            .map(|i| format!("line {i} {}", "x".repeat(200)))
+            .collect();
         let rendered = render_console(&long, Some(9)).expect("many lines");
-        assert!(rendered.contains("of 400 lines"), "a real clip counts: {rendered}");
+        assert!(
+            rendered.contains("of 400 lines"),
+            "a real clip counts: {rendered}"
+        );
         assert!(
             rendered.contains("history.fetch(9)"),
             "and names where the rest is: {rendered}"
@@ -2587,7 +2654,13 @@ mod tests {
             call(5, "outline"),
             call(6, "read_file"),
             call(7, "grep"),
-            ev(8, EventPayload::Compacted { of: EventId::new(5), text: None }),
+            ev(
+                8,
+                EventPayload::Compacted {
+                    of: EventId::new(5),
+                    text: None,
+                },
+            ),
             ev(
                 9,
                 EventPayload::Compacted {

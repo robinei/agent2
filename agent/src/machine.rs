@@ -30,8 +30,7 @@ use std::collections::HashMap;
 use std::io;
 
 use interp::{
-    InvokeCall, PromisePtr, RcStr, ResumeMode, SettleCall, StepResult, VM, VMError,
-    Value,
+    InvokeCall, PromisePtr, RcStr, ResumeMode, SettleCall, StepResult, VM, VMError, Value,
 };
 
 use crate::host::ProgramStatus;
@@ -1256,10 +1255,7 @@ impl Runner {
         from: Author,
         origin: Origin,
     ) -> io::Result<(EventId, Vec<StepOutput>)> {
-        let post = tree.append(
-            &mut self.spine,
-            EventPayload::Post { from, origin },
-        )?;
+        let post = tree.append(&mut self.spine, EventPayload::Post { from, origin })?;
         // Logged on arrival either way — visible and crash-safe before
         // anything decides what to do about it. Whether it starts a turn
         // *now* is the trigger rule's call and nothing else's.
@@ -1490,11 +1486,11 @@ impl Runner {
         tree.append(
             &mut self.spine,
             EventPayload::Handback {
-                    reply: self.reply_id,
-                    how: Handback::Abandoned,
-                    site: 0,
-                    stack: Vec::new(),
-                },
+                reply: self.reply_id,
+                how: Handback::Abandoned,
+                site: 0,
+                stack: Vec::new(),
+            },
         )?;
         self.last_vm = Some(run.vm);
         self.prompt_if_needed(tree)
@@ -2069,7 +2065,9 @@ impl Runner {
                     [question, value] => vec![question.clone(), value.clone()],
                     [question, _label, value] => vec![question.clone(), value.clone()],
                     _ => {
-                        self.settle_err("answer(question, value) takes the question's id and the value");
+                        self.settle_err(
+                            "answer(question, value) takes the question's id and the value",
+                        );
                         return Ok(true);
                     }
                 };
@@ -2989,8 +2987,8 @@ impl Runner {
             .iter()
             .map(|f| f.name().to_owned())
             .collect();
-        let console = run.vm.console_lines[run.console_logged.min(run.vm.console_lines.len())..]
-            .to_vec();
+        let console =
+            run.vm.console_lines[run.console_logged.min(run.vm.console_lines.len())..].to_vec();
         run.console_logged = run.vm.console_lines.len();
         let program_id = run.program_id;
         // A handover does not park: there is nothing to come back to,
@@ -3328,10 +3326,7 @@ impl Runner {
             .map(|e| e.id)
             .collect();
         for of in blocks {
-            tree.append(
-                &mut self.spine,
-                EventPayload::Compacted { of, text: None },
-            )?;
+            tree.append(&mut self.spine, EventPayload::Compacted { of, text: None })?;
         }
         Ok(())
     }
@@ -4147,12 +4142,10 @@ impl Runner {
             self.reply_ended = Some(ReplyEnd::Truncated);
         }
         let tail = match &mut self.phase {
-            Phase::Running(run) | Phase::Suspended(run, _) => {
-                match run.notebook.as_mut() {
-                    Some(notebook) => notebook.end_truncated(truncated),
-                    None => Vec::new(),
-                }
-            }
+            Phase::Running(run) | Phase::Suspended(run, _) => match run.notebook.as_mut() {
+                Some(notebook) => notebook.end_truncated(truncated),
+                None => Vec::new(),
+            },
             _ => return Ok(Some(Vec::new())),
         };
         self.log_parts(tree, &tail)?;
@@ -4262,10 +4255,7 @@ impl Runner {
         // that dies before saying anything still leaves the record that
         // it was attempted — a provider error used to leave none.
         self.reply_id = match author {
-            Author::User => tree.append(
-                &mut self.spine,
-                EventPayload::Restart,
-            )?,
+            Author::User => tree.append(&mut self.spine, EventPayload::Restart)?,
             _ => tree.append(&mut self.spine, EventPayload::Reply)?,
         };
         self.phase = Phase::Running(Run {
@@ -4773,11 +4763,7 @@ mod tests {
             .path_events(leaf)
             .iter()
             .rev()
-            .find(|e| {
-                matches!(
-                    e.payload,
-                    EventPayload::Handback { .. }                 )
-            })
+            .find(|e| matches!(e.payload, EventPayload::Handback { .. }))
             .map(|e| e.id)
             .expect("an outcome to render");
         crate::report::derive_report(tree, leaf, outcome, TEST_BUDGET)
@@ -4923,11 +4909,7 @@ mod tests {
             "the span is the whole call"
         );
 
-        let doc = crate::document::render(
-            &tree,
-            &state.spine,
-            64 * 1024,
-        );
+        let doc = crate::document::render(&tree, &state.spine, 64 * 1024);
         let program = doc
             .conversation()
             .iter()
@@ -4958,11 +4940,7 @@ mod tests {
             .unwrap();
         drain(&mut state, &mut tree, out);
 
-        let doc = crate::document::render(
-            &tree,
-            &state.spine,
-            64 * 1024,
-        );
+        let doc = crate::document::render(&tree, &state.spine, 64 * 1024);
         let program = doc
             .conversation()
             .iter()
@@ -5002,7 +4980,9 @@ mod tests {
         let out = state
             .step(
                 &mut tree,
-                StepInput::LlmResponse(llm_program("console.log(\"hi there\"); history.append(6 * 7);")),
+                StepInput::LlmResponse(llm_program(
+                    "console.log(\"hi there\"); history.append(6 * 7);",
+                )),
             )
             .unwrap();
         drain(&mut state, &mut tree, out);
@@ -5012,7 +4992,9 @@ mod tests {
         assert!(report.contains("hi there"), "{report}");
         assert_eq!(
             payload_kinds(&state, &tree),
-            ["Agent", "Post", "Reply", "Part", "ReplyEnd", "Note", "Handback", "Console"]
+            [
+                "Agent", "Post", "Reply", "Part", "ReplyEnd", "Note", "Handback", "Console"
+            ]
         );
     }
 
@@ -5021,8 +5003,6 @@ mod tests {
     // inert: the model's prose reached no log and no user (gap 1), and
     // the conversation never turned after a program finished (gap 2).
     // These four pin the fix, one per named acceptance case.
-
-
 
     /// **Superseded by the `done()` change**: this used to pin
     /// `Transport::Program`'s own regression guard — completing a
@@ -5127,7 +5107,9 @@ mod tests {
         assert!(state.is_idle());
         assert_eq!(
             payload_kinds(&state, &tree),
-            ["Agent", "Post", "Reply", "Part", "ReplyEnd", "Call", "Handback", "Console"],
+            [
+                "Agent", "Post", "Reply", "Part", "ReplyEnd", "Call", "Handback", "Console"
+            ],
             "one reply, one part, and no cell in it"
         );
 
@@ -5337,7 +5319,10 @@ mod tests {
         assert!(
             state.agent_segment(&tree).iter().any(|e| matches!(
                 &e.payload,
-                EventPayload::Handback { how: crate::types::Handback::Abandoned, .. }
+                EventPayload::Handback {
+                    how: crate::types::Handback::Abandoned,
+                    ..
+                }
             )),
             "the abandon is a logged Condition"
         );
@@ -5362,7 +5347,10 @@ mod tests {
                 StepInput::LlmResponse(llm_program("while (true) {}")),
             )
             .unwrap();
-        assert!(out.iter().any(|o| matches!(o, StepOutput::Working)), "{out:?}");
+        assert!(
+            out.iter().any(|o| matches!(o, StepOutput::Working)),
+            "{out:?}"
+        );
 
         // `interrupt()` on a `Running` phase only delivers the notice
         // (`Working`, per `deliver`'s own rule for a busy branch) — the
@@ -5803,7 +5791,10 @@ mod tests {
         state.compaction_requested = false;
         state.next_prompt_floor = Counted::Floor(5_000);
         assert!(
-            state.compaction_if_needed(&mut tree, 1, 0.25).unwrap().is_none(),
+            state
+                .compaction_if_needed(&mut tree, 1, 0.25)
+                .unwrap()
+                .is_none(),
             "a counted prompt with room to spare overrides any byte budget"
         );
         // With no count to go on there is nothing to override it with,
@@ -5819,7 +5810,10 @@ mod tests {
         // step in for it — see `Counted::Stale`.
         state.next_prompt_floor = Counted::Stale;
         assert!(
-            state.compaction_if_needed(&mut tree, 1, 0.25).unwrap().is_none(),
+            state
+                .compaction_if_needed(&mut tree, 1, 0.25)
+                .unwrap()
+                .is_none(),
             "a stale count waits for a fresh one rather than handing the decision to bytes"
         );
         unsafe {
@@ -5852,7 +5846,9 @@ mod tests {
             .expect("the trap")
             .id;
 
-        let fetched = state.fetch_history(&tree, &[Value::PosInt(handback.as_u64())]).unwrap();
+        let fetched = state
+            .fetch_history(&tree, &[Value::PosInt(handback.as_u64())])
+            .unwrap();
         // Indexable: a handler can branch on `resumable` without
         // parsing a sentence.
         assert_eq!(fetched["Trapped"]["kind"], json!("TypeError"));
@@ -5880,7 +5876,9 @@ mod tests {
             .find(|e| matches!(e.payload, EventPayload::Handback { .. }))
             .expect("the handback")
             .id;
-        let fetched = state.fetch_history(&tree, &[Value::PosInt(handback.as_u64())]).unwrap();
+        let fetched = state
+            .fetch_history(&tree, &[Value::PosInt(handback.as_u64())])
+            .unwrap();
         assert_eq!(fetched, json!("Completed"));
     }
 
@@ -5932,6 +5930,96 @@ mod tests {
         // A reply comes back as the markdown the model wrote — fences
         // and all, because that is the row (28).
         assert_eq!(returned[1], json!(format!("```js\n{src}\n```\n")));
+    }
+
+    /// **Nothing a program can write may take the agent down.**
+    ///
+    /// Every entry point here is called with whatever the model's
+    /// arithmetic produced, which is not the same set as what the card
+    /// describes. Two panics reached live runs before anyone swept for
+    /// them — `history.fetch(0)` against a `NonZeroU64`, and call
+    /// offsets outliving the text compaction shortened — so the sweep
+    /// is worth having standing rather than rediscovering from an
+    /// `exit=101` in a verdict file.
+    ///
+    /// The bar is only "no panic". A refusal is a fine answer, and so
+    /// is doing the thing; what is not fine is the process ending
+    /// mid-task, because everything the run had done is then
+    /// unreachable behind a corpse.
+    #[test]
+    fn no_argument_a_program_can_write_panics_the_agent() {
+        // Ids that are not ids, arguments of the wrong shape, arity
+        // that does not match, and the values JS arithmetic reaches
+        // when something upstream went wrong.
+        let hostile = [
+            "await fetch_history(0);",
+            "await fetch_history(-1);",
+            "await fetch_history(1e400);",
+            "await fetch_history(0.5);",
+            "await fetch_history(\"7\");",
+            "await fetch_history(null);",
+            "await fetch_history(undefined);",
+            "await fetch_history();",
+            "await fetch_history([1, 2]);",
+            "await fetch_history({});",
+            "await fetch_history(NaN);",
+            "await remove_history(0);",
+            "await remove_history(0, 0);",
+            "await remove_history(9, 2);",
+            "await remove_history(undefined);",
+            "await replace_history(0, \"x\");",
+            "await replace_history(1);",
+            "await replace_history(undefined, undefined);",
+            "history.append(undefined);",
+            "history.append();",
+            "await tell();",
+            "await tell(undefined);",
+            "await tell(null);",
+            "await ask(0, \"q\");",
+            "await ask(\"#0\", \"q\");",
+            "await ask(\"\", \"q\");",
+            "await ask(undefined, undefined);",
+            "await choose(\"user\", \"q\", []);",
+            "await choose(\"user\", \"q\", undefined);",
+            "await choose(0, 0, 0);",
+            "await list_agents({ under: 0 });",
+            "await list_agents({ under: -1 });",
+            "await list_agents(undefined);",
+            "await spawn();",
+            "await spawn(undefined, undefined);",
+            "await fork();",
+            "await fork(0);",
+            "await answer(0, \"x\");",
+            "await answer(undefined, undefined);",
+        ];
+        for src in hostile {
+            let (mut tree, mut state) = setup();
+            state.kickoff(&mut tree).unwrap();
+            // Wrapped, because a rejected promise is an ordinary
+            // outcome here — the point is that the process is still
+            // alive to report it.
+            let wrapped = format!("try {{ {src} }} catch (e) {{ /* fine */ }}");
+            let out = state
+                .step(&mut tree, StepInput::LlmResponse(llm_program(&wrapped)))
+                .unwrap_or_else(|e| panic!("`{src}` failed the step: {e}"));
+            drain(&mut state, &mut tree, out);
+            // **And it has to have run.** A case that does not compile
+            // exercises the parser and nothing else, which is how a
+            // sweep like this quietly stops testing what it names.
+            assert!(
+                !tree
+                    .path_events(state.spine.leaf_id)
+                    .iter()
+                    .any(|e| matches!(
+                        e.payload,
+                        EventPayload::Handback {
+                            how: Handback::CellFailed { .. },
+                            ..
+                        }
+                    )),
+                "`{src}` never compiled, so it tested nothing"
+            );
+        }
     }
 
     /// **Zero is a number a program can arrive at, and never an id.**
@@ -6765,7 +6853,10 @@ mod tests {
             .agent_segment(&tree)
             .iter()
             .filter_map(|e| match &e.payload {
-                EventPayload::Part { part: crate::types::Part::Cell(source), .. } => Some(source.as_str()),
+                EventPayload::Part {
+                    part: crate::types::Part::Cell(source),
+                    ..
+                } => Some(source.as_str()),
                 _ => None,
             })
             .collect();
@@ -6787,10 +6878,8 @@ mod tests {
         assert_eq!(
             payload_kinds(&state, &tree),
             [
-                "Agent",
-                "Post", //
-                "Reply",
-                "Part", // "Reading the two files first."
+                "Agent", "Post", //
+                "Reply", "Part", // "Reading the two files first."
                 "Part", // cell 0
                 "Part", // "Now the adjustment."
                 "Part", // cell 1
@@ -6798,12 +6887,8 @@ mod tests {
                 "Part", // cell 2
                 // The reply's cost, once. The whole text arrived
                 // before anything ran, so this is where it stopped.
-                "ReplyEnd",
-                "Call", // the three prose segments, as sends to the user
-                "Call",
-                "Call",
-                "Handback",
-                "Console",
+                "ReplyEnd", "Call", // the three prose segments, as sends to the user
+                "Call", "Call", "Handback", "Console",
             ],
             "three cells, six parts, one ReplyEnd, one Handback"
         );
@@ -6954,11 +7039,7 @@ mod tests {
         let outcomes = state
             .agent_segment(&tree)
             .iter()
-            .filter(|e| {
-                matches!(
-                    e.payload,
-                    EventPayload::Handback { .. }                 )
-            })
+            .filter(|e| matches!(e.payload, EventPayload::Handback { .. }))
             .count();
         assert_eq!(outcomes, 1, "one report, not one per cell");
     }
@@ -7121,7 +7202,9 @@ mod tests {
             // any more — so it closes with an outcome like any other
             // reply, and rests because no `Turn` of its own was ever
             // logged for `last_turn_outcome` to find.
-            ["Agent", "Post", "Reply", "Part", "ReplyEnd", "Call", "Handback", "Console"],
+            [
+                "Agent", "Post", "Reply", "Part", "ReplyEnd", "Call", "Handback", "Console"
+            ],
             "the prose is delivered and nothing ran"
         );
         let said = state
@@ -7172,13 +7255,10 @@ mod tests {
     fn a_reply_that_said_nothing_is_asked_again_once() {
         let (mut tree, mut state) = setup_under();
         user_post(&mut state, &mut tree, "go");
-        let empty = || {
-            StepInput::LlmResponse(crate::host::scripted_markdown(""))
-        };
+        let empty = || StepInput::LlmResponse(crate::host::scripted_markdown(""));
 
-        let asked = |outs: &[StepOutput]| {
-            outs.iter().any(|o| matches!(o, StepOutput::LlmRequest(_)))
-        };
+        let asked =
+            |outs: &[StepOutput]| outs.iter().any(|o| matches!(o, StepOutput::LlmRequest(_)));
 
         let out = state.step(&mut tree, empty()).unwrap();
         let settled = drain(&mut state, &mut tree, out);
@@ -7234,8 +7314,7 @@ mod tests {
     fn a_traps_site_is_an_offset_into_the_reply() {
         let (mut tree, mut state) = setup_under();
         user_post(&mut state, &mut tree, "go");
-        let reply =
-            "Using what the last reply read.\n\n```js\nconst prev = null;\nconsole.log(prev.content);\n```\n";
+        let reply = "Using what the last reply read.\n\n```js\nconst prev = null;\nconsole.log(prev.content);\n```\n";
         let out = state
             .step(&mut tree, StepInput::LlmResponse(llm_program(reply)))
             .unwrap();
@@ -7502,7 +7581,9 @@ mod tests {
         drain(&mut state, &mut tree, out);
         assert_eq!(
             payload_kinds(&state, &tree),
-            ["Agent", "Post", "Reply", "Part", "ReplyEnd", "Handback", "Console"]
+            [
+                "Agent", "Post", "Reply", "Part", "ReplyEnd", "Handback", "Console"
+            ]
         );
     }
 
@@ -7742,7 +7823,8 @@ mod tests {
         // A post the branch has not been shown, logged mid-run: the
         // next fuel slice parks on it.
         user_post(&mut state, &mut tree, "one more thing");
-        let _ = state.step(&mut tree, StepInput::Tick { fuel: TICK_FUEL })
+        let _ = state
+            .step(&mut tree, StepInput::Tick { fuel: TICK_FUEL })
             .unwrap();
         assert!(
             matches!(state.phase, Phase::Suspended(..)),
@@ -7976,17 +8058,17 @@ mod tests {
             .collect();
         assert_eq!(costs, vec![321], "one completion, one cost");
 
-        let (replies, cells) = state.agent_segment(&tree).iter().fold(
-            (0, 0),
-            |(r, c), e| match &e.payload {
+        let (replies, cells) = state
+            .agent_segment(&tree)
+            .iter()
+            .fold((0, 0), |(r, c), e| match &e.payload {
                 EventPayload::Reply => (r + 1, c),
                 EventPayload::Part {
                     part: crate::types::Part::Cell(_),
                     ..
                 } => (r, c + 1),
                 _ => (r, c),
-            },
-        );
+            });
         assert_eq!((replies, cells), (1, 3), "three cells, one reply, one cost");
     }
 
@@ -8085,11 +8167,7 @@ mod tests {
             .step(&mut tree, StepInput::LlmResponse(llm_program(reply)))
             .unwrap();
         drain(&mut state, &mut tree, out);
-        let doc = crate::document::render(
-            &tree,
-            &state.spine,
-            100_000,
-        );
+        let doc = crate::document::render(&tree, &state.spine, 100_000);
         doc.conversation()
             .iter()
             .map(|m| (m.role, m.content.clone()))
@@ -8144,9 +8222,8 @@ mod tests {
     /// doubled marker is the example it imitates next turn.
     #[test]
     fn a_block_marker_the_model_wrote_is_replaced() {
-        let rows = notebook_conversation(
-            "↓ history[999]\nReading it first.\n\n```js\nlet n = 1;\n```\n",
-        );
+        let rows =
+            notebook_conversation("↓ history[999]\nReading it first.\n\n```js\nlet n = 1;\n```\n");
         let assistant: Vec<&String> = rows
             .iter()
             .filter(|(r, _)| *r == crate::document::ChatRole::Assistant)
@@ -8353,11 +8430,7 @@ mod tests {
             )
             .unwrap();
         drain(&mut state, &mut tree, out);
-        let doc = crate::document::render(
-            &tree,
-            &state.spine,
-            100_000,
-        );
+        let doc = crate::document::render(&tree, &state.spine, 100_000);
         let assistant: Vec<&String> = doc
             .conversation()
             .iter()
@@ -8371,7 +8444,6 @@ mod tests {
             assistant[0]
         );
     }
-
 
     /// A scripted completion that reasoned before answering.
     fn llm_program_thinking(source: &str, thinking: &str, reasoning: u64) -> LlmTurn {
@@ -8394,7 +8466,10 @@ mod tests {
             .agent_segment(tree)
             .iter()
             .filter_map(|e| match &e.payload {
-                EventPayload::Part { part: crate::types::Part::Thinking(t), .. } => Some(t.clone()),
+                EventPayload::Part {
+                    part: crate::types::Part::Thinking(t),
+                    ..
+                } => Some(t.clone()),
                 _ => None,
             })
             .collect()

@@ -2603,7 +2603,8 @@ fn condition_line(cause: &crate::types::Handback) -> String {
 mod tests {
     use super::*;
     use crate::host::{
-        ScriptedLlm, ToolDef, ToolRegistry, run_demo, scripted_markdown, scripted_program, scripted_text,
+        ScriptedLlm, ToolDef, ToolRegistry, run_demo, scripted_markdown, scripted_program,
+        scripted_text,
     };
     use crate::types::{EventId, Tree};
     use serde_json::json;
@@ -3762,7 +3763,9 @@ mod tests {
             Tree::new(None),
             "say hi",
             ToolRegistry::new(),
-            Box::new(ScriptedLlm::new([scripted_markdown("# Heading\nplain text")])),
+            Box::new(ScriptedLlm::new([scripted_markdown(
+                "# Heading\nplain text",
+            )])),
             tx,
         )
         .unwrap();

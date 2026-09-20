@@ -227,11 +227,7 @@ fn print_document(log: Option<&str>, at: Option<&String>) -> Result<(), String> 
             .max_by_key(|id| id.as_u64())
             .ok_or("the log is empty")?,
     };
-    let doc = document::render(
-        &tree,
-        &tree.spine_at(leaf),
-        64 * 1024,
-    );
+    let doc = document::render(&tree, &tree.spine_at(leaf), 64 * 1024);
 
     let total: usize = doc.messages.iter().map(|m| m.content.len()).sum();
     println!("{} messages, {total} bytes\n", doc.messages.len());
@@ -437,10 +433,7 @@ fn run_session_headless(
     let printer = std::thread::spawn(move || {
         for event in rx {
             if let SessionEvent::Event { event, .. } = &event
-                && matches!(
-                    event.payload,
-                    types::EventPayload::Reply
-                )
+                && matches!(event.payload, types::EventPayload::Reply)
             {
                 saw_a_program.store(true, std::sync::atomic::Ordering::Relaxed);
             }

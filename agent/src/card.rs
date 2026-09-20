@@ -203,7 +203,10 @@ fn the_working_directory_listing_is_bounded_and_skips_noise() {
     assert!(out.contains("sub/"), "directories are marked: {out}");
     assert!(out.contains("sub/mod.py"), "two levels deep: {out}");
     assert!(!out.contains("buried.py"), "and not three: {out}");
-    assert!(!out.contains("node_modules"), "build noise is skipped: {out}");
+    assert!(
+        !out.contains("node_modules"),
+        "build noise is skipped: {out}"
+    );
 
     // A big tree costs a fixed number of bytes and says that it stopped.
     let big = dir.join("many");
@@ -271,9 +274,15 @@ fn every_worked_example_compiles() {
             .skip(1)
             .filter_map(|rest| rest.split_once("```").map(|(code, _)| code.to_owned()))
             .collect::<Vec<_>>()
-            .join("
-");
-        assert!(!js.is_empty(), "an exemplar with no ```js block: {}", ex.user);
+            .join(
+                "
+",
+            );
+        assert!(
+            !js.is_empty(),
+            "an exemplar with no ```js block: {}",
+            ex.user
+        );
         if let Err(errs) = interp::compile(&js) {
             panic!(
                 "a worked example does not compile — it is shipped in every prompt:\n{errs:?}\n{js}"
@@ -302,8 +311,8 @@ fn the_cards_declarations_are_valid_typescript() {
             continue;
         };
         blocks += 1;
-        let out = crate::host::structural::run_parse_errors(code, "typescript")
-            .expect("the parser runs");
+        let out =
+            crate::host::structural::run_parse_errors(code, "typescript").expect("the parser runs");
         assert_eq!(
             out["ok"], true,
             "the card's TypeScript does not parse: {}",
@@ -330,10 +339,15 @@ fn every_tool_example_compiles() {
                     const lang = 'rust'; const p = 'p'; const f = { content: '', version: '' }; \
                     const old = 'a'; const replacement = 'b';";
     for def in crate::host::tools::real_registry().iter() {
-        let Some(example) = &def.example else { continue };
+        let Some(example) = &def.example else {
+            continue;
+        };
         let src = format!("{preamble}\nasync function __ex() {{ {example} }}");
         if let Err(errs) = interp::compile(&src) {
-            panic!("`{}`'s @example does not compile:\n{errs:?}\n{src}", def.name);
+            panic!(
+                "`{}`'s @example does not compile:\n{errs:?}\n{src}",
+                def.name
+            );
         }
     }
 }
@@ -662,7 +676,10 @@ fn listing(dir: &std::path::Path) -> String {
     } else {
         ""
     };
-    format!("\n\nWhat is in it, two levels deep:\n\n```text\n{}\n```{more}", out.join("\n"))
+    format!(
+        "\n\nWhat is in it, two levels deep:\n\n```text\n{}\n```{more}",
+        out.join("\n")
+    )
 }
 
 /// A worked exemplar: a real user/assistant pair opening `messages`,
@@ -823,7 +840,10 @@ mod tests {
 
         let fenced = tool_manifest(&registry_with_tools(), true);
         assert!(fenced.contains("## This session\'s tools"), "{fenced}");
-        assert!(fenced.contains("```ts\ndeclare namespace tools {"), "{fenced}");
+        assert!(
+            fenced.contains("```ts\ndeclare namespace tools {"),
+            "{fenced}"
+        );
         assert!(fenced.trim_end().ends_with("```"), "{fenced}");
 
         // Both carry the same declarations: the framing is the only
@@ -844,7 +864,10 @@ mod tests {
     fn the_shipped_card_is_markdown_and_the_frozen_one_is_not() {
         let shipped = include_str!("../card/card.md");
         assert!(!shipped.starts_with("/**"), "the shipped card is markdown");
-        assert!(shipped.contains("\n```ts\n"), "its declarations live in a fence");
+        assert!(
+            shipped.contains("\n```ts\n"),
+            "its declarations live in a fence"
+        );
 
         let frozen = std::fs::read_to_string(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../evals/cards/program/card.md"),
@@ -862,7 +885,10 @@ mod tests {
     #[test]
     fn a_markdown_card_balances_its_fences() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let cards = [dir.join("card/card.md"), dir.join("../evals/cards/notebook/card.md")];
+        let cards = [
+            dir.join("card/card.md"),
+            dir.join("../evals/cards/notebook/card.md"),
+        ];
         for path in cards {
             let Ok(text) = std::fs::read_to_string(&path) else {
                 continue; // the eval cards do not ship with the binary
