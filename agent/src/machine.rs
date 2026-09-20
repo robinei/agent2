@@ -153,10 +153,8 @@ const OPEN_NOTE_MAX_IDS: usize = 8;
 /// that sense, since a person reads the transcript afterwards. So it
 /// says what is known (a client) and what follows from it (whether an
 /// `ask` is worth the wait), and nothing about who is reading.
-const PRESENT: &str = "A client is attached to this session, so a question to the user may be \
-                       answered promptly.";
-const ABSENT: &str = "No client is attached to this session; a question to the user may sit \
-                      unanswered for a long time.";
+const PRESENT: &str = "- A client is attached; an ask() may be answered promptly.";
+const ABSENT: &str = "- No client is attached; an ask() may wait hours for an answer.";
 
 /// What the harness says when the user interrupts a running program and
 /// has nothing else to add. It is a `tell` — the branch owes no answer —
@@ -220,9 +218,8 @@ const STOPPED_SHORT_NOTICE: &str = "Your last reply ran nothing, and nobody had 
 /// reply (the card's own usage, and `<end_of_turn>` in the model's
 /// prior), `run` is a program. The card already says what happens
 /// without naming it, and this borrows the phrase.
-const WORK_UNDER_WAY: &str = "A program has already run since you were last spoken to. A reply \
-     with no ```js block in it ends here: nothing runs, and the next thing to happen is whatever \
-     the person says.";
+const WORK_UNDER_WAY: &str =
+    "- A reply with no ```js block ends here: nothing runs, and the person speaks next.";
 
 /// **The contract, restated where it is about to be acted on.**
 ///
@@ -245,9 +242,8 @@ const WORK_UNDER_WAY: &str = "A program has already run since you were last spok
 /// Unconditional, and last. Every other line here is a fact about right
 /// now; this is the standing shape of the thing being written, and it
 /// is what the model should be holding as it starts to write.
-const REPLY_IS_MARKDOWN: &str = "Your reply is markdown, and it reaches the person as it is \
-     written. Only a ```js block runs — a ```text block, or code with no fence, is text and \
-     does nothing.";
+const REPLY_IS_MARKDOWN: &str = "- Your reply is markdown and reaches the person as written. \
+     Only a ```js block runs; ```text and unfenced code do nothing.";
 
 /// **A `finish()` that told nobody anything is not honoured**, and this
 /// is the request that says so.
@@ -264,9 +260,8 @@ const REPLY_IS_MARKDOWN: &str = "Your reply is markdown, and it reaches the pers
 /// and false the moment the next reply speaks, so it should not be on
 /// the log forever — which is what `stopped_short`'s notice does, and
 /// is why that one is re-read on every request after it fires.
-const SILENT_FINISH: &str = "Your last reply called `finish()` without saying anything — no prose, \
-     no `tell()`. Nothing reached the person, so the branch was not rested. Say what you found, \
-     then `finish()`.";
+const SILENT_FINISH: &str = "- Your last finish() said nothing to anybody, so it was not \
+     honoured. tell() the answer, then finish().";
 
 /// **The reply-shape line**, for the request where someone has just
 /// asked something and the branch has no work of its own outstanding.
@@ -3804,6 +3799,12 @@ impl Runner {
         {
             return Some(directive);
         }
+        // **A readout, not an argument.** The card is where reasons
+        // live and where a sentence is allowed to persuade; this is a
+        // list of what is true right now, in the smallest number of
+        // bytes that stays true — and it is paid uncached on every
+        // request. Two lines written here today read as card prose and
+        // both overclaimed; terse facts are harder to overclaim in.
         let mut lines: Vec<String> = Vec::new();
         let open = self.open();
         if !open.is_empty() {
@@ -3819,25 +3820,21 @@ impl Runner {
                 .collect();
             let more = match open.len() - shown {
                 0 => String::new(),
-                n => format!(", and {n} more"),
+                n => format!(" +{n} more"),
             };
-            let count = match open.len() {
-                1 => "1 question is".to_owned(),
-                n => format!("{n} questions are"),
-            };
+            // The ids and who asked, because a plain reply answers none
+            // of them and the verb needs the id (18_TARGETING B2).
             lines.push(format!(
-                "{count} open on this branch: {}{more}. A post from an agent means that \
-                 agent's program is suspended on this value and stays suspended until a \
-                 program on this branch calls answer(question, label, value) naming it — any \
-                 of your open questions, in any order, from anywhere in the program.",
+                "- {} open: {}{more}. A reply does not answer them; \
+                 answer(question, label, value) does.",
+                open.len(),
                 ids.join(", "),
             ));
         }
         if let Some((count, first, last)) = self.artifact_span(tree) {
             lines.push(format!(
-                "{count} rows on this branch, #{first}–#{last}. A report lists only \
-                 what is new since the last one; every id above stays fetchable with \
-                 history.fetch(id)."
+                "- {count} rows, #{first}–#{last}. history.fetch(id) for any of them; \
+                 a report lists only what is new."
             ));
         }
         if self.finish_ignored {
@@ -3847,17 +3844,26 @@ impl Runner {
             lines.push(REPLY_SHAPE_TAIL.to_owned());
         }
         lines.push(if self.attached { PRESENT } else { ABSENT }.to_owned());
-        if self.work_under_way(tree) {
+        if let Some(n) = self.replies_since_spoken_to(tree) {
+            lines.push(format!(
+                "- {n} program{} run since you were last spoken to.",
+                if n == 1 { "" } else { "s" }
+            ));
             lines.push(WORK_UNDER_WAY.to_owned());
         }
         lines.push(REPLY_IS_MARKDOWN.to_owned());
         Some(lines.join("\n"))
     }
 
-    /// **Has a cell run since the person last spoke?** If so the
-    /// branch is mid-work, and a reply that runs nothing stops it
-    /// rather than answering anything.
-    fn work_under_way(&self, tree: &Tree) -> bool {
+    /// How many replies have run a program since anyone last spoke to
+    /// this branch — `None` when none have, which is also when
+    /// [`WORK_UNDER_WAY`] does not apply.
+    ///
+    /// **A fact the model cannot derive.** It would have to re-read its
+    /// own history to count, and the number is the one that says
+    /// whether this is going anywhere: `sweep-40` spent nine programs
+    /// and fifty minutes on one task without converging.
+    fn replies_since_spoken_to(&self, tree: &Tree) -> Option<usize> {
         let segment = self.agent_segment(tree);
         let last_post = segment
             .iter()
@@ -3865,16 +3871,20 @@ impl Runner {
             .find(|e| matches!(e.payload, EventPayload::Post { .. }))
             .map(|e| e.id.as_u64())
             .unwrap_or(0);
-        segment.iter().any(|e| {
-            e.id.as_u64() > last_post
-                && matches!(
+        let n = segment
+            .iter()
+            .filter(|e| e.id.as_u64() > last_post)
+            .filter(|e| {
+                matches!(
                     &e.payload,
                     EventPayload::Part {
                         part: crate::types::Part::Cell(_),
                         ..
                     }
                 )
-        })
+            })
+            .count();
+        (n > 0).then_some(n)
     }
 
     /// **Did this reply put anything in front of anybody?** Prose and
@@ -7842,7 +7852,7 @@ mod tests {
         assert!(
             c.runner()
                 .request_tail(c.tree())
-                .is_some_and(|t| t.contains("without saying anything")),
+                .is_some_and(|t| t.contains("said nothing to anybody")),
             "and the next request says why"
         );
 
@@ -7852,7 +7862,7 @@ mod tests {
         assert!(
             !c.runner()
                 .request_tail(c.tree())
-                .is_some_and(|t| t.contains("without saying anything")),
+                .is_some_and(|t| t.contains("said nothing to anybody")),
             "the note is true of one request and gone the next"
         );
     }
@@ -7867,7 +7877,7 @@ mod tests {
         user_post(&mut state, &mut tree, "what is a mutex?");
         let tail = state.request_tail(&tree).expect("a tail");
         assert!(
-            !tail.contains("already run since you were last spoken to"),
+            !tail.contains("run since you were last spoken to"),
             "nobody has run anything yet: {tail}"
         );
 
@@ -7877,7 +7887,7 @@ mod tests {
         drain(&mut state, &mut tree, out);
         let tail = state.request_tail(&tree).expect("a tail");
         assert!(
-            tail.contains("already run since you were last spoken to"),
+            tail.contains("run since you were last spoken to"),
             "a cell has run: {tail}"
         );
 
@@ -7886,7 +7896,7 @@ mod tests {
         user_post(&mut state, &mut tree, "and a semaphore?");
         let tail = state.request_tail(&tree).expect("a tail");
         assert!(
-            !tail.contains("already run since you were last spoken to"),
+            !tail.contains("run since you were last spoken to"),
             "a new post resets it: {tail}"
         );
     }

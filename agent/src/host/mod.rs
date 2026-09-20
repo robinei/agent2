@@ -5017,7 +5017,7 @@ mod tests {
                 .map(|m| m.content.as_str())
                 .unwrap_or_default();
             let Some(id) = tail
-                .split("open on this branch: #")
+                .split(" open: #")
                 .nth(1)
                 .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
                 .and_then(|s| s.parse::<u64>().ok())
@@ -6372,10 +6372,10 @@ mod tests {
         let lines: Vec<&str> = here_tail.lines().collect();
         assert_eq!(
             lines[lines.len() - 2],
-            "A client is attached to this session, so a question to the user may be answered promptly."
+            "- A client is attached; an ask() may be answered promptly."
         );
         assert!(
-            lines[lines.len() - 1].starts_with("Your reply is markdown"),
+            lines[lines.len() - 1].starts_with("- Your reply is markdown"),
             "{:?}",
             lines.last()
         );
