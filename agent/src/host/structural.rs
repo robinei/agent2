@@ -69,7 +69,7 @@ pub fn outline_def() -> ToolDef {
             "maxItems": 1
         }),
         guidelines: vec![
-            "Nothing here tells you a definition is unused. A name can be reached without appearing anywhere as that name — `getattr(mod, \"f_\" + i)`, a table keyed by strings, a decorator registry — so neither this nor a search for the name can see it. Before deleting a definition, look for the *mechanisms*: read the callers, and grep for the prefix and for `getattr`/`globals`/registry calls.".into(),
+            "Nothing here tells you a definition is unused. A name can be reached without appearing anywhere as that name — `getattr(mod, \"f_\" + i)`, a table keyed by strings, a decorator registry — so neither this nor a search for the name can see it. Before deleting a definition, look for the *mechanisms*: read the callers, and grep for the prefix and for `getattr`/`globals`/registry calls. Then work out which names that mechanism can actually reach — a dispatch table is usually a list you can read, and \"a lookup exists\" is not the same answer as \"every name is reachable\".".into(),
             "`start_line` is an edit anchor, not just a fact: `Edit.replaceLines(text, start_line, end_line, …)` names one place exactly, where a string that looks distinctive often is not. A marker like `TODO(perf)` appears seven times in a small file; `parse_header` appears once, and outline says which lines it spans.".into(),
         ],
         example: Some("const { items } = await tools.outline(path);".into()),
