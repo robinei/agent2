@@ -7,24 +7,16 @@ finding, so it is first.
 
 ## What wants a decision
 
-Everything below is done and measured. Three things are not, and each
+Everything below is done and measured. Two things are not, and each
 is a judgement rather than a repair:
 
-1. **The large sweeps — probably resolved, worth one more look.**
-   `sweep-40` and `sweep-200` were the only tasks that got worse (6/6 →
-   6/9, 4/4 → 7/9). After `outline` was made to say it lists what a
-   file defines and never what uses it, a fresh arm of ten runs came
-   back **10/10** — matching the baseline's 10/10, at 5 programs
-   against 11 for `sweep-200` and 171 KB against 395. Against the
-   earlier HEAD arms that is p = 0.13, so it is a good sign rather than
-   a proof, and the overall 56/63 below predates it.
-2. **Whether the document should shrink a duplicated `history.append`.**
+1. **Whether the document should shrink a duplicated `history.append`.**
    72% of appended bytes copy a result. The report now names it, which
    costs nothing and acts a turn late; rendering it as a pointer would
    save the bytes now and needs the card's "what you get is what its
    row shows" promise re-read first. I did not decide this at one in
    the morning.
-3. **The local model.** `Qwen3.8-27B` works and is far too slow for the
+2. **The local model.** `Qwen3.8-27B` works and is far too slow for the
    suite — 450 seconds a program, a `skipped-tests` run capped out
    after two. Useful for watching behaviour, not for measuring it.
 
@@ -54,11 +46,14 @@ either. What can be said about it:
   `ambiguous-config` and `skipped-tests` all held or improved.
 - Every failure is the same task judgement: a definition deleted that
   something still reached without naming it. None is a harness fault.
-- **It may already be gone.** Ten fresh runs of these two tasks, after
-  `outline` was made to say what it does not know, came back 10/10 —
-  the baseline's own number, at half the programs. p = 0.13 against the
-  earlier HEAD arms: a good sign, not a proof, and everything below was
-  measured before it.
+- **It is gone.** Ten fresh runs of these two tasks, after `outline`
+  was made to say what it does not know, came back 10/10 — the
+  baseline's own number, at half the programs. A second ten-run arm
+  came back 9/10, and its one loss was not the model: `exit=101`, the
+  agent panicking in its own renderer (below). **Twenty runs, twenty
+  correct answers, one harness crash.** Against the earlier HEAD arms
+  (13/18) that is p = 0.017 by Fisher's exact test. Everything below
+  was measured before both arms.
 - Fewer *programs* is not the mechanism: within HEAD the failing runs
   average 5.6 programs against 5.4 for the passing ones.
 - **Bigger programs may be.** On the sweep tasks, HEAD's cells average
@@ -79,7 +74,7 @@ either. What can be said about it:
 `outline` now says it lists what a file defines and never what uses it,
 and names the mechanisms — `getattr`, string tables, registries — to
 look for instead of the names. It landed after every run in the table
-above, and the ten-run arm that followed went 10/10.
+above, and the twenty runs that followed went 20/20 on the answer.
 
 **And the behaviour it names moved, which is better evidence than the
 outcome.** Across those runs against the nine before it:
@@ -178,6 +173,87 @@ it was wrong five times out of six.
 
 **Where an example and a rule disagree, the example wins.** Twice, with
 receipts.
+
+**Render the prompt at the moment you are asking about.** `agent
+document <log>` could only show the newest leaf, which is the least
+interesting point in a run: what a reply was answering is the spine
+*before* it, and a run that went wrong went wrong in the middle. It
+takes an event id now. The first mid-run document it printed had a
+report reading "The last 0 of 3 lines" over an empty fence, and the
+first log rendered end to end crashed the binary.
+
+## Three ways the harness broke itself
+
+These are a different class from everything else here. A snag costs a
+round trip; these cost the run. Three of 294 kept runs exited 101 —
+the agent dead, the task half done, the work unreachable.
+
+### A console line bigger than the budget showed none of it
+
+A `sweep-40` reply printed `outline("helpers.py")`, 4,531 bytes, the
+one thing it had gone to fetch. What came back:
+
+    ### it printed
+    The last 0 of 3 lines; `history.fetch(19)` for all of them.
+    ```text
+
+    ```
+
+Its next two replies were spent re-fetching that row and re-reading
+the file, and the run scored 40%.
+
+`render_console` walks the tail newest-first and stops at the first
+line that does not fit, so a line past the *whole* budget stopped it on
+the first step and `start` ran off the end. Not a corner case: the
+interpreter caps a console line at 4,096 bytes, the report's section
+budget **is** 4,096, and the walk charges a line its length plus its
+newline — so every capped line overshot by exactly one. Any
+`console.log` of a file, an outline or a grep dump over 4KB hit it.
+
+One line now always survives and is clipped to the budget. An interp
+test pins cap == budget so the two cannot drift apart in silence.
+
+This is the third time the same shape has appeared: a channel exists,
+is too narrow for what programs actually reach for it to do, and the
+model pays for it somewhere else. The first two were a 200-byte
+per-line clip and a 20-line cap on this same section.
+
+### Call offsets do not survive compaction
+
+`told_literal_cuts` concatenates every `Prose`/`Cell` part to get the
+string a call's `site` indexes. The render loop concatenates the same
+parts — except that a compacted one contributes a one-line `↓
+history[N] … summary` marker instead of its bytes. From the first
+shadow onward the two strings disagree, and every later offset points
+somewhere else in a string that is now shorter.
+
+A live `sweep-200` compacted 54,651 bytes mid-run and panicked with
+`start=5596 end=5620` against a 369-byte reply. The fix carries the
+cuts across with the parts that survived; a cut inside a shadowed part
+is dropped, because the call it annotates is no longer in the text.
+With nothing compacted it is the identity, which is nearly every
+render.
+
+Worth noticing: compaction is new, and this is the failure mode a new
+mechanism has — not wrong in itself, but invalidating an assumption
+something older was built on.
+
+### `history.fetch(0)`
+
+`EventId` is a `NonZeroU64`. Every id-taking entry point filters `> 0`
+before converting — except the re-attach check, which runs first and
+built one straight from the program's argument. Two runs reached 0
+through their own arithmetic and died on `expected non-zero EventId!`.
+
+The fix is a constructor that cannot panic rather than a filter
+somebody has to remember. And since a panic is the one outcome no
+program can recover from, there is now a standing sweep: forty calls
+with ids that are not ids, arguments of the wrong shape, and the values
+JS arithmetic reaches when something upstream went wrong. The bar is
+only "no panic" — refusing is a fine answer, and so is doing the thing.
+Each case has to compile and run too, or a sweep like this quietly
+stops testing what it names; that assertion immediately caught two
+cases that were exercising the parser and nothing else.
 
 ## What was actually wrong
 
