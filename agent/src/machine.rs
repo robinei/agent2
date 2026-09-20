@@ -192,6 +192,31 @@ const STOPPED_SHORT_NOTICE: &str = "Your last reply ran nothing, and nobody had 
      done, say so with `finish(text)` inside a ```js block. Otherwise carry on from where you left \
      off.";
 
+/// **The contract, restated where it is about to be acted on.**
+///
+/// The card says this in its first paragraph, and the first paragraph
+/// of a 22 KB system prompt sits 11 KB from the end of a short request
+/// and 28 KB from the end of a long one. The one precedent in this file
+/// points the same way: a card sentence forbidding foreign tool-call
+/// syntax was ignored 3 runs of 3, and the same words in the report
+/// worked.
+///
+/// It earns the bytes because it is the rule whose violation is
+/// **silent**. A reply that meant to act and emitted no cell runs
+/// nothing, rests the branch (D4), and exits reporting success. Three
+/// of nine tasks failed exactly this way on 2026-09-20: one wrote its
+/// program into a ```text block, one wrote `tell(…); finish();` with no
+/// fence at all, one quoted a fragment of its own console back. None of
+/// them is a hard task, and 19% of that run's replies ran nothing
+/// against 6% across the kept corpus.
+///
+/// Unconditional, and last. Every other line here is a fact about right
+/// now; this is the standing shape of the thing being written, and it
+/// is what the model should be holding as it starts to write.
+const REPLY_IS_MARKDOWN: &str = "Your reply is markdown, and it reaches the person as it is \
+     written. Only a ```js block runs — a ```text block, or code with no fence, is text and \
+     does nothing.";
+
 /// **A `finish()` that told nobody anything is not honoured**, and this
 /// is the request that says so.
 ///
@@ -3790,6 +3815,7 @@ impl Runner {
             lines.push(REPLY_SHAPE_TAIL.to_owned());
         }
         lines.push(if self.attached { PRESENT } else { ABSENT }.to_owned());
+        lines.push(REPLY_IS_MARKDOWN.to_owned());
         Some(lines.join("\n"))
     }
 
