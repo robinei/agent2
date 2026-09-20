@@ -600,22 +600,23 @@ impl super::Compiler {
                 // After ToNum: coerce to Number.isFinite.
                 self.emit(Instr::CallBuiltin(Builtin::NumberIsFinite, 1), span);
             }
-            // **`stop` is an effect, like `raise` and unlike `done`.**
-            // `done` only sets a flag — the blocks after it still run —
-            // which is the right shape for "the task is over" and the
-            // wrong one for "this cannot finish". So `stop` halts, and
-            // nothing it leaves behind can be caught.
-            "done" => {
+            // **The two endings.** Both halt where they stand and
+            // neither can be caught: an effect never enters the handler
+            // search, so a `try` the program wrote for something else
+            // cannot swallow the one decision it most needs to survive.
+            // They differ only in what the harness does next — rest the
+            // branch, or put the reason in front of the next reply.
+            "finish" => {
                 if argv.len() != 1 {
                     return self.error(
                         span,
-                        "`done(text)` takes the answer you are finishing with — what you \
+                        "`finish(text)` takes the answer you are finishing with — what you \
                          concluded, in a sentence, which is what the person reads. If the \
                          work cannot finish, `stop(reason)` instead.",
                     );
                 }
                 self.compile_args(argv);
-                self.emit(Instr::Done, span);
+                self.emit(Instr::Finish, span);
                 self.emit(Instr::PushUndefined, span);
             }
             "stop" => {
@@ -623,7 +624,7 @@ impl super::Compiler {
                     return self.error(
                         span,
                         "`stop(reason)` takes the reason you cannot finish — one string, \
-                         which the next reply reads. To end the task instead, `done(text)`.",
+                         which the next reply reads. To end the task instead, `finish(text)`.",
                     );
                 }
                 self.compile_args(argv);
@@ -687,7 +688,7 @@ impl super::Compiler {
                 // reads a row, `answer`/`append_history` append one,
                 // `remove_history`/`rewrite_history` add an edit to the
                 // batch the running compaction handler is building,
-                // `done` sets the flag that stops the loop, and
+                // `finish` sets the flag that stops the loop, and
                 // `spawn`/`fork`/`list_agents` root a child, branch a
                 // context, and read the subtree back. So they lower to
                 // `Settle`, which yields the call and takes the value
@@ -723,24 +724,10 @@ impl super::Compiler {
                 // a non-promise straight through, and the card and its
                 // exemplars spell several of these with one.
                 //
-                // `done` takes no arguments — the only fixed arity
+                // `finish` takes no arguments — the only fixed arity
                 // here. Nothing else would mean anything, so a wrong
                 // count is a clear mistake worth a compile error rather
                 // than silently ignored args (same shape as `abandon`).
-                // **`done` carries the last word.** Ending without one
-                // was writable, and 20 of 283 runs that finished did it
-                // — the person got nothing. The card already said the
-                // reply that finishes owes them the answer; this is
-                // that sentence as a signature.
-                if name == "done" && argv.len() != 1 {
-                    self.error(
-                        span,
-                        "`done(text)` takes the answer you are finishing with — what you \
-                         concluded, in a sentence, which is what the person reads. If the \
-                         work cannot finish, `stop(reason)` instead.",
-                    );
-                    return;
-                }
                 // `ask` is deliberately NOT in this set: it is the one
                 // call in this vocabulary with a value genuinely coming
                 // back from somewhere else, which may take minutes and

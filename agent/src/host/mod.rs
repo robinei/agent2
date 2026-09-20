@@ -879,7 +879,7 @@ impl Session {
                     // being generated is waste, and the harness stops
                     // reading.
                     //
-                    // `done`/`stop` halt too, and the tokens after them
+                    // `finish`/`stop` halt too, and the tokens after them
                     // are waste by the same argument — but they do not
                     // park, they *end*, and the ending is applied when
                     // the reply closes (`Run::halted`). Cancelling here
@@ -2258,7 +2258,7 @@ mod tests {
     /// `on_llm_response`, so that layer is covered by something.
     #[test]
     fn a_notebook_reply_survives_the_real_session_loop() {
-        let reply = "Opening the file.\n\n```js\nlet n = 1;\n```\n\nNow the sum.\n\n```js\ntell(`n is ${n + 41}`);\ndone(`n is ${n + 41}`);\n```\n";
+        let reply = "Opening the file.\n\n```js\nlet n = 1;\n```\n\nNow the sum.\n\n```js\ntell(`n is ${n + 41}`);\nfinish(`n is ${n + 41}`);\n```\n";
         let (tx, rx) = channel();
         let mut session = Session::new(
             Tree::new(None),
@@ -2386,7 +2386,7 @@ mod tests {
             ToolRegistry::new(),
             Box::new(ScriptedLlm::new(vec![
                 scripted_program("Working on it.\n\n```js\nundefined_thing_here();\n```\n"),
-                scripted_program("Recovering.\n\n```js\ntell(\"done\");\ndone(\"ok\");\n```\n"),
+                scripted_program("Recovering.\n\n```js\ntell(\"done\");\nfinish(\"ok\");\n```\n"),
             ])),
             tx,
         )
@@ -2722,14 +2722,14 @@ mod tests {
             Ok(json!("slow"))
         }));
         registry.register(tool("fast", |_| Ok(json!("fast"))));
-        // `done(text)` last: otherwise this completion would continue
+        // `finish(text)` last: otherwise this completion would continue
         // by default (`machine.rs`'s `finish_program`) and consume the
         // leftover `scripted_text("done")` below, logging a second row
         // and a third delivery receipt.
         let script = vec![
             scripted_program(
                 "const s = tools.slow(); const f = tools.fast(); \
-                 const r = [await s, await f]; history.append(r); done(\"done.\");",
+                 const r = [await s, await f]; history.append(r); finish(\"done.\");",
             ),
             scripted_text("done"),
         ];
@@ -2738,7 +2738,7 @@ mod tests {
         // Calls are logged at *dispatch* (issue order); their `Result`s
         // land in completion order, which is what the inbox decides.
         //
-        // **The tool calls' results, named as such.** `done(text)` is a
+        // **The tool calls' results, named as such.** `finish(text)` is a
         // `Send`, and a `Send` gets a delivery receipt like anything
         // else — it just has nothing to do with the race being measured.
         let tools_called: Vec<EventId> = session
@@ -2851,14 +2851,14 @@ mod tests {
         let mut registry = ToolRegistry::new();
         // MAX_RESULT_BYTES is now MB-scale (16 MB); trigger it.
         registry.register(tool("big", |_| Ok(json!("x".repeat(MAX_RESULT_BYTES + 1)))));
-        // `done(text)` last on both paths: otherwise this completion
+        // `finish(text)` last on both paths: otherwise this completion
         // would continue by default (`machine.rs`'s `finish_program`)
         // and consume the leftover `scripted_text("done")` below, which
         // logs a second row and breaks the lookup below.
         let script = vec![
             scripted_program(
-                r#"try { const r = await tools.big(); history.append(r); done("done."); }
-                   catch (e) { history.append("rejected: " + e); done("done."); }"#,
+                r#"try { const r = await tools.big(); history.append(r); finish("done."); }
+                   catch (e) { history.append("rejected: " + e); finish("done."); }"#,
             ),
             scripted_text("done"),
         ];
@@ -2875,7 +2875,7 @@ mod tests {
             .map(|e| e.id)
             .expect("the call is still logged");
         // **That call's own `Result`**, named rather than "the only one
-        // there is": `done(text)` sends the finishing word, and that
+        // there is": `finish(text)` sends the finishing word, and that
         // send settles too.
         let outcome = session
             .tree()
@@ -3753,7 +3753,7 @@ mod tests {
     ///
     /// **Prose, not a cell.** These fixtures are settled conversations:
     /// the model said its piece and stopped, which is D4's cell-less
-    /// reply — an implicit `done(text)`. Give it a cell and re-opening the
+    /// reply — an implicit `finish(text)`. Give it a cell and re-opening the
     /// log reads the reply as a program whose outcome was never turned
     /// into a request, and wakes the branch.
     fn assistant(tree: &mut Tree, spine: &mut crate::types::Spine, text: &str) -> EventId {
@@ -4413,7 +4413,7 @@ mod tests {
                 (
                     "test agent",
                     vec![
-                        // `done(text)` last, and it has to be there:
+                        // `finish(text)` last, and it has to be there:
                         // without it this completion would continue by
                         // default (`machine.rs`'s `finish_program`) and
                         // consume the leftover `scripted_text("done")`
@@ -4426,7 +4426,7 @@ mod tests {
                             r#"const w = await spawn("reads files");
                                const value = await ask(w.agent, "which file?");
                                history.append(value);
-                               done("done.");"#,
+                               finish("done.");"#,
                         ),
                         scripted_text("done"),
                     ],
@@ -4439,7 +4439,7 @@ mod tests {
 
         // Start from the `Send` — the event that records "I asked" — and
         // walk to the other three, then back.
-        // The one that expects an answer: `done`'s own report to the
+        // The one that expects an answer: `finish`'s own report to the
         // user is a `Send` too, and it is not the one this walk is about.
         let send = tree
             .events
@@ -4937,7 +4937,7 @@ mod tests {
                 .and_then(|s| s.parse::<u64>().ok())
             else {
                 // Nothing open — a plain reprompt with nothing to
-                // answer. Relies on `scripted_text`'s own `done(text)`: a
+                // answer. Relies on `scripted_text`'s own `finish(text)`: a
                 // completed program is no longer, on its own, reason to
                 // rest (`machine.rs`'s `finish_program`), so without it
                 // this fallback would re-fire itself forever — every
@@ -4958,14 +4958,14 @@ mod tests {
             let Some(value) = values.lock().unwrap().pop_front() else {
                 return Err(format!("no scripted value queued for open post #{id}"));
             };
-            // `done(text)` right after answering — same reasoning as
+            // `finish(text)` right after answering — same reasoning as
             // `scripted_text`'s own doc: without it this worker's
             // program would continue by default, land back in this
             // function with nothing open, and earn an extra "ok" turn
             // no caller here wants (`broadcast_is_promise_all_over_
             // agents`'s own comment: "one program, not two").
             Ok(scripted_program(&format!(
-                "answer({}, {}, {}); done(\"ok\");\n",
+                "answer({}, {}, {}); finish(\"ok\");\n",
                 id,
                 json!("answer"),
                 json!(value)
@@ -5001,16 +5001,16 @@ mod tests {
                         scripted_program(
                             r#"const child = spawn("worker");
                                tell(child, "make one of your own");
-                               done("done.");"#,
+                               finish("done.");"#,
                         ),
                         scripted_program("history.append(list_agents());"),
                     ],
                 ),
                 (
                     "worker",
-                    vec![scripted_program("spawn(\"grandchild\"); done(\"ok\");\n")],
+                    vec![scripted_program("spawn(\"grandchild\"); finish(\"ok\");\n")],
                 ),
-                ("grandchild", vec![scripted_program("done(\"ok\");\n")]),
+                ("grandchild", vec![scripted_program("finish(\"ok\");\n")]),
             ],
         );
         let h = session.handle();
@@ -5107,9 +5107,9 @@ mod tests {
         // synchronously and does not end the turn on its own
         // (`structured_answer_reaches_the_program`'s doc), so each
         // worker's single program answers and then ends itself with
-        // `done("ok")` — nothing forces, or needs, a second completion.
+        // `finish("ok")` — nothing forces, or needs, a second completion.
         //
-        // The `Call`/`Result` pair between them is that `done`: the verb
+        // The `Call`/`Result` pair between them is that `finish`: the verb
         // carries what it says, so finishing is a `Send` like any other.
         // Its `Answer` already discharged the question, so the word goes
         // to the person rather than back up the chain.
@@ -5371,7 +5371,7 @@ mod tests {
                         scripted_program(&format!(r#"answer({question}, "w1", "maybe");"#)),
                         scripted_program(&format!(
                             r#"answer({question}, "w1", "big");
-                               done("done.");"#
+                               finish("done.");"#
                         )),
                     ],
                 ),
@@ -5382,7 +5382,7 @@ mod tests {
                             r#"const w = await spawn("counts things");
                                const v = await choose(w.agent, "how many?", ["small", "big"]);
                                history.append(v);
-                               done("done.");"#,
+                               finish("done.");"#,
                         ),
                         scripted_text("done"),
                     ],
@@ -5441,13 +5441,13 @@ mod tests {
                     // But completing the program *is*, now, always a
                     // reason for a fresh request (`machine.rs`'s
                     // `finish_program`: completing continues by default,
-                    // `done(text)` is the opt-out) — so the worker's own
+                    // `finish(text)` is the opt-out) — so the worker's own
                     // program calls it right after answering, the same
                     // "one program" shape this test pins, made explicit
                     // instead of assumed.
                     vec![scripted_program(&format!(
                         r#"answer({question}, "w1", {});
-                           done("done.");"#,
+                           finish("done.");"#,
                         json!({ "files": 3, "bytes": 1200 }),
                     ))],
                 ),
@@ -5458,7 +5458,7 @@ mod tests {
                             r#"const w = await spawn("counts things");
                                const v = await ask(w.agent, "how many?");
                                history.append([typeof v, v.files, v.bytes]);
-                               done("done.");"#,
+                               finish("done.");"#,
                         ),
                         scripted_text("structured"),
                     ],
@@ -5489,11 +5489,11 @@ mod tests {
         // `answer(...)` is a bare-global call like any other, settled
         // synchronously with no host round trip (`dispatch_calls`'s
         // `TOOL_ANSWER` arm) — it does not end the program on its own.
-        // The worker's script calls `done(text)` right after answering, so
+        // The worker's script calls `finish(text)` right after answering, so
         // it still goes idle owing nothing rather than earning a second,
-        // pointless completion. That `done` is the `Call`/`Result` pair:
+        // pointless completion. That `finish` is the `Call`/`Result` pair:
         // the verb carries what it says, so it is a `Send`. It lands
-        // before `ReplyEnd` because `done` halts where it stands — the
+        // before `ReplyEnd` because `finish` halts where it stands — the
         // reply was still arriving when the program ended itself.
         assert_eq!(
             kinds(tree, worker_leaf),
@@ -5543,7 +5543,7 @@ mod tests {
     /// still passes. It used to say completing a program is not, on its
     /// own, a reason to reprompt — which was the rule then and is the
     /// opposite of the rule now: a program that finishes prompts for
-    /// the next one unless it called `done(text)`. What still holds is the
+    /// the next one unless it called `finish(text)`. What still holds is the
     /// *property this test is about*: the child's script answers #8
     /// itself rather than relying on a second, re-invited turn, so the
     /// round trip closes on its own terms and not on a continuation

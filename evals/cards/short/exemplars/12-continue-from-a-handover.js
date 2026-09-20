@@ -10,4 +10,4 @@ for (const hit of prev.hits) {
     if (check.status === 0) dropped.push(path);
     else kept.push(path);
 }
-done(`dropped ${dropped.length}, kept ${kept.length}.`);
+finish(`dropped ${dropped.length}, kept ${kept.length}.`);

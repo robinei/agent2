@@ -48,7 +48,7 @@ def check(env):
         "question that needed none",
     )
     # Under automatic continuation (27.1) a second program *is* the
-    # handover: the only way to stop is `done()`, so "handed itself a
+    # handover: the only way to stop is `finish()`, so "handed itself a
     # to-do list" and "took more than one program" became the same
     # claim, and the separate `handovers` count went with `next_program`.
     env.require(

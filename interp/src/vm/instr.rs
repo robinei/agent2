@@ -655,15 +655,15 @@ pub enum Instr {
     /// not an exception: it never reaches the handler search, so a
     /// `try` the program wrote for something else cannot swallow it.
     Stop, // (reason) -> !
-    /// `done("text")` — the task is finished; halt here too.
+    /// `finish("text")` — the task is finished; halt here too.
     ///
-    /// **Both endings halt.** `done` used to set a flag and let the
-    /// blocks after it run, which needed a paragraph of card and a
-    /// worked bug to explain, and 51 programs in the kept corpus wrote
-    /// real statements after it — including writes that happened after
-    /// the program had decided it was finished. The two verbs now
+    /// **Both endings halt.** This was `finish`, which set a flag and let
+    /// the blocks after it run — a shape that needed a paragraph of
+    /// card and a worked bug to explain, and that 51 programs in the
+    /// kept corpus wrote real statements after, including writes made
+    /// after the program had decided it was finished. The two verbs now
     /// differ in one thing only: whether the branch rests afterwards.
-    Done, // (text) -> !
+    Finish, // (text) -> !
 
     /// Enter a `try` block: push an entry onto the VM's handler stack,
     /// snapshotting the current stack height, call depth, and frame pointer.

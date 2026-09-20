@@ -15,5 +15,5 @@ for (let i = 0; i < hits.length; i++) {
 }
 const c = await tools.bash("CHECK 2>&1");
 if (c.status !== 0) stop(`${hits.length} changed, but CHECK fails:\n${c.stdout}`);
-done(`${hits.length} changed, CHECK passes.`);
+finish(`${hits.length} changed, CHECK passes.`);
 ```

@@ -162,19 +162,19 @@ pub fn scripted_answer(
 /// more (`card.rs`: "no prose, no code fence... the whole response is
 /// parsed as JavaScript"); the closest equivalent to the pre-code-mode
 /// "plain reply ends the turn" is a two-line program that tells the user
-/// something and then calls `done(text)` — completing on its own is no
+/// something and then calls `finish(text)` — completing on its own is no
 /// longer enough to rest a branch (`machine.rs`'s `finish_program`), so
 /// every call site that reached for this helper for exactly that "say
-/// it and stop" shape needs the explicit `done(text)` to still get it,
+/// it and stop" shape needs the explicit `finish(text)` to still get it,
 /// rather than a needless extra scripted round trip (or, for a test
 /// double that answers every re-prompt the same way regardless of what
 /// is open, an outright infinite loop — `AutoAnswerLlm`'s own doc).
 #[allow(dead_code)] // used only from test modules, which the non-test
 // build does not compile; not dead.
 pub fn scripted_text(text: &str) -> LlmTurn {
-    // `done(text)` is the pair this used to write out longhand: the
+    // `finish(text)` is the pair this used to write out longhand: the
     // answer goes to the person and the task ends, in one call.
-    scripted_program(&format!("done({});", serde_json::json!(text)))
+    scripted_program(&format!("finish({});", serde_json::json!(text)))
 }
 
 /// A scripted client that answers by **which agent asked**, not by

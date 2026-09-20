@@ -46,7 +46,7 @@ pub const HARNESS_VERBS: &[&str] = &[
     "choose",
     "spawn",
     "fork",
-    "done",
+    "finish",
     "fetch_history",
     "answer",
     "append_history",

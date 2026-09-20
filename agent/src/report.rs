@@ -1471,7 +1471,7 @@ fn what_happened(h: &Handback<'_>, cause: &HandbackHow, site: u32) -> String {
         // wrong that the program did not foresee; this is the program
         // foreseeing it and saying so. Rendering them alike taught that
         // stopping yourself is a kind of failure, which is the opposite
-        // of what it is — and it is why `tell(…); done("done.")` on a failed
+        // of what it is — and it is why `tell(…); finish("done.")` on a failed
         // check looked like the tidier option.
         HandbackHow::Stopped { reason } => format!(
             "Your program stopped itself:\n\n{reason}\n\nNothing after that ran. \

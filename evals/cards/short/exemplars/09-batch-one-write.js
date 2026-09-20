@@ -3,4 +3,4 @@ for (const p of files) {
     const f = await tools.read_file(p);
     await tools.replace_file(p, f.content.replaceAll("parse_span(", "read_span("), f.version);
 }
-done(`updated ${files.length} file(s).`);
+finish(`updated ${files.length} file(s).`);

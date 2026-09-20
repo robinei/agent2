@@ -788,7 +788,7 @@ pub enum StepResult {
         /// about what is left to execute, not about undoing what was.
         unstarted: Vec<InvokeCall>,
     },
-    /// `done("text")`: the task is finished and `text` is the answer.
+    /// `finish("text")`: the task is finished and `text` is the answer.
     /// The VM halts, exactly as `Stopped` does; the difference is what
     /// the host does next — rest the branch rather than continue it.
     Finished {

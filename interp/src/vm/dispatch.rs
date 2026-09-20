@@ -3033,7 +3033,7 @@ impl VM {
                     });
                 }
 
-                Instr::Done => {
+                Instr::Finish => {
                     let v = self.pop()?;
                     let text = match &v {
                         Value::String(s) => s.as_str().to_owned(),
@@ -3041,7 +3041,7 @@ impl VM {
                     };
                     self.ip += 1;
                     // The outbox drains the same way an ordinary
-                    // ending drains it. **Nothing after `done` runs,
+                    // ending drains it. **Nothing after `finish` runs,
                     // but everything before it did**: a `tell` the
                     // program issued and never awaited was issued, and
                     // dropping it here would make the verb quietly

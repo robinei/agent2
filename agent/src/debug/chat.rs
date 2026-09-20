@@ -2964,10 +2964,10 @@ mod tests {
         let mut chat = ChatState::new();
         chat.apply(&agent_event());
         chat.set_show_cells(true);
-        for e in cell(2, "tell(\"hi\");\ndone(\"ok\");\n") {
+        for e in cell(2, "tell(\"hi\");\nfinish(\"ok\");\n") {
             chat.apply(&e);
         }
-        assert_eq!(code_rows(&chat), vec!["tell(\"hi\");", "done(\"ok\");"]);
+        assert_eq!(code_rows(&chat), vec!["tell(\"hi\");", "finish(\"ok\");"]);
     }
 
     /// Expanding shows the rest.

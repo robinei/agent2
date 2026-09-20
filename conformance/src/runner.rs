@@ -408,7 +408,7 @@ fn run_work_item(item: WorkItem) -> TestResult {
         Ok(StepResult::Finished { text, .. }) => TestResult {
             path: item.path.clone(),
             outcome: TestOutcome::Fail,
-            detail: format!("the program called done(): {text}"),
+            detail: format!("the program called finish(): {text}"),
             features: item.features.clone(),
         },
         Ok(StepResult::Stopped { reason, .. }) => TestResult {

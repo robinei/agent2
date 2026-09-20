@@ -1284,7 +1284,7 @@ mod tests {
         let mut tree = Tree::new(None);
         let snapshotted = vec![Exemplar {
             user: "the user turn this branch was born with".into(),
-            assistant: "done(\"ok\");".into(),
+            assistant: "finish(\"ok\");".into(),
         }];
         let mut spine = tree
             .start_agent(None, None, "root", None, "CARD OF THE DAY", snapshotted)

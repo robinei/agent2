@@ -1069,7 +1069,7 @@ mod tests {
         // `card()` shows up as a diff review must look at, not a byte
         // count that silently drifts. Comparing full text (not just a
         // hash) so the diff itself is legible in a failure message.
-        const EXPECTED_LEN: usize = 21741;
+        const EXPECTED_LEN: usize = 21992;
         assert_eq!(
             card().len(),
             EXPECTED_LEN,
@@ -1159,7 +1159,7 @@ mod tests {
         assert!(card().contains("is quoted, not run"), "{}", card());
         // And the two halves of the ending, which 27.1 inverted: a
         // program finishing is not the task finishing.
-        assert!(card().contains("done("), "{}", card());
+        assert!(card().contains("finish("), "{}", card());
         assert!(
             card().contains("not trying to finish the task in one reply"),
             "{}",
@@ -1254,8 +1254,8 @@ mod tests {
     /// than an omission, so it is worth reading back off a real run
     /// instead of grepping the source for the word.
     struct Ending {
-        /// `done(text)` was called: the task is over.
-        done: bool,
+        /// `finish(text)` was called: the task is over.
+        finished: bool,
         /// `history.append` was called: something was handed to the
         /// reply after this one. A reply has no `return` (D5), so this
         /// is the other way one can end on purpose.
@@ -1273,11 +1273,11 @@ mod tests {
             .map_err(|e| format!("could not start: {e:?}"))?;
         // An exemplar that ends the task does it by halting
         // (`StepResult::Finished`); one that hands on simply runs out.
-        let done = false;
+        let finished = false;
         let mut appended = false;
         loop {
             match vm.step(u64::MAX).map_err(|e| format!("{e:?}"))? {
-                StepResult::Done { .. } => return Ok(Ending { done, appended }),
+                StepResult::Done { .. } => return Ok(Ending { finished, appended }),
                 StepResult::Pending { calls } => {
                     for call in calls {
                         let result = stub_result(&call.name, &call.args);
@@ -1291,7 +1291,7 @@ mod tests {
                 // The settle-at-dispatch verbs come back here instead of
                 // through the outbox: they answer into the frame that
                 // called them, so the stub pushes the value rather than
-                // settling a promise. `done` is not among them — it
+                // settling a promise. `finish` is not among them — it
                 // halts, and arrives as `Finished` below.
                 StepResult::Settle { call } => {
                     if call.name == crate::machine::TOOL_APPEND_HISTORY {
@@ -1312,11 +1312,11 @@ mod tests {
                 // Unreachable with `u64::MAX` fuel, and there is
                 // nothing to do about it but step again.
                 StepResult::Stopped { reason, .. } => return Err(format!("stopped: {reason}")),
-                // `done(text)` halts now, so this is how an exemplar
+                // `finish(text)` halts now, so this is how an exemplar
                 // that finishes ends — the flag is set by the verb.
                 StepResult::Finished { .. } => {
                     return Ok(Ending {
-                        done: true,
+                        finished: true,
                         appended,
                     });
                 }
@@ -1334,7 +1334,7 @@ mod tests {
     /// runs off the end does not stop — the next one is written — so
     /// falling off the end is no longer an ending at all, and an
     /// exemplar that did it would be teaching the accident the whole
-    /// change exists to prevent. Each one either calls `done(text)`, because
+    /// change exists to prevent. Each one either calls `finish(text)`, because
     /// its task is finished, or `history.append`s the thing the next
     /// reply continues from.
     #[test]
@@ -1347,7 +1347,7 @@ mod tests {
             let source = cells_of(&ex.assistant);
             let ending = run_against_stubs(&source)
                 .unwrap_or_else(|e| panic!("exemplar for {:?} trapped: {e}", ex.user));
-            // **The two endings a reply has.** `done(text)` says the task is
+            // **The two endings a reply has.** `finish(text)` says the task is
             // finished; `history.append` hands a finding to the reply
             // after this one and rests the branch (D4). There is no
             // `return` to be the second of those any more, and an
@@ -1357,7 +1357,7 @@ mod tests {
             // Read off the run, not off the text: a call inside a
             // branch never taken is not an ending.
             assert!(
-                ending.done || ending.appended,
+                ending.finished || ending.appended,
                 "exemplar for {:?} neither finishes nor hands anything on",
                 ex.user
             );
@@ -1437,7 +1437,7 @@ mod tests {
                 // And what counts as an *ending* depends on it too. A
                 // notebook cell cannot `return` at all (D5), so the verb
                 // that hands work to the next reply is `history.append`.
-                let ends = ex.assistant.contains("done(")
+                let ends = ex.assistant.contains("finish(")
                     || ex.assistant.contains("stop(")
                     || ex.assistant.contains("history.append")
                     || ex
@@ -1528,7 +1528,7 @@ mod tests {
         let ex = exemplars();
         assert_eq!(ex.len(), 5, "five, and each earns its place");
         assert!(
-            ex[0].assistant.contains("done(") && !ex[0].assistant.contains("return"),
+            ex[0].assistant.contains("finish(") && !ex[0].assistant.contains("return"),
             "the first ends a finished task: {}",
             ex[0].assistant
         );
@@ -1536,7 +1536,7 @@ mod tests {
         // (D5): what the second exemplar demonstrates is handing a
         // finding on to the next reply and *not* ending the task.
         assert!(
-            ex[1].assistant.contains("history.append") && !ex[1].assistant.contains("done("),
+            ex[1].assistant.contains("history.append") && !ex[1].assistant.contains("finish("),
             "the second hands on and does not stop: {}",
             ex[1].assistant
         );
@@ -1553,7 +1553,7 @@ mod tests {
         assert!(
             ex[2].assistant.contains("await choose(")
                 && ex[2].assistant.contains("===")
-                && ex[2].assistant.contains("done("),
+                && ex[2].assistant.contains("finish("),
             "the third offers a bounded choice and acts on the answer: {}",
             ex[2].assistant
         );
@@ -1602,7 +1602,7 @@ mod tests {
             ex[3].assistant
         );
         // **The finishing one changes something and checks it.** It used
-        // to be `bash("make check")` → `tell` → `done(text)`, against the
+        // to be `bash("make check")` → `tell` → `finish(text)`, against the
         // prompt "is the build green?" — right for that prompt, and
         // structurally identical to the dominant failure: measured on
         // 2026-09-17, 45% of programs read something, wrote nothing,
@@ -1617,10 +1617,10 @@ mod tests {
         );
         // **Whatever finishes, speaks — and the verb no longer lets it
         // do otherwise.** This used to pin the pairing by hand: every
-        // exemplar calling `done()` had to `tell()` first, because a
+        // exemplar calling `finish()` had to `tell()` first, because a
         // finish with nothing said is a run that ended without a word
         // to anybody (1 in 12 runs, and 4 in 12 once a crossing-table
-        // line talked the models out of `tell`). `done(text)` carries
+        // line talked the models out of `tell`). `finish(text)` carries
         // the words itself now, so the pairing is the verb's arity
         // (`call.rs` requires the argument) rather than a habit three
         // exemplars have to teach.
@@ -1630,7 +1630,7 @@ mod tests {
         // whose value the reader cannot see. Same for `stop`: the
         // reason is the whole point of stopping there.
         for e in &ex {
-            for verb in ["done(", "stop("] {
+            for verb in ["finish(", "stop("] {
                 for rest in e.assistant.split(verb).skip(1) {
                     assert!(
                         rest.starts_with('"') || rest.starts_with('`'),
@@ -1643,9 +1643,9 @@ mod tests {
         // **And both endings are shown, not just the good one.** A
         // check that failed is the commonest thing a reply has to say,
         // and the exemplars are the only place the model sees what to
-        // do about it: `stop(reason)`, not a `done()` claiming the
+        // do about it: `stop(reason)`, not a `finish()` claiming the
         // change landed. Two of the five demonstrate it, on the branch
-        // right before the `done` they would otherwise have reached.
+        // right before the `finish` they would otherwise have reached.
         let stopping = ex.iter().filter(|e| e.assistant.contains("stop(")).count();
         assert!(
             stopping >= 2,
@@ -1753,7 +1753,7 @@ mod tests {
     }
 
     /// **Every notebook exemplar ends on purpose too**, and under this
-    /// transport there are only two ways to: `done(text)`, because the task is
+    /// transport there are only two ways to: `finish(text)`, because the task is
     /// finished, or `history.append`, because something is being handed to
     /// the next reply. `return` is not one — a cell cannot (D5) — so the
     /// third option the shipped exemplars have is simply gone.
@@ -1768,7 +1768,7 @@ mod tests {
         }
         let card = load_from(&dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
         for ex in &card.exemplars {
-            let finishes = ex.assistant.contains("done(");
+            let finishes = ex.assistant.contains("finish(");
             let hands_on = ex.assistant.contains("history.append");
             assert!(
                 finishes || hands_on,
@@ -1804,28 +1804,28 @@ mod tests {
         // The first finishes a task it actually changed, and checks the
         // change by running the thing that would fail.
         assert!(
-            ex[0].assistant.contains("done(") && ex[0].assistant.contains("tools.replace_file"),
+            ex[0].assistant.contains("finish(") && ex[0].assistant.contains("tools.replace_file"),
             "the first changes something and finishes: {}",
             ex[0].assistant
         );
         // The second hands on without stopping — which is now `append`,
         // there being no `return`.
         assert!(
-            ex[1].assistant.contains("history.append") && !ex[1].assistant.contains("done("),
+            ex[1].assistant.contains("history.append") && !ex[1].assistant.contains("finish("),
             "the second hands on and does not stop: {}",
             ex[1].assistant
         );
         // The third offers a *bounded* choice and acts on the answer. The
         // awaited value is the point: a free-form `ask` answered in prose
         // could not be compared with `===`. And it guards the skip with
-        // `else` — which under this transport is not merely tidy: `done(text)`
+        // `else` — which under this transport is not merely tidy: `finish(text)`
         // stops nothing, so a guard that used it would write the file it
         // meant to leave alone (D8).
         assert!(
             ex[2].assistant.contains("await choose(")
                 && ex[2].assistant.contains("===")
                 && ex[2].assistant.contains("} else {")
-                && ex[2].assistant.contains("done("),
+                && ex[2].assistant.contains("finish("),
             "the third offers a bounded choice and guards with else: {}",
             ex[2].assistant
         );

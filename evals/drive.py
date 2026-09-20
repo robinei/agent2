@@ -90,6 +90,12 @@ PI_HOME = Path(os.environ.get("PI_HOME", Path.home()))
 #            `Edit.replaceOnce` declining an ambiguous needle is the
 #            design working; counting it as a defect would penalise the
 #            safety it exists to provide.
+#
+# A fourth thing used to land here and no longer does: a program that
+# had found its own check failing and said so by throwing.  It read as
+# `program` — the model's own bug — which is the opposite of what it
+# was.  `stop(reason)` is that act now, it is not a trap, and it is
+# reported on its own line.
 TRAP_KINDS = [
     ("gap", "cannot read .length of a map"),
     ("gap", "falls inside a multi-byte UTF-8 character"),
@@ -603,6 +609,15 @@ def aggregate(runs: list) -> dict:
         for s in scores:
             for t in s.get("trap_messages", []):
                 traps[t] = traps.get(t, 0) + 1
+        # Kept apart from traps on purpose: a `stop(reason)` is the run
+        # noticing its own check came back wrong and saying so.  It is
+        # the behaviour we want, so it is reported and never counted as
+        # a defect — but a run that stops on every reply and a run that
+        # sails through must not print the same.
+        stops = {}
+        for s in scores:
+            for t in s.get("stops", []):
+                stops[t] = stops.get(t, 0) + 1
         summary[name] = {
             "runs": sum(1 for r in rs if r["pass"] is not None),
             "passed": sum(1 for r in rs if r["pass"] is True),
@@ -642,6 +657,7 @@ def aggregate(runs: list) -> dict:
             "completion_out": med([s.get("completion_out", 0) for s in scores]),
             "provider_s": med([s["provider_ms"] / 1000 for s in scores]),
             "traps": traps,
+            "stops": stops,
             # Failures a dialect gap is implicated in — reported beside
             # the pass count, never subtracted from it.
             "failed_with_gap": sum(
@@ -752,6 +768,8 @@ def print_summary(summary: dict):
         )
         for trap, n in s["traps"].items():
             print(f"  trap [{classify_trap(trap)}] x{n}: {trap}")
+        for stop, n in s.get("stops", {}).items():
+            print(f"  stopped x{n}: {stop}")
         for why in s["failures"]:
             print(f"  FAIL: {why}")
     if stamp:
@@ -826,7 +844,9 @@ def pool_suites(out, parts: list) -> int:
     pooled = {}
     for d in parsed:
         for name, s in d.items():
-            acc = pooled.setdefault(name, {"_traps": {}, "_failures": []})
+            acc = pooled.setdefault(
+                name, {"_traps": {}, "_stops": {}, "_failures": []}
+            )
             for k, v in s.items():
                 if k in COUNTS:
                     acc[k] = acc.get(k, 0) + v
@@ -834,6 +854,8 @@ def pool_suites(out, parts: list) -> int:
                     acc[k] = acc.get(k, 0) + v * s["runs"]
             for t, n in s.get("traps", {}).items():
                 acc["_traps"][t] = acc["_traps"].get(t, 0) + n
+            for t, n in s.get("stops", {}).items():
+                acc["_stops"][t] = acc["_stops"].get(t, 0) + n
             acc["_failures"].extend(s.get("failures", []))
 
     total_k = total_n = 0
@@ -843,6 +865,7 @@ def pool_suites(out, parts: list) -> int:
             if k not in COUNTS and not k.startswith("_"):
                 acc[k] = round(acc[k] / n, 3) if n else 0
         acc["traps"] = acc.pop("_traps")
+        acc["stops"] = acc.pop("_stops")
         acc["failures"] = acc.pop("_failures")
         lo, hi = wilson(acc["passed"], n)
         total_k += acc["passed"]

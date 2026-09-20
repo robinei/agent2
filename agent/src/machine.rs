@@ -189,7 +189,7 @@ const FOREIGN_TOOL_CALL_NOTICE: &str = "Your last reply contained a tool call in
 /// ran nothing — see [`Runner::stopped_short`].
 const STOPPED_SHORT_NOTICE: &str = "Your last reply ran nothing, and nobody had asked you \
      anything — so the work stopped where it was rather than finishing. If the task really is \
-     done, say so with `done(text)` inside a ```js block. Otherwise carry on from where you left \
+     done, say so with `finish(text)` inside a ```js block. Otherwise carry on from where you left \
      off.";
 
 /// Whether this reply tried to call a tool in another harness's syntax.
@@ -388,7 +388,7 @@ struct Run {
     /// drops entries makes any stored index approximate. It says so
     /// itself with `[… N lines dropped]`.
     console_logged: usize,
-    /// Set once the program has halted itself with `done` or `stop`.
+    /// Set once the program has halted itself with `finish` or `stop`.
     ///
     /// **The program is over before the reply is.** Both verbs halt
     /// where they stand, part-way through a notebook that may still be
@@ -408,7 +408,7 @@ struct Run {
 }
 
 /// How a program ended itself. The value each verb was given is
-/// already accounted for by the time this is recorded — `done`'s text
+/// already accounted for by the time this is recorded — `finish`'s text
 /// is a logged `Call::Send`, `stop`'s reason rides the `Handback` —
 /// so this only has to say which of the two it was.
 #[derive(Debug, Clone)]
@@ -416,7 +416,7 @@ enum Halt {
     /// `stop(reason)`: the reply stops here and the branch is prompted
     /// again with the reason in front of it.
     Stopped(String),
-    /// `done(text)`: the task is finished and the branch rests.
+    /// `finish(text)`: the task is finished and the branch rests.
     Finished,
 }
 
@@ -726,11 +726,11 @@ pub struct Runner {
     /// the log exactly as it found it.
     pending_edits: Vec<crate::compaction::CompactionOp>,
     /// Whether the program currently running ended itself with
-    /// `done(text)` — checked and reset by `finish_program`, which is
+    /// `finish(text)` — checked and reset by `finish_program`, which is
     /// the only reader. Set on the way through `halt`, which is the
     /// single moment that fact becomes true; `finish_program`'s own
     /// comment is where the polarity this exists to flip is explained.
-    done: bool,
+    finished: bool,
     /// Runs suspended **beneath** the one currently in `phase`, each
     /// frozen exactly where it stopped, oldest first popped last (a
     /// stack) — see `Phase::Suspended`'s own doc for why this, and not
@@ -858,7 +858,7 @@ impl Runner {
         Runner {
             compaction_requested: false,
             pending_edits: Vec::new(),
-            done: false,
+            finished: false,
             spine,
             agent,
             branch,
@@ -1015,7 +1015,7 @@ impl Runner {
     /// - **ran a cell** — there is a program, and its `Handback` is a
     ///   cause for the next request.
     /// - **spoke only** — prose reached the person and no cell ran.
-    ///   That is D4's implicit `done(text)`: the model said its piece and
+    ///   That is D4's implicit `finish(text)`: the model said its piece and
     ///   the next thing to happen is whatever the person says.
     /// - **said nothing** — no prose, no cell, no `tell`. Not an
     ///   answer, and not a rest: nobody was told anything, so a branch
@@ -1088,7 +1088,7 @@ impl Runner {
     /// `None` when the reply ended on purpose and the branch should
     /// rest.
     ///
-    /// D4 says a reply with no cells is an implicit `done(text)`: the model
+    /// D4 says a reply with no cells is an implicit `finish(text)`: the model
     /// said its piece and the next thing to happen is whatever the
     /// person says. That is right for an **answer** and wrong for the
     /// two cases below, which the card already distinguishes in prose
@@ -1106,7 +1106,7 @@ impl Runner {
     ///   the moment of the mistake rather than 16 KB earlier.
     /// - **A continuation that ran nothing.** No post prompted this
     ///   reply, so nobody asked it anything; it was carrying on its own
-    ///   work and stopped without a `done(text)`.
+    ///   work and stopped without a `finish(text)`.
     ///
     /// A reply that *was* answering a post and ran nothing is left
     /// alone. That is `plain-question`'s whole shape, and a follow-up
@@ -1709,7 +1709,7 @@ impl Runner {
     /// through either dispatcher — earns another round.
     fn pump(&mut self, tree: &mut Tree, fuel: u64) -> io::Result<Vec<StepOutput>> {
         let mut out = Vec::new();
-        // Nothing after `done`/`stop` runs, including whatever a
+        // Nothing after `finish`/`stop` runs, including whatever a
         // late-arriving tool result would otherwise have woken.
         if self.halted() {
             return Ok(out);
@@ -1808,7 +1808,7 @@ impl Runner {
                     // whoever this branch owes its oldest open post to,
                     // the user when it owes nobody. A delegated child
                     // finishing reports to its parent without having to
-                    // name it, which is the whole reason `done` takes
+                    // name it, which is the whole reason `finish` takes
                     // the text rather than leaving a `tell` beside it.
                     let to = self
                         .resolve_address(tree, None)
@@ -1845,7 +1845,7 @@ impl Runner {
     /// Record that the program ended itself, and end the turn if the
     /// reply has already finished arriving.
     ///
-    /// `done` and `stop` halt **where they stand**, which is usually
+    /// `finish` and `stop` halt **where they stand**, which is usually
     /// somewhere in the middle of a notebook the provider is still
     /// writing. Two things follow, and this is the one place both are
     /// arranged:
@@ -1912,7 +1912,7 @@ impl Runner {
                 self.suspend(tree, SuspendCause::Stopped { reason }, out)
             }
             Halt::Finished => {
-                self.done = true;
+                self.finished = true;
                 self.finish_program(tree, Value::Undefined, unstarted, out)
             }
         }
@@ -1941,7 +1941,7 @@ impl Runner {
     /// settled later by exactly one `Result`.
     ///
     /// The settle-at-dispatch verbs — `spawn`, `fork`, `list_agents`,
-    /// `done`, `answer`, `append_history`, `fetch_history`,
+    /// `finish`, `answer`, `append_history`, `fetch_history`,
     /// `remove_history`, `rewrite_history` — can no longer reach this
     /// function at all: the compiler lowers them to `Instr::Settle`, so
     /// they arrive as `StepResult::Settle` and are handled one at a time
@@ -2073,7 +2073,7 @@ impl Runner {
     /// - **Answered here.** `fetch_history` reads a row off the log,
     ///   `answer` and `append_history` append one, `remove_history` /
     ///   `rewrite_history` add an edit to the batch the running
-    ///   compaction handler is building, `done` sets the flag that
+    ///   compaction handler is building, `finish` sets the flag that
     ///   stops the loop. The value is pushed before this function
     ///   returns and the program runs on in the same pump round
     ///   (`true`).
@@ -3037,7 +3037,7 @@ impl Runner {
         // a program that does one step and stops, abandoning the task —
         // and with rest as the default, the easiest accident (an
         // ordinary `return` with nothing left to say) causes exactly
-        // that, most expensive, failure. `done(text)` (`TOOL_DONE`) is the
+        // that, most expensive, failure. `finish(text)` (`TOOL_DONE`) is the
         // opt-in the other way: rest happens only when a program
         // actually said so, so an accidental continuation costs one
         // visible, self-correcting turn instead.
@@ -3048,7 +3048,7 @@ impl Runner {
         // `render_request` (called from `prompt_if_needed`, below)
         // advances `shown` itself the moment that request actually goes
         // out, exactly as it always has.
-        if self.done {
+        if self.finished {
             // Matches `suspend`'s own depth>0 branch precedent: `shown`
             // advances here, marking this outcome accounted-for so
             // `needs_prompt`'s crash-recovery clause doesn't spuriously
@@ -3057,7 +3057,7 @@ impl Runner {
             // genuinely stale `shown`, not for "immediately after I
             // logged this myself").
             self.shown = self.spine.leaf_id.as_u64();
-            self.done = false;
+            self.finished = false;
         }
         self.phase = Phase::Idle;
         out.extend(self.prompt_if_needed(tree)?);
@@ -4433,7 +4433,7 @@ impl Runner {
     /// not by stepping: the code vector grows in front of it, and only then is
     /// there anything to execute.
     fn drive_notebook(&mut self, tree: &mut Tree) -> io::Result<Vec<StepOutput>> {
-        // **A halted program is driven no further.** `done`/`stop`
+        // **A halted program is driven no further.** `finish`/`stop`
         // ended it part-way through this reply; what is left of the
         // reply is logged (by `notebook_feed`, before this is reached)
         // and then dropped unrun. This is the one door the rest of the
@@ -4639,7 +4639,7 @@ impl Runner {
         }
         // **The reply is over however it ended**, so the notebook it
         // was filling is closed too. Without this a program that had
-        // already halted itself (`done`/`stop`) and was waiting for the
+        // already halted itself (`finish`/`stop`) and was waiting for the
         // last of its own reply would wait forever: cancellation is the
         // one ending that does not come through `notebook_stream_end`,
         // which is where every other reply gets its `end()`.
@@ -4665,7 +4665,7 @@ impl Runner {
     /// - `Raised`, `Posted` — keep streaming. The model knew it was
     ///   asking; a message arriving falsifies nothing it wrote. The
     ///   cells after the raise run when the answer lands.
-    /// - `done(text)`, `stop(reason)` — halt rather than park, so they
+    /// - `finish(text)`, `stop(reason)` — halt rather than park, so they
     ///   never reach here. Everything after them is waste by the same
     ///   argument, but the ending is applied when the reply closes
     ///   (`Run::halted`), and closing it early would hand that ending
@@ -4950,9 +4950,9 @@ mod tests {
             // Enough arguments that the arity-checked verbs compile;
             // nothing here runs past the first call, and a complaint
             // about the *arguments* is a real answer for this purpose.
-            // `done` and `stop` are effects: they halt the VM rather
+            // `finish` and `stop` are effects: they halt the VM rather
             // than settling a call, so there is no answerer to find.
-            if *verb == "done" || *verb == "stop" {
+            if *verb == "finish" || *verb == "stop" {
                 continue;
             }
             let src = if *verb == "fork" {
@@ -5305,7 +5305,7 @@ mod tests {
     // the conversation never turned after a program finished (gap 2).
     // These four pin the fix, one per named acceptance case.
 
-    /// **Superseded by the `done(text)` change**: this used to pin
+    /// **Superseded by the `finish(text)` change**: this used to pin
     /// `Transport::Program`'s own regression guard — completing a
     /// program was a silent no-op by default (this file's old words in
     /// `finish_program`), and only `Transport::RunProgram` continued.
@@ -5313,8 +5313,8 @@ mod tests {
     /// `finish_program`'s current comment): the dominant observed
     /// failure across every card variant and both models is a program
     /// that does one step and stops, so completing now continues on
-    /// *both* transports unless the program called `done(text)`. What was
-    /// this test's assertion is now `done_ends_the_conversation`'s; this
+    /// *both* transports unless the program called `finish(text)`. What was
+    /// this test's assertion is now `finish_ends_the_conversation`'s; this
     /// one instead pins the new default.
     #[test]
     fn a_completed_program_continues_by_default() {
@@ -5332,43 +5332,43 @@ mod tests {
                 .iter()
                 .any(|o| matches!(o, StepOutput::LlmRequest(_))),
             "a completed program continues by default now, on both \
-             transports, unless it called done(text): {settled:?}"
+             transports, unless it called finish(text): {settled:?}"
         );
         assert!(!state.is_idle());
     }
 
-    /// `done(text)` is the one thing that rests the branch: the mirror
+    /// `finish(text)` is the one thing that rests the branch: the mirror
     /// image of the test above, same shape, only the program's text
     /// differs.
     #[test]
-    fn done_ends_the_conversation() {
+    fn finish_ends_the_conversation() {
         let (mut tree, mut state) = setup_under();
         user_post(&mut state, &mut tree, "go");
         let out = state
-            .step(&mut tree, StepInput::LlmResponse(llm_program("done(\"ok\");\n")))
+            .step(&mut tree, StepInput::LlmResponse(llm_program("finish(\"ok\");\n")))
             .unwrap();
         let settled = drain(&mut state, &mut tree, out);
         assert!(
             !settled
                 .iter()
                 .any(|o| matches!(o, StepOutput::LlmRequest(_))),
-            "done(text) ends the conversation with no further request: {settled:?}"
+            "finish(text) ends the conversation with no further request: {settled:?}"
         );
         assert!(state.is_idle());
     }
 
-    /// `done(text)` settles at dispatch (like `spawn`/`fork`), so it is
+    /// `finish(text)` settles at dispatch (like `spawn`/`fork`), so it is
     /// recorded on the `Runner` well before the program's own
     /// completion is known — a call after it in the same program (here,
     /// a `tell()`) must not un-record it.
     #[test]
-    fn done_is_recorded_before_the_program_ends() {
+    fn finish_is_recorded_before_the_program_ends() {
         let (mut tree, mut state) = setup_under();
         user_post(&mut state, &mut tree, "go");
         let out = state
             .step(
                 &mut tree,
-                StepInput::LlmResponse(llm_program("done(\"ok\"); tell(\"wrapping up now\");")),
+                StepInput::LlmResponse(llm_program("finish(\"ok\"); tell(\"wrapping up now\");")),
             )
             .unwrap();
         let settled = drain(&mut state, &mut tree, out);
@@ -5376,7 +5376,7 @@ mod tests {
             !settled
                 .iter()
                 .any(|o| matches!(o, StepOutput::LlmRequest(_))),
-            "a statement after done(text) must not cancel it: {settled:?}"
+            "a statement after finish(text) must not cancel it: {settled:?}"
         );
         assert!(state.is_idle());
     }
@@ -6043,7 +6043,7 @@ mod tests {
 
     /// **A stop skips the rest of the reply, blocks and prose alike.**
     ///
-    /// This is the whole difference from `done(text)`, which sets a flag and
+    /// This is the whole difference from `finish(text)`, which sets a flag and
     /// lets everything after it run — the card has a worked bug about
     /// exactly that. A program that has found out it cannot finish must
     /// not go on to write the file it was about to write.
@@ -6500,7 +6500,7 @@ mod tests {
         let (mut tree, mut state) = setup();
         state.kickoff(&mut tree).unwrap();
         let out = state
-            .step(&mut tree, StepInput::LlmResponse(llm_program("done(\"ok\");")))
+            .step(&mut tree, StepInput::LlmResponse(llm_program("finish(\"ok\");")))
             .unwrap();
         drain(&mut state, &mut tree, out);
         let handback = state
@@ -6706,7 +6706,7 @@ mod tests {
         let src = "const parsed = {};\n\
                    try { await tools.write_file(\"out.py\", parsed.missing); }\n\
                    catch (e) { tell(`refused: ${e}`); }\n\
-                   done(\"ok\");";
+                   finish(\"ok\");";
         let out = state
             .step(&mut tree, StepInput::LlmResponse(llm_program(src)))
             .unwrap();
@@ -7579,14 +7579,14 @@ mod tests {
     fn a_prose_send_settles_exactly_once() {
         let (mut tree, mut state) = setup_under();
         user_post(&mut state, &mut tree, "go");
-        let reply = "Just a sentence.\n\n```js\ndone(\"ok\");\n```\n";
+        let reply = "Just a sentence.\n\n```js\nfinish(\"ok\");\n```\n";
         let out = state
             .step(&mut tree, StepInput::LlmResponse(llm_program(reply)))
             .unwrap();
         let outs = drain(&mut state, &mut tree, out);
 
         // The host is handed the send to deliver, exactly once. Two
-        // sends leave this reply — the prose and the `done("ok")` that
+        // sends leave this reply — the prose and the `finish("ok")` that
         // ends it — and only the first is what this test is about.
         let delivered: Vec<EventId> = outs
             .iter()
@@ -7814,7 +7814,7 @@ mod tests {
     /// implemented to make it: with no `Turn` and no outcome logged,
     /// `last_turn_outcome` finds nothing and `needs_prompt` is false on
     /// both clauses — a `Send` is not a `Post`. That is bit-for-bit the
-    /// state `done(text)` produces.
+    /// state `finish(text)` produces.
     ///
     /// The model still **speaks**: silence is a branch that produces
     /// nothing, and this one produced an answer.
@@ -8041,11 +8041,11 @@ mod tests {
         let out = state
             .step(
                 &mut tree,
-                StepInput::LlmResponse(llm_program("let a = 1; done(\"ok\");")),
+                StepInput::LlmResponse(llm_program("let a = 1; finish(\"ok\");")),
             )
             .unwrap();
         drain(&mut state, &mut tree, out);
-        assert!(state.is_idle(), "done(text) rests");
+        assert!(state.is_idle(), "finish(text) rests");
 
         // Then the person asks a question, and it is answered in prose.
         user_post(&mut state, &mut tree, "what does that mean?");
@@ -8069,7 +8069,7 @@ mod tests {
 
     /// **A continuation that ran nothing did stop short.** Nobody asked
     /// it anything; it was carrying on its own work and ended without a
-    /// `done(text)`.
+    /// `finish(text)`.
     #[test]
     fn a_continuation_that_ran_nothing_is_asked_again() {
         let (mut tree, mut state) = setup_under();
@@ -8181,11 +8181,11 @@ mod tests {
 
         let report = last_report(&state, &tree);
         assert!(report.contains("history.append"), "{report}");
-        assert!(report.contains("done("), "{report}");
+        assert!(report.contains("finish("), "{report}");
     }
 
-    /// `done(text)` does not stop anything (D8): the cells after it still
-    /// **`done` halts, and that is the whole difference from before.**
+    /// `finish(text)` does not stop anything (D8): the cells after it still
+    /// **`finish` halts, and that is the whole difference from before.**
     ///
     /// It used to set a flag and let every block after it run, which
     /// needed a card paragraph and a worked bug to explain — and 51
@@ -8193,10 +8193,10 @@ mod tests {
     /// including a `replace_file` that happened once the program had
     /// already decided it was finished.
     #[test]
-    fn done_in_cell_0_stops_the_later_cells() {
+    fn finish_in_cell_0_stops_the_later_cells() {
         let (mut tree, mut state) = setup_under();
         user_post(&mut state, &mut tree, "go");
-        let reply = "```js\ndone(\"ok\");\n```\n\n\
+        let reply = "```js\nfinish(\"ok\");\n```\n\n\
                      ```js\nconsole.log(\"must not run\");\n```\n";
         let out = state
             .step(&mut tree, StepInput::LlmResponse(llm_program(reply)))
@@ -8212,7 +8212,7 @@ mod tests {
             .collect();
         assert!(
             !printed.iter().any(|l| l.contains("must not run")),
-            "the block after done() must not run: {printed:?}"
+            "the block after finish() must not run: {printed:?}"
         );
         // And the answer reached the person.
         assert!(
@@ -8220,7 +8220,7 @@ mod tests {
                 &e.payload,
                 EventPayload::Call(Call::Send { text, .. }) if text == "ok"
             )),
-            "done's text goes out as the last word"
+            "finish's text goes out as the last word"
         );
     }
 
@@ -8386,7 +8386,7 @@ mod tests {
         user_post(&mut state, &mut tree, "go");
         state.phase = Phase::AwaitingLlm;
 
-        let reply = "Here is the answer.\n\n```js\ndone(\"ok\");\n```\n";
+        let reply = "Here is the answer.\n\n```js\nfinish(\"ok\");\n```\n";
         stream_chunks(&mut state, &mut tree, &[reply]);
         // Stand in for the run having already ended, which is what the
         // real ordering does — every one of the twelve empty-text
@@ -8495,7 +8495,7 @@ mod tests {
         );
     }
 
-    /// **`done(text)` halts, and the cells after it never run** (D8,
+    /// **`finish(text)` halts, and the cells after it never run** (D8,
     /// D11) — which is the whole difference from the verb that used to
     /// settle and carry on. What it does *not* do is cancel the
     /// generation: the reply keeps arriving, every part of it is logged
@@ -8503,12 +8503,12 @@ mod tests {
     /// closes on the `ReplyEnd` that carries what the completion cost.
     /// Written but not run is a state the log can say, and this is it.
     #[test]
-    fn done_in_a_cell_skips_the_cells_after_it() {
+    fn finish_in_a_cell_skips_the_cells_after_it() {
         let (mut tree, mut state) = setup_under();
         user_post(&mut state, &mut tree, "go");
         state.phase = Phase::AwaitingLlm;
 
-        stream_chunks(&mut state, &mut tree, &["```js\ndone(\"ok\");\n```\n"]);
+        stream_chunks(&mut state, &mut tree, &["```js\nfinish(\"ok\");\n```\n"]);
         assert!(
             !state.notebook_cancels_generation(),
             "halting is not parking: the reply is still allowed to arrive"
@@ -8522,7 +8522,7 @@ mod tests {
         stream_chunks(
             &mut state,
             &mut tree,
-            &["\n```js\ntell(\"after done\");\n```\n"],
+            &["\n```js\ntell(\"after finish\");\n```\n"],
         );
         let out = state
             .step(&mut tree, StepInput::LlmResponse(llm_program("")))
@@ -8531,22 +8531,22 @@ mod tests {
 
         let wrote_it = state.agent_segment(&tree).iter().any(|e| {
             matches!(&e.payload, EventPayload::Part { part: Part::Cell(src), .. }
-                if src.contains("after done"))
+                if src.contains("after finish"))
         });
-        assert!(wrote_it, "the cell it wrote after `done` is on the log");
+        assert!(wrote_it, "the cell it wrote after `finish` is on the log");
         let ran_it = state.agent_segment(&tree).iter().any(|e| {
             matches!(&e.payload, EventPayload::Call(Call::Send { text, .. })
-                if text == "after done")
+                if text == "after finish")
         });
-        assert!(!ran_it, "nothing after `done(text)` runs");
+        assert!(!ran_it, "nothing after `finish(text)` runs");
 
-        // And the turn is a whole one: what `done` said, then the end of
+        // And the turn is a whole one: what `finish` said, then the end of
         // the reply, then the terminal.
         let said = state.agent_segment(&tree).iter().any(|e| {
             matches!(&e.payload, EventPayload::Call(Call::Send { text, .. })
                 if text == "ok")
         });
-        assert!(said, "`done(text)` says its text");
+        assert!(said, "`finish(text)` says its text");
         let segment = state.agent_segment(&tree);
         assert!(
             segment
@@ -8559,7 +8559,7 @@ mod tests {
         );
         assert!(
             !state.needs_prompt(&tree),
-            "`done(text)` rests the branch"
+            "`finish(text)` rests the branch"
         );
     }
 
@@ -8836,7 +8836,7 @@ mod tests {
         let (mut tree, mut state) = setup();
         user_post(&mut state, &mut tree, "go");
         let out = state
-            .step(&mut tree, StepInput::LlmResponse(llm_program("done(\"ok\");\n")))
+            .step(&mut tree, StepInput::LlmResponse(llm_program("finish(\"ok\");\n")))
             .unwrap();
         drain(&mut state, &mut tree, out);
 
@@ -9256,7 +9256,7 @@ mod tests {
         let out = state
             .step(
                 &mut tree,
-                StepInput::LlmResponse(llm_program_thinking("done(\"ok\");\n", "still thinking", 55)),
+                StepInput::LlmResponse(llm_program_thinking("finish(\"ok\");\n", "still thinking", 55)),
             )
             .unwrap();
         drain(&mut state, &mut tree, out);

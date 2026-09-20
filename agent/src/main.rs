@@ -313,7 +313,7 @@ fn open_tree_read_only(path: &str) -> Result<Tree, String> {
 /// **And only the role.** It used to end "reply with your final answer
 /// when done", which is chat idiom and contradicts the card twice over
 /// in the same clause: there is no final-answer reply here — the
-/// answer is a `tell` and the ending is `done(text)` — and "when done"
+/// answer is a `tell` and the ending is `finish(text)` — and "when done"
 /// reads as the name of the function that does something else. It sits
 /// last in the system message, after the card and the listing, which is
 /// the most recency-weighted position in the prompt; a sentence there
