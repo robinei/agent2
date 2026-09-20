@@ -434,6 +434,35 @@ rendered as `string` is an invitation to guess, and a filter is the
 one place where a wrong guess returns a plausible answer instead of an
 error.
 
+## The edit that eats an indent, one branch further on
+
+Ten kept runs hit an `IndentationError`; six of them failed for it.
+Three wrote the same call:
+
+    Edit.replaceCount(text, '@unittest.skip("rates were in flux")\n', "")
+
+against `    @unittest.skip(…)\n    def test_base_rate(self):`. The
+four spaces before the `@` survive, the `def` keeps its own, and the
+method ends up defined eight columns in with a body no longer indented
+relative to it.
+
+Two things had to be wrong at once for that to land. `replaceCount`
+had **no indentation check at all** — and it is the verb a program
+reaches for to strip a decorator from several methods at once, which
+is this edit once per method. And the check its siblings do have
+required `new` to *begin* with the same indentation, the case where
+the two collide; an empty `new` orphans the indentation instead. Same
+corruption, one branch further on, and the guard written for the
+family missed the member that was actually being written.
+
+The remaining seven have other causes — line splicing through bash,
+heredocs — and are not this.
+
+Worth noticing about the shape: the first version of this guard was
+written from two live incidents and generalised from exactly those
+two. The third incident was the same mistake with one detail changed.
+A guard written from examples covers the examples.
+
 ## Rows that said the same thing whichever way it went
 
 The narrow-channel shape has a mirror image, and it took a second pass
