@@ -168,22 +168,44 @@ win.** Fisher's exact on 36/37 against 56/63 gives p = 0.25: the drop
 is not distinguishable from chance, and it is not evidence of safety
 either.
 
-**Three more arms did not settle it.** 40 further runs at later HEADs
-came back 34/40, which pools to **90/103 (87%) against the baseline's
-36/37**, p = 0.11. Four sets of arms now, the same direction each
+**Four more arms, and the last one is the first clean read.** 54
+further runs came back 47/54, pooling to **103/117 (88%) against the
+baseline's 36/37**, p = 0.12.
+
+The last of them is the only arm built after every fix the night
+produced, and it came back **13/14 (93%)** — against the baseline's
+36/37 that is p = 0.48, indistinguishable. Its one loss is a `sweep-8`
+run that spent a single enormous reply on an AST analysis and was cut
+off part-way through it, having written nothing.
+
+On cost that arm is the strongest result of the night, on passing runs
+only, mean of task means:
+
+| task | baseline | night5 |
+|---|---|---|
+| ambiguous-config | 2.2 | 2.0 |
+| dead-code-sweep | 6.7 | 2.0 |
+| plain-question | 1.0 | 1.0 |
+| skipped-tests | 5.8 | 2.5 |
+| sweep-200 | 10.5 | 6.5 |
+| sweep-40 | 5.3 | 3.0 |
+| sweep-8 | 6.2 | 2.0 |
+| **mean of task means** | **5.4** | **2.7 (−50%)** |
+
+Every task down or flat, none up. Two runs per task, so the figure is
+soft and the direction is not. Five sets of arms now, the same direction each
 time, and never significant — which is what a small real effect and a
 small sample look like from the outside, and also what noise looks
 like.
 
-Worth saying plainly: **every arm was built before some of its own
-failures had their causes fixed.** Of the six losses across the three,
-five now have a fix in the tree that did not exist when they ran — a
-no-op write nobody could see, an async IIFE that silently left calls
-in flight, an `outline` enum whose commonest guess matched nothing, an
-edit that ate an indent, and a spread that refused an array-like. The
-sixth is a judgement error. So none of these is a read on the current
-tree, and the honest state of the pass rate is that it has not been
-measured since the fixes landed.
+Worth saying plainly about the middle three: **each was built before
+some of its own failures had their causes fixed.** Of the six losses
+across them, five now have a fix in the tree that did not exist when
+they ran — a no-op write nobody could see, an async IIFE that silently
+left calls in flight, an `outline` enum whose commonest guess matched
+nothing, an edit that ate an indent, and a spread that refused an
+array-like. The sixth is a judgement error. That is what the last arm
+was for.
 
 What can be said about the original drop:
 
