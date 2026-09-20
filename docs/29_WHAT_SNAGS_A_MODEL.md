@@ -714,3 +714,16 @@ Two consequences worth carrying:
   removed a round trip — the orientation program, the re-read, the
   compaction that could not help, the reply spent on a trap. Nothing
   that shaved bytes off a turn showed up in the totals at all.
+
+  The opening listing is the cleanest case, measured on the call
+  rather than on the outcome. Does the first program run `ls` or
+  `find`?
+
+  | | first program orients |
+  |---|---|
+  | baseline (`baseline`, `base2`) | 26/31 |
+  | with the listing (`sweeps`, `sweeps2`) | **2/20** |
+
+  p = 2×10⁻⁷. Four lines of directory in the system message, and 84%
+  of runs stop spending a completion to find out what is in front of
+  them.
