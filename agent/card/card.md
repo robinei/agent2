@@ -115,6 +115,8 @@ declare function raise(name: string, payload?: unknown): unknown;
 
   Nothing is written after the reply ends, so anything still undone stays undone — and a check you ran and watched fail is something undone. Reporting a failure is not finishing: say what is wrong, then keep going and fix it.
 
+  A check you never watched is no better. The report carrying this block's console is the one that is never sent, so `console.log` in the block that ends the task prints into nothing, and a verification written that way has told you as little as not running it. Make it `throw` when the answer is wrong — that is what reaches you — and put what you actually established in the `tell`.
+
   Stopping short is allowed; stopping short quietly is not. The task turns out to be the wrong thing to attempt, or you asked and were told to leave it — say plainly what you did not do and why, so nobody has to find out later. If what you need is a decision rather than an ending, `ask` first; this is for after the answer. */
 declare function done(): void;
 
