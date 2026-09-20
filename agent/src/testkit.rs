@@ -42,6 +42,22 @@
 //! ([`Invariant`]), so a test written about one thing still fails when
 //! something else breaks underneath it. That is where the doubled reply
 //! would have been caught in eighty tests instead of one.
+//!
+//! **It pays on the way in, not only afterwards.** Porting the existing
+//! tests to this shape found two live bugs on the first afternoon, both
+//! because the harness drives what the host drives rather than what the
+//! old test happened to drive:
+//!
+//! - A cell ending in a fire-and-forget `tell` ended the whole reply.
+//!   The old streaming tests pumped ticks but never handed back the
+//!   settlements the host hands back, so the reply never reached the
+//!   state that breaks
+//!   ([`tests::settling_a_cells_last_tell_does_not_end_the_reply`]).
+//! - Writing [`Invariant::SitesAreReplyAbsolute`] turned up the case it
+//!   does not hold in — a handler's reply and the program it wakes
+//!   produce events at once, and a span can only be read against the
+//!   reply it came from. Which is a fact about the design that was
+//!   nowhere written down.
 
 use std::collections::HashMap;
 
