@@ -33,7 +33,8 @@ is a judgement rather than a repair:
    the lever for it is the card. It is the small lever either way:
    6.7% of bytes, against round trips that cost whole completions.
 
-3. **A twentieth of the card is unmeasured.** `spawn`, `fork`,
+3. **A twentieth of the card is unmeasured**, though one probe now
+   says the mechanism works. `spawn`, `fork`,
    `list_agents`, `answer`, the `Agent` type and the two-argument
    `tell` come to 923 bytes, 4.9% of the card, on every turn of every
    run — and not one program in 295 kept runs calls any of them. The
@@ -43,6 +44,24 @@ is a judgement rather than a repair:
    second agent, or accept that a twentieth of the prompt is carried
    on faith. Deleting it is a third, and the wrong one — it would
    remove a capability rather than test it.
+
+   Two live probes, one completion each, settled the functional half
+   and found a snag in passing. Told to spawn a helper and ask it
+   `17*23`, the model did exactly that and the answer came back — the
+   vocabulary works end to end against a real provider. But the helper
+   then spent **two more completions and 691 output tokens** doing
+   nothing: `answer(11, "391")` discharges the question and the block
+   carrying it is still a block, so the reply earned another turn. It
+   wrote prose, got the "your last reply ran nothing" nudge — correct
+   advice, wrong situation — and only then said `done()`. Three
+   completions for a one-line answer.
+
+   The second probe confirmed the fix before it was written: a helper
+   whose charter told it to `done()` after answering used one
+   completion per question, and a later `ask` woke it with everything
+   it knew still in front of it. `answer`'s entry in the card says so
+   now. It is the kind of thing that only shows up when the path is
+   actually run, which is the argument for the eval task.
 
 4. **The local model.** `Qwen3.8-27B` works and is far too slow for the
    suite — 450 seconds a program, a `skipped-tests` run capped out

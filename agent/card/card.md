@@ -72,7 +72,9 @@ declare function ask(who: "user" | Agent, text: string): Promise<string>;
   An answer that is none of them fails the call with their words. The reply you write next decides what they meant: `resume(<one of the options>)` puts a value back in place of this call and runs on from here, or handle it some other way. */
 declare function choose(who: "user" | Agent, text: string, options: string[]): Promise<string>;
 
-/** Discharge an `ask()` or `choose()` another agent is blocked on, by its id. A `choose` takes one of the options it offered and nothing else. */
+/** Discharge an `ask()` or `choose()` another agent is blocked on, by its id. A `choose` takes one of the options it offered and nothing else.
+
+  Answering is not resting. The block carrying this is still a block, so the reply still earns another turn, and an agent whose whole job was that answer spends a completion finding out it has nothing left to do. Say `done()` in the same block: a later `ask` or `tell` wakes it with everything it knew still in front of it. */
 declare function answer(question: number, value: unknown): void;
 
 /** A new agent with a clean context. Creating is not messaging: it is idle until you `tell` or `ask` the handle. */
