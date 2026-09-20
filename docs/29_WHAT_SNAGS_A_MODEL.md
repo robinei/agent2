@@ -335,6 +335,22 @@ as a route around something.** The card forbade the copy, the worked
 example was fixed, the report now names it — and none of that would
 have helped while looking at a file whole was impossible any other way.
 
+### The waste it removed, measured
+
+The same file read twice inside one reply — the thing the
+redeclaration diagnostic was catching all along:
+
+| | read_file calls | repeats of the same path in one reply |
+|---|---|---|
+| baseline | 95 | 7 (7%) |
+| HEAD, suite 1 | 91 | 0 |
+| HEAD, suite 2 | 120 | 1 (1%) |
+
+Not from the message, which changed after both suites: from the report
+that now shows what an earlier block already did, and from the console
+that now returns a file whole rather than its last twenty lines. A
+model that can see what it has does not fetch it again.
+
 ## What is left, and the one decision I did not make
 
 Traps after the night, over 58 runs: twelve, all singletons, and not
