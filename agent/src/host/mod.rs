@@ -4517,8 +4517,13 @@ mod tests {
             .events
             .values()
             .find(|e| {
-                matches!(&e.payload,
-                    EventPayload::Call(Call::Send { expects_reply: true, .. }))
+                matches!(
+                    &e.payload,
+                    EventPayload::Call(Call::Send {
+                        expects_reply: true,
+                        ..
+                    })
+                )
             })
             .map(|e| e.id)
             .expect("the Send");
@@ -5059,9 +5064,7 @@ mod tests {
         let (session, _rx) = open(
             tree_with_answered_root(),
             vec![
-                scripted_program(
-                    r#"const n = await ask("user", "how many?"); history.append(n);"#,
-                ),
+                scripted_program(r#"const n = await ask("user", "how many?"); history.append(n);"#),
                 scripted_program(r#"history.append("a fresh turn");"#),
             ],
         );

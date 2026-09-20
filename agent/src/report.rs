@@ -2327,12 +2327,7 @@ mod tests {
     /// was more than half of a 7,668-byte conversation.
     #[test]
     fn the_compaction_directive_says_how_much_is_actually_yours() {
-        let with = compaction_message(
-            35_552,
-            42_000,
-            crate::types::Measure::Bytes,
-            Some(27_797),
-        );
+        let with = compaction_message(35_552, 42_000, crate::types::Measure::Bytes, Some(27_797));
         assert!(with.contains("27797 is the card"), "{with}");
         assert!(
             with.contains("conversation itself is 7755"),

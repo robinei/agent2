@@ -152,9 +152,7 @@ pub fn script_of(tree: &Tree, leaf: EventId) -> Result<Script, String> {
                 crate::types::Part::Prose(t) | crate::types::Part::Cell(t) => {
                     replies.entry(*reply).or_default().push_str(t)
                 }
-                crate::types::Part::Thinking(t) => {
-                    thinking.entry(*reply).or_default().push_str(t)
-                }
+                crate::types::Part::Thinking(t) => thinking.entry(*reply).or_default().push_str(t),
             }
         }
     }
@@ -278,7 +276,8 @@ pub fn run(script: &Script) -> Replayed {
                 eprintln!(
                     "TRACE call {expected_name}({}) -> {:?}",
                     brief(args),
-                    next.as_ref().map(|c| (c.name.clone(), brief(&c.args), c.outcome.is_some()))
+                    next.as_ref()
+                        .map(|c| (c.name.clone(), brief(&c.args), c.outcome.is_some()))
                 );
             }
             match next {
@@ -389,8 +388,16 @@ pub fn compare(was: &Said, now: &Said) -> Vec<Divergence> {
             });
         }
     };
-    note("prose", format!("{:?}", was.prose), format!("{:?}", now.prose));
-    note("tells", format!("{:?}", was.tells), format!("{:?}", now.tells));
+    note(
+        "prose",
+        format!("{:?}", was.prose),
+        format!("{:?}", now.prose),
+    );
+    note(
+        "tells",
+        format!("{:?}", was.tells),
+        format!("{:?}", now.tells),
+    );
     note(
         "rows",
         format!("{:?}", was.values()),
@@ -504,7 +511,10 @@ mod tests {
     #[test]
     fn a_run_replays_to_the_same_conversation() {
         let mut c = Conversation::new();
-        c.answers("read_file", serde_json::json!({ "content": "NEW", "version": 1 }));
+        c.answers(
+            "read_file",
+            serde_json::json!({ "content": "NEW", "version": 1 }),
+        );
         c.answers("bash", serde_json::json!({ "status": 0, "stdout": "ok\n" }));
         c.user("is PATH right, and does the check pass?");
         c.reply(
@@ -523,7 +533,12 @@ mod tests {
         let was = Said::of_branch(c.tree(), leaf);
         let now = run(&script);
         assert_eq!(now.drift, None, "the replay followed the run");
-        assert_eq!(compare(&was, &now.said).len(), 0, "{:#?}", compare(&was, &now.said));
+        assert_eq!(
+            compare(&was, &now.said).len(),
+            0,
+            "{:#?}",
+            compare(&was, &now.said)
+        );
         assert_eq!(now.said.tells, ["PATH says NEW and the check passes."]);
         assert_eq!(now.said.ended, Ending::Finished);
     }
@@ -550,7 +565,12 @@ mod tests {
         let was = Said::of_branch(c.tree(), leaf);
         let now = run(&script);
         assert_eq!(now.drift, None, "the replay followed the run");
-        assert_eq!(compare(&was, &now.said).len(), 0, "{:#?}", compare(&was, &now.said));
+        assert_eq!(
+            compare(&was, &now.said).len(),
+            0,
+            "{:#?}",
+            compare(&was, &now.said)
+        );
         assert_eq!(now.said.tells, ["picked B."]);
     }
 
@@ -588,7 +608,11 @@ mod tests {
         };
         let path = std::path::PathBuf::from(path);
         let tree = crate::open_tree_read_only(path.to_str().unwrap()).expect("a readable log");
-        let leaf = tree.list_leaves().first().map(|(l, _)| *l).expect("a branch");
+        let leaf = tree
+            .list_leaves()
+            .first()
+            .map(|(l, _)| *l)
+            .expect("a branch");
         let script = script_of(&tree, leaf).expect("a script");
         println!("{} steps, {} calls", script.steps.len(), script.calls.len());
         if script.names_ids {
@@ -629,7 +653,10 @@ mod tests {
         for d in compare(&was, &now.said) {
             println!("\n── {} ──\n  was {}\n  now {}", d.field, d.was, d.now);
         }
-        println!("\nwas ending {:?}\nnow ending {:?}", was.ended, now.said.ended);
+        println!(
+            "\nwas ending {:?}\nnow ending {:?}",
+            was.ended, now.said.ended
+        );
     }
 
     /// **The corpus sweep.** Ignored by default because it needs logs
@@ -692,9 +719,9 @@ mod tests {
                     if verbose {
                         println!("drift {:24} {}  {why}", "", path.display());
                     }
-                    examples.entry("drifted").or_insert_with(|| {
-                        format!("{}\n           {why}", path.display())
-                    });
+                    examples
+                        .entry("drifted")
+                        .or_insert_with(|| format!("{}\n           {why}", path.display()));
                 }
                 Ok(Ok(Verdict::Moved(diffs))) => {
                     read += 1;
@@ -729,7 +756,10 @@ mod tests {
              {drifted} stopped following the run, {id_bound} name event ids"
         );
         if drifted > 0 {
-            println!("\n{drifted:6}  drifted\n        e.g. {}", examples["drifted"]);
+            println!(
+                "\n{drifted:6}  drifted\n        e.g. {}",
+                examples["drifted"]
+            );
         }
         for (field, n) in &moved {
             println!("\n{n:6}  {field} moved");

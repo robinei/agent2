@@ -77,7 +77,11 @@ fn line_for(tree: &Tree, path: &[&Event], event: &Event) -> Option<String> {
             };
             // A post carrying a `Send` is that send arriving; the send
             // itself already printed on the other branch.
-            let arrow = if matches!(origin, Origin::Sent(_)) { "»" } else { "→" };
+            let arrow = if matches!(origin, Origin::Sent(_)) {
+                "»"
+            } else {
+                "→"
+            };
             format!("#{id} {who:<7}{arrow} {}", clip(text.trim()))
         }
         // **The harness asking for room, not the person asking for
@@ -100,8 +104,15 @@ fn line_for(tree: &Tree, path: &[&Event], event: &Event) -> Option<String> {
             match call {
                 // Prose is the agent talking; it reads as speech, not
                 // as a call, whatever the log calls it.
-                Call::Send { prose: true, text, .. } => format!("       ┆ {}", clip(text.trim())),
-                Call::Send { to, text, expects_reply, .. } => {
+                Call::Send {
+                    prose: true, text, ..
+                } => format!("       ┆ {}", clip(text.trim())),
+                Call::Send {
+                    to,
+                    text,
+                    expects_reply,
+                    ..
+                } => {
                     let mark = match (expects_reply, to) {
                         (true, _) => "?",
                         (false, Address::User) => "!",
@@ -110,7 +121,11 @@ fn line_for(tree: &Tree, path: &[&Event], event: &Event) -> Option<String> {
                     format!("#{id}    {mark} {}", clip(text.trim()))
                 }
                 Call::Invoke { name, args, .. } => {
-                    format!("#{id}    → {name}({}) {}", clip_args(args), outcome_tag(settled))
+                    format!(
+                        "#{id}    → {name}({}) {}",
+                        clip_args(args),
+                        outcome_tag(settled)
+                    )
                 }
                 Call::Spawn { charter, .. } => {
                     format!("#{id}    ✳ spawn «{}»", clip(charter.trim()))
@@ -123,12 +138,23 @@ fn line_for(tree: &Tree, path: &[&Event], event: &Event) -> Option<String> {
         }
         EventPayload::Console { lines } if !lines.is_empty() => console_block(lines),
         EventPayload::Answer { question, value } => {
-            format!("#{id}    ✓ answered #{}: {}", question.as_u64(), clip(&value.to_string()))
+            format!(
+                "#{id}    ✓ answered #{}: {}",
+                question.as_u64(),
+                clip(&value.to_string())
+            )
         }
         EventPayload::Compacted { of, text, window } => {
             let how = match (text, window) {
                 (Some(_), _) => "replaced",
-                (None, Some(w)) => return Some(format!("#{id}    ✂ #{} → window {}..{}", of.as_u64(), w.from, w.to)),
+                (None, Some(w)) => {
+                    return Some(format!(
+                        "#{id}    ✂ #{} → window {}..{}",
+                        of.as_u64(),
+                        w.from,
+                        w.to
+                    ));
+                }
                 (None, None) => "removed",
             };
             format!("#{id}    ✂ #{} {how}", of.as_u64())
@@ -140,9 +166,7 @@ fn line_for(tree: &Tree, path: &[&Event], event: &Event) -> Option<String> {
         // rested — so this asks the same question the closing line
         // does, one reply at a time.
         EventPayload::Handback { how, .. } => match how {
-            Handback::Completed if finished_here(path, event.id) => {
-                "       ✓ finished".to_owned()
-            }
+            Handback::Completed if finished_here(path, event.id) => "       ✓ finished".to_owned(),
             Handback::Completed => "       ⏎ handed on".to_owned(),
             Handback::Stopped { reason } => format!("       ⏹ stopped: {}", clip(reason)),
             Handback::Raised { name, .. } => format!("#{id}    ⏸ raised «{name}»"),
@@ -272,8 +296,7 @@ fn waiting_on(path: &[&Event]) -> String {
             "waiting on: the next reply, to resume the parked program or replace it".to_owned()
         }
         Some(Handback::Interrupted) => {
-            "waiting on: nothing — the last run went with its process, so say it again"
-                .to_owned()
+            "waiting on: nothing — the last run went with its process, so say it again".to_owned()
         }
         _ => "waiting on: nothing".to_owned(),
     }
@@ -286,7 +309,11 @@ fn open_ask<'a>(path: &[&'a Event]) -> Option<&'a Event> {
     path.iter().rev().copied().find(|e| {
         matches!(
             &e.payload,
-            EventPayload::Call(Call::Send { to: Address::User, expects_reply: true, .. })
+            EventPayload::Call(Call::Send {
+                to: Address::User,
+                expects_reply: true,
+                ..
+            })
         ) && settlement(path, e.id).is_none()
     })
 }
@@ -361,12 +388,11 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
                 .find(|l| tree.path_events(*l).iter().any(|e| e.id == id))
                 .ok_or_else(|| format!("#{n} is not on any branch of this log"))?
         }
-        None => {
-            tree.list_leaves()
-                .first()
-                .map(|(l, _)| *l)
-                .ok_or("the log has no branches to render")?
-        }
+        None => tree
+            .list_leaves()
+            .first()
+            .map(|(l, _)| *l)
+            .ok_or("the log has no branches to render")?,
     };
     print!("{}", render(&tree, leaf));
     Ok(())
@@ -464,7 +490,10 @@ mod tests {
     #[test]
     fn a_stop_reads_as_a_decision() {
         let mut c = Conversation::new();
-        c.answers("bash", serde_json::json!({ "status": 1, "stdout": "2 failed\n" }));
+        c.answers(
+            "bash",
+            serde_json::json!({ "status": 1, "stdout": "2 failed\n" }),
+        );
         c.user("is it green?");
         c.reply(
             "```js\nconst r = await tools.bash(\"make check\");\n\
@@ -490,7 +519,11 @@ mod tests {
         let out = render(c.tree(), c.runner().spine.leaf_id);
         let printed: Vec<&str> = out.lines().filter(|l| l.contains(" · ")).collect();
         assert_eq!(printed.len(), CONSOLE_ROWS + 1, "{printed:#?}");
-        assert!(printed[0].contains("line 1"), "the start is kept: {}", printed[0]);
+        assert!(
+            printed[0].contains("line 1"),
+            "the start is kept: {}",
+            printed[0]
+        );
         assert!(
             printed[CONSOLE_ROWS - CONSOLE_TAIL_ROWS].contains("… 48 more lines"),
             "and it says how much is missing: {}",
@@ -541,7 +574,14 @@ mod tests {
             .lines()
             .find(|l| l.contains(" ▸ "))
             .expect("the row is in the transcript");
-        assert!(row.len() < LINE_MAX + 60, "one line, bounded: {} chars", row.len());
-        assert!(row.contains("chars)"), "and it says how much there is: {row}");
+        assert!(
+            row.len() < LINE_MAX + 60,
+            "one line, bounded: {} chars",
+            row.len()
+        );
+        assert!(
+            row.contains("chars)"),
+            "and it says how much there is: {row}"
+        );
     }
 }

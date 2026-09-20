@@ -1879,9 +1879,7 @@ impl Runner {
                     // finishing reports to its parent without having to
                     // name it, which is the whole reason `finish` takes
                     // the text rather than leaving a `tell` beside it.
-                    let to = self
-                        .resolve_address(tree, None)
-                        .unwrap_or(Address::User);
+                    let to = self.resolve_address(tree, None).unwrap_or(Address::User);
                     let send = tree.append(
                         &mut self.spine,
                         EventPayload::Call(Call::Send {
@@ -2756,7 +2754,11 @@ impl Runner {
     /// (`document::pending_line`). This reads the log, so it reads the
     /// original. That asymmetry is the design: the document shrinks,
     /// the history does not.
-    pub(crate) fn fetch_history(&self, tree: &Tree, args: &[Value]) -> Result<serde_json::Value, String> {
+    pub(crate) fn fetch_history(
+        &self,
+        tree: &Tree,
+        args: &[Value],
+    ) -> Result<serde_json::Value, String> {
         let id = match args.first() {
             Some(Value::PosInt(n)) => *n,
             _ => return Err("history.fetch needs a numeric id".into()),
@@ -3163,11 +3165,9 @@ impl Runner {
                     ResumeWith::Raise,
                 )
             }
-            SuspendCause::Stopped { reason } => (
-                Handback::Stopped { reason },
-                0,
-                ResumeWith::Continue,
-            ),
+            SuspendCause::Stopped { reason } => {
+                (Handback::Stopped { reason }, 0, ResumeWith::Continue)
+            }
             SuspendCause::Trapped(e) => {
                 let site = span_at(&run.vm, e.ip as usize);
                 let cause = Handback::Trapped {
@@ -3643,13 +3643,14 @@ impl Runner {
                     // `compaction_message`. Rendering again costs a
                     // pass, and this runs once per compaction.
                     let fixed = matches!(unit, crate::types::Measure::Bytes).then(|| {
-                        let doc = crate::document::render(
-                            tree,
-                            &self.spine,
-                            self.document_budget(),
-                        );
+                        let doc =
+                            crate::document::render(tree, &self.spine, self.document_budget());
                         crate::compaction::rendered_size(&doc)
-                            - doc.conversation().iter().map(|m| m.content.len()).sum::<usize>()
+                            - doc
+                                .conversation()
+                                .iter()
+                                .map(|m| m.content.len())
+                                .sum::<usize>()
                     });
                     Some(crate::report::compaction_message(
                         *measured, *limit, *unit, fixed,
@@ -4731,10 +4732,7 @@ impl Runner {
     /// `ReplyEnd` reads `Finished` gives the model no reason for that —
     /// it reads its own last turn breaking off and has to invent one.
     /// `Interrupted` renders as a marker where the text stops.
-    pub fn notebook_generation_ended(
-        &mut self,
-        tree: &mut Tree,
-    ) -> io::Result<Vec<StepOutput>> {
+    pub fn notebook_generation_ended(&mut self, tree: &mut Tree) -> io::Result<Vec<StepOutput>> {
         if self.streaming_epoch.is_some() {
             self.reply_ended.get_or_insert(ReplyEnd::Interrupted);
         }
@@ -5304,7 +5302,8 @@ mod tests {
             "the span is the whole call"
         );
         assert!(
-            c.document().contains(&format!("/* ← history[{}] */", r.row().id.as_u64())),
+            c.document()
+                .contains(&format!("/* ← history[{}] */", r.row().id.as_u64())),
             "and the call points at the row it wrote: {}",
             c.document()
         );
@@ -5431,7 +5430,10 @@ mod tests {
         let (mut tree, mut state) = setup_under();
         user_post(&mut state, &mut tree, "go");
         let out = state
-            .step(&mut tree, StepInput::LlmResponse(llm_program("finish(\"ok\");\n")))
+            .step(
+                &mut tree,
+                StepInput::LlmResponse(llm_program("finish(\"ok\");\n")),
+            )
             .unwrap();
         let settled = drain(&mut state, &mut tree, out);
         assert!(
@@ -5645,14 +5647,24 @@ mod tests {
         let r = c.reply(
             "```js\nconst x = raise(\"need_help\", { got: 41 });\nhistory.append(x + 1);\n```\n",
         );
-        assert_eq!(r.ended, Ending::Raised { name: "need_help".into(), payload: Some(json!({ "got": 41 })) });
+        assert_eq!(
+            r.ended,
+            Ending::Raised {
+                name: "need_help".into(),
+                payload: Some(json!({ "got": 41 }))
+            }
+        );
         assert_eq!(c.status(), "suspended");
 
         // The handler answers with a program, not a direct host call —
         // `finish_program` is the one reading the tag off its
         // completion.
         let handled = c.reply("```js\nhistory.append(resume(41));\n```\n");
-        assert_eq!(handled.values(), [&json!(42)], "the raise resumed into its own expression");
+        assert_eq!(
+            handled.values(),
+            [&json!(42)],
+            "the raise resumed into its own expression"
+        );
         assert_eq!(c.status(), "idle");
 
         // A second raise, this time abandoned the same way — through a
@@ -5661,7 +5673,11 @@ mod tests {
         assert_eq!(c.status(), "suspended");
         let gave_up = c.reply("```js\nhistory.append(abandon());\n```\n");
         assert_eq!(c.status(), "idle");
-        assert_eq!(gave_up.ended, Ending::Abandoned, "the abandon is a logged handback");
+        assert_eq!(
+            gave_up.ended,
+            Ending::Abandoned,
+            "the abandon is a logged handback"
+        );
         // A decision is not a row: appending one records the verdict,
         // it does not write a note about it.
         assert!(
@@ -5960,7 +5976,11 @@ mod tests {
             "```js\nhistory.append((await fetch_history({})).length);\n```\n",
             id.as_u64()
         ));
-        assert_eq!(back.row().value, json!(n), "fetch hands back all {n} characters");
+        assert_eq!(
+            back.row().value,
+            json!(n),
+            "fetch hands back all {n} characters"
+        );
     }
 
     /// **A stop skips the rest of the reply, blocks and prose alike.**
@@ -6018,7 +6038,11 @@ mod tests {
         let shown = c.row_shown(id);
         assert!(shown.contains("TAIL"), "the window moved: {shown}");
         assert!(shown.len() < 200, "and it is small: {} bytes", shown.len());
-        assert_eq!(c.rows_named(id), 1, "a window moves a row, it does not add one");
+        assert_eq!(
+            c.rows_named(id),
+            1,
+            "a window moves a row, it does not add one"
+        );
 
         // The value behind it is untouched.
         let back = c.reply(&format!(
@@ -6041,7 +6065,11 @@ mod tests {
             "```js\nhistory.append(\"hello there\");\n\
              try { history.slice(4, 8, 2); } catch (e) { history.append(String(e)); }\n```\n",
         );
-        let said = r.values().last().and_then(|v| v.as_str()).unwrap_or_default();
+        let said = r
+            .values()
+            .last()
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
         assert!(said.contains("half-open"), "names the convention: {said}");
     }
 
@@ -6277,7 +6305,10 @@ mod tests {
     fn a_completed_handback_fetches_as_a_bare_name() {
         let mut c = Conversation::new();
         let r = c.reply("```js\nfinish(\"ok\");\n```\n");
-        assert_eq!(c.fetch(r.handback.expect("the handback")), json!("Completed"));
+        assert_eq!(
+            c.fetch(r.handback.expect("the handback")),
+            json!("Completed")
+        );
     }
 
     /// A `Note` and a program's own source come back too — the three
@@ -6370,7 +6401,9 @@ mod tests {
             c.allow(Invariant::CallsSettle);
             // Wrapped, because a rejected promise is an ordinary
             // outcome here too.
-            let r = c.reply(&format!("```js\ntry {{ {src} }} catch (e) {{ /* fine */ }}\n```\n"));
+            let r = c.reply(&format!(
+                "```js\ntry {{ {src} }} catch (e) {{ /* fine */ }}\n```\n"
+            ));
             // **And it has to have run.** A case that does not compile
             // exercises the parser and nothing else, which is how a
             // sweep like this quietly stops testing what it names.
@@ -6397,7 +6430,10 @@ mod tests {
              catch (e) { history.append(String(e.message || e)); }\n```\n",
         );
         let said = r.row().value.as_str().unwrap_or_default();
-        assert!(said.contains("#0"), "the id it asked for is named back to it: {said}");
+        assert!(
+            said.contains("#0"),
+            "the id it asked for is named back to it: {said}"
+        );
         assert!(said != "no throw", "and it is an error, not a silent pass");
     }
 
@@ -6425,7 +6461,9 @@ mod tests {
             r.calls
         );
         assert!(
-            r.tells.iter().any(|t| t.contains("argument 2 is `undefined`")),
+            r.tells
+                .iter()
+                .any(|t| t.contains("argument 2 is `undefined`")),
             "the program is told which argument, and that nothing ran: {:?}",
             r.tells
         );
@@ -6536,7 +6574,10 @@ mod tests {
             r.settled
         );
         assert!(
-            r.row().value.as_str().is_some_and(|t| t.contains("host is down")),
+            r.row()
+                .value
+                .as_str()
+                .is_some_and(|t| t.contains("host is down")),
             "and the reason reaches the program that catches it: {:?}",
             r.row().value
         );
@@ -7162,7 +7203,10 @@ mod tests {
             .iter()
             .filter(|(call, _)| c.site_of(*call) == (0, 0))
             .count();
-        assert_eq!(settlements, 2, "one delivery each, for the prose and the finish");
+        assert_eq!(
+            settlements, 2,
+            "one delivery each, for the prose and the finish"
+        );
     }
 
     /// A multi-paragraph report — the case this whole phase exists for —
@@ -7223,7 +7267,10 @@ mod tests {
              ```js\nconsole.log(`picked ${pick}`);\n```\n\n\
              ```js\nconsole.log(\"and the last cell ran\");\n```\n",
         );
-        assert!(matches!(r.ended, Ending::Raised { .. }), "a raise suspends the run");
+        assert!(
+            matches!(r.ended, Ending::Raised { .. }),
+            "a raise suspends the run"
+        );
 
         let after = c.resume(json!("the second one"));
         assert_eq!(
@@ -7304,9 +7351,16 @@ mod tests {
              nothing to change.\n\n```text\njust a quote, not a cell\n```\n",
         );
 
-        assert!(r.rests, "the model spoke and stopped: that is a finished turn");
+        assert!(
+            r.rests,
+            "the model spoke and stopped: that is a finished turn"
+        );
         assert!(r.cells.is_empty(), "a ```text block is a quote, not a cell");
-        assert!(r.prose[0].contains("already lives in `retry.rs`"), "{:?}", r.prose);
+        assert!(
+            r.prose[0].contains("already lives in `retry.rs`"),
+            "{:?}",
+            r.prose
+        );
         assert_eq!(
             r.kinds,
             // A cell-less reply is still a completion, and still what
@@ -7315,7 +7369,9 @@ mod tests {
             // path any more — so it closes with an outcome like any
             // other reply, and rests because no cell of its own was
             // ever logged for `last_turn_outcome` to find.
-            ["Reply", "Part", "ReplyEnd", "Call", "Handback", "Console", "Result"],
+            [
+                "Reply", "Part", "ReplyEnd", "Call", "Handback", "Console", "Result"
+            ],
             "the prose is delivered and nothing ran"
         );
     }
@@ -7674,7 +7730,11 @@ mod tests {
             "```js\nfinish(\"ok\");\n```\n\n\
              ```js\nconsole.log(\"must not run\");\n```\n",
         );
-        assert!(r.printed.is_empty(), "the block after finish() must not run: {:?}", r.printed);
+        assert!(
+            r.printed.is_empty(),
+            "the block after finish() must not run: {:?}",
+            r.printed
+        );
         assert_eq!(r.tells, ["ok"], "and the answer reached the person");
         assert!(r.rests, "finish's text goes out as the last word");
     }
@@ -7915,9 +7975,7 @@ mod tests {
     fn a_mid_stream_truncation_keeps_what_ran_and_reports_partial() {
         let mut c = Conversation::new();
         c.user("go");
-        c.chunk(
-            "```js\ntell(\"cell 0 ran\");\n```\n\nNext I will\n\n```js\nawait tools.read_fi",
-        );
+        c.chunk("```js\ntell(\"cell 0 ran\");\n```\n\nNext I will\n\n```js\nawait tools.read_fi");
         // The token budget ran out here.
         let r = c.truncate_reply();
 
@@ -8116,7 +8174,10 @@ mod tests {
         let (mut tree, mut state) = setup();
         user_post(&mut state, &mut tree, "go");
         let out = state
-            .step(&mut tree, StepInput::LlmResponse(llm_program("finish(\"ok\");\n")))
+            .step(
+                &mut tree,
+                StepInput::LlmResponse(llm_program("finish(\"ok\");\n")),
+            )
             .unwrap();
         drain(&mut state, &mut tree, out);
 
@@ -8490,7 +8551,11 @@ mod tests {
         let out = state
             .step(
                 &mut tree,
-                StepInput::LlmResponse(llm_program_thinking("finish(\"ok\");\n", "still thinking", 55)),
+                StepInput::LlmResponse(llm_program_thinking(
+                    "finish(\"ok\");\n",
+                    "still thinking",
+                    55,
+                )),
             )
             .unwrap();
         drain(&mut state, &mut tree, out);

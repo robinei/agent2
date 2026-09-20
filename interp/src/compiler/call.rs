@@ -708,8 +708,8 @@ impl super::Compiler {
                 self.compile_args(argv);
                 self.emit(Instr::Notify(name.into(), argv.len() as u32), span);
             }
-            "spawn" | "fork" | "list_agents" | "fetch_history" | "answer"
-            | "append_history" | "remove_history" | "replace_history" | "slice_history" => {
+            "spawn" | "fork" | "list_agents" | "fetch_history" | "answer" | "append_history"
+            | "remove_history" | "replace_history" | "slice_history" => {
                 // **The settle-at-dispatch verbs.** None of these leaves
                 // the frame that called it: the host answers each from
                 // the log or the tree it already has — `fetch_history`
@@ -1375,7 +1375,11 @@ fn is_empty_literal(argv: &[&ast::Expression<'_>]) -> bool {
                     // Cooked, not raw: in `` `\n` `` the raw text is a
                     // backslash and an `n`, and the thing the person
                     // would read is a newline.
-                    let text = q.value.cooked.as_ref().map_or(q.value.raw.as_str(), |c| c.as_str());
+                    let text = q
+                        .value
+                        .cooked
+                        .as_ref()
+                        .map_or(q.value.raw.as_str(), |c| c.as_str());
                     text.trim().is_empty()
                 })
         }
