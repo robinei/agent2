@@ -1,23 +1,38 @@
 Card variants, for arms the default card is measured against.
 
 The **default** card — no `--card` flag — is the shipped one,
-`agent/card/`: the `.d.ts` plus two exemplars. Everything here exists to
-be compared with it.
+`agent/card/`: the `.d.ts` plus five exemplars. Everything here exists
+to be compared with it.
 
-- `notebook/` — the markdown card for `AGENT2_TRANSPORT=notebook`:
-  prose at the top level, the API in one `ts` block, the tools appended
-  in a fence of their own. The shipped card stays a TypeScript document
-  because its own first line says the reply is JavaScript and nothing
-  else; which framing the generated manifest takes is read off the
-  card's first bytes (`card.rs`'s `full_card`).
+- `prose-answer/` — the shipped card plus one exemplar that runs
+  nothing. See its own README; it is the only variant here currently
+  runnable as an arm.
 
-- `ts/` — the shipped card with the two exemplars removed. The live
-  ablation: exemplars were measured at six runs in fifteen once, and
-  that number should be re-taken whenever the card changes shape.
+- `program/` and `ts/` — **both predate "one transport: the notebook"
+  and are not runnable as baselines.** Each opens by telling the model
+  its entire reply is a JavaScript program with no prose and no fences,
+  which this harness no longer parses: a run of either would produce a
+  reply with no cells in it and measure nothing about the card. Their
+  verbs were mechanically updated on 2026-09-20 (`stop(reason)` and
+  `finish(text)` are gone from the dialect, and the gate below compiles
+  every variant's exemplars), so they *look* current and are not.
+  Re-base them on the notebook transport before quoting a number from
+  either, or delete them.
 
-Deleted on 2026-09-20, recoverable from git: `short` (it taught `stop(reason)` and `finish(text)`, a vocabulary the harness stopped speaking, and its own entry here had already said it was not runnable as a baseline). Deleted on 2026-09-17: `mid`, `minimal`,
-`sketch`, `no-exemplars`, `short-noex`, `short-rp`, `short-scrappy`.
-Every one was an arm against a card that no longer exists — most of
-them still teaching `next_program`, a verb deleted in phase 27 — so a
-run of any of them would measure a system we do not have. Their results
-are in `docs/27_ONE_HISTORY.md`, which is the part worth keeping.
+  `ts/` is worth re-basing rather than dropping: it is not "the shipped
+  card minus exemplars" as this file used to claim, but an independent
+  minimal arm with its own argument — override priors only where the
+  dialect would silently betray them, and otherwise say nothing. That
+  question is still open.
+
+Deleted on 2026-09-20, recoverable from git: `short`, for the same
+reason — it taught `append_history`, `return value` and a vocabulary
+the harness stopped speaking, and its own entry here already said it
+was not runnable as a baseline.
+
+Deleted on 2026-09-17: `mid`, `minimal`, `sketch`, `no-exemplars`,
+`short-noex`, `short-rp`, `short-scrappy`. Every one was an arm against
+a card that no longer exists — most of them still teaching
+`next_program`, a verb deleted in phase 27 — so a run of any of them
+would measure a system we do not have. Their results are in
+`docs/27_ONE_HISTORY.md`, which is the part worth keeping.
