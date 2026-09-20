@@ -117,6 +117,15 @@ is a judgement rather than a repair:
    well served. Naming it would mean deciding what `tell` is for when
    the two readers want different things.
 
+   The other half of that surface is clean, which is worth knowing
+   before anyone goes looking. Prose reaches the person as it is
+   written, so deliberation in it is visible deliberation — and of
+   1,580 prose parts, 8 contain any ("Hmm", "wait", "maybe we
+   should"), 0.5%. Two of those eight are the same confusion, about
+   whether a `console.log` from an earlier block in the same reply is
+   readable yet. That is a hint about which paragraph is hardest, on
+   an n of two.
+
 5. **The local model.** `Qwen3.8-27B` works and is far too slow for the
    suite — 450 seconds a program, a `skipped-tests` run capped out
    after two. Useful for watching behaviour, not for measuring it.
