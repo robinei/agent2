@@ -5430,34 +5430,19 @@ mod tests {
 
     #[test]
     fn raise_suspends_with_pushed_disposition_and_host_driven_resume_continues() {
-        let (mut tree, mut state) = setup();
-        state.kickoff(&mut tree).unwrap();
-        let src = r#"
-            const x = raise("need_help", { got: 41 });
-            history.append(x + 1);
-        "#;
-        let out = state
-            .step(&mut tree, StepInput::LlmResponse(llm_program(src)))
-            .unwrap();
-        drain(&mut state, &mut tree, out);
-        assert_eq!(state.status(), "suspended");
-
-        // A raise *pauses*: the handback is non-terminal, which is
-        // where `Disposition::Pushed` used to be stored separately.
-        let how = state
-            .agent_segment(&tree)
-            .iter()
-            .find_map(|e| match &e.payload {
-                EventPayload::Handback { how, .. } => Some(how.clone()),
-                _ => None,
-            })
-            .expect("a logged handback");
-        assert!(!how.is_terminal(), "{how:?}");
+        let mut c = Conversation::new();
+        let r = c.reply(
+            "```js\nconst x = raise(\"need_help\", { got: 41 });\nhistory.append(x + 1);\n```\n",
+        );
+        // A raise *pauses*: the run is still there to come back to,
+        // which is what `suspended` means and a terminal handback does
+        // not.
+        assert_eq!(c.status(), "suspended");
+        assert!(matches!(r.ended, Ending::Raised { .. }), "{:?}", r.ended);
 
         // The host, not the LLM, drives the continuation directly.
-        let out = state.resume(&mut tree, json!(41)).unwrap();
-        drain(&mut state, &mut tree, out);
-        assert!(last_report(&state, &tree).contains("42"));
+        let after = c.resume(json!(41));
+        assert_eq!(after.values(), [&json!(42)]);
     }
 
     #[test]
@@ -5555,71 +5540,33 @@ mod tests {
 
     #[test]
     fn a_tagged_completion_is_routed_to_resume_or_abandon() {
-        let (mut tree, mut state) = setup();
-        state.kickoff(&mut tree).unwrap();
-        let out = state
-            .step(
-                &mut tree,
-                StepInput::LlmResponse(llm_program(
-                    "const x = raise(\"need_help\", { got: 41 }); history.append(x + 1);",
-                )),
-            )
-            .unwrap();
-        drain(&mut state, &mut tree, out);
-        assert_eq!(state.status(), "suspended");
+        let mut c = Conversation::new();
+        let r = c.reply(
+            "```js\nconst x = raise(\"need_help\", { got: 41 });\nhistory.append(x + 1);\n```\n",
+        );
+        assert_eq!(r.ended, Ending::Raised { name: "need_help".into(), payload: Some(json!({ "got": 41 })) });
+        assert_eq!(c.status(), "suspended");
 
         // The handler answers with a program, not a direct host call —
         // `finish_program` is the one reading the tag off its
         // completion.
-        let out = state
-            .step(
-                &mut tree,
-                StepInput::LlmResponse(llm_program("history.append(resume(41));")),
-            )
-            .unwrap();
-        drain(&mut state, &mut tree, out);
-        assert!(last_report(&state, &tree).contains("42"));
-        assert_eq!(state.status(), "idle");
+        let handled = c.reply("```js\nhistory.append(resume(41));\n```\n");
+        assert_eq!(handled.values(), [&json!(42)], "the raise resumed into its own expression");
+        assert_eq!(c.status(), "idle");
 
         // A second raise, this time abandoned the same way — through a
         // handler's own completion, not a direct host call.
-        let out = state
-            .step(
-                &mut tree,
-                StepInput::LlmResponse(llm_program("raise(\"need\", null); history.append(1);")),
-            )
-            .unwrap();
-        drain(&mut state, &mut tree, out);
-        assert_eq!(state.status(), "suspended");
-
-        let out = state
-            .step(
-                &mut tree,
-                StepInput::LlmResponse(llm_program("history.append(abandon());")),
-            )
-            .unwrap();
-        drain(&mut state, &mut tree, out);
-        assert_eq!(state.status(), "idle");
-        // The abandoned raise is a logged `crate::types::Handback::Abandoned`, not a
-        // `Return` of the raw decision object anywhere on the branch.
-        assert!(
-            state.agent_segment(&tree).iter().any(|e| matches!(
-                &e.payload,
-                EventPayload::Handback {
-                    how: crate::types::Handback::Abandoned,
-                    ..
-                }
-            )),
-            "the abandon is a logged Condition"
-        );
+        c.reply("```js\nraise(\"need\", null);\nhistory.append(1);\n```\n");
+        assert_eq!(c.status(), "suspended");
+        let gave_up = c.reply("```js\nhistory.append(abandon());\n```\n");
+        assert_eq!(c.status(), "idle");
+        assert_eq!(gave_up.ended, Ending::Abandoned, "the abandon is a logged handback");
         // A decision is not a row: appending one records the verdict,
         // it does not write a note about it.
         assert!(
-            !state.agent_segment(&tree).iter().any(|e| matches!(
-                &e.payload,
-                EventPayload::Note { value, .. } if note_text(value).contains("__decision")
-            )),
-            "no decision object ever lands as a row"
+            gave_up.rows.is_empty(),
+            "no decision object ever lands as a row: {:?}",
+            gave_up.rows
         );
     }
 
@@ -6159,30 +6106,17 @@ mod tests {
     /// the model output it had read a reply earlier.
     #[test]
     fn a_resumed_run_logs_only_what_it_printed_since() {
-        let (mut tree, mut state) = setup_under();
-        user_post(&mut state, &mut tree, "go");
-        let reply = "```js\nconsole.log(\"before\");\nconst v = raise(\"which\");\n```\n\n```js\nconsole.log(\"after: \" + v);\n```\n";
-        let out = state
-            .step(&mut tree, StepInput::LlmResponse(llm_program(reply)))
-            .unwrap();
-        drain(&mut state, &mut tree, out);
-        let out = state.resume(&mut tree, json!("that one")).unwrap();
-        drain(&mut state, &mut tree, out);
-
-        let consoles: Vec<Vec<String>> = state
-            .agent_segment(&tree)
-            .iter()
-            .filter_map(|e| match &e.payload {
-                EventPayload::Console { lines } => Some(lines.clone()),
-                _ => None,
-            })
-            .collect();
+        let mut c = Conversation::new();
+        c.user("go");
+        let r = c.reply(
+            "```js\nconsole.log(\"before\");\nconst v = raise(\"which\");\n```\n\n\
+             ```js\nconsole.log(\"after: \" + v);\n```\n",
+        );
+        let after = c.resume(json!("that one"));
+        assert_eq!(r.printed, ["before"]);
         assert_eq!(
-            consoles,
-            vec![
-                vec!["before".to_owned()],
-                vec!["after: that one".to_owned()],
-            ],
+            after.printed,
+            ["after: that one"],
             "each handback logs its own output, not the run's whole history"
         );
     }
@@ -7275,36 +7209,19 @@ mod tests {
     /// (D9).
     #[test]
     fn a_raise_in_cell_0_resumes_into_the_later_cells() {
-        let (mut tree, mut state) = setup_under();
-        user_post(&mut state, &mut tree, "go");
-        let reply = "```js\nconst pick = raise(\"which\", { of: [1, 2] });\n```\n\n\
-                     ```js\nconsole.log(`picked ${pick}`);\n```\n\n\
-                     ```js\nconsole.log(\"and the last cell ran\");\n```\n";
-        let out = state
-            .step(&mut tree, StepInput::LlmResponse(llm_program(reply)))
-            .unwrap();
-        drain(&mut state, &mut tree, out);
-
-        // Parked mid-cell-0, with a condition logged.
-        assert!(
-            matches!(state.phase, Phase::Suspended(..)),
-            "a raise suspends the run"
+        let mut c = Conversation::new();
+        c.user("go");
+        let r = c.reply(
+            "```js\nconst pick = raise(\"which\", { of: [1, 2] });\n```\n\n\
+             ```js\nconsole.log(`picked ${pick}`);\n```\n\n\
+             ```js\nconsole.log(\"and the last cell ran\");\n```\n",
         );
-        let out = state.resume(&mut tree, json!("the second one")).unwrap();
-        drain(&mut state, &mut tree, out);
+        assert!(matches!(r.ended, Ending::Raised { .. }), "a raise suspends the run");
 
-        let consoles: Vec<String> = state
-            .agent_segment(&tree)
-            .iter()
-            .filter_map(|e| match &e.payload {
-                EventPayload::Console { lines } => Some(lines.clone()),
-                _ => None,
-            })
-            .flatten()
-            .collect();
+        let after = c.resume(json!("the second one"));
         assert_eq!(
-            consoles,
-            vec!["picked the second one", "and the last cell ran"],
+            after.printed,
+            ["picked the second one", "and the last cell ran"],
             "the cells after the raise run on resume"
         );
     }
@@ -7364,28 +7281,15 @@ mod tests {
     /// markdown, and the site says so — it is *not* cell-local.
     #[test]
     fn a_site_is_reply_absolute_not_cell_local() {
-        let (mut tree, mut state) = setup_under();
-        user_post(&mut state, &mut tree, "go");
+        let mut c = Conversation::new();
+        c.user("go");
         let reply = "A fairly long opening paragraph, so the offsets differ.\n\n\
                      ```js\nlet a = 1;\n```\n\n\
                      More prose here as well.\n\n\
                      ```js\ntell(\"second\");\n```\n";
-        let out = state
-            .step(&mut tree, StepInput::LlmResponse(llm_program(reply)))
-            .unwrap();
-        drain(&mut state, &mut tree, out);
+        let r = c.reply(reply);
 
-        let site = state
-            .agent_segment(&tree)
-            .iter()
-            .filter_map(|e| match &e.payload {
-                EventPayload::Call(Call::Send { site, site_end, .. }) if *site_end > 0 => {
-                    Some(*site as usize)
-                }
-                _ => None,
-            })
-            .next()
-            .expect("the tell");
+        let site = c.site_of(r.told[0]).0 as usize;
         assert_eq!(
             site,
             reply.find("tell(\"second\")").unwrap(),
@@ -7521,37 +7425,23 @@ mod tests {
     /// renders against the ten-line reply.
     #[test]
     fn a_traps_site_is_an_offset_into_the_reply() {
-        let (mut tree, mut state) = setup_under();
-        user_post(&mut state, &mut tree, "go");
-        let reply = "Using what the last reply read.\n\n```js\nconst prev = null;\nconsole.log(prev.content);\n```\n";
-        let out = state
-            .step(&mut tree, StepInput::LlmResponse(llm_program(reply)))
-            .unwrap();
-        drain(&mut state, &mut tree, out);
+        let mut c = Conversation::new();
+        c.user("go");
+        let reply = "Using what the last reply read.\n\n\
+                     ```js\nconst prev = null;\nconsole.log(prev.content);\n```\n";
+        let r = c.reply(reply);
 
-        let (site, message) = state
-            .agent_segment(&tree)
-            .iter()
-            .find_map(|e| match &e.payload {
-                EventPayload::Handback {
-                    how: crate::types::Handback::Trapped { message, .. },
-                    site,
-                    ..
-                } => Some((*site as usize, message.clone())),
-                _ => None,
-            })
-            .expect("the trap");
+        // That the site is in the reply at all is checked on every
+        // reply now (`Invariant::SitesAreReplyAbsolute`); what is left
+        // for this test is that it names the right expression.
+        let Ending::Trapped { message, site } = &r.ended else {
+            panic!("expected a trap, got {:?}", r.ended)
+        };
         assert!(message.contains("cannot read property"), "{message}");
-        assert!(
-            site < reply.len(),
-            "site {site} is past the end of a {}-byte reply — it is still \
-             a parse-buffer offset",
-            reply.len()
-        );
         assert_eq!(
-            &reply[site..site + 7],
+            &reply[*site as usize..*site as usize + 7],
             "content",
-            "and it names the offending expression"
+            "it names the offending expression"
         );
     }
 

@@ -113,6 +113,24 @@ pub enum Invariant {
     /// site here would send the debugger to an offset that means
     /// nothing.
     ProseIsSynthetic,
+    /// **A site is an offset into the reply, not into a parse buffer.**
+    /// Every span a reply logs — a call's, a row's, a trap's — is
+    /// reply-absolute and half-open, so cutting the reply with it
+    /// yields the expression it names. A cell-local offset is usually
+    /// still *in range*, which is why being in bounds is not the test:
+    /// the cut has to land on a character boundary and not be empty.
+    ///
+    /// The bug this is written against had traps reporting an offset
+    /// into the compiler's own parse buffer, which pointed the debugger
+    /// at whatever happened to be at that index in the reply.
+    ///
+    /// **Not checked on a reply that resumes a suspended one.** A
+    /// handler's reply wakes the program underneath it, and that
+    /// program's own calls land in this reply's scope carrying spans
+    /// into the reply *it* was written in — correctly. Two replies are
+    /// producing events at once there, and a span can only be read
+    /// against the one it came from.
+    SitesAreReplyAbsolute,
     /// **Every call settles**, or is still honestly waiting. A `tell`
     /// gets its delivery receipt, a tool call gets its result; an `ask`
     /// may sit open, because an answer is someone else's to give, and a
@@ -138,8 +156,9 @@ pub enum Ending {
     Stopped(String),
     /// `raise(name, payload)` — parked for a judgement.
     Raised { name: String, payload: Option<serde_json::Value> },
-    /// A runtime error nobody caught.
-    Trapped(String),
+    /// A runtime error nobody caught, and where in the reply it
+    /// happened.
+    Trapped { message: String, site: u32 },
     /// A cell that did not compile.
     CellFailed(String),
     /// A handler's `abandon()` discarded the run beneath it.
@@ -209,6 +228,9 @@ pub struct Said {
     /// `tell(text)` and `finish(text)`, in log order: everything this
     /// reply said that expected no answer.
     pub tells: Vec<String>,
+    /// The `Send` behind each of `tells`, same order — for the tests
+    /// that are about the call rather than the words.
+    pub told: Vec<EventId>,
     /// `ask` / `choose` — the sends still waiting on someone.
     pub asks: Vec<Ask>,
     /// `history.append(value)`, in order.
@@ -295,6 +317,10 @@ pub struct Conversation {
     /// A fresh generation per reply — what tells `notebook_stream` that
     /// the last reply is over and a new one is arriving.
     epoch: u64,
+    /// Whether the reply just fed woke a program suspended beneath it,
+    /// in which case two replies were producing events at once — see
+    /// [`Invariant::SitesAreReplyAbsolute`].
+    resumed: bool,
 }
 
 // **Unused here is not unused.** This is the harness's surface, and
@@ -322,6 +348,7 @@ impl Conversation {
             requests: 0,
             open_asks: Vec::new(),
             epoch: 0,
+            resumed: false,
         }
     }
 
@@ -399,6 +426,7 @@ impl Conversation {
     /// the text lands: a program that halts in the first cell while the
     /// second is still being written, a fence closing across a seam.
     pub fn reply_in_chunks(&mut self, chunks: &[&str]) -> Said {
+        self.resumed = self.runner.status() == "suspended";
         let before = self.tree.id_counter;
         self.requests = 0;
         self.epoch += 1;
@@ -430,6 +458,7 @@ impl Conversation {
     }
 
     fn deliver_reply(&mut self, markdown: &str, streamed: bool) -> Said {
+        self.resumed = self.runner.status() == "suspended";
         let before = self.tree.id_counter;
         self.requests = 0;
         let out = if streamed {
@@ -535,6 +564,25 @@ impl Conversation {
         self.runner
             .fetch_history(&self.tree, &[interp::Value::PosInt(id.as_u64())])
             .unwrap_or_else(|e| panic!("fetch #{} : {e}", id.as_u64()))
+    }
+
+    /// What the branch is: `idle`, `thinking`, `running`, `suspended`.
+    /// The same word the session's own branch list reports.
+    pub fn status(&self) -> &'static str {
+        self.runner.status()
+    }
+
+    /// The source span an event logged — where in the reply the
+    /// expression that produced it was written. `(0, 0)` for anything
+    /// synthetic.
+    pub fn site_of(&self, id: EventId) -> (u32, u32) {
+        match self.tree.events.get(&id).map(|e| &e.payload) {
+            Some(EventPayload::Call(Call::Send { site, site_end, .. })) => (*site, *site_end),
+            Some(EventPayload::Call(Call::Invoke { site, .. })) => (*site, 0),
+            Some(EventPayload::Note { site, site_end, .. }) => (*site, *site_end),
+            Some(EventPayload::Handback { site, .. }) => (*site, 0),
+            _ => panic!("#{} has no site", id.as_u64()),
+        }
     }
 
     /// The document the next request would carry — what the model is
@@ -672,6 +720,7 @@ impl Conversation {
             prose: Vec::new(),
             cells: Vec::new(),
             tells: Vec::new(),
+            told: Vec::new(),
             asks: Vec::new(),
             rows: Vec::new(),
             calls: Vec::new(),
@@ -723,6 +772,7 @@ impl Conversation {
                         });
                     } else {
                         s.tells.push(text.clone());
+                        s.told.push(e.id);
                     }
                 }
                 EventPayload::Call(Call::Invoke { name, args, .. }) => {
@@ -736,8 +786,8 @@ impl Conversation {
                 EventPayload::Compacted { of, .. } => s.compacted.push(*of),
                 EventPayload::Console { lines } => s.printed.extend(lines.iter().cloned()),
                 EventPayload::Result { call, outcome } => s.settled.push((*call, outcome.clone())),
-                EventPayload::Handback { how, .. } => {
-                    s.ended = ending_of(how);
+                EventPayload::Handback { how, site, .. } => {
+                    s.ended = ending_of(how, *site);
                     s.handback = Some(e.id);
                 }
                 _ => {}
@@ -816,6 +866,32 @@ impl Conversation {
                 }
             }
         }
+        if self.enforced(Invariant::SitesAreReplyAbsolute) && !self.resumed {
+            for e in &events {
+                let (site, site_end) = match &e.payload {
+                    EventPayload::Call(Call::Send { site, site_end, .. }) => (*site, *site_end),
+                    EventPayload::Note { site, site_end, .. } => (*site, *site_end),
+                    // A handback carries a point, not a span.
+                    EventPayload::Handback { site, .. } if *site > 0 => (*site, *site + 1),
+                    _ => continue,
+                };
+                if site_end == 0 {
+                    continue; // synthetic; `ProseIsSynthetic` has that one
+                }
+                assert!(
+                    site < site_end && (site_end as usize) <= markdown.len(),
+                    "#{} spans {site}..{site_end} of a {}-byte reply",
+                    e.id.as_u64(),
+                    markdown.len()
+                );
+                assert!(
+                    markdown.is_char_boundary(site as usize)
+                        && markdown.is_char_boundary(site_end as usize),
+                    "#{} spans {site}..{site_end}, which is not a character boundary",
+                    e.id.as_u64()
+                );
+            }
+        }
         if self.enforced(Invariant::CallsSettle) {
             // Not while something is parked: a suspended or abandoned
             // run leaves calls open by design.
@@ -841,14 +917,16 @@ impl Conversation {
     }
 }
 
-fn ending_of(how: &Handback) -> Ending {
+fn ending_of(how: &Handback, site: u32) -> Ending {
     match how {
         Handback::Completed => Ending::Completed,
         Handback::Stopped { reason } => Ending::Stopped(reason.clone()),
         Handback::Raised { name, payload, .. } => {
             Ending::Raised { name: name.clone(), payload: payload.clone() }
         }
-        Handback::Trapped { message, .. } => Ending::Trapped(message.clone()),
+        Handback::Trapped { message, .. } => {
+            Ending::Trapped { message: message.clone(), site }
+        }
         Handback::CellFailed { message } => Ending::CellFailed(message.clone()),
         Handback::Abandoned => Ending::Abandoned,
         Handback::Posted { .. } => Ending::Posted,
@@ -1040,7 +1118,7 @@ mod tests {
         let r = c.reply("```js\nawait tools.bash(\"nope\");\nfinish(\"ran it.\");\n```\n");
 
         assert!(
-            matches!(&r.ended, Ending::Trapped(m) if m.contains("no such command")),
+            matches!(&r.ended, Ending::Trapped { message, .. } if message.contains("no such command")),
             "the tool's own words reach the trap: {:?}",
             r.ended
         );
