@@ -376,13 +376,17 @@ fn every_promise_above_the_tools_is_named_as_one() {
         vec!["ask", "choose"],
         "the async verbs above `tools.*`"
     );
-    for name in &promised {
-        assert!(
-            card.contains(&format!("only `ask` and `choose` are"))
-                || card.contains(&format!("`{name}`")),
-            "`{name}` returns a Promise and the `await` paragraph does not say so"
-        );
-    }
+    // Built from the declarations rather than written out, so adding a
+    // third async verb fails here until the paragraph names it too.
+    let named = promised
+        .iter()
+        .map(|n| format!("`{n}`"))
+        .collect::<Vec<_>>()
+        .join(" and ");
+    assert!(
+        card.contains(&format!("only {named} are")),
+        "the `await` paragraph does not name exactly {named}"
+    );
 }
 
 /// **A closed value set renders as a union, not as `string`.**
