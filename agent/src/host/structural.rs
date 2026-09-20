@@ -74,8 +74,10 @@ pub fn outline_def() -> ToolDef {
         ],
         example: Some("const { items } = await tools.outline(path);".into()),
         returns: Some(
-            "{ items: Array<{ name: string; kind: string; start_line: number; end_line: number; \
-             signature?: string; attributes?: string[]; doc?: string }> }"
+            "{ items: Array<{ name: string; kind: \"function\" | \"method\" | \"class\" | \
+             \"struct\" | \"enum\" | \"trait\" | \"impl\" | \"module\" | \"const\" | \"static\" | \
+             \"type\" | \"macro\" | \"interface\" | \"variable\"; start_line: number; \
+             end_line: number; signature?: string; attributes?: string[]; doc?: string }> }"
                 .into(),
         ),
         handler: Box::new(|args| {
@@ -185,13 +187,58 @@ fn leading_context(node: &Node, source: &str) -> (Vec<String>, Option<String>) {
     (attributes, doc)
 }
 
+/// The kind a reader would guess, from the kind the grammar uses.
+///
+/// **Four languages, four names for a function.** `kind` was the
+/// tree-sitter node kind — `function_item` in Rust,
+/// `function_declaration` in JS and TS, `function_definition` in
+/// Python — so a program filtering an outline had to know which
+/// grammar produced it, and the word every model actually reaches for,
+/// `"function"`, matched none of them. Across the kept corpus programs
+/// compared `kind` against `"function"` 26 times in 17 runs and
+/// against `"function_definition"` 17 times in 15: the wrong guess was
+/// commoner than the right one.
+///
+/// And it fails silently. `items.filter(i => i.kind === "function")`
+/// is an empty array, not an error, so a run reads it as "nothing here
+/// is live" and carries on. One `sweep-8` run did exactly that and
+/// replaced the whole of `helpers.py` with its docstring.
+///
+/// The distinctions the grammars make are kept — a Rust `struct` and
+/// an `enum` do not both become "type" — only the spelling is made
+/// language-independent, so one filter works on any file.
+fn readable_kind(kind: &str) -> &str {
+    match kind {
+        "function_item"
+        | "function_declaration"
+        | "function_definition"
+        | "generator_function_declaration" => "function",
+        "method_definition" => "method",
+        "class_declaration" | "class_definition" | "abstract_class_declaration" => "class",
+        "struct_item" => "struct",
+        "enum_item" | "enum_declaration" => "enum",
+        "trait_item" => "trait",
+        "impl_item" => "impl",
+        "mod_item" => "module",
+        "const_item" => "const",
+        "static_item" => "static",
+        "type_item" | "type_alias_declaration" => "type",
+        "macro_definition" => "macro",
+        "interface_declaration" => "interface",
+        "lexical_declaration" | "variable_declaration" => "variable",
+        // A grammar kind with no word yet keeps its own, so a new
+        // language degrades to the old behaviour rather than to a lie.
+        other => other,
+    }
+}
+
 /// One entry for a definition node, or `None` when it has no name.
 fn entry_for(node: &Node, source: &str, lang: &str) -> Option<OutlineEntry> {
     let name = find_name(node, source)?;
     let (attributes, doc) = leading_context(node, source);
     Some(OutlineEntry {
         name,
-        kind: node.kind().to_string(),
+        kind: readable_kind(node.kind()).to_string(),
         start_line: node.start_position().row + 1,
         end_line: node.end_position().row + 1,
         signature: signature_for(node, source, lang),
@@ -482,11 +529,73 @@ mod tests {
         let arr = result["items"].as_array().unwrap();
         assert!(!arr.is_empty(), "expected non-empty outline");
         let kinds: Vec<&str> = arr.iter().map(|e| e["kind"].as_str().unwrap()).collect();
-        assert!(
-            kinds.contains(&"function_item"),
-            "missing function in {arr:?}"
-        );
-        assert!(kinds.contains(&"struct_item"), "missing struct in {arr:?}");
+        assert!(kinds.contains(&"function"), "missing function in {arr:?}");
+        assert!(kinds.contains(&"struct"), "missing struct in {arr:?}");
+    }
+
+    /// **One filter works on any file.** `kind` used to be the
+    /// tree-sitter node kind, so the same concept had four names and
+    /// the word every model reaches for matched none of them: across
+    /// the kept corpus, programs compared `kind` against `"function"`
+    /// 26 times and against `"function_definition"` 17, so the wrong
+    /// guess was the commoner one. It fails silently — an empty
+    /// `filter` is not an error — and one `sweep-8` run read that
+    /// emptiness as "nothing here is live" and replaced the whole of
+    /// `helpers.py` with its docstring.
+    #[test]
+    fn a_function_is_called_a_function_in_every_language() {
+        for (ext, src) in [
+            ("rs", "fn hello() {}\n"),
+            ("py", "def hello():\n    pass\n"),
+            ("js", "function hello() {}\n"),
+            ("ts", "function hello(): void {}\n"),
+        ] {
+            let (_dir, path) = temp_path_with_ext(ext);
+            std::fs::write(&path, src).unwrap();
+            let result = call_handler(&outline_def(), json!([path.to_str().unwrap()])).unwrap();
+            let arr = result["items"].as_array().unwrap();
+            let kinds: Vec<&str> = arr.iter().map(|e| e["kind"].as_str().unwrap()).collect();
+            assert!(kinds.contains(&"function"), "{ext}: {arr:?}");
+        }
+
+        // The distinctions the grammars make are kept — a struct and an
+        // enum do not both become "type".
+        let (_dir, path) = temp_path_with_ext("rs");
+        std::fs::write(&path, "struct P {}\nenum E { A }\ntrait T {}\n").unwrap();
+        let result = call_handler(&outline_def(), json!([path.to_str().unwrap()])).unwrap();
+        let kinds: Vec<&str> = result["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["kind"].as_str().unwrap())
+            .collect();
+        for want in ["struct", "enum", "trait"] {
+            assert!(kinds.contains(&want), "missing {want} in {kinds:?}");
+        }
+
+        // And every word the declaration promises is one this produces.
+        let declared = outline_def().returns.unwrap();
+        for word in [
+            "function",
+            "method",
+            "class",
+            "struct",
+            "enum",
+            "trait",
+            "impl",
+            "module",
+            "const",
+            "static",
+            "type",
+            "macro",
+            "interface",
+            "variable",
+        ] {
+            assert!(
+                declared.contains(&format!("\"{word}\"")),
+                "the declaration does not name `{word}`"
+            );
+        }
     }
 
     #[test]
