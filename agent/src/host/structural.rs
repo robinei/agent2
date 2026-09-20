@@ -58,7 +58,7 @@ pub fn outline_def() -> ToolDef {
         // its top-level definitions") was accurate and said nothing
         // about what is absent, which is what a reader needs in order to
         // pick a different tool.
-        description: "Top-level definitions of a source file, language inferred from the extension — Rust, JavaScript, TypeScript or Python. Read-only."
+        description: "Top-level definitions of a source file, language inferred from the extension — Rust, JavaScript, TypeScript or Python. Read-only. It lists what a file *defines*, never what uses it."
             .into(),
         input_schema: json!({
             "type": "array",
@@ -69,6 +69,7 @@ pub fn outline_def() -> ToolDef {
             "maxItems": 1
         }),
         guidelines: vec![
+            "Nothing here tells you a definition is unused. A name can be reached without appearing anywhere as that name — `getattr(mod, \"f_\" + i)`, a table keyed by strings, a decorator registry — so neither this nor a search for the name can see it. Before deleting a definition, look for the *mechanisms*: read the callers, and grep for the prefix and for `getattr`/`globals`/registry calls.".into(),
             "`start_line` is an edit anchor, not just a fact: `Edit.replaceLines(text, start_line, end_line, …)` names one place exactly, where a string that looks distinctive often is not. A marker like `TODO(perf)` appears seven times in a small file; `parse_header` appears once, and outline says which lines it spans.".into(),
         ],
         example: Some("const { items } = await tools.outline(path);".into()),
