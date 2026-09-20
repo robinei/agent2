@@ -43,35 +43,49 @@ is a judgement rather than a repair:
    the lever for it is the card. It is the small lever either way:
    6.7% of bytes, against round trips that cost whole completions.
 
-3. **A twentieth of the card is unmeasured**, though one probe now
-   says the mechanism works. `spawn`, `fork`,
-   `list_agents`, `answer`, the `Agent` type and the two-argument
-   `tell` come to 923 bytes, 4.9% of the card, on every turn of every
-   run — and not one program in 295 kept runs calls any of them. The
-   suite has no multi-agent task, so this is not evidence that the
-   vocabulary is unused in general; it is evidence that **we know
-   nothing about it**. Two honest options: add a task that needs a
-   second agent, or accept that a twentieth of the prompt is carried
-   on faith. Deleting it is a third, and the wrong one — it would
-   remove a capability rather than test it.
+3. **A ninth of the card has never been exercised.** Counting every
+   verb no program called in 350 kept runs:
 
-   Two live probes, one completion each, settled the functional half
-   and found a snag in passing. Told to spawn a helper and ask it
-   `17*23`, the model did exactly that and the answer came back — the
-   vocabulary works end to end against a real provider. But the helper
-   then spent **two more completions and 691 output tokens** doing
-   nothing: `answer(11, "391")` discharges the question and the block
-   carrying it is still a block, so the reply earned another turn. It
-   wrote prose, got the "your last reply ran nothing" nudge — correct
-   advice, wrong situation — and only then said `done()`. Three
-   completions for a one-line answer.
+   | | bytes |
+   |---|---|
+   | `spawn`, `fork`, `list_agents`, `tell(to, …)`, `answer`, `Agent` | 1,247 |
+   | `raise`, `resume`, `abandon`, `Decision` | 657 |
+   | `ask` | 258 |
+   | **total** | **2,164 — 11.3% of the card** |
+
+   Paid for on every turn of every run, and never used once. `ask` is
+   the surprise: `ambiguous-config` passes by asking, and every one of
+   those runs reaches for `choose` instead — 29 uses in 28 runs
+   against zero for `ask`.
+
+   `raise`/`resume`/`abandon` is the one to think hardest about,
+   because it is not a convenience: `docs/20_CODE_MODE.md` calls
+   `raise` the sole re-entry path, and no eval has ever taken it. The
+   suite has no task that needs a judgement mid-program that the
+   program itself could act on afterwards.
+
+   Two live probes settled the functional half for the multi-agent
+   verbs, one completion each, and found a snag in passing. Told to
+   spawn a helper and ask it `17*23`, the model did exactly that and
+   the answer came back — the vocabulary works end to end against a
+   real provider. But the helper then spent **two more completions and
+   691 output tokens** doing nothing: `answer(11, "391")` discharges
+   the question and the block carrying it is still a block, so the
+   reply earned another turn. It wrote prose, got the "your last reply
+   ran nothing" nudge — correct advice, wrong situation — and only
+   then said `done()`. Three completions for a one-line answer.
 
    The second probe confirmed the fix before it was written: a helper
    whose charter told it to `done()` after answering used one
    completion per question, and a later `ask` woke it with everything
    it knew still in front of it. `answer`'s entry in the card says so
-   now. It is the kind of thing that only shows up when the path is
-   actually run, which is the argument for the eval task.
+   now.
+
+   So: the mechanisms work, one of them had a three-times cost nobody
+   had paid yet, and 11% of the prompt rests on two probes rather than
+   on the suite. The options are an eval task per family, or an
+   explicit decision to carry it on faith. Deleting is the wrong
+   third — it would remove capability rather than test it.
 
 4. **What the person actually reads, and who pays for it.** Of 237
    closing messages, 44 (18%) carry raw tool output — a traceback, a
