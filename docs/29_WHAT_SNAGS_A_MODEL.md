@@ -137,15 +137,22 @@ win.** Fisher's exact on 36/37 against 56/63 gives p = 0.25: the drop
 is not distinguishable from chance, and it is not evidence of safety
 either.
 
-**Two more arms did not settle it.** 27 further runs at later HEADs
-came back 23/27, which pools to **79/90 (88%) against the baseline's
-36/37**, p = 0.18. Three sets of arms now, the same direction each
+**Three more arms did not settle it.** 40 further runs at later HEADs
+came back 34/40, which pools to **90/103 (87%) against the baseline's
+36/37**, p = 0.11. Four sets of arms now, the same direction each
 time, and never significant — which is what a small real effect and a
 small sample look like from the outside, and also what noise looks
-like. Worth saying plainly: the two arms were built before two of
-their own four failures had their causes fixed (a no-op write nobody
-could see, and the async IIFE), so they are not a clean read on the
-current tree either.
+like.
+
+Worth saying plainly: **every arm was built before some of its own
+failures had their causes fixed.** Of the six losses across the three,
+five now have a fix in the tree that did not exist when they ran — a
+no-op write nobody could see, an async IIFE that silently left calls
+in flight, an `outline` enum whose commonest guess matched nothing, an
+edit that ate an indent, and a spread that refused an array-like. The
+sixth is a judgement error. So none of these is a read on the current
+tree, and the honest state of the pass rate is that it has not been
+measured since the fixes landed.
 
 What can be said about the original drop:
 
@@ -511,6 +518,33 @@ all wrote `applyEdits` with the indentation included, which is the
 correct form. So the 4/4 is the task going well, not the guard
 catching anything: its unit tests prove it fires on the exact input
 that broke a file, and no live run has yet asked it to.
+
+## Two spellings of one operation, again
+
+A `sweep-8` reply wrote `[...helpers.content.match(/…/)]` twice and
+trapped twice on "array spread source must be an array, a Map, a Set,
+or a string" — a sentence that says what a spread source may be and
+not what this one was.
+
+What it was: `String.match` with a non-global pattern answers an
+object carrying `0`, `index`, `input` and `length`. JavaScript's own
+match result is an array *wearing* those extra properties, which a
+`ThinVec` cannot be. So the object is right and the spread was wrong:
+`Array.from(m)` already worked, because it accepts anything with a
+`length`, and `[...m]` did not.
+
+That is the gap this codebase closed once before, for `Array.from(new
+Set())`, with the reason written into the source — two spellings of
+one operation that disagree are a gap a reader can only find by
+falling into it. Spread takes an array-like now, the extra properties
+survive, and the refusal names both the value it got and the
+commonest way to arrive at it (`String.match` answers `null`, not an
+empty array).
+
+Checked the rest of the family rather than guessing: `for…of`,
+`.map()` and array destructuring already work on a match object;
+`.slice()` does not, and appears zero times in the corpus against two
+`.map()` and one `.length`. Left alone.
 
 ## Rows that said the same thing whichever way it went
 
