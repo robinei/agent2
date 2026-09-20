@@ -250,6 +250,14 @@ fn waiting_on(path: &[&Event]) -> String {
         Some(Handback::Raised { name, .. }) => {
             format!("waiting on: a handler for «{name}»")
         }
+        // **A parked program is not a finished one.** A message landing
+        // mid-run suspends it (rule B) exactly as a raise does, and it
+        // sits there until a reply decides whether to carry on or write
+        // something else. Reading `nothing` here is how a driver
+        // concludes a run is over when it is holding a program open.
+        Some(Handback::Posted { .. }) => {
+            "waiting on: the next reply, to resume the parked program or replace it".to_owned()
+        }
         Some(Handback::Interrupted) => {
             "waiting on: nothing — the last run went with its process, so say it again"
                 .to_owned()
@@ -407,6 +415,34 @@ mod tests {
         let out = render(c.tree(), c.runner().spine.leaf_id);
         assert!(out.contains("waiting on: nothing"), "{out}");
         assert!(out.contains("! picked B."), "{out}");
+    }
+
+    /// **A parked program is not a finished one.** A message arriving
+    /// mid-run suspends the program (rule B); the branch then owes a
+    /// reply that either resumes it or writes something else, and a
+    /// closing line reading `nothing` is how a driver concludes the run
+    /// is over while it is holding a program open.
+    ///
+    /// Seen live on 2026-09-20: a `bash` call still in flight, the
+    /// program suspended on an arriving message, and the transcript
+    /// said nothing was waiting.
+    #[test]
+    fn a_program_parked_by_a_message_says_what_it_owes() {
+        let mut c = Conversation::new();
+        c.user("go");
+        // A cell that blocks on a tool, so a post can land mid-run.
+        c.never_answers("scan");
+        c.allow(crate::testkit::Invariant::CallsSettle);
+        c.chunk("```js\nconst r = await tools.scan();\nfinish(r.out);\n```\n");
+        c.harness("something arrived");
+        c.end_reply();
+
+        let out = render(c.tree(), c.runner().spine.leaf_id);
+        assert!(out.contains("⏸ a message arrived"), "{out}");
+        assert!(
+            out.contains("waiting on: the next reply"),
+            "the branch owes a decision, and says so: {out}"
+        );
     }
 
     /// A stop reads as a decision, not as a fault, and the closing line

@@ -368,6 +368,9 @@ pub struct Conversation {
     tree: Tree,
     runner: Runner,
     tools: HashMap<String, ToolFn>,
+    /// Tools dispatched and deliberately left hanging — see
+    /// [`never_answers`](Conversation::never_answers).
+    unanswered: std::collections::BTreeSet<String>,
     allowed: Vec<Invariant>,
     /// Requests that went out since the last reply — how `rests` is
     /// decided.
@@ -412,6 +415,7 @@ impl Conversation {
             tree,
             runner,
             tools: HashMap::new(),
+            unanswered: Default::default(),
             allowed: Vec::new(),
             requests: 0,
             open_asks: Vec::new(),
@@ -441,6 +445,17 @@ impl Conversation {
     /// Answer `tools.<name>(...)` with a fixed value.
     pub fn answers(&mut self, name: &str, value: serde_json::Value) -> &mut Self {
         self.tool(name, move |_| Ok(value.clone()))
+    }
+
+    /// Leave `tools.<name>(...)` outstanding — dispatched and never
+    /// answered, which is what a slow tool is while it is running.
+    ///
+    /// The program blocks on it, which is the only state in which a
+    /// message arriving can suspend a *running* program (rule B).
+    /// Everything short of that settles too fast to land in.
+    pub fn never_answers(&mut self, name: &str) -> &mut Self {
+        self.unanswered.insert(name.to_owned());
+        self
     }
 
     /// Reject `tools.<name>(...)` with `message` — a tool that failed,
@@ -837,6 +852,9 @@ impl Conversation {
                     StepOutput::LlmRequest(_) => self.requests += 1,
                     StepOutput::ToolCalls(calls) => {
                         for OutCall { call, name, args } in calls {
+                            if self.unanswered.contains(&name) {
+                                continue; // dispatched, still running
+                            }
                             let result = match self.tools.get(&name) {
                                 Some(f) => f(&args),
                                 None => Err(format!(
