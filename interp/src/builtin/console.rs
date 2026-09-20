@@ -20,7 +20,18 @@ use crate::vm::{VM, VMError, Value};
 /// no longer disagree about what they are counting.
 const CONSOLE_CAP: usize = 2_000;
 /// Maximum bytes per line; longer lines are truncated with a trailing `…`.
-const CONSOLE_LINE_CAP: usize = 4096;
+///
+/// **The same number as `report::CONSOLE_SECTION_MAX_BYTES`, and they
+/// touch.** A capped line is exactly this many bytes, and the report's
+/// newest-first walk charges a line its length *plus its newline* — so
+/// a capped line overshot the section budget by one and the walk
+/// stopped before taking anything. `console.log` of any file, outline
+/// or grep dump over 4KB rendered "The last 0 of N lines" above an
+/// empty fence: the whole point of the call, withheld, announced as a
+/// clip of nothing. The report now keeps one line whatever its size;
+/// `a_capped_line_fits_the_report_section_exactly` pins the equality
+/// so that the two bounds cannot drift apart unnoticed.
+pub(crate) const CONSOLE_LINE_CAP: usize = 4096;
 
 pub fn console_log(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     console_write(vm, args, "")
@@ -130,6 +141,18 @@ mod line_split_tests {
     #[test]
     fn a_blank_line_inside_the_output_survives() {
         assert_eq!(console(r#"console.log("a\n\nb");"#), vec!["a", "", "b"]);
+    }
+
+    /// What the per-line cap actually produces, in bytes — the next
+    /// bound out (`report::CONSOLE_SECTION_MAX_BYTES`) is the same
+    /// number, so whether a capped line fits inside it or blows it by
+    /// one is the difference between the reader seeing the line and
+    /// seeing an empty fence.
+    #[test]
+    fn a_capped_line_fits_the_report_section_exactly() {
+        let out = console(&format!(r#"console.log("{}");"#, "z".repeat(9000)));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].len(), crate::builtin::console::CONSOLE_LINE_CAP, "capped length");
     }
 
     /// Each call still starts its own line, so two calls never merge.

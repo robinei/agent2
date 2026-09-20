@@ -509,7 +509,20 @@ fn render_console(lines: &[String], event: Option<u64>) -> Option<String> {
             break;
         }
     }
-    let shown = &lines[start.min(lines.len())..];
+    // **The budget may never take the last line.** The loop above walks
+    // newest-first and stops at the first line that does not fit, so a
+    // single line larger than the whole budget stopped it on the first
+    // step: `start` became `lines.len()` and the section rendered "The
+    // last 0 of 3 lines" over an empty fence. Found 2026-09-20 in a
+    // `sweep-40` run whose program printed a 4,531-byte `outline` — the
+    // one thing it had asked for — and was shown none of it; its next
+    // two replies were spent fetching that row and re-reading the file.
+    //
+    // One line always survives, and `clip` below trims it to the
+    // budget. A truncated answer is worth two round trips; nothing is
+    // not, and "0 of 3" reads as though the program printed nothing.
+    let start = start.min(lines.len() - 1);
+    let shown = &lines[start..];
     // **Count the lines only when some were dropped.** "last 3 of 3
     // lines" announces a clip that did not happen, and it was every
     // single one: measured 2026-09-18, 31 of 31 console sections under
@@ -2172,6 +2185,31 @@ mod tests {
         assert!(
             rendered.contains(&"y".repeat(1000)),
             "a 1000-byte line is well inside the budget and survives whole"
+        );
+
+        // **One line always survives, however big it is.** A single
+        // line past the whole budget used to stop the newest-first walk
+        // on its first step, so the section read "The last 0 of 3
+        // lines" over an empty fence — the program's own output,
+        // withheld in full, announced as a clip of nothing.
+        let huge = vec![
+            "small".to_string(),
+            "also small".to_string(),
+            "x".repeat(CONSOLE_SECTION_MAX_BYTES * 2),
+        ];
+        let rendered = render_console(&huge, Some(4)).expect("lines present");
+        assert!(
+            rendered.contains("The last 1 of 3 lines"),
+            "the newest line is kept: {rendered}"
+        );
+        assert!(
+            rendered.contains("xxxx"),
+            "and its bytes are actually there: {}",
+            &rendered[..200.min(rendered.len())]
+        );
+        assert!(
+            !rendered.contains("The last 0 of"),
+            "never zero: {rendered}"
         );
 
         // And bytes are what bind when something really is too big.

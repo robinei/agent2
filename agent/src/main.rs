@@ -45,11 +45,15 @@ const USAGE: &str = "usage: agent <command>
                                     and print its id
     --name <text>                   name the branch (with --fork), else rename
                                     the conversation branch
-  document <log.jsonl>              print the exact document the log's
-                                    newest leaf would be sent as — every
-                                    message, role and size. The prompt is
+  document <log.jsonl> [id]         print the exact document the log
+                                    would be sent as — every message,
+                                    role and size. The prompt is
                                     otherwise the one thing you cannot
-                                    look at.
+                                    look at. With an event id, the
+                                    document as of that point rather
+                                    than the newest leaf: what a reply
+                                    was answering, not what the run
+                                    ended on.
   score <log.jsonl ...>             fold each finished log into the
                                     numbers a change is argued from:
                                     programs, calls per program, tokens
@@ -166,7 +170,7 @@ fn main() {
             }
         }
         Some("document") => {
-            if let Err(e) = print_document(args.get(2).map(String::as_str)) {
+            if let Err(e) = print_document(args.get(2).map(String::as_str), args.get(3)) {
                 eprintln!("{e}");
                 std::process::exit(1);
             }
@@ -193,15 +197,36 @@ fn main() {
 /// output.
 ///
 /// A prompt you cannot read is a prompt you will reason about wrongly.
-fn print_document(log: Option<&str>) -> Result<(), String> {
-    let path = log.ok_or("usage: agent document <log.jsonl>")?;
+///
+/// The optional `at` names an event id and renders the document as of
+/// that point instead of the newest leaf. Without it only the end of a
+/// finished run can be looked at, which is the least interesting
+/// moment: what a reply was answering is the spine *before* it, and a
+/// run that went wrong went wrong in the middle. Reading the document
+/// the model held when it wrote a particular block is how the
+/// rendering gets checked against the replies it produced.
+fn print_document(log: Option<&str>, at: Option<&String>) -> Result<(), String> {
+    let path = log.ok_or("usage: agent document <log.jsonl> [event-id]")?;
     let file = std::fs::File::open(path).map_err(|e| format!("{path}: {e}"))?;
     let tree = types::Tree::open(file).map_err(|e| format!("{path}: {e}"))?;
-    let leaf = *tree
-        .events
-        .keys()
-        .max_by_key(|id| id.as_u64())
-        .ok_or("the log is empty")?;
+    let leaf = match at {
+        Some(raw) => {
+            let n: u64 = raw
+                .trim_start_matches('#')
+                .parse()
+                .map_err(|_| format!("event id must be a positive number, got `{raw}`"))?;
+            *tree
+                .events
+                .keys()
+                .find(|id| id.as_u64() == n)
+                .ok_or_else(|| format!("no event #{n} in {path}"))?
+        }
+        None => *tree
+            .events
+            .keys()
+            .max_by_key(|id| id.as_u64())
+            .ok_or("the log is empty")?,
+    };
     let doc = document::render(
         &tree,
         &tree.spine_at(leaf),
