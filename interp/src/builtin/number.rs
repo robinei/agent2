@@ -107,8 +107,19 @@ pub fn number_is_nan(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 /// `Number.parseFloat(s)` → float. JS semantics: skip leading whitespace, take
 /// the longest numeric prefix, return NaN on failure, accept `Infinity`.
 pub fn number_parse_float(vm: &mut VM, args: Args) -> Result<Value, VMError> {
-    let s = vm.str_from(args.get(vm, 0))?;
-    let n = js_parse_float(s);
+    // **Coerce, exactly as `parseInt` above does and as the spec says**
+    // (`ToString(value)`, then parse). This took the string and threw
+    // on anything else, so `parseFloat(120.50)` — ordinary JavaScript,
+    // and what you write when a JSON field is already a number — was a
+    // type error here and nowhere else.
+    //
+    // Found live on 2026-09-20: a run summing a ledger wrote
+    // `parseFloat(record.amount)` inside a per-row `try`, caught the
+    // throw on all six rows, and wrote a total of `0` to the file
+    // believing it had succeeded. The two verbs disagreeing is what
+    // made it look like the data's fault rather than the dialect's.
+    let s = vm.to_js_string(args.get(vm, 0), 0);
+    let n = js_parse_float(s.as_str());
     Ok(Value::Float(n))
 }
 

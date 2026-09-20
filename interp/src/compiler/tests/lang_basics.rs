@@ -325,3 +325,26 @@ fn top_level_return_object_values() {
     assert_eq!(testutil::run_ret("return true;"), serde_json::json!(true));
     assert_eq!(testutil::run_ret("return null;"), serde_json::json!(null));
 }
+
+/// **`parseFloat` and `parseInt` coerce the same way** — `ToString`,
+/// then parse — because the spec says so and because a dialect whose
+/// two number parsers disagree makes the divergence look like a
+/// property of the data. `parseFloat(120.5)` threw here for a while,
+/// and a live run caught the throw per row and wrote a total of `0`.
+#[test]
+fn the_number_parsers_coerce_alike() {
+    for (src, want) in [
+        ("return parseFloat(\"120.50\");", 120.5),
+        ("return parseFloat(120.50);", 120.5),
+        ("return parseFloat(true);", f64::NAN),
+        ("return parseInt(42);", 42.0),
+        ("return parseInt(\"42\");", 42.0),
+    ] {
+        let got = crate::testutil::run_ret(src);
+        let n = got.as_f64().unwrap_or(f64::NAN);
+        assert!(
+            (n.is_nan() && want.is_nan()) || n == want,
+            "{src} gave {got}, wanted {want}"
+        );
+    }
+}
