@@ -28,7 +28,17 @@ export DEEPSEEK_BASE_URL="$LOCAL_BASE_URL"
 export DEEPSEEK_MODEL="$LOCAL_MODEL"
 # Bounds a reasoning trace that would otherwise run to the context end
 # and spend a whole run's timeout on one program.
-export DEEPSEEK_MAX_TOKENS="${DEEPSEEK_MAX_TOKENS:-8000}"
+#
+# **8000 was too tight and cost a task outright.** On 2026-09-20
+# `ambiguous-config` spent two consecutive completions of exactly 8000
+# tokens entirely inside reasoning, emitted no content either time, and
+# the branch went quiet with the task untouched — a FAIL that was our
+# cap, not the model. `dead-code-sweep` lost a reply the same way. The
+# models on this box are configured with `--ctx-size 65536`
+# (`evals/lanmodels.sh` prints the preset), and a request's document is
+# ~8-30KB, so this leaves room for a long trace without ever reaching
+# the context end.
+export DEEPSEEK_MAX_TOKENS="${DEEPSEEK_MAX_TOKENS:-24000}"
 
 if ! curl -sf --max-time 10 "$LOCAL_BASE_URL/models" >/dev/null; then
   echo "evals/local.sh: no model server at $LOCAL_BASE_URL" >&2
