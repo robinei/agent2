@@ -86,9 +86,19 @@ a regression in the harness:
 
 **Compare the model-facing surface against what the code does.** Every
 claim the harness makes — a tool's `returns`, an `@example`, a card
-sentence, an error message — is a promise a model will act on. Two of
-them were false, and the measurements say those two cost more than
-every dialect gap put together.
+sentence, an error message — is a promise a model will act on. Four
+declarations turned out to describe something other than what the tool
+did, and the measurements say those cost more than every dialect gap
+put together.
+
+**Probe, don't grep.** 105 sites in `interp` say "type error" or "value
+error"; seven are reachable by a program. 81 dialect constructs were
+tried to find 14 gaps. 38 results were compared against JS to find the
+silent ones. Reading the code tells you what exists; running it tells
+you what a model can hit.
+
+**A message that names the value finds the bug it was hiding.** Twice
+in one night, and both times the bug was older than the message.
 
 **Read the runs, not the aggregates.** Every real finding below came
 from opening a log. The one thing built from an aggregate alone was
