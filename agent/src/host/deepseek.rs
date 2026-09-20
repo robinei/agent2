@@ -885,4 +885,25 @@ mod tests {
         let err = parse_sse(stream.as_bytes(), &Cancel::new(), &mut |_| {}).unwrap_err();
         assert!(err.contains("rate limited"), "{err}");
     }
+
+    /// **`evals/drive.py` keeps a copy of these, and prints a warning
+    /// off it.** The client falls back to a paid endpoint when the
+    /// environment says nothing, so exporting a key and nothing else
+    /// points a whole arm at a provider that bills. The driver says so
+    /// before the first run — and it can only say so correctly while
+    /// its copy matches this one.
+    #[test]
+    fn the_client_defaults_are_what_the_eval_driver_says_they_are() {
+        let driver = include_str!("../../../evals/drive.py");
+        for (name, value) in [
+            ("CLIENT_DEFAULT_BASE_URL", DEFAULT_BASE_URL),
+            ("CLIENT_DEFAULT_MODEL", DEFAULT_MODEL),
+        ] {
+            assert!(
+                driver.contains(&format!("{name} = \"{value}\"")),
+                "evals/drive.py's {name} is not `{value}` — its warning about \
+                 which endpoint is about to be billed would be wrong"
+            );
+        }
+    }
 }

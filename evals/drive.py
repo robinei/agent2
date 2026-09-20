@@ -686,6 +686,7 @@ def fingerprint(card: Path | None) -> dict:
         k: os.environ[k]
         for k in (
             "DEEPSEEK_MODEL",
+            "DEEPSEEK_BASE_URL",
             "DEEPSEEK_REASONING_EFFORT",
             "DEEPSEEK_NO_THINKING",
             "AGENT2_TRANSPORT",
@@ -693,6 +694,14 @@ def fingerprint(card: Path | None) -> dict:
         if k in os.environ
     }
     return {"binary": binary, "card": h.hexdigest()[:12], "env": knobs}
+
+
+# What `agent/src/host/deepseek.rs` falls back to when the environment
+# says nothing. Duplicated rather than imported because this is Python
+# and that is Rust; `the_client_defaults_are_what_this_says` in
+# `deepseek.rs` fails if they drift.
+CLIENT_DEFAULT_BASE_URL = "https://opencode.ai/zen/go/v1"
+CLIENT_DEFAULT_MODEL = "deepseek-v4-flash"
 
 
 def print_summary(summary: dict):
@@ -990,6 +999,22 @@ def main():
     if args.agent == "code" and "DEEPSEEK_API_KEY" not in os.environ:
         print("DEEPSEEK_API_KEY is not set", file=sys.stderr)
         return 2
+
+    # **Say which endpoint is about to be billed.** `DEEPSEEK_BASE_URL`
+    # and `DEEPSEEK_MODEL` both have defaults inside the client, so
+    # exporting a key and nothing else points a whole arm at a paid
+    # provider without a word anywhere — and `fingerprint` only stamps
+    # `DEEPSEEK_MODEL` when it is set, so the JSON afterwards could not
+    # say where the numbers came from either. One line, before anything
+    # runs, because an arm is 14 runs and the moment to notice is now.
+    if args.agent == "code":
+        where = os.environ.get("DEEPSEEK_BASE_URL", CLIENT_DEFAULT_BASE_URL)
+        model = os.environ.get("DEEPSEEK_MODEL", CLIENT_DEFAULT_MODEL)
+        local = "127.0.0.1" in where or "localhost" in where or "192.168." in where
+        print(
+            f"{model} at {where}" + ("" if local else "   [remote — this bills]"),
+            file=sys.stderr,
+        )
 
     # Runs are independent and spend nearly all their time waiting on a
     # completion — one 2026-09-16 run sat 317 seconds for its second
