@@ -36,7 +36,20 @@ if ! curl -sf --max-time 10 "$LOCAL_BASE_URL/models" >/dev/null; then
   exit 2
 fi
 
-have() { case " $* " in *" $1 "*) return 0;; esac; return 1; }
+# **Shift the needle off before looking for it.** `have --jobs "$@"`
+# put `--jobs` into `$*` as well as `$1`, so the pattern always matched
+# its own needle and neither default below was ever applied: every run
+# through this script took drive.py's `--jobs 4` against a box that
+# serves one slot, and its 900s timeout instead of the 3000s this file
+# asks for. Four runs queueing behind each other and being killed at 900
+# seconds is what "the LAN model is too slow to measure with" was
+# partly made of.
+have() {
+  local needle=$1
+  shift
+  case " $* " in *" $needle "*) return 0 ;; esac
+  return 1
+}
 extra=()
 have --jobs "$@" || extra+=(--jobs 1)
 have --timeout "$@" || extra+=(--timeout 3000)
