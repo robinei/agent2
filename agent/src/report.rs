@@ -672,7 +672,30 @@ fn delivered_tail(v: &serde_json::Value) -> String {
             if map.len() > SHAPE_MAX_KEYS {
                 keys.push("…");
             }
-            format!("ok, {{{}}}, {} bytes", keys.join(", "), v.to_string().len())
+            // **A command that failed says so here.** `bash` is the
+            // one tool whose result carries a verdict rather than only
+            // a value, the card opens its description with "Read
+            // `status` before `stdout`", and the row said `ok,
+            // {status, stdout, stderr}` either way — the field names,
+            // which the card already declares, in place of the one
+            // number that varies. 105 of 1,178 bash calls in the kept
+            // corpus exited non-zero and not one row mentioned it; the
+            // only way to find out was to spend a `fetch` on a row
+            // that looked exactly like the 1,073 that had nothing to
+            // report.
+            //
+            // Silent when it is zero, like every other count in this
+            // file: a line that says the same thing on every row is
+            // one the reader learns to skip.
+            let lead = match map.get("status").and_then(serde_json::Value::as_i64) {
+                Some(n) if n != 0 => format!("status {n}"),
+                _ => "ok".to_owned(),
+            };
+            format!(
+                "{lead}, {{{}}}, {} bytes",
+                keys.join(", "),
+                v.to_string().len()
+            )
         }
         serde_json::Value::Array(items) => format!(
             "ok, [{} item{}], {} bytes",
@@ -2458,6 +2481,25 @@ mod tests {
         assert!(delivered_tail(&wide).starts_with("ok, {a, b, c, d, e, …}, "));
 
         // Scalars are unchanged — they already showed their value.
+        // **A command that failed says so in its row.** The card
+        // opens `bash` with "Read `status` before `stdout`", and the
+        // row printed the field names either way — 105 of 1,178 bash
+        // calls in the kept corpus exited non-zero and not one row
+        // mentioned it.
+        assert_eq!(
+            delivered_tail(&json!({"status": 1, "stdout": "", "stderr": "boom"})),
+            "status 1, {status, stdout, stderr}, 40 bytes"
+        );
+        // Silent when it is zero, like every other count here.
+        assert!(
+            delivered_tail(&json!({"status": 0, "stdout": "hi", "stderr": ""}))
+                .starts_with("ok, {status,"),
+        );
+        // And an object with no status is untouched.
+        assert!(
+            delivered_tail(&json!({"content": "x", "version": "v"})).starts_with("ok, {content,")
+        );
+
         assert_eq!(delivered_tail(&json!(null)), "ok");
         assert_eq!(delivered_tail(&json!(42)), "42");
         assert_eq!(delivered_tail(&json!("short")), "\"short\"");
