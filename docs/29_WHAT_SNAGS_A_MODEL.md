@@ -78,9 +78,21 @@ either. What can be said about it:
 
 `outline` now says it lists what a file defines and never what uses it,
 and names the mechanisms — `getattr`, string tables, registries — to
-look for instead of the names. That is aimed squarely at these
-failures, landed after every run in the table above, and the ten-run
-arm that followed it went 10/10.
+look for instead of the names. It landed after every run in the table
+above, and the ten-run arm that followed went 10/10.
+
+**And the behaviour it names moved, which is better evidence than the
+outcome.** Across those runs against the nine before it:
+
+| | before | with the guidance |
+|---|---|---|
+| a program mentions `getattr` | 2/9 | **6/10** |
+| a program reads the `IDS` table | 4/9 | **8/10** |
+| a program asserts before writing | 3/9 | 6/10 |
+
+An outcome can move for any reason; a guideline naming `getattr` and
+then tripling how often programs mention `getattr` is the guideline
+doing the thing it was written to do.
 
 Per task: `sweep-200` 11 → 5 programs and 395 → 146 KB, `sweep-8` 4 → 2
 and 107 → 53 KB, `skipped-tests` 5.5 → 3 and 146 → 82 KB,
