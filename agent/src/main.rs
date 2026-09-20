@@ -309,8 +309,16 @@ fn open_tree_read_only(path: &str) -> Result<Tree, String> {
 
 /// Context prompt for real (M1) sessions; the dialect card carries the
 /// mechanics, this carries the role.
-const REAL_PROMPT: &str = "You are a capable general-purpose agent. Solve the user's task; reply with \
-     your final answer when done.";
+///
+/// **And only the role.** It used to end "reply with your final answer
+/// when done", which is chat idiom and contradicts the card twice over
+/// in the same clause: there is no final-answer reply here — the
+/// answer is a `tell` and the ending is `done()` — and "when done"
+/// reads as the name of the function that does something else. It sits
+/// last in the system message, after the card and the listing, which is
+/// the most recency-weighted position in the prompt; a sentence there
+/// that disagrees with 23 KB above it is the sentence that wins.
+const REAL_PROMPT: &str = "You are a capable general-purpose agent. Solve the user's task.";
 
 /// Registry + LLM client + agent prompt for a session: the real
 /// DeepSeek setup, or the scripted M0 demo.

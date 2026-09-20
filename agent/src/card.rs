@@ -291,6 +291,61 @@ fn every_worked_example_compiles() {
     }
 }
 
+/// **The dialect table is true of the interpreter it describes.**
+///
+/// The card names three places this language answers differently from
+/// JS, each as a literal expression and a literal result. They are the
+/// only claims in the card a reader is invited to rely on without
+/// trying them, and nothing connected them to the interpreter — the
+/// behaviours are pinned in `interp`'s own tests, but under their own
+/// names, so a change there would leave the card asserting something
+/// false in every prompt.
+///
+/// This runs the left column and checks the right. It reads the table
+/// out of the card rather than restating it, so a row added to the
+/// card is a row this checks, and a row this cannot parse is a row the
+/// card has written in some shape a reader will not recognise either.
+#[test]
+fn the_dialect_table_says_what_the_interpreter_does() {
+    let card = active().text.clone();
+    let rows: Vec<(String, String)> = card
+        .lines()
+        .skip_while(|l| !l.starts_with("| you write "))
+        .skip(1)
+        .skip_while(|l| l.starts_with("|---"))
+        .take_while(|l| l.starts_with('|'))
+        .filter_map(|l| {
+            let cells: Vec<&str> = l.trim_matches('|').split('|').collect();
+            let un = |c: &str| c.trim().trim_matches('`').to_owned();
+            Some((un(cells.first()?), un(cells.get(1)?)))
+        })
+        .collect();
+    assert_eq!(rows.len(), 3, "the table's rows parsed: {rows:?}");
+
+    for (expr, expected) in rows {
+        // `e` is the card's own word for a caught error, and one row is
+        // about exactly that. Binding it here is what makes the row
+        // runnable without restating it.
+        let src =
+            format!("let e; try {{ null.x; }} catch (err) {{ e = err; }} return String({expr});");
+        let prog = interp::compile(&src)
+            .unwrap_or_else(|e| panic!("the table's `{expr}` does not compile: {e:?}"));
+        let mut vm = interp::VM::for_program(prog, serde_json::Value::Null).unwrap();
+        let got = match vm.step(u64::MAX).expect("the table's expression runs") {
+            interp::StepResult::Done { value, .. } => vm
+                .stack_value_to_json(&value, 0)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_owned))
+                .unwrap_or_default(),
+            other => panic!("`{expr}` did not finish: {other:?}"),
+        };
+        assert_eq!(
+            got, expected,
+            "the card says `{expr}` is `{expected}`; it is `{got}`"
+        );
+    }
+}
+
 /// **The card's TypeScript parses.**
 ///
 /// The declaration block is the largest single thing the model reads —
