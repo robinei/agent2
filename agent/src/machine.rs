@@ -4619,7 +4619,23 @@ fn call_label(call: &Call) -> String {
                 arg_preview(&serde_json::Value::String(text.clone()))
             )
         }
-        Call::Spawn { name, .. } => format!("spawn({})", name.as_deref().unwrap_or("<unnamed>")),
+        // **The charter, when there is no name — which is almost
+        // always.** `spawn(charter)` takes one argument and it is not a
+        // name, so `name` is `None` on essentially every spawn in the
+        // corpus and this row read `spawn(<unnamed>)`: the one call
+        // whose identity the model must carry forward, rendered as the
+        // only row on the menu that says nothing about itself.
+        //
+        // Seen live on 2026-09-20: a parent spawned a helper, was shown
+        // `[9] spawn(<unnamed>) → ok, {agent}`, and spawned a second
+        // helper on its very next reply.
+        Call::Spawn { name, charter, .. } => format!(
+            "spawn({})",
+            match name {
+                Some(n) => n.clone(),
+                None => arg_preview(&serde_json::Value::String(charter.clone())),
+            }
+        ),
         Call::Fork { name, .. } => {
             format!("fork({})", name.as_deref().unwrap_or(""))
         }
@@ -6295,6 +6311,34 @@ mod tests {
             "nobody abandoned anything: {how:?}"
         );
         assert_eq!(r.tells, ["took another route"]);
+    }
+
+    /// **A spawn row says what it spawned.** `spawn(charter)` takes one
+    /// argument and it is not a name, so `name` is `None` on every
+    /// spawn in the kept corpus — 12 of 12 — and the row read
+    /// `spawn(<unnamed>)`: the one call whose identity the model has to
+    /// carry forward, rendered as the only row that says nothing about
+    /// itself. A parent shown that spawned a second helper on its next
+    /// reply.
+    #[test]
+    fn a_spawn_row_names_what_it_spawned() {
+        let mut c = Conversation::new();
+        c.user("get a helper to total the ledger");
+        c.reply("```js\nconst a = spawn(\"Total notes/ledger.md and say the number.\");\n```\n");
+
+        let spawn = c
+            .tree()
+            .events
+            .values()
+            .find(|e| matches!(&e.payload, EventPayload::Call(Call::Spawn { .. })))
+            .expect("the spawn is on the log")
+            .id;
+        let row = c.row_shown(spawn);
+        assert!(
+            row.contains("Total notes/ledger.md"),
+            "the charter identifies it: {row}"
+        );
+        assert!(!row.contains("<unnamed>"), "{row}");
     }
 
     /// **A program with the fence left off is caught, and prose is
