@@ -84,16 +84,28 @@ pub fn json_stringify(vm: &mut VM, args: Args) -> Result<Value, VMError> {
                 " ".repeat(n)
             }
             Value::String(s) => s.chars().take(10).collect(),
-            _ => {
-                return Err(vm.fail(ErrorKind::TypeError, "type error"));
+            other => {
+                let what = vm.describe_operand(&other.clone());
+                return Err(vm.fail(
+                    ErrorKind::TypeError,
+                    format!(
+                        "JSON.stringify's third argument is the indent — a number of \
+                         spaces, or the string to indent with. Got {what}."
+                    )
+                    .as_str(),
+                ));
             }
         }
     } else {
         String::new()
     };
     if indent.is_empty() {
-        let s = serde_json::to_string(&json)
-            .map_err(|_| vm.fail(ErrorKind::ValueError, "value error"))?;
+        let s = serde_json::to_string(&json).map_err(|e| {
+            vm.fail(
+                ErrorKind::ValueError,
+                format!("this value cannot be written as JSON: {e}").as_str(),
+            )
+        })?;
         Ok(Value::String(RcStr::from(s)))
     } else {
         let s = pretty_print_json(&json, &indent);
@@ -154,6 +166,38 @@ fn pretty_print_value(value: &serde_json::Value, indent: &str, depth: usize, out
 }
 
 // ── tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod indent_argument_tests {
+    use crate::testutil;
+
+    /// **The third argument is the indent, and the refusal says so.**
+    /// It said "type error", which names neither the argument nor what
+    /// it should have been — and this is the argument a reader is most
+    /// likely to guess at, because in JavaScript it quietly accepts a
+    /// number *or* a string and ignores everything else.
+    #[test]
+    fn a_bad_indent_names_the_argument_and_the_value() {
+        for (src, what) in [
+            ("JSON.stringify({a:1}, null, {})", "an object"),
+            ("JSON.stringify({a:1}, null, [1])", "an array"),
+            ("JSON.stringify({a:1}, null, true)", "a boolean"),
+        ] {
+            let m = testutil::run_ret(&format!(
+                r#"try {{ return {src}; }} catch (e) {{ return e.message; }}"#
+            ));
+            let m = m.as_str().unwrap_or_default();
+            assert!(m.contains("third argument is the indent"), "{src}: {m}");
+            assert!(m.contains(what), "{src} names the value: {m}");
+        }
+
+        // Both forms JavaScript accepts still work.
+        let out = testutil::run_ret(r#"return JSON.stringify({a:1}, null, 2);"#);
+        assert!(out.as_str().unwrap().contains("\n  \"a\""), "{out}");
+        let out = testutil::run_ret(r#"return JSON.stringify({a:1}, null, "\t");"#);
+        assert!(out.as_str().unwrap().contains("\t"), "{out}");
+    }
+}
 
 #[cfg(test)]
 mod tests {

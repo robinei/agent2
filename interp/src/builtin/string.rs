@@ -278,7 +278,7 @@ pub fn str_replace_all(vm: &mut VM, args: Args) -> Result<Value, VMError> {
         if !rx.flags.contains('g') {
             return Err(vm.fail(
                 ErrorKind::TypeError,
-                "replaceAll must be called with a global RegExp",
+                "replaceAll must be called with a global RegExp — add the `g` flag, as in `/…/g`",
             ));
         }
         let text = s.as_str();
@@ -442,7 +442,7 @@ pub fn str_match_all(vm: &mut VM, args: Args) -> Result<Value, VMError> {
         None => {
             return Err(vm.fail(
                 ErrorKind::TypeError,
-                "matchAll must be called with a global RegExp",
+                "matchAll must be called with a global RegExp — add the `g` flag, as in `/…/g`",
             ));
         }
     };
