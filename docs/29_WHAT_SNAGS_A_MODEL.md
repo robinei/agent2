@@ -63,19 +63,20 @@ and 107 → 53 KB, `skipped-tests` 5.5 → 3 and 146 → 82 KB,
 
 The denominators are the other result. A run the provider never
 answered is excluded rather than failed, and the baseline lost three
-that way; this one lost none, because the retry budget now outlasts the
-530 that took them.
+(A run the provider never answered is excluded by the driver rather
+than failed. The baseline lost three that way in one batch; the HEAD
+suites lost none, because the retry budget now outlasts the 530 that
+took them.)
 
-A third off both, with the pass rate holding — and rather more than a
-third on the tasks with room to move: `skipped-tests` and `sweep-200`
-each lost roughly two thirds of their prompt. Most of the cost came off
-one change — telling the model what is in
-the working directory, so it stops spending its first program finding
-out — and the shape of the win is that a model which can see the tree
-plans the whole job in one program instead of discovering it three
-files at a time.
+A third off the cost, and rather more than a third on the tasks with
+room to move: `skipped-tests` and `sweep-200` each lost roughly two
+thirds of their prompt. Most of it came off one change — telling the
+model what is in the working directory, so it stops spending its first
+program finding out — and the shape of the win is that a model which
+can see the tree plans the whole job in one program instead of
+discovering it three files at a time.
 
-The pass rate moved on one change too: refusing an edit that would
+One change moved a pass rate outright: refusing an edit that would
 double a line's indentation took `skipped-tests` from 2/4 to 6/6. The
 guard fired once in those six runs, and the reply after it opened
 
