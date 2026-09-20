@@ -1779,115 +1779,82 @@ fn token_color(kind: super::highlight::Kind) -> Option<Color> {
     }
 }
 
-fn chat_style(kind: ChatKind, even: bool) -> Style {
-    let dim = |r, g, b| Color::Rgb((r * 3 / 4) as u8, (g * 3 / 4) as u8, (b * 3 / 4) as u8);
+/// **The three backgrounds a program block is made of.** A block is one
+/// shape on the screen: a lid saying what it is and how it went, the
+/// source under it, and the calls it made attached below. They share a
+/// family so the eye reads them as one panel, and differ enough to say
+/// which part is which.
+const SLAB_HEADER: Color = Color::Rgb(54, 54, 54);
+const SLAB_CODE: Color = Color::Rgb(40, 40, 40);
+const SLAB_ATTACHED: Color = Color::Rgb(30, 32, 36);
+
+/// The background a row belongs to, or `None` for one that sits on the
+/// pane's own ground.
+fn slab_of(kind: ChatKind, detail: &RowDetail) -> Option<Color> {
+    match (kind, detail) {
+        (ChatKind::Program, RowDetail::Program(_)) => Some(SLAB_HEADER),
+        // Any code, a block's own source or a fenced quote in prose:
+        // both are code and both read as one slab. Only the *lid* is
+        // particular to a block.
+        (ChatKind::Code, _) => Some(SLAB_CODE),
+        (_, RowDetail::Invoke(..)) => Some(SLAB_ATTACHED),
+        _ => None,
+    }
+}
+
+/// Which voice a row is in — what the blank line between turns is
+/// counted against. A program block and the prose around it are the
+/// same voice: the agent's.
+fn speaker_of(kind: ChatKind) -> u8 {
     match kind {
-        ChatKind::System => {
-            let fg = if even {
-                Color::Magenta
-            } else {
-                dim(255, 0, 255)
-            };
-            Style::default().fg(fg).add_modifier(Modifier::DIM)
-        }
-        ChatKind::User => {
-            let fg = if even { Color::Cyan } else { dim(0, 220, 220) };
-            Style::default().fg(fg).add_modifier(Modifier::BOLD)
-        }
-        ChatKind::Assistant => {
-            let fg = if even {
-                Color::Rgb(220, 220, 220)
-            } else {
-                Color::Rgb(155, 155, 155)
-            };
-            Style::default().fg(fg)
-        }
-        ChatKind::Heading => {
-            let fg = if even {
-                Color::Rgb(220, 220, 220)
-            } else {
-                Color::Rgb(155, 155, 155)
-            };
-            Style::default()
-                .fg(fg)
-                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
-        }
-        ChatKind::Blockquote => {
-            let fg = if even {
-                Color::Rgb(130, 130, 130)
-            } else {
-                Color::Rgb(85, 85, 85)
-            };
-            Style::default()
-                .fg(fg)
-                .add_modifier(Modifier::DIM | Modifier::ITALIC)
-        }
-        // Flat, not even/odd-alternated: a code block reads as one
-        // continuous slab regardless of which row parity it lands on,
-        // the same "one look" the predecessor's own fenced-code styling
-        // used (this is that port).
-        ChatKind::Code => Style::default()
-            .bg(Color::Rgb(40, 40, 40))
-            .fg(Color::Rgb(210, 210, 210)),
-        ChatKind::TableHeader => {
-            let fg = if even {
-                Color::Rgb(220, 220, 220)
-            } else {
-                Color::Rgb(155, 155, 155)
-            };
-            Style::default().fg(fg).add_modifier(Modifier::BOLD)
-        }
-        ChatKind::TableRow => {
-            let fg = if even {
-                Color::Rgb(220, 220, 220)
-            } else {
-                Color::Rgb(155, 155, 155)
-            };
-            Style::default().fg(fg)
-        }
-        // Not even/odd-alternated, same reasoning as `Code`: a table's
-        // frame reads as one fixed structure, not a striped row.
+        ChatKind::User => 1,
+        ChatKind::System | ChatKind::Marker | ChatKind::Error => 2,
+        _ => 0,
+    }
+}
+
+/// **One colour per kind, not two.** Rows used to alternate brightness
+/// by parity, which was the only grouping signal the pane had. It is
+/// not any more — turns are separated by whitespace and a program's
+/// parts share a background — and two signals for "these lines belong
+/// together" disagree more often than they agree.
+fn chat_style(kind: ChatKind) -> Style {
+    match kind {
+        ChatKind::System => Style::default()
+            .fg(Color::Magenta)
+            .add_modifier(Modifier::DIM),
+        ChatKind::User => Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+        ChatKind::Assistant => Style::default().fg(Color::Rgb(220, 220, 220)),
+        ChatKind::Heading => Style::default()
+            .fg(Color::Rgb(220, 220, 220))
+            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+        ChatKind::Blockquote => Style::default()
+            .fg(Color::Rgb(130, 130, 130))
+            .add_modifier(Modifier::DIM | Modifier::ITALIC),
+        ChatKind::Code => Style::default().fg(Color::Rgb(205, 205, 205)),
+        ChatKind::TableHeader => Style::default()
+            .fg(Color::Rgb(220, 220, 220))
+            .add_modifier(Modifier::BOLD),
+        ChatKind::TableRow => Style::default().fg(Color::Rgb(220, 220, 220)),
+        // A table's frame reads as one fixed structure.
         ChatKind::TableBorder => Style::default().fg(Color::DarkGray),
         // Already a full line of `─` by the time it's here (`classify_
         // markdown_lines` renders it at the pane's own width) — nothing
         // left to style but the color.
         ChatKind::Hr => Style::default().fg(Color::DarkGray),
-        ChatKind::Thinking => {
-            let fg = if even {
-                Color::Rgb(130, 130, 130)
-            } else {
-                Color::Rgb(85, 85, 85)
-            };
-            Style::default().fg(fg).add_modifier(Modifier::DIM)
-        }
-        ChatKind::Streaming => {
-            let fg = if even {
-                Color::Rgb(140, 140, 140)
-            } else {
-                Color::Rgb(90, 90, 90)
-            };
-            Style::default().fg(fg).add_modifier(Modifier::ITALIC)
-        }
-        ChatKind::Program => {
-            let fg = if even {
-                Color::Yellow
-            } else {
-                Color::Rgb(180, 170, 0)
-            };
-            Style::default().fg(fg)
-        }
-        ChatKind::Marker => {
-            let fg = if even {
-                Color::DarkGray
-            } else {
-                Color::Rgb(70, 70, 70)
-            };
-            Style::default().fg(fg).add_modifier(Modifier::ITALIC)
-        }
-        ChatKind::Error => {
-            let fg = if even { Color::Red } else { dim(240, 0, 0) };
-            Style::default().fg(fg)
-        }
+        ChatKind::Thinking => Style::default()
+            .fg(Color::Rgb(130, 130, 130))
+            .add_modifier(Modifier::DIM),
+        ChatKind::Streaming => Style::default()
+            .fg(Color::Rgb(140, 140, 140))
+            .add_modifier(Modifier::ITALIC),
+        ChatKind::Program => Style::default().fg(Color::Rgb(200, 190, 120)),
+        ChatKind::Marker => Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::ITALIC),
+        ChatKind::Error => Style::default().fg(Color::Red),
     }
 }
 
@@ -2066,55 +2033,50 @@ fn render_chat(
     // `push_wrapped_width` does, and what lets a click (a wrapped-line
     // coordinate) find its way back to a logical row.
     let mut row_at_line: Vec<usize> = Vec::with_capacity(rows.len());
-    let mut parity: HashMap<ChatKind, bool> = HashMap::new();
-    let mut in_program: Option<EventId> = None;
-    let mut prev_kind: Option<ChatKind> = None;
+    let mut prev_speaker: Option<u8> = None;
+    let mut prev_block: Option<EventId> = None;
     for (row_idx, (kind, text, detail, id)) in rows.iter().enumerate() {
         if *kind == ChatKind::Thinking && !app.show_thinking {
             continue;
         }
-        let even = match detail {
-            RowDetail::Program(pid) | RowDetail::Invoke(pid, _) => {
-                if in_program != Some(*pid) {
-                    in_program = Some(*pid);
-                    let e = parity.entry(ChatKind::Program).or_insert(true);
-                    *e = !*e;
-                }
-                *parity.get(&ChatKind::Program).unwrap_or(&true)
-            }
-            RowDetail::None => {
-                in_program = None;
-                if prev_kind != Some(*kind) {
-                    let e = parity.entry(*kind).or_insert(true);
-                    *e = !*e;
-                }
-                *parity.get(kind).unwrap_or(&true)
-            }
+        // **A blank line where the voice changes.** Turns used to run
+        // into each other, with row parity the only thing separating
+        // them; whitespace says it plainly and costs one row per change
+        // rather than a shade per row.
+        let speaker = speaker_of(*kind);
+        // A block is a panel, so it gets air after it too — otherwise
+        // the prose that follows butts against the slab and reads as
+        // part of it. Keyed on which program a row belongs to, not on
+        // the background, because a block's lid and its source are
+        // different backgrounds and the same panel.
+        let block = match detail {
+            RowDetail::Program(pid) | RowDetail::Invoke(pid, _) => Some(*pid),
+            RowDetail::None => None,
         };
-        prev_kind = Some(*kind);
-        let mut style = chat_style(*kind, even);
+        if prev_speaker.is_some_and(|p| p != speaker) || (prev_block.is_some() && block != prev_block)
+        {
+            lines.push(Line::from(""));
+            row_at_line.resize(lines.len(), row_idx);
+        }
+        prev_speaker = Some(speaker);
+        prev_block = block;
+        let mut style = chat_style(*kind);
         if matches!(detail, RowDetail::Program(_))
             && let Some(color) = program_header_severity(text)
         {
             style = style.fg(color);
         }
-        // Highlight the selected subitem line.
-        if let Some(sel) = app.selected_subitem {
-            let highlight = matches!(
-                detail,
-                RowDetail::Invoke(pid, idx)
-                    if app.selected_program == Some(*pid) && *idx == sel
-            );
-            if highlight {
-                style = style.add_modifier(Modifier::REVERSED);
-            }
-        }
-        // Highlight the selected message (the fork-from-here target,
-        // 19_UX Step C2) the same way — one visual language for
-        // "selected," not a second one just for this.
-        if app.last_clicked_event == Some(*id) {
-            style = style.add_modifier(Modifier::REVERSED);
-        }
+        // **Selection is a mark in the gutter, not an inversion.**
+        // `REVERSED` meant three different things at once — the
+        // selected sub-item, the fork-from-here target, and the help
+        // bar — so two of them looked identical, and on a code row it
+        // swapped the slab for the foreground, which read as damage
+        // rather than as a cursor. A gutter mark composes with a
+        // background instead of fighting it.
+        let selected = app.selected_subitem.is_some_and(|sel| {
+            matches!(detail, RowDetail::Invoke(pid, idx)
+                if app.selected_program == Some(*pid) && *idx == sel)
+        }) || app.last_clicked_event == Some(*id);
         let before = lines.len();
         if app.show_markdown
             && matches!(
@@ -2153,8 +2115,40 @@ fn render_chat(
         } else {
             push_wrapped_width(&mut lines, text, style, wrap_width);
         }
-        row_at_line.resize(lines.len(), row_idx);
         debug_assert!(lines.len() > before, "every row pushes at least one line");
+        // **A slab reaches the edge, and a selection shows in the
+        // gutter.** ratatui paints a `Line`'s style only where the line
+        // has cells, so a background stopped at the last character and
+        // a block read as ragged highlighting rather than a panel. Both
+        // are applied here, after the row's lines exist, because a row
+        // can become several of them and every one is part of the same
+        // shape.
+        let slab = slab_of(*kind, detail);
+        if slab.is_some() || selected {
+            for line in &mut lines[before..] {
+                let width: usize = line
+                    .spans
+                    .iter()
+                    .map(|s| s.content.chars().count())
+                    .sum::<usize>();
+                if let Some(bg) = slab {
+                    if width < wrap_width {
+                        line.spans
+                            .push(Span::styled(" ".repeat(wrap_width - width), style));
+                    }
+                    for span in &mut line.spans {
+                        span.style = span.style.bg(bg);
+                    }
+                }
+                if selected {
+                    line.spans.insert(
+                        0,
+                        Span::styled("▌", Style::default().fg(Color::Cyan)),
+                    );
+                }
+            }
+        }
+        row_at_line.resize(lines.len(), row_idx);
     }
     let visible = transcript_area.height.saturating_sub(2) as usize;
     let default_top = lines.len().saturating_sub(visible);
@@ -2600,9 +2594,319 @@ fn condition_line(cause: &crate::types::Handback) -> String {
     }
 }
 
+/// Render a pane and read back what actually landed on the terminal.
+///
+/// **Because this is the only pane whose correctness is how it looks.**
+/// Every other test here asserts on the row *model* — the strings
+/// `ChatState` produces — and the row model is not the thing a person
+/// sees: a background that stops at the end of the text, a selection
+/// drawn three different ways, a slab that does not reach the edge are
+/// all invisible to it. The tests that did look scanned the buffer cell
+/// by cell with nested loops, once per question asked.
+///
+/// So: render to a `TestBackend`, then ask the buffer questions in the
+/// terms the change is about — where does this row's background start
+/// and stop, what colour is that gutter, does this text appear. And
+/// `dump` prints the whole thing with its backgrounds marked, which is
+/// how someone who cannot see the terminal reviews a change to it.
+#[cfg(test)]
+pub(crate) struct Screen {
+    buffer: ratatui::buffer::Buffer,
+}
+
+#[cfg(test)]
+impl Screen {
+    /// Draw the chat pane at `w`×`h` and keep the buffer.
+    pub(crate) fn chat(app: &AttachedApp, w: u16, h: u16) -> Self {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).expect("a test terminal");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_chat(frame, app, area, None, None);
+            })
+            .expect("draw");
+        Self {
+            buffer: terminal.backend().buffer().clone(),
+        }
+    }
+
+    fn width(&self) -> u16 {
+        self.buffer.area.width
+    }
+
+    fn height(&self) -> u16 {
+        self.buffer.area.height
+    }
+
+    /// One row's text, trailing blanks kept off.
+    pub(crate) fn row(&self, y: u16) -> String {
+        (0..self.width())
+            .filter_map(|x| self.buffer.cell((x, y)).map(|c| c.symbol().to_owned()))
+            .collect::<String>()
+            .trim_end()
+            .to_owned()
+    }
+
+    /// One row with the pane's own border trimmed off — what the row
+    /// *says*, as distinct from what the terminal holds. Every
+    /// question about content wants this; `row` is for the ones about
+    /// the frame.
+    pub(crate) fn inner(&self, y: u16) -> String {
+        self.row(y)
+            .trim_start_matches('│')
+            .trim_end_matches('│')
+            .trim_end()
+            .to_owned()
+    }
+
+    /// Every row, as one string — for `contains` questions.
+    pub(crate) fn text(&self) -> String {
+        (0..self.height())
+            .map(|y| self.row(y))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The first row whose text contains `needle`.
+    pub(crate) fn find(&self, needle: &str) -> Option<u16> {
+        (0..self.height()).find(|y| self.row(*y).contains(needle))
+    }
+
+    /// The background colours across one row, run-length encoded — the
+    /// question "does the slab reach the edge" in the form the buffer
+    /// can answer it.
+    pub(crate) fn backgrounds(&self, y: u16) -> Vec<(Color, u16)> {
+        let mut runs: Vec<(Color, u16)> = Vec::new();
+        for x in 0..self.width() {
+            let bg = self.buffer.cell((x, y)).map_or(Color::Reset, |c| c.bg);
+            match runs.last_mut() {
+                Some((last, n)) if *last == bg => *n += 1,
+                _ => runs.push((bg, 1)),
+            }
+        }
+        runs
+    }
+
+    pub(crate) fn modifiers(&self, y: u16) -> Modifier {
+        (0..self.width())
+            .filter_map(|x| self.buffer.cell((x, y)).map(|c| c.modifier))
+            .fold(Modifier::empty(), |a, b| a | b)
+    }
+
+    /// The whole pane with its backgrounds marked, for a reader who
+    /// cannot see the terminal. `·` is the default background; any
+    /// other gets a letter, and the key is printed underneath.
+    pub(crate) fn dump(&self) -> String {
+        let mut seen: Vec<Color> = Vec::new();
+        let mut out = String::new();
+        for y in 0..self.height() {
+            let mut marks = String::new();
+            for x in 0..self.width() {
+                let bg = self.buffer.cell((x, y)).map_or(Color::Reset, |c| c.bg);
+                if bg == Color::Reset {
+                    marks.push('·');
+                    continue;
+                }
+                let at = seen.iter().position(|c| *c == bg).unwrap_or_else(|| {
+                    seen.push(bg);
+                    seen.len() - 1
+                });
+                marks.push((b'a' + at as u8) as char);
+            }
+            out.push_str(&format!("{y:>3} |{marks}| {}\n", self.row(y)));
+        }
+        for (i, c) in seen.iter().enumerate() {
+            out.push_str(&format!("      {} = {c:?}\n", (b'a' + i as u8) as char));
+        }
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A session with one of everything the chat pane draws: a user
+    /// turn, prose, a multi-line cell, calls under it, a `tell`, and a
+    /// terminal. What every look-at-it test renders.
+    fn a_session_with_one_of_everything() -> AttachedApp {
+        let (tx, rx) = channel();
+        let mut registry = ToolRegistry::new();
+        registry.register(crate::host::ToolDef {
+            name: "read_file".into(),
+            description: String::new(),
+            input_schema: serde_json::json!({ "type": "array" }),
+            guidelines: Vec::new(),
+            example: None,
+            returns: None,
+            handler: Box::new(|_| {
+                Ok(serde_json::json!({ "content": "x = 1\n", "version": "v1" }))
+            }),
+        });
+        let session = Session::new(
+            Tree::new(None),
+            "a test agent",
+            registry,
+            Box::new(ScriptedLlm::new([scripted_markdown(
+                concat!(
+                    "Reading it first, then I will say what I found.\n\n",
+                    "```js\n",
+                    "const f = await tools.read_file(\"a.txt\");\n",
+                    "const n = f.content.trim().length;\n",
+                    "const doubled = n * 2;\n",
+                    "const label = `len ${n}`;\n",
+                    "console.log(label, doubled);\n",
+                    "tell(`a.txt is ${n} characters.`);\n",
+                    "```\n",
+                ),
+            )])),
+            tx,
+        )
+        .unwrap();
+        session.handle().send(SessionCommand::UserTurn {
+            branch: session.conversation_branch(),
+            text: "how long is a.txt?".into(),
+            expects_reply: true,
+        });
+        let session = session.run();
+        let mut app = AttachedApp::new(session.conversation_branch());
+        for event in rx.try_iter() {
+            app.apply(&event);
+        }
+        app
+    }
+
+    /// **A program block is one shape that reaches both edges.** A
+    /// `Line`'s style paints only where the line has cells, so every
+    /// background used to stop at the last character and a block read
+    /// as ragged highlighting rather than a panel.
+    #[test]
+    fn a_program_block_is_a_full_width_slab_in_three_shades() {
+        let app = a_session_with_one_of_everything();
+        let screen = Screen::chat(&app, 64, 26);
+
+        let lid = screen.find("program: completed").expect("the block's lid");
+        let code = screen.find("const n =").expect("its source");
+        let call = screen.find("⚙ read_file").expect("the call it made");
+
+        for (y, what) in [(lid, "lid"), (code, "source"), (call, "call")] {
+            let runs = screen.backgrounds(y);
+            // The pane's border owns column 0 and the last column; the
+            // slab is everything between, in one piece.
+            let inner: Vec<_> = runs[1..runs.len() - 1].to_vec();
+            assert_eq!(
+                inner.len(),
+                1,
+                "the {what} row is not one slab: {runs:?}\n{}",
+                screen.dump()
+            );
+        }
+        // Three shades of one family: lid, source, and the calls
+        // attached below it.
+        let shade = |y| screen.backgrounds(y)[1].0;
+        assert_ne!(shade(lid), shade(code));
+        assert_ne!(shade(code), shade(call));
+    }
+
+    /// **The fences are gone and their tag is not.** A `Part::Cell`
+    /// carries its own ` ```js `, which makes the parts concatenate
+    /// back to the reply and said nothing to a reader — but the tag on
+    /// it says which dialect ran, so it moves to the lid.
+    #[test]
+    fn a_block_shows_no_fences_and_names_its_dialect() {
+        let app = a_session_with_one_of_everything();
+        let screen = Screen::chat(&app, 64, 26);
+        assert!(
+            !screen.text().contains("```"),
+            "a fence reached the screen:\n{}",
+            screen.dump()
+        );
+        assert!(
+            screen.inner(screen.find("program:").unwrap()).contains("· js"),
+            "the lid names the dialect the fence did"
+        );
+    }
+
+    /// **Turns are separated by air, and a block is a panel with air
+    /// around it.** Row parity used to be the only grouping signal
+    /// there was; it is gone, so this is the one that has to hold.
+    #[test]
+    fn a_blank_line_separates_the_voices_and_the_block() {
+        let app = a_session_with_one_of_everything();
+        let screen = Screen::chat(&app, 64, 26);
+        let user = screen.find("how long is a.txt").expect("the question");
+        assert_eq!(screen.inner(user - 1), "", "air above the user's turn");
+        let call = screen.find("⚙ read_file").expect("the block's last row");
+        assert_eq!(screen.inner(call + 1), "", "air below the block");
+        assert!(
+            screen.inner(call + 2).contains("Reading it first"),
+            "and the prose after it is outside the slab"
+        );
+    }
+
+    /// **A `tell` is speech, not a call.** It reaches the pane as its
+    /// own `Send` and renders as prose on the pane's own ground —
+    /// never inside the block, whose background it would otherwise
+    /// take.
+    #[test]
+    fn a_tell_renders_as_prose_outside_the_block() {
+        let app = a_session_with_one_of_everything();
+        let screen = Screen::chat(&app, 64, 26);
+        let said = screen
+            .find("a.txt is 5 characters")
+            .expect("the tell reached the person");
+        assert_eq!(
+            screen.backgrounds(said)[0].0,
+            Color::Reset,
+            "it is on the pane's ground, not in a slab:\n{}",
+            screen.dump()
+        );
+    }
+
+    /// **Selection is a gutter mark.** `REVERSED` meant three things at
+    /// once, so two of them looked identical — and on a code row it
+    /// swapped the slab for the foreground, which reads as damage
+    /// rather than as a cursor.
+    #[test]
+    fn selection_marks_the_gutter_and_leaves_the_slab_alone() {
+        let mut app = a_session_with_one_of_everything();
+        let plain = Screen::chat(&app, 64, 26);
+        let call_row = plain.find("⚙ read_file").expect("a call to select");
+        let before = plain.backgrounds(call_row)[1].0;
+
+        app.selected_program = Some(EventId::new(3));
+        app.selected_subitem = Some(0);
+        let screen = Screen::chat(&app, 64, 26);
+        let y = screen.find("⚙ read_file").expect("still there");
+        assert!(
+            screen.inner(y).starts_with("▌"),
+            "the mark is in the gutter: {:?}",
+            screen.inner(y)
+        );
+        assert!(
+            !screen.modifiers(y).contains(Modifier::REVERSED),
+            "and nothing is inverted"
+        );
+        assert_eq!(
+            screen.backgrounds(y)[1].0,
+            before,
+            "the slab is untouched"
+        );
+    }
+
+    /// Not an assertion — a picture, for changing how this looks.
+    /// `cargo test -p agent look_at_the_chat_pane -- --ignored --nocapture`
+    #[test]
+    #[ignore = "prints the pane; it asserts nothing"]
+    fn look_at_the_chat_pane() {
+        let app = a_session_with_one_of_everything();
+        for (kind, text, detail, id) in app.chat.rows(app.selected, 60) {
+            println!("ROW {kind:?} {detail:?} #{} {text:?}", id.as_u64());
+        }
+        println!("{}", Screen::chat(&app, 64, 26).dump());
+    }
     use crate::host::{
         ScriptedLlm, ToolDef, ToolRegistry, run_demo, scripted_markdown, scripted_program,
         scripted_text,

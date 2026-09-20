@@ -44,6 +44,32 @@ use crate::types::{Address, Call, Event, EventId, EventPayload, Outcome};
 /// How many lines of a cell's source show while it is collapsed (D13).
 pub const CELL_COLLAPSED_LINES: usize = 5;
 
+/// A cell's source without its fences, and the dialect they named.
+///
+/// **The fences are punctuation the reader already knows.** A
+/// `Part::Cell` carries its own ` ```js ` and ` ``` ` because that is
+/// what makes the parts concatenate back to the reply (28), and the
+/// chat pane was printing them: two of every block's lines said
+/// nothing, and the first of them pushed the code down a row. The tag
+/// on the opening fence is not punctuation — it says which dialect ran
+/// — so it comes back separately and goes in the header, where there
+/// is already a line about what this block is.
+fn unfenced(source: &str) -> (Vec<&str>, Option<&str>) {
+    let mut lines: Vec<&str> = source.trim_end().lines().collect();
+    let mut dialect = None;
+    if let Some(first) = lines.first()
+        && let Some(tag) = first.trim_start().strip_prefix("```")
+    {
+        let tag = tag.trim();
+        dialect = (!tag.is_empty()).then_some(tag);
+        lines.remove(0);
+        if lines.last().is_some_and(|l| l.trim() == "```") {
+            lines.pop();
+        }
+    }
+    (lines, dialect)
+}
+
 /// What a transcript row is, for styling by the renderer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ChatKind {
@@ -699,7 +725,7 @@ impl ChatState {
         if !self.show_cells || source.trim().is_empty() {
             return Vec::new();
         }
-        let lines: Vec<&str> = source.trim_end().lines().collect();
+        let (lines, _) = unfenced(source);
         let expanded = self.expanded_cells.contains(&program);
         let shown = if expanded {
             lines.len()
@@ -717,17 +743,57 @@ impl ChatState {
                 )
             })
             .collect();
+        // **The affordance is on the row, in both directions.** A
+        // collapsed block said how much was hidden and not how to see
+        // it; an expanded one said nothing at all, so the way back was
+        // a thing you had to remember. Both are a row now, and both say
+        // what happens if you use them.
         if shown < lines.len() {
             let rest = lines.len() - shown;
             let plural = if rest == 1 { "" } else { "s" };
             out.push((
                 ChatKind::Code,
-                format!("{indent}… {rest} more line{plural}"),
+                format!("{indent}… {rest} more line{plural} — click or ⏎ to expand"),
+                RowDetail::Program(program),
+                program,
+            ));
+        } else if expanded && lines.len() > CELL_COLLAPSED_LINES {
+            out.push((
+                ChatKind::Code,
+                format!("{indent}… click or ⏎ to collapse"),
                 RowDetail::Program(program),
                 program,
             ));
         }
         out
+    }
+
+    /// One entry's lines, classified and cached by width — the one
+    /// copy of that, now that a `⚙` line can be emitted from two
+    /// places (under its block, or where it fell when it has none).
+    fn entry_lines(
+        &self,
+        entry_index: usize,
+        kind: ChatKind,
+        text: &str,
+        render_markdown: bool,
+        width: usize,
+    ) -> Vec<(ChatKind, String)> {
+        let cache = if render_markdown {
+            &self.classified_line_cache
+        } else {
+            &self.raw_line_cache
+        };
+        {
+            let mut cache_mut = cache.borrow_mut();
+            let stale = !matches!(&cache_mut[entry_index], Some((w, _)) if *w == width);
+            if stale {
+                self.line_derivations.set(self.line_derivations.get() + 1);
+                cache_mut[entry_index] =
+                    Some((width, classify_entry_lines(kind, text, render_markdown, width)));
+            }
+        }
+        cache.borrow()[entry_index].as_ref().unwrap().1.clone()
     }
 
     /// Same rows, but with markdown block/inline classification skipped
@@ -761,11 +827,32 @@ impl ChatState {
         };
         let mut out = Vec::new();
         let mut invoke_index: HashMap<EventId, usize> = HashMap::new();
-        let cache = if render_markdown {
-            &self.classified_line_cache
-        } else {
-            &self.raw_line_cache
-        };
+        // **A program's calls belong under its block, not where they
+        // happened to land.** They arrive as their own events, so prose
+        // written between the cell and the call's result used to sit
+        // between the two — a `⚙ read_file → …` line orphaned from the
+        // block that issued it, with a paragraph in the middle. The
+        // block is the unit a reader is following, so this pulls them
+        // back to it: one forward pass, because a `Reply` is always
+        // logged before the calls its cells make.
+        let mut calls_of: HashMap<EventId, Vec<usize>> = HashMap::new();
+        for (i, entry) in self.entries.iter().enumerate() {
+            if let Entry::Line {
+                branch,
+                id,
+                kind: ChatKind::Program,
+                program: Some(pid),
+                ..
+            } = entry
+                && visible(*branch, *id)
+            {
+                calls_of.entry(*pid).or_default().push(i);
+            }
+        }
+        // Which programs put a header out — the ones whose calls have
+        // somewhere to go. A reply with no cells has no block, and its
+        // calls stay where they are.
+        let mut grouped: std::collections::HashSet<EventId> = Default::default();
         for (entry_index, entry) in self.entries.iter().enumerate() {
             match entry {
                 Entry::Header {
@@ -808,13 +895,33 @@ impl ChatState {
                     // model would otherwise have written.
                     let label = if *depth == 0 { "program" } else { "handler" };
                     let who = if *by_user { "you ▸ " } else { "" };
+                    // The dialect the fences named, which stripping
+                    // them would otherwise throw away.
+                    let dialect = match unfenced(source).1 {
+                        Some(tag) => format!(" · {tag}"),
+                        None => String::new(),
+                    };
                     out.push((
                         ChatKind::Program,
-                        format!("{indent}{who}{label}: {status}"),
+                        format!("{indent}{who}{label}: {status}{dialect}"),
                         RowDetail::Program(*program),
                         *program,
                     ));
                     out.extend(self.cell_rows(*program, source, &indent));
+                    grouped.insert(*program);
+                    for i in calls_of.get(program).into_iter().flatten().copied() {
+                        let Entry::Line { id, text, .. } = &self.entries[i] else {
+                            continue;
+                        };
+                        let idx = invoke_index.entry(*program).or_insert(0);
+                        let detail = RowDetail::Invoke(*program, *idx);
+                        *idx += 1;
+                        for (k, line) in
+                            self.entry_lines(i, ChatKind::Program, text, render_markdown, width)
+                        {
+                            out.push((k, line, detail.clone(), *id));
+                        }
+                    }
                 }
                 Entry::Line {
                     branch,
@@ -823,6 +930,12 @@ impl ChatState {
                     text,
                     program,
                 } if visible(*branch, *id) => {
+                    // Already drawn under its block, above.
+                    if *kind == ChatKind::Program
+                        && program.is_some_and(|pid| grouped.contains(&pid))
+                    {
+                        continue;
+                    }
                     if *kind == ChatKind::System {
                         out.push((ChatKind::System, "system".into(), RowDetail::None, *id));
                         continue;
@@ -839,20 +952,10 @@ impl ChatState {
                     } else {
                         RowDetail::None
                     };
+                    for (k, line) in
+                        self.entry_lines(entry_index, *kind, text, render_markdown, width)
                     {
-                        let mut cache_mut = cache.borrow_mut();
-                        let stale = !matches!(&cache_mut[entry_index], Some((w, _)) if *w == width);
-                        if stale {
-                            self.line_derivations.set(self.line_derivations.get() + 1);
-                            cache_mut[entry_index] = Some((
-                                width,
-                                classify_entry_lines(*kind, text, render_markdown, width),
-                            ));
-                        }
-                    }
-                    let cache_ref = cache.borrow();
-                    for (k, line) in &cache_ref[entry_index].as_ref().unwrap().1 {
-                        out.push((*k, line.clone(), detail.clone(), *id));
+                        out.push((k, line, detail.clone(), *id));
                     }
                 }
                 _ => {}
@@ -2955,7 +3058,11 @@ mod tests {
         );
         assert_eq!(rows[0], "line1();");
         assert_eq!(rows[CELL_COLLAPSED_LINES - 1], "line5();");
-        assert_eq!(rows[CELL_COLLAPSED_LINES], "… 3 more lines");
+        assert_eq!(
+            rows[CELL_COLLAPSED_LINES],
+            "… 3 more lines — click or ⏎ to expand",
+            "the row says how much is hidden and how to see it"
+        );
     }
 
     /// A cell shorter than the cap shows whole, with no count row.
@@ -2985,7 +3092,12 @@ mod tests {
         }
         chat.toggle_cell(EventId::new(2));
         assert!(chat.cell_expanded(EventId::new(2)));
-        assert_eq!(code_rows(&chat).len(), 8, "every line, no count row");
+        // Every line, and the way back — an expanded block used to say
+        // nothing at all, so collapsing it again was something you had
+        // to remember rather than something you could see.
+        let open = code_rows(&chat);
+        assert_eq!(open.len(), 9);
+        assert_eq!(open[8], "… click or ⏎ to collapse");
         chat.toggle_cell(EventId::new(2));
         assert_eq!(code_rows(&chat).len(), CELL_COLLAPSED_LINES + 1);
     }
@@ -3022,7 +3134,9 @@ mod tests {
             "the other cell is untouched"
         );
         let rows = code_rows(&chat);
-        assert_eq!(rows.len(), 8 + (CELL_COLLAPSED_LINES + 1));
+        // The open one is eight lines and its collapse row; the shut
+        // one is five and its count row.
+        assert_eq!(rows.len(), (8 + 1) + (CELL_COLLAPSED_LINES + 1));
         assert!(rows.contains(&"a8();".to_string()), "the first is open");
         assert!(!rows.contains(&"b8();".to_string()), "the second is not");
     }
