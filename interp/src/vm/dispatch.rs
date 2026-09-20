@@ -2474,10 +2474,77 @@ impl VM {
                             })?;
                             arr.extend(elts);
                         }
-                        _ => {
+                        // **Array-like spreads too, because
+                        // `Array.from` takes one.** `String.match`
+                        // with a non-global pattern answers an object
+                        // carrying `0`, `index`, `input` and `length`
+                        // — JavaScript's own match result is an array
+                        // wearing those extra properties, which a
+                        // `ThinVec` cannot do, so this keeps the
+                        // object and spreads it by its `length`.
+                        //
+                        // The argument is the one already written into
+                        // `Array.from`: `Array.from(x)` and `[...x]`
+                        // are two spellings of one operation, and two
+                        // spellings that disagree are a gap a reader
+                        // can only find by falling into it.
+                        // `Array.from(m)` worked on a match object and
+                        // `[...m]` did not; a `sweep-8` reply on
+                        // 2026-09-20 wrote the second one twice.
+                        Value::Object(obj_ptr)
+                            if self
+                                .objects
+                                .get(obj_ptr as usize)
+                                .and_then(|o| o.map.get("length"))
+                                .and_then(Value::to_number)
+                                .is_some() =>
+                        {
+                            let obj = self.objects.get(obj_ptr as usize).ok_or_else(|| {
+                                VMError::fail_at(ip, ErrorKind::TypeError, "bad object pointer")
+                            })?;
+                            let n = obj
+                                .map
+                                .get("length")
+                                .and_then(Value::to_number)
+                                .unwrap_or(0.0)
+                                .max(0.0) as usize;
+                            let elts: ThinVec<Value> = (0..n.min(10_000_000))
+                                .map(|i| {
+                                    obj.map
+                                        .get(&RcStr::from(i.to_string().as_str()))
+                                        .cloned()
+                                        .unwrap_or(Value::Undefined)
+                                })
+                                .collect();
+                            let arr = self.arrays.get_mut(arr_ptr as usize).ok_or_else(|| {
+                                VMError::fail_at(ip, ErrorKind::TypeError, "bad array pointer")
+                            })?;
+                            arr.extend(elts);
+                        }
+                        // **Name the value, and the commonest way to
+                        // get this one.** The message said what a
+                        // spread source may be and not what this one
+                        // was — and the way a program arrives here is
+                        // almost always `[...s.match(re)]` where the
+                        // match found nothing, because `String.match`
+                        // answers `null` rather than an empty array.
+                        // Seen live 2026-09-20, twice in one `sweep-8`
+                        // reply.
+                        ref other => {
+                            let what = self.describe_operand(&other.clone());
+                            let hint = if matches!(other, Value::Null | Value::Undefined) {
+                                " — a `String.match` that found nothing answers null, not an \
+                                 empty array, so check it before spreading"
+                            } else {
+                                ""
+                            };
                             return Err(self.fail(
                                 ErrorKind::TypeError,
-                                "array spread source must be an array, a Map, a Set, or a string",
+                                format!(
+                                    "array spread source must be an array, a Map, a Set, or a \
+                                     string. Got {what}{hint}."
+                                )
+                                .as_str(),
                             ));
                         }
                     }

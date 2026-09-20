@@ -823,3 +823,60 @@ fn a_settle_failure_inside_an_async_call_rejects_its_promise() {
         other => panic!("expected Done, got {other:?}"),
     }
 }
+
+/// **`[...m]` and `Array.from(m)` take the same things.**
+///
+/// `String.match` with a non-global pattern answers an object
+/// carrying `0`, `index`, `input` and `length` — JavaScript's own
+/// match result is an array wearing those extra properties, which a
+/// `ThinVec` cannot be. `Array.from` already accepted it and spread
+/// did not, which is the gap this codebase already closed once for
+/// `Array.from(new Set())`: two spellings of one operation that
+/// disagree can only be found by falling into them. A `sweep-8` reply
+/// on 2026-09-20 wrote the losing one twice.
+#[test]
+fn a_match_result_spreads_like_the_array_it_is_in_javascript() {
+    let out = crate::testutil::run_ret(r#"return [..."hello".match(/l(l)/)];"#);
+    assert_eq!(out, serde_json::json!(["ll", "l"]));
+
+    // The extra properties the real thing carries are still there.
+    let out = crate::testutil::run_ret(r#"return "hello".match(/l(l)/).index;"#);
+    assert_eq!(out, serde_json::json!(2));
+
+    // And the two spellings agree, which is the whole point.
+    let out = crate::testutil::run_ret(
+        r#"const m = "hello".match(/l(l)/); return JSON.stringify([...m]) === JSON.stringify(Array.from(m));"#,
+    );
+    assert_eq!(out, serde_json::json!(true));
+}
+
+/// **A spread that fails says what it got, and how you got there.**
+///
+/// The message named what a spread source may be and not what this
+/// one was. The way a program arrives here is almost always
+/// `[...s.match(re)]` where the match found nothing — `String.match`
+/// answers `null`, not an empty array — and that happened twice in
+/// one `sweep-8` reply on 2026-09-20.
+#[test]
+fn spreading_a_failed_match_says_so() {
+    let msg = crate::testutil::run_ret(
+        r#"try { return [..."abc".match(/zzz/)]; } catch (e) { return e.message; }"#,
+    );
+    let msg = msg.as_str().unwrap();
+    assert!(msg.contains("Got null"), "names the value: {msg}");
+    assert!(
+        msg.contains("`String.match` that found nothing"),
+        "and how a program gets here: {msg}"
+    );
+
+    // A wrong-but-not-null source names itself and skips the hint.
+    let msg =
+        crate::testutil::run_ret(r#"try { return [...42]; } catch (e) { return e.message; }"#);
+    let msg = msg.as_str().unwrap();
+    assert!(msg.contains("Got"), "{msg}");
+    assert!(!msg.contains("String.match"), "no irrelevant hint: {msg}");
+
+    // And a match that found something still spreads.
+    let out = crate::testutil::run_ret(r#"return [..."abc".match(/b/)].length;"#);
+    assert_eq!(out, serde_json::json!(1));
+}
