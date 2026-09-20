@@ -970,6 +970,17 @@ It also never caught the case that motivated it, because that run wrote
 A report section that is wrong most of the time it appears is how a
 reader learns to skip that section.
 
+**A search tool, to remove a layer of quoting.** A `grep` regex
+written inside a JS template literal inside a shell double-quoted
+string passes through three escapers, and one run died on `grep:
+Unmatched ( or \(` — `vars\(` in a template literal is just `vars(`,
+because JavaScript drops an escape it does not recognise. A
+`tools.grep` would delete the whole problem. The numbers say no: 4 of
+1,554 bash results fail on quoting or escaping, 0.3%, and three of
+those four are a Python heredoc with a quote in it rather than a
+regex. Not a case for a tool; recorded so the next person weighing it
+has the figure.
+
 **A parse check inside `replace_file`.** Tempting after the
 indentation findings: the harness can see for nothing that a write
 turns a valid Python file into a syntax error. Reading the runs says
