@@ -546,6 +546,28 @@ Checked the rest of the family rather than guessing: `for…of`,
 `.slice()` does not, and appears zero times in the corpus against two
 `.map()` and one `.length`. Left alone.
 
+## Re-rendering the corpus, at the end
+
+Every kept log rendered again with the final binary — 350 documents —
+and grepped for the shapes that should never appear:
+
+| | |
+|---|---|
+| a block marker doubled | 0 |
+| a diagnostic at `1:1` with a caret under prose | 0 |
+| "The last 0 of N lines" | 0 |
+| a call annotation doubled | 0 |
+| an empty `text` fence | 1 |
+
+The one remaining empty fence is a program that printed an empty
+string — 1 in 725 console sections, measured and left alone, because
+"your command produced no output" is a true thing for that section to
+say and the alternative is a sentence saying it in words.
+
+Five logs no longer render at all: they predate a field on the
+compaction event and fail with `missing field \`measured\``, cleanly
+and by name. New logs, per the standing decision not to migrate.
+
 ## Rows that said the same thing whichever way it went
 
 The narrow-channel shape has a mirror image, and it took a second pass
