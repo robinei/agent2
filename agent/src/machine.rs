@@ -3702,7 +3702,7 @@ impl Runner {
 
     /// Events of this agent's spine segment (its `Agent` down to
     /// the leaf), in log order.
-    fn agent_segment<'t>(&self, tree: &'t Tree) -> Vec<&'t Event> {
+    pub(crate) fn agent_segment<'t>(&self, tree: &'t Tree) -> Vec<&'t Event> {
         let mut events = Vec::new();
         let mut current = self.spine.leaf_id;
         while let Some(event) = tree.events.get(&current) {
@@ -7336,78 +7336,9 @@ mod tests {
         }
     }
 
-    /// The history verbs work in any program, not only a compaction
-    /// one, and the edit lands when that program finishes.
-    ///
-    /// They used to be refused outside a compaction program, on the
-    /// reasoning that history is not a thing an ordinary program edits.
-    /// But the program that made an entry is the one that knows what it
-    /// was worth: having read a listing and picked four paths out of
-    /// it, it knows right then that the listing is not worth carrying,
-    /// and knows it better than a compaction program will later with
-    /// less to go on.
-    #[test]
-    fn a_history_edit_applies_from_any_program() {
-        let (mut tree, mut state) = setup();
-        user_post(&mut state, &mut tree, "go");
-        let post = tree
-            .events
-            .values()
-            .filter(|e| matches!(e.payload, EventPayload::Post { .. }))
-            .map(|e| e.id)
-            .min()
-            .expect("a post to remove");
-        let out = state
-            .step(
-                &mut tree,
-                StepInput::LlmResponse(llm_program(&format!(
-                    "history.remove({}); tell(\"done\");",
-                    post.as_u64()
-                ))),
-            )
-            .unwrap();
-        drain(&mut state, &mut tree, out);
-
-        let said: Vec<String> = tree
-            .events
-            .values()
-            .filter_map(|e| match &e.payload {
-                EventPayload::Call(Call::Send { text, .. }) => Some(text.clone()),
-                _ => None,
-            })
-            .collect();
-        assert!(
-            said.iter().any(|t| t == "done"),
-            "no refusal, the program ran straight through: {said:?}"
-        );
-        assert!(
-            tree.events.values().any(|e| matches!(
-                &e.payload,
-                EventPayload::Compacted { of, text: None, .. } if *of == post
-            )),
-            "and the edit landed when the program finished"
-        );
-        // **And it does not compact itself.** That rule is for the
-        // reply the harness *asked* for, which is work in a document it
-        // asked to be made smaller. An ordinary program that happens to
-        // use the same verb is the conversation, and stays in it.
-        let own_blocks: Vec<EventId> = tree
-            .events
-            .values()
-            .filter(|e| matches!(&e.payload, EventPayload::Part { reply, .. } if *reply == state.reply_id))
-            .map(|e| e.id)
-            .collect();
-        for b in own_blocks {
-            assert!(
-                !tree.events.values().any(|e| matches!(
-                    &e.payload,
-                    EventPayload::Compacted { of, .. } if *of == b
-                )),
-                "an ordinary program's own block #{} was compacted",
-                b.as_u64()
-            );
-        }
-    }
+    // `a_history_edit_applies_from_any_program` lives in `testkit`
+    // now, where "this reply's own blocks" is something the projection
+    // already knows rather than something the test reconstructs.
 
     /// A label indexes a call; it does not replay its arguments. The
     /// argument that *identifies* the call survives a huge one standing
@@ -8495,73 +8426,9 @@ mod tests {
         );
     }
 
-    /// **`finish(text)` halts, and the cells after it never run** (D8,
-    /// D11) — which is the whole difference from the verb that used to
-    /// settle and carry on. What it does *not* do is cancel the
-    /// generation: the reply keeps arriving, every part of it is logged
-    /// (28 — the record of what was written stays whole), and the turn
-    /// closes on the `ReplyEnd` that carries what the completion cost.
-    /// Written but not run is a state the log can say, and this is it.
-    #[test]
-    fn finish_in_a_cell_skips_the_cells_after_it() {
-        let (mut tree, mut state) = setup_under();
-        user_post(&mut state, &mut tree, "go");
-        state.phase = Phase::AwaitingLlm;
-
-        stream_chunks(&mut state, &mut tree, &["```js\nfinish(\"ok\");\n```\n"]);
-        assert!(
-            !state.notebook_cancels_generation(),
-            "halting is not parking: the reply is still allowed to arrive"
-        );
-        assert!(
-            matches!(&state.phase, Phase::Running(run) if run.halted.is_some()),
-            "the program halted where it stood, and is waiting for its own reply"
-        );
-
-        // The rest of the reply arrives. It is logged, and it does not run.
-        stream_chunks(
-            &mut state,
-            &mut tree,
-            &["\n```js\ntell(\"after finish\");\n```\n"],
-        );
-        let out = state
-            .step(&mut tree, StepInput::LlmResponse(llm_program("")))
-            .unwrap();
-        drain(&mut state, &mut tree, out);
-
-        let wrote_it = state.agent_segment(&tree).iter().any(|e| {
-            matches!(&e.payload, EventPayload::Part { part: Part::Cell(src), .. }
-                if src.contains("after finish"))
-        });
-        assert!(wrote_it, "the cell it wrote after `finish` is on the log");
-        let ran_it = state.agent_segment(&tree).iter().any(|e| {
-            matches!(&e.payload, EventPayload::Call(Call::Send { text, .. })
-                if text == "after finish")
-        });
-        assert!(!ran_it, "nothing after `finish(text)` runs");
-
-        // And the turn is a whole one: what `finish` said, then the end of
-        // the reply, then the terminal.
-        let said = state.agent_segment(&tree).iter().any(|e| {
-            matches!(&e.payload, EventPayload::Call(Call::Send { text, .. })
-                if text == "ok")
-        });
-        assert!(said, "`finish(text)` says its text");
-        let segment = state.agent_segment(&tree);
-        assert!(
-            segment
-                .iter()
-                .any(|e| matches!(e.payload, EventPayload::ReplyEnd { .. }))
-                && segment
-                    .iter()
-                    .any(|e| matches!(e.payload, EventPayload::Handback { .. })),
-            "the reply ended and the run handed back"
-        );
-        assert!(
-            !state.needs_prompt(&tree),
-            "`finish(text)` rests the branch"
-        );
-    }
+    // `finish_in_a_cell_skips_the_cells_after_it` lives in `testkit`
+    // now — the same facts, written against the reply rather than
+    // against the log, at a fifth of the length.
 
     /// **Truncation becomes partial progress** (D11). The cell that
     /// closed ran and its effects stand; the half-written one after it

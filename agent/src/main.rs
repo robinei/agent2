@@ -10,6 +10,8 @@ mod report;
 mod score;
 #[cfg(test)]
 mod scripted;
+#[cfg(test)]
+mod testkit;
 mod tree;
 mod types;
 
