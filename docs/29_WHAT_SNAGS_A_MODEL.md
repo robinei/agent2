@@ -7,7 +7,7 @@ finding, so it is first.
 
 ## What wants a decision
 
-Everything below is done and measured. Two things are not, and each
+Everything below is done and measured. Three things are not, and each
 is a judgement rather than a repair:
 
 1. **Whether the document should shrink a duplicated `history.append`.**
@@ -16,7 +16,24 @@ is a judgement rather than a repair:
    save the bytes now and needs the card's "what you get is what its
    row shows" promise re-read first. I did not decide this at one in
    the morning.
-2. **The local model.** `Qwen3.8-27B` works and is far too slow for the
+2. **The console duplicates rows at exactly the same rate.** 72% of
+   the 2.0 MB of console output in the corpus is verbatim a result
+   already held in a row — the same figure as `history.append`, from
+   the same habit. Console bodies are 9.3% of all document bytes, so
+   about 6.7% of every prompt is text that is one `fetch` away.
+
+   I did not act on it, and the reason is worth writing down rather
+   than rediscovering. Unlike the `append` case this breaks no card
+   promise — the console section is openly a clipped tail. It fails on
+   something else: the model prints a file it already has *in order to
+   have it in front of it next turn*. Replacing those bytes with a
+   pointer would defeat the only purpose the call had. Whether paying
+   4 KB of prompt to avoid a `fetch` is a good trade is a question
+   about how the model works, not about how the report renders, and
+   the lever for it is the card. It is the small lever either way:
+   6.7% of bytes, against round trips that cost whole completions.
+
+3. **The local model.** `Qwen3.8-27B` works and is far too slow for the
    suite — 450 seconds a program, a `skipped-tests` run capped out
    after two. Useful for watching behaviour, not for measuring it.
 
