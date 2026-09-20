@@ -119,6 +119,7 @@ pub fn scripted_program(source: &str) -> LlmTurn {
 /// A scripted reply **verbatim** — markdown, prose, fences and all.
 /// For the fixtures that are about the reply's shape rather than its
 /// program: a reply with no cell, one with two, one whose prose matters.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn scripted_markdown(markdown: &str) -> LlmTurn {
     LlmTurn {
         usage: None,

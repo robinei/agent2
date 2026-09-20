@@ -1,0 +1,405 @@
+//! What happened, for the person who was not watching.
+//!
+//! `agent session --headless` prints events as they arrive, which is
+//! the right thing for a machine reading a pipe and the wrong thing for
+//! someone opening a finished log: every part, every settlement, every
+//! console line, in the order the loop happened to produce them.
+//! `agent document` prints the other extreme — the exact bytes the
+//! model is about to read, which answers "what is it looking at" and
+//! not "what did it do".
+//!
+//! This is the middle one, and it exists for **driving a session from
+//! outside**. A person running the harness unattended needs three
+//! things after each exchange: what the agent said to them, what it
+//! actually did, and whether it is waiting on them. The last line here
+//! is the one that matters — a branch waiting on an `ask()` and a
+//! branch that has rested look identical in an event dump, and only one
+//! of them wants you to type something.
+
+use crate::types::{
+    Address, Author, Call, Event, EventId, EventPayload, Handback, Origin, Outcome, Tree,
+};
+
+/// Longest a quoted line runs before it is cut. Generous — this is for
+/// reading, not for a budget — but a `tell` carrying a pasted file
+/// should not be the whole transcript.
+const LINE_MAX: usize = 400;
+
+/// Render the branch that `leaf` sits on, oldest event first.
+pub fn render(tree: &Tree, leaf: EventId) -> String {
+    let path = tree.path_events(leaf);
+    let mut out = String::new();
+    for event in &path {
+        if let Some(line) = line_for(tree, &path, event) {
+            out.push_str(&line);
+            out.push('\n');
+        }
+    }
+    out.push('\n');
+    out.push_str(&waiting_on(&path));
+    out.push('\n');
+    out
+}
+
+/// One line — or a small block — per event, or `None` for the ones that
+/// are bookkeeping rather than conversation.
+///
+/// **What is left out is the point.** `Part`s are the reply broken into
+/// pieces and the pieces are already shown as what they *did*; a
+/// `ReplyEnd` is a cost, which `agent score` is for; a `Result` is
+/// folded into the call it settles, because a call and its answer are
+/// one fact to a reader and two rows to the log.
+fn line_for(tree: &Tree, path: &[&Event], event: &Event) -> Option<String> {
+    let id = event.id.as_u64();
+    Some(match &event.payload {
+        EventPayload::Agent { charter, .. } => {
+            format!("#{id} agent  «{}»", clip(charter.trim()))
+        }
+        EventPayload::Fork { name } => match name {
+            Some(n) => format!("#{id} fork   «{n}»"),
+            None => format!("#{id} fork"),
+        },
+        EventPayload::Post { from, origin } => {
+            let resolved = tree.resolve(origin);
+            let text = resolved
+                .direct()
+                .map(|(t, _, _)| t.to_owned())
+                .unwrap_or_else(|| "(message body unavailable)".into());
+            let who = match from {
+                Author::User => "you",
+                Author::Harness => "harness",
+                Author::Agent(_) => "agent",
+            };
+            // A post carrying a `Send` is that send arriving; the send
+            // itself already printed on the other branch.
+            let arrow = if matches!(origin, Origin::Sent(_)) { "»" } else { "→" };
+            format!("#{id} {who:<7}{arrow} {}", clip(text.trim()))
+        }
+        EventPayload::Reply => format!("#{id} reply"),
+        EventPayload::Restart => format!("#{id} restart"),
+        EventPayload::Call(call) => {
+            let settled = settlement(path, event.id);
+            match call {
+                // Prose is the agent talking; it reads as speech, not
+                // as a call, whatever the log calls it.
+                Call::Send { prose: true, text, .. } => format!("       ┆ {}", clip(text.trim())),
+                Call::Send { to, text, expects_reply, .. } => {
+                    let mark = match (expects_reply, to) {
+                        (true, _) => "?",
+                        (false, Address::User) => "!",
+                        (false, _) => "»",
+                    };
+                    format!("#{id}    {mark} {}", clip(text.trim()))
+                }
+                Call::Invoke { name, args, .. } => {
+                    format!("#{id}    → {name}({}) {}", clip_args(args), outcome_tag(settled))
+                }
+                Call::Spawn { charter, .. } => {
+                    format!("#{id}    ✳ spawn «{}»", clip(charter.trim()))
+                }
+                Call::Fork { .. } => format!("#{id}    ✳ fork"),
+            }
+        }
+        EventPayload::Note { value, .. } => {
+            format!("#{id}    ▸ {}", clip(&crate::machine::note_text(value)))
+        }
+        EventPayload::Console { lines } if !lines.is_empty() => lines
+            .iter()
+            .map(|l| format!("       · {}", clip(l)))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        EventPayload::Answer { question, value } => {
+            format!("#{id}    ✓ answered #{}: {}", question.as_u64(), clip(&value.to_string()))
+        }
+        EventPayload::Compacted { of, text, window } => {
+            let how = match (text, window) {
+                (Some(_), _) => "replaced",
+                (None, Some(w)) => return Some(format!("#{id}    ✂ #{} → window {}..{}", of.as_u64(), w.from, w.to)),
+                (None, None) => "removed",
+            };
+            format!("#{id}    ✂ #{} {how}", of.as_u64())
+        }
+        // **Finishing and handing on are one `Completed` on the log**
+        // and two very different things to read: one says the task is
+        // over, the other says the next reply carries on. The log does
+        // not spell them apart — the difference is whether the branch
+        // rested — so this asks the same question the closing line
+        // does, one reply at a time.
+        EventPayload::Handback { how, .. } => match how {
+            Handback::Completed if finished_here(path, event.id) => {
+                "       ✓ finished".to_owned()
+            }
+            Handback::Completed => "       ⏎ handed on".to_owned(),
+            Handback::Stopped { reason } => format!("       ⏹ stopped: {}", clip(reason)),
+            Handback::Raised { name, .. } => format!("#{id}    ⏸ raised «{name}»"),
+            Handback::Trapped { kind, message, .. } => {
+                format!("#{id}    ✗ trapped {kind}: {}", clip(message))
+            }
+            Handback::CellFailed { message } => {
+                format!("#{id}    ✗ would not compile: {}", clip(message))
+            }
+            Handback::Abandoned => format!("#{id}    ⏏ abandoned"),
+            Handback::Posted { .. } => format!("#{id}    ⏸ a message arrived"),
+            _ => format!("#{id}    ·"),
+        },
+        _ => return None,
+    })
+}
+
+/// Whether the `Completed` at `at` was a `finish(text)` rather than a
+/// handover.
+///
+/// `finish` sends its text and then rests, so the tell-tale is a
+/// `Send { to: user, expects_reply: false }` in the same reply with no
+/// call expression behind it — the synthetic zero-width site the verb
+/// gives it, which an ordinary `tell` never has.
+fn finished_here(path: &[&Event], at: EventId) -> bool {
+    let reply = path
+        .iter()
+        .rev()
+        .skip_while(|e| e.id.as_u64() > at.as_u64())
+        .find(|e| matches!(e.payload, EventPayload::Reply | EventPayload::Restart))
+        .map(|e| e.id.as_u64())
+        .unwrap_or(0);
+    path.iter()
+        .filter(|e| e.id.as_u64() > reply && e.id.as_u64() < at.as_u64())
+        .any(|e| {
+            matches!(
+                &e.payload,
+                EventPayload::Call(Call::Send {
+                    prose: false,
+                    expects_reply: false,
+                    site: 0,
+                    site_end: 0,
+                    ..
+                })
+            )
+        })
+}
+
+/// The closing line, and the only one a driver has to read: whether
+/// this branch wants something from the person.
+///
+/// Three states, and they are not three shades of the same one. A
+/// branch waiting on an `ask()` cannot move until someone answers; a
+/// branch that rested is finished with the task; a branch that merely
+/// ran out of turn will carry on by itself when it is next prompted.
+fn waiting_on(path: &[&Event]) -> String {
+    if let Some(ask) = open_ask(path) {
+        let EventPayload::Call(Call::Send { text, options, .. }) = &ask.payload else {
+            unreachable!("open_ask returns a Send")
+        };
+        let choices = if options.is_empty() {
+            String::new()
+        } else {
+            format!("  [{}]", options.join(", "))
+        };
+        return format!(
+            "waiting on you: #{}  {}{choices}\n  answer it: agent session --headless --real \
+             --turn '…' <log>",
+            ask.id.as_u64(),
+            clip(text.trim())
+        );
+    }
+    match path.iter().rev().find_map(|e| match &e.payload {
+        EventPayload::Handback { how, .. } => Some(how),
+        _ => None,
+    }) {
+        Some(Handback::Stopped { .. }) => {
+            "waiting on: nothing — it stopped itself and will carry on when prompted".to_owned()
+        }
+        Some(Handback::Raised { name, .. }) => {
+            format!("waiting on: a handler for «{name}»")
+        }
+        _ => "waiting on: nothing".to_owned(),
+    }
+}
+
+/// The `Send { to: user, expects_reply }` on this path with no `Result`
+/// — the same fold the session's own inbox uses, over a log rather than
+/// over live state, so a finished log answers the question too.
+fn open_ask<'a>(path: &[&'a Event]) -> Option<&'a Event> {
+    path.iter().rev().copied().find(|e| {
+        matches!(
+            &e.payload,
+            EventPayload::Call(Call::Send { to: Address::User, expects_reply: true, .. })
+        ) && settlement(path, e.id).is_none()
+    })
+}
+
+fn settlement<'a>(path: &[&'a Event], call: EventId) -> Option<&'a Outcome> {
+    path.iter().rev().find_map(|e| match &e.payload {
+        EventPayload::Result { call: c, outcome } if *c == call => Some(outcome),
+        _ => None,
+    })
+}
+
+/// How a call turned out, in the smallest thing that is still an
+/// answer. A `status` is what a `bash` result is read for and nothing
+/// else in the value usually matters; anything else gets `ok`, because
+/// the value itself is what `history.fetch` is for.
+fn outcome_tag(outcome: Option<&Outcome>) -> String {
+    match outcome {
+        None => "…".to_owned(),
+        Some(Outcome::Failed(why)) => format!("✗ {}", clip(why)),
+        Some(Outcome::Delivered(v)) => match v.get("status").and_then(|s| s.as_i64()) {
+            Some(0) => "ok".to_owned(),
+            Some(n) => format!("status {n}"),
+            None => "ok".to_owned(),
+        },
+    }
+}
+
+fn clip_args(args: &serde_json::Value) -> String {
+    let rendered = match args.as_array() {
+        Some(items) => items
+            .iter()
+            .map(|a| match a.as_str() {
+                Some(s) => format!("{s:?}"),
+                None => a.to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join(", "),
+        None => args.to_string(),
+    };
+    clip(&rendered)
+}
+
+/// One line, bounded. Newlines become `⏎` so a multi-line value stays
+/// one row of the transcript — the shape is what is being read here,
+/// and a value that needs its own screen has an id to fetch it by.
+fn clip(text: &str) -> String {
+    let flat = text.replace('\n', " ⏎ ");
+    if flat.chars().count() <= LINE_MAX {
+        return flat;
+    }
+    let head: String = flat.chars().take(LINE_MAX).collect();
+    format!("{head}… ({} chars)", flat.chars().count())
+}
+
+pub fn run_cli(args: &[String]) -> Result<(), String> {
+    let Some(path) = args.first() else {
+        return Err("usage: agent transcript <log.jsonl> [branch-id]".into());
+    };
+    let tree = crate::open_tree_read_only(path)?;
+    let leaf = match args.get(1) {
+        Some(raw) => {
+            let n: u64 = raw
+                .trim_start_matches('#')
+                .parse()
+                .map_err(|_| format!("not an event id: {raw}"))?;
+            let id = EventId::checked(n).ok_or("event ids start at 1")?;
+            // Any id on the branch will do — what is rendered is the
+            // path down to that branch's newest leaf.
+            tree.list_leaves()
+                .into_iter()
+                .map(|(l, _)| l)
+                .find(|l| tree.path_events(*l).iter().any(|e| e.id == id))
+                .ok_or_else(|| format!("#{n} is not on any branch of this log"))?
+        }
+        None => {
+            tree.list_leaves()
+                .first()
+                .map(|(l, _)| *l)
+                .ok_or("the log has no branches to render")?
+        }
+    };
+    print!("{}", render(&tree, leaf));
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testkit::Conversation;
+
+    /// The shape of it, over a run that reads, says something and
+    /// finishes: what it said, what it ran, how it ended, and that
+    /// nobody is being waited on.
+    #[test]
+    fn a_finished_run_reads_as_what_it_did() {
+        let mut c = Conversation::new();
+        c.answers("bash", serde_json::json!({ "status": 0, "stdout": "ok\n" }));
+        c.user("is it green?");
+        c.reply(
+            "Running the check.\n\n```js\nconst r = await tools.bash(\"make check\");\n\
+             finish(r.status === 0 ? \"green.\" : \"not green.\");\n```\n",
+        );
+
+        let out = render(c.tree(), c.runner().spine.leaf_id);
+        assert!(out.contains("you    → is it green?"), "{out}");
+        assert!(out.contains("┆ Running the check."), "{out}");
+        assert!(out.contains("→ bash(\"make check\") ok"), "{out}");
+        assert!(out.contains("! green."), "{out}");
+        assert!(
+            out.contains("✓ finished"),
+            "finishing and handing on read differently: {out}"
+        );
+        assert!(out.ends_with("waiting on: nothing\n"), "{out}");
+    }
+
+    /// **The line a driver actually reads.** A branch parked on an
+    /// `ask()` says so, names the id to answer, and shows the closed
+    /// set of answers when there is one — the difference between a
+    /// session that is finished and one that is waiting for you is
+    /// invisible in an event dump, and it is the whole reason to look.
+    #[test]
+    fn a_branch_waiting_on_a_person_says_so_and_names_the_id() {
+        let mut c = Conversation::new();
+        c.user("A or B?");
+        let r = c.reply(
+            "```js\nconst pick = await choose(\"user\", \"which one?\", [\"A\", \"B\"]);\n\
+             finish(`picked ${pick}.`);\n```\n",
+        );
+
+        let out = render(c.tree(), c.runner().spine.leaf_id);
+        assert!(
+            out.contains(&format!("waiting on you: #{}", r.ask().call.as_u64())),
+            "{out}"
+        );
+        assert!(out.contains("which one?  [A, B]"), "{out}");
+
+        // And once it is answered, it is not waiting any more.
+        c.answer(r.ask().call, serde_json::json!("B"));
+        let out = render(c.tree(), c.runner().spine.leaf_id);
+        assert!(out.contains("waiting on: nothing"), "{out}");
+        assert!(out.contains("! picked B."), "{out}");
+    }
+
+    /// A stop reads as a decision, not as a fault, and the closing line
+    /// says the work carries on — which is the distinction the verb
+    /// exists to make.
+    #[test]
+    fn a_stop_reads_as_a_decision() {
+        let mut c = Conversation::new();
+        c.answers("bash", serde_json::json!({ "status": 1, "stdout": "2 failed\n" }));
+        c.user("is it green?");
+        c.reply(
+            "```js\nconst r = await tools.bash(\"make check\");\n\
+             if (r.status !== 0) stop(`CHECK fails: ${r.stdout}`);\nfinish(\"green.\");\n```\n",
+        );
+
+        let out = render(c.tree(), c.runner().spine.leaf_id);
+        assert!(out.contains("→ bash(\"make check\") status 1"), "{out}");
+        assert!(out.contains("⏹ stopped: CHECK fails:"), "{out}");
+        assert!(out.contains("it stopped itself and will carry on"), "{out}");
+    }
+
+    /// A value that would take the screen is one line with an id beside
+    /// it: the transcript says the shape, and `history.fetch` says the
+    /// rest.
+    #[test]
+    fn a_long_value_is_one_line_with_its_size() {
+        let mut c = Conversation::new();
+        c.user("go");
+        c.reply("```js\nhistory.append(\"x\".repeat(5000));\n```\n");
+
+        let out = render(c.tree(), c.runner().spine.leaf_id);
+        let row = out
+            .lines()
+            .find(|l| l.contains(" ▸ "))
+            .expect("the row is in the transcript");
+        assert!(row.len() < LINE_MAX + 60, "one line, bounded: {} chars", row.len());
+        assert!(row.contains("chars)"), "and it says how much there is: {row}");
+    }
+}

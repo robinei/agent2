@@ -4745,8 +4745,12 @@ impl Runner {
                     // part carries every byte so the reply can be put
                     // back together exactly (28); what someone reads is
                     // the same text without the blank lines that
-                    // separated it from the fences.
-                    let trimmed = verbatim.trim();
+                    // separated it from the fences — and without the
+                    // `↓ history[N]` annotations the model copies out of
+                    // its own document, which are ours and mean nothing
+                    // to the person reading them.
+                    let cleaned = crate::document::strip_imitated_markers(&verbatim);
+                    let trimmed = cleaned.trim();
                     if trimmed.is_empty() {
                         continue;
                     }

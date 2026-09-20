@@ -12,6 +12,7 @@ mod score;
 mod scripted;
 #[cfg(test)]
 mod testkit;
+mod transcript;
 mod tree;
 mod types;
 
@@ -35,10 +36,13 @@ const USAGE: &str = "usage: agent <command>
                                     the TUI picks it automatically when the
                                     key is set — --headless stays scripted
                                     unless --real is given
-    --turn <text>                   queue a first user turn on the
-                                    conversation branch, before the TUI
-                                    takes over — so a session can start
-                                    with nobody there to type one
+    --turn <text>                   say this on the conversation branch
+                                    before the TUI takes over, so a
+                                    session can start — or carry on —
+                                    with nobody there to type. If the
+                                    branch is waiting on an ask(), this
+                                    answers it; otherwise it is a new
+                                    turn.
     --list-leaves                   print the log's leaf set and exit
     --list-branches                 print the log's branch set and exit
     --resume <id>                   open the branch leaf <id> sits on (else
@@ -47,6 +51,10 @@ const USAGE: &str = "usage: agent <command>
                                     and print its id
     --name <text>                   name the branch (with --fork), else rename
                                     the conversation branch
+  transcript <log.jsonl> [id]       what happened, for the person who
+                                    was not watching: what it said, what
+                                    it ran, how it ended, and — the last
+                                    line — whether it is waiting on you.
   document <log.jsonl> [id]         print the exact document the log
                                     would be sent as — every message,
                                     role and size. The prompt is
@@ -169,6 +177,12 @@ fn main() {
             if let Err(e) = result {
                 eprintln!("{e}");
                 std::process::exit(1);
+            }
+        }
+        Some("transcript") => {
+            if let Err(e) = transcript::run_cli(&args[2..]) {
+                eprintln!("{e}");
+                std::process::exit(2);
             }
         }
         Some("document") => {
@@ -384,13 +398,30 @@ fn queue_nav(session: &host::Session, nav: &SessionNav) {
         h.send(host::SessionCommand::Rename { branch, name });
     }
     if let Some(text) = nav.turn.clone() {
+        // **One gesture: the person typed something.** Whether that is
+        // an answer or a new instruction is not theirs to declare — it
+        // depends on whether the branch is holding a question open, and
+        // the branch is the thing that knows. This is `resolve_submit`
+        // (`debug/attach.rs`), which the TUI has always used; without
+        // it a headless driver could start a conversation and never
+        // continue one, because a `UserTurn` sent to a branch parked on
+        // `ask()` leaves the question open forever and the reply it
+        // was waiting for never arrives.
+        //
         // A kickoff line is a task instruction, not a question, and the
         // agent's reply reaches the client either way (18_TARGETING).
-        h.send(host::SessionCommand::UserTurn {
-            branch,
-            text,
-            expects_reply: false,
-        });
+        match session.asking_user_on(branch) {
+            Some(call) => h.send(host::SessionCommand::Reply {
+                branch,
+                call,
+                value: serde_json::Value::String(text),
+            }),
+            None => h.send(host::SessionCommand::UserTurn {
+                branch,
+                text,
+                expects_reply: false,
+            }),
+        }
     }
 }
 

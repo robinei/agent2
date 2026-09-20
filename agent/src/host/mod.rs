@@ -1221,6 +1221,16 @@ impl Session {
     /// The `Send { to: user }` this branch is still waiting on, if any —
     /// what makes the inbox a *view*: every live branch with a pending
     /// ask to the human, highlighted where it sits.
+    ///
+    /// The `_on` form is for a caller holding a branch rather than a
+    /// leaf: a CLI deciding whether what the person just typed is an
+    /// answer or a new turn, which is the same question the TUI asks
+    /// through `BranchInfo::asking_user`.
+    pub fn asking_user_on(&self, branch: BranchId) -> Option<EventId> {
+        let leaf = self.states.get(&branch)?.spine.leaf_id;
+        self.asking_user(leaf)
+    }
+
     fn asking_user(&self, leaf: EventId) -> Option<EventId> {
         let path = self.tree.path_events(leaf);
         path.iter()

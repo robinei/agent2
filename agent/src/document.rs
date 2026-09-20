@@ -468,6 +468,54 @@ pub(crate) const BLOCK_ARROW: &str = "↓";
 /// evidently does not.
 pub(crate) const ARROW: &str = " ←";
 
+/// Drop the `↓ history[N]` lines the model copied out of its own
+/// document, from text that is about to reach a person.
+///
+/// **The two readers of a reply are not the same reader.** The
+/// document render strips an imitated marker before the *model* sees
+/// its own turn again ([`imitated_block_marker`] and its sibling) — but
+/// prose also leaves by a second door, as the `Call::Send` a paragraph
+/// becomes, and that one carried the marker through untouched. Live
+/// against `Qwen3.8-27B` on 2026-09-20 the person read:
+///
+/// ```text
+/// ↓ history[17]
+/// The check is simple: no `old.example.com` anywhere in config.json…
+///
+/// ↓ history[18]
+/// ```
+///
+/// which is an annotation the harness wrote, quoted back at the person
+/// who never saw the original. The part on the log keeps every byte —
+/// that is what makes the parts concatenate back to the reply (28) —
+/// and only what is *delivered* is cleaned, which is the split
+/// `advance_notebook` already names: verbatim on the log, trimmed to
+/// the person.
+///
+/// Only a whole line that is nothing but the marker shape. A `↓`
+/// inside a sentence is something the model meant.
+pub(crate) fn strip_imitated_markers(text: &str) -> String {
+    let kept: Vec<&str> = text
+        .lines()
+        .filter(|line| !is_bare_marker(line.trim()))
+        .collect();
+    kept.join("\n")
+}
+
+/// `↓ history[<digits>]`, and nothing else on the line.
+fn is_bare_marker(line: &str) -> bool {
+    let Some(rest) = line
+        .strip_prefix(BLOCK_ARROW)
+        .and_then(|r| r.strip_prefix(" history["))
+    else {
+        return false;
+    };
+    match rest.strip_suffix(']') {
+        Some(digits) => !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()),
+        None => false,
+    }
+}
+
 /// The end of a `↓ history[N]` line the model wrote itself at the head
 /// of a block, so the marker pass can replace it rather than add a
 /// second one below it.

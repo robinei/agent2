@@ -691,14 +691,11 @@ impl Conversation {
         };
         for e in &events {
             s.kinds.push(kind_of(&e.payload));
-            match &e.payload {
-                EventPayload::Part { part, .. } => match part {
-                    crate::types::Part::Prose(_) | crate::types::Part::Cell(_) => {
-                        s.parts.push(e.id)
-                    }
-                    crate::types::Part::Thinking(_) => {}
-                },
-                _ => {}
+            // Thinking is not a piece of the reply, so it is not a part.
+            if let EventPayload::Part { part, .. } = &e.payload
+                && !matches!(part, crate::types::Part::Thinking(_))
+            {
+                s.parts.push(e.id);
             }
             match &e.payload {
                 EventPayload::Part { part, .. } => match part {
@@ -1101,6 +1098,48 @@ mod tests {
             c.document().contains("two config files"),
             "the next reply reads what this one appended"
         );
+    }
+
+    /// **The harness's own annotations do not reach the person.** The
+    /// model reads `↓ history[N]` above each of its blocks and writes
+    /// them back; the document render has stripped those from its next
+    /// prompt for a while, but prose leaves by a second door — the
+    /// `Send` a paragraph becomes — and that one carried them through.
+    ///
+    /// Found live against `Qwen3.8-27B` on 2026-09-20, driving a real
+    /// session as the person at the keyboard: the answer that reached
+    /// the screen opened with an annotation the person never saw the
+    /// original of.
+    #[test]
+    fn a_marker_the_model_copied_does_not_reach_the_person() {
+        let mut c = Conversation::new();
+        c.user("go");
+        let r = c.reply(
+            "↓ history[17]\nThe check is simple, so I will just run it.\n\n\
+             ↓ history[18]\n```js\nfinish(\"ran it.\");\n```\n",
+        );
+
+        assert_eq!(
+            r.prose,
+            ["The check is simple, so I will just run it."],
+            "the annotation is ours; the person reads the sentence"
+        );
+        // And the log still has every byte — that is what makes the
+        // parts concatenate back to the reply, which the harness
+        // checks on every reply.
+        assert!(
+            c.fetch(r.parts[0]).as_str().is_some_and(|t| t.contains("history[17]")),
+            "the part keeps what the model wrote"
+        );
+    }
+
+    /// A `↓` in a sentence is something the model meant, and stays.
+    #[test]
+    fn only_a_bare_marker_line_is_dropped() {
+        let mut c = Conversation::new();
+        c.user("go");
+        let r = c.reply("The count ↓ history[3] is the one I want.\n\n```js\nfinish(\"ok\");\n```\n");
+        assert_eq!(r.prose, ["The count ↓ history[3] is the one I want."]);
     }
 
     // ── the harness's own guarantees ────────────────────────────────
