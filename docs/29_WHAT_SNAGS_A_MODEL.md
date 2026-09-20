@@ -217,6 +217,29 @@ And `Array.from(new Set(xs))` threw while `[...new Set(xs)]` worked —
 two spellings of one operation disagreeing, which a reader can only
 find by falling into it.
 
+**And the worst category, checked separately.** A silent wrong answer
+never shows up as a trap, so 38 cases were compared against what JS
+would return. Seven differ:
+
+| | here | JS |
+|---|---|---|
+| `[NaN].includes(NaN)` | `false` | `true` |
+| `String(1e21)` | `1000000000000000000000` | `1e+21` |
+| `'ab'.replace('a','[$&]')` | `[$&]b` | `[a]b` |
+| `Object.keys({b:1,'2':1,a:1,'1':1})` | insertion order | integer keys first |
+| `Object.is`, `[] + []`, `a.length = 1` | throw | a value |
+
+The last three are loud and therefore fine. The other four are quiet —
+and none occurs in 1,076 cells of real model code: no `NaN` at all, no
+`Object.is`, no `.length` assignment, and all three uses of `$&` are
+the regex-escape idiom `name.replace(/[.*+?…]/g, "\\$&")`, where `$&`
+works. `$1`, `$&` against a regex, and the replacement-function form
+all behave.
+
+So the dialect is sound where models actually operate, and these stay
+as they are rather than being fixed on spec — recorded here so the next
+person knows they were looked at.
+
 **A message that names the value finds the bug it was hiding.** Twice
 in one night. `Array.from`'s "type error" hid the fact that it took no
 Set; when it started naming what it got, `Object.fromEntries needs an
