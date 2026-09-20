@@ -263,6 +263,10 @@ pub struct Said {
     pub calls: Vec<(String, serde_json::Value)>,
     /// Lines the program printed.
     pub printed: Vec<String>,
+    /// What another agent said to this branch — a `Send` from
+    /// elsewhere, landing here as a post. Where `notices` is the
+    /// harness speaking, this is the other half of the conversation.
+    pub heard: Vec<String>,
     /// Harness notices logged on this branch during the reply — the
     /// channel the model demonstrably reads, used to tell it that its
     /// last reply stopped short or wrote a call in a channel that does
@@ -918,6 +922,7 @@ fn fold(tree: &Tree, events: &[&Event], span: (u64, u64)) -> Said {
         rows: Vec::new(),
         calls: Vec::new(),
         printed: Vec::new(),
+        heard: Vec::new(),
         notices: Vec::new(),
         compacted: Vec::new(),
         settled: Vec::new(),
@@ -999,12 +1004,13 @@ fn fold(tree: &Tree, events: &[&Event], span: (u64, u64)) -> Said {
                 value: value.clone(),
                 site: (*site, *site_end),
             }),
-            EventPayload::Post {
-                from: Author::Harness,
-                origin,
-            } => {
+            EventPayload::Post { from, origin } => {
                 if let Some((text, _, _)) = tree.resolve(origin).direct() {
-                    s.notices.push(text.to_owned());
+                    match from {
+                        Author::Harness => s.notices.push(text.to_owned()),
+                        Author::Agent(_) => s.heard.push(text.to_owned()),
+                        Author::User => {}
+                    }
                 }
             }
             EventPayload::Compacted { of, .. } => s.compacted.push(*of),

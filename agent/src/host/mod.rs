@@ -2341,55 +2341,28 @@ mod tests {
 
         // Prose reached the person, and the cell's `tell` ran — so the
         // fence was not eaten and the reply was not sent to repair.
-        let said: Vec<String> = tree
-            .events
-            .values()
-            .filter_map(|e| match &e.payload {
-                EventPayload::Call(Call::Send { text, .. }) => Some(text.clone()),
-                _ => None,
-            })
-            .collect();
-        assert!(
-            said.iter().any(|t| t.contains("Opening the file")),
-            "the opening prose is a send: {said:?}"
-        );
-        assert!(
-            said.iter().any(|t| t == "n is 42"),
-            "the second cell ran with the first cell's binding: {said:?}"
-        );
-
+        //
         // **The reasoning is kept, once.** It arrives with the
-        // completion, after every cell `Turn` is already on the log, so
-        // this is the layer it used to fall through: 28/28 kept runs
-        // stored none of it, and the arm scored as though the model had
-        // not thought at all.
-        let reasoned: Vec<String> = tree
-            .events
-            .values()
-            .filter_map(|e| match &e.payload {
-                EventPayload::Part {
-                    part: crate::types::Part::Thinking(t),
-                    ..
-                } => Some(t.clone()),
-                _ => None,
-            })
-            .collect();
+        // completion, after every cell is already on the log, so this
+        // is the layer it used to fall through: 28/28 kept runs stored
+        // none of it, and the arm scored as though the model had not
+        // thought at all.
+        let r = said(&session, branch);
+        assert_eq!(r.prose, ["Opening the file.", "Now the sum."]);
         assert_eq!(
-            reasoned,
-            vec!["weighing it up"],
-            "one completion, one record"
+            r.tells,
+            ["n is 42", "n is 42"],
+            "the second cell ran with the first cell's binding, and finished with it"
+        );
+        // One run: exactly one terminal for the whole reply (D7).
+        assert_eq!(
+            r.kinds.iter().filter(|k| **k == "Handback").count(),
+            1,
+            "a reply is one run, however many cells"
         );
         let score = crate::score::score(tree);
         assert_eq!(score.thinking_bytes, "weighing it up".len());
         assert_eq!(score.reasoning_out, 700, "and the provider's token count");
-
-        // One run: exactly one terminal for the whole reply (D7).
-        let terminals = tree
-            .events
-            .values()
-            .filter(|e| matches!(e.payload, EventPayload::Handback { .. }))
-            .count();
-        assert_eq!(terminals, 1, "a reply is one run, however many cells");
     }
 
     /// **A trapped cell must get a handler.** `suspend` deliberately
@@ -5282,42 +5255,24 @@ mod tests {
             "delegate",
         );
         let tree = session.tree();
-        let upward = tree
-            .events
-            .values()
-            .find_map(|e| match &e.payload {
-                EventPayload::Call(Call::Send { to, text, .. }) if text == "which one?" => {
-                    Some(*to)
-                }
-                _ => None,
-            })
-            .expect("the upward ask");
+        let worker = said(&session, agent_by_charter(tree, "needs guidance"));
         assert_eq!(
-            upward,
+            worker.ask().to,
             Address::Branch(session.conversation_branch()),
             "a subagent's asker is its parent's branch"
         );
         // It reached the parent: logged on arrival even mid-program, and
         // heard there as a condition (rule B, `upward_clarification_
         // does_not_deadlock` walks the whole round trip).
-        let parent_path = tree.path_events(root_leaf(&session));
-        assert!(
-            parent_path.iter().any(|e| matches!(
-                &e.payload,
-                EventPayload::Post { from: Author::Agent(a), .. }
-                if tree.enclosing_agent(*a) != Some(session.conversation_branch())
-            )),
-            "the worker's question is on the parent's branch: {:?}",
-            kinds(tree, root_leaf(&session))
+        let parent = said(&session, session.conversation_branch());
+        assert_eq!(
+            parent.heard,
+            ["which one?"],
+            "the worker's question is on the parent's branch"
         );
-        assert!(
-            parent_path.iter().any(|e| matches!(
-                &e.payload,
-                EventPayload::Handback {
-                    how: crate::types::Handback::Posted { .. },
-                    ..
-                }
-            )),
+        assert_eq!(
+            parent.ended,
+            crate::testkit::Ending::Posted,
             "and the running parent suspended on it"
         );
     }
