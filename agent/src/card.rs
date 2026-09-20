@@ -217,6 +217,34 @@ fn the_working_directory_listing_is_bounded_and_skips_noise() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// **Bounded before the sort.** The 50-entry cap limits what is shown;
+/// without a read cap, a directory with a hundred thousand entries is
+/// still enumerated and sorted in full to print fifty of them, at the
+/// start of every session.
+#[test]
+fn a_huge_directory_costs_a_bounded_amount_of_work() {
+    let dir = std::env::temp_dir().join(format!("agent2-listing-big-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for i in 0..(LISTING_MAX_SCAN + 200) {
+        std::fs::write(dir.join(format!("f{i:05}.txt")), "").unwrap();
+    }
+    let started = std::time::Instant::now();
+    let out = listing(&dir);
+    assert!(out.contains("… and more"), "says it stopped: {out}");
+    assert!(
+        out.lines().count() < LISTING_MAX_ENTRIES + 12,
+        "{} lines",
+        out.lines().count()
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "took {:?}",
+        started.elapsed()
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Every shipped tool's description fits inside the clip above.
 ///
 /// The doc there says they all "fit comfortably", and `bash` did not:
@@ -431,6 +459,12 @@ fn working_directory() -> String {
 /// How many entries the opening listing shows before it stops.
 const LISTING_MAX_ENTRIES: usize = 50;
 
+/// How many directory entries are read before one is given up on.
+/// Ten times what can be shown, so ordinary directories sort whole and
+/// a pathological one costs a bounded amount of work rather than
+/// however much happens to be on disk.
+const LISTING_MAX_SCAN: usize = 500;
+
 /// Noise every listing of a working tree has and nobody wants: build
 /// output and dependency trees, which are large, uninteresting, and the
 /// reason a naive `find .` comes back with ten thousand lines.
@@ -482,8 +516,18 @@ fn listing(dir: &std::path::Path) -> String {
         let Ok(rd) = std::fs::read_dir(dir) else {
             return dirs;
         };
-        let mut entries: Vec<_> = rd.flatten().collect();
+        // **Bounded before the sort, not after.** The cap below limits
+        // what is *shown*; this limits what is read, because a
+        // directory with a hundred thousand entries would otherwise be
+        // enumerated and sorted in full to print fifty of them, at the
+        // start of every session. The evals run in directories with
+        // four files; a real checkout is where this matters.
+        let mut entries: Vec<_> = rd.flatten().take(LISTING_MAX_SCAN).collect();
+        let overflowed = entries.len() == LISTING_MAX_SCAN;
         entries.sort_by_key(|e| e.file_name());
+        if overflowed {
+            *cut = true;
+        }
         for e in entries {
             let name = e.file_name().to_string_lossy().into_owned();
             if LISTING_SKIP.contains(&name.as_str()) {
