@@ -620,7 +620,7 @@ fn render_row_list(heading: &str, artifacts: &[&Artifact]) -> Option<String> {
             //
             // The size stays, because it is what a reader needs in order
             // to decide whether the fetch is worth a round trip.
-            ArtifactState::Delivered(v) => delivered_tail(v),
+            ArtifactState::Delivered(v) => delivered_tail(v, &a.label),
             // A failure keeps its text. It is exactly the thing nobody
             // chose and everybody needs: the only place the reason
             // appears, and unlike a result it is not fetchable under its
@@ -651,7 +651,24 @@ fn render_row_list(heading: &str, artifacts: &[&Artifact]) -> Option<String> {
 /// description of it: `→ 0` costs less than `→ ok, 1 byte` and tells a
 /// reader strictly more. The rule is about not replaying *payloads*,
 /// not about withholding numbers.
-fn delivered_tail(v: &serde_json::Value) -> String {
+fn delivered_tail(v: &serde_json::Value, label: &str) -> String {
+    // **A write that changed nothing is news.** `replace_file` reports
+    // it by *omitting* `diff`, which is the weakest signal in the
+    // system: a field that is not there. A `sweep-40` run on
+    // 2026-09-20 computed a cleaned file, wrote back bytes identical
+    // to what was already on disk, read no `diff`, and told the person
+    // it had deleted the dead helpers. All 24 were still there. Five
+    // writes in 323 changed nothing and two of their runs failed.
+    //
+    // Keyed on the label rather than the shape, because `create_file`
+    // also returns a bare `{version}` and a new file is not "no
+    // change".
+    if label.starts_with("replace_file(")
+        && v.get("version").is_some()
+        && v.get("diff").is_none_or(serde_json::Value::is_null)
+    {
+        return format!("no change, {{version}}, {} bytes", v.to_string().len());
+    }
     match v {
         serde_json::Value::Null => "ok".into(),
         serde_json::Value::Bool(_) | serde_json::Value::Number(_) => v.to_string(),
@@ -705,6 +722,11 @@ fn delivered_tail(v: &serde_json::Value) -> String {
         ),
         other => format!("ok, {} bytes", other.to_string().len()),
     }
+}
+
+#[cfg(test)]
+fn delivered_tail_t(v: &serde_json::Value) -> String {
+    delivered_tail(v, "bash(\"x\")")
 }
 
 /// Keys named in a menu row's shape before it gives up and says `…`.
@@ -2469,16 +2491,16 @@ mod tests {
     #[test]
     fn a_structured_row_says_what_kind_of_thing_it_indexes() {
         let file = json!({ "content": "x".repeat(4000), "version": "abc" });
-        let tail = delivered_tail(&file);
+        let tail = delivered_tail_t(&file);
         assert!(tail.starts_with("ok, {content, version}, "), "{tail}");
         assert!(!tail.contains("xxxx"), "the contents stay out: {tail}");
 
-        assert!(delivered_tail(&json!([1, 2, 3])).starts_with("ok, [3 items], "));
-        assert!(delivered_tail(&json!([1])).starts_with("ok, [1 item], "));
+        assert!(delivered_tail_t(&json!([1, 2, 3])).starts_with("ok, [3 items], "));
+        assert!(delivered_tail_t(&json!([1])).starts_with("ok, [1 item], "));
 
         // A wide object gives up rather than spilling onto three lines.
         let wide = json!({"a":1,"b":2,"c":3,"d":4,"e":5,"f":6,"g":7});
-        assert!(delivered_tail(&wide).starts_with("ok, {a, b, c, d, e, …}, "));
+        assert!(delivered_tail_t(&wide).starts_with("ok, {a, b, c, d, e, …}, "));
 
         // Scalars are unchanged — they already showed their value.
         // **A command that failed says so in its row.** The card
@@ -2487,22 +2509,49 @@ mod tests {
         // calls in the kept corpus exited non-zero and not one row
         // mentioned it.
         assert_eq!(
-            delivered_tail(&json!({"status": 1, "stdout": "", "stderr": "boom"})),
+            delivered_tail_t(&json!({"status": 1, "stdout": "", "stderr": "boom"})),
             "status 1, {status, stdout, stderr}, 40 bytes"
         );
         // Silent when it is zero, like every other count here.
         assert!(
-            delivered_tail(&json!({"status": 0, "stdout": "hi", "stderr": ""}))
+            delivered_tail_t(&json!({"status": 0, "stdout": "hi", "stderr": ""}))
                 .starts_with("ok, {status,"),
         );
         // And an object with no status is untouched.
         assert!(
-            delivered_tail(&json!({"content": "x", "version": "v"})).starts_with("ok, {content,")
+            delivered_tail_t(&json!({"content": "x", "version": "v"})).starts_with("ok, {content,")
         );
 
-        assert_eq!(delivered_tail(&json!(null)), "ok");
-        assert_eq!(delivered_tail(&json!(42)), "42");
-        assert_eq!(delivered_tail(&json!("short")), "\"short\"");
+        // **A write that changed nothing is news**, and it was
+        // reported by omitting a field. A `sweep-40` run wrote back
+        // bytes identical to what was on disk, read no `diff`, and
+        // told the person it had deleted the dead helpers; all 24
+        // were still there.
+        assert_eq!(
+            delivered_tail(
+                &json!({"version": "abc"}),
+                "replace_file(\"helpers.py\", …)"
+            ),
+            "no change, {version}, 17 bytes"
+        );
+        // A write that did something keeps its shape.
+        assert!(
+            delivered_tail(
+                &json!({"version": "abc", "diff": "@@ -1 +1 @@"}),
+                "replace_file(\"helpers.py\", …)"
+            )
+            .starts_with("ok, {version, diff}")
+        );
+        // And `create_file` returns a bare `{version}` too — a new
+        // file is not "no change".
+        assert!(
+            delivered_tail(&json!({"version": "abc"}), "create_file(\"n.md\", …)")
+                .starts_with("ok, {version}")
+        );
+
+        assert_eq!(delivered_tail_t(&json!(null)), "ok");
+        assert_eq!(delivered_tail_t(&json!(42)), "42");
+        assert_eq!(delivered_tail_t(&json!("short")), "\"short\"");
     }
 
     /// A menu row says a call arrived and how big its value is — never
@@ -2560,10 +2609,10 @@ mod tests {
     /// A scalar is smaller than any description of it, so it is shown.
     #[test]
     fn a_small_delivered_scalar_is_shown_whole() {
-        assert_eq!(delivered_tail(&json!(0)), "0");
-        assert_eq!(delivered_tail(&json!(null)), "ok");
-        assert_eq!(delivered_tail(&json!("v2")), "\"v2\"");
-        assert!(delivered_tail(&json!("x".repeat(400))).starts_with("ok, "));
+        assert_eq!(delivered_tail_t(&json!(0)), "0");
+        assert_eq!(delivered_tail_t(&json!(null)), "ok");
+        assert_eq!(delivered_tail_t(&json!("v2")), "\"v2\"");
+        assert!(delivered_tail_t(&json!("x".repeat(400))).starts_with("ok, "));
     }
 
     #[test]
