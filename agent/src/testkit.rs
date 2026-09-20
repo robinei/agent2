@@ -263,6 +263,9 @@ pub struct Said {
     /// How the *reply* ended, which is a fact about the text and not
     /// about the program: `Finished`, `Truncated`, `Interrupted`.
     pub reply_ended: Option<crate::types::ReplyEnd>,
+    /// What the completion cost, as the provider reported it — one
+    /// figure per reply, which is the whole reason `ReplyEnd` exists.
+    pub usage: Vec<crate::host::Usage>,
     /// Whether the branch rested: no further request went out after
     /// this reply. The other half of `finish`'s contract, and the one
     /// no scan of the log can see — resting is the *absence* of an
@@ -350,6 +353,8 @@ pub struct Conversation {
     /// The reply being streamed a chunk at a time, if one is open:
     /// where its scope starts, and the text fed so far.
     open_reply: Option<(u64, String)>,
+    /// What the next completion to close will report having cost.
+    usage: Option<crate::host::Usage>,
     /// Whether the reply just fed woke a program suspended beneath it,
     /// in which case two replies were producing events at once — see
     /// [`Invariant::SitesAreReplyAbsolute`].
@@ -382,6 +387,7 @@ impl Conversation {
             open_asks: Vec::new(),
             epoch: 0,
             open_reply: None,
+            usage: None,
             resumed: false,
         }
     }
@@ -533,6 +539,19 @@ impl Conversation {
         self.close_reply(true)
     }
 
+    /// The completion is over and cost this many output tokens — for
+    /// the tests that are about the figure riding on `ReplyEnd` rather
+    /// than about what the reply did.
+    pub fn end_reply_costing(&mut self, completion: u64) -> Said {
+        self.usage = Some(crate::host::Usage {
+            prompt: 10,
+            cached: 0,
+            completion,
+            reasoning: 0,
+        });
+        self.close_reply(false)
+    }
+
     fn close_reply(&mut self, truncated: bool) -> Said {
         let (before, written) = self
             .open_reply
@@ -544,6 +563,7 @@ impl Conversation {
                 &mut self.tree,
                 StepInput::LlmResponse(crate::machine::LlmTurn {
                     truncated,
+                    usage: self.usage.take(),
                     ..crate::host::scripted_markdown("")
                 }),
             )
@@ -888,6 +908,7 @@ fn fold(tree: &Tree, events: &[&Event], span: (u64, u64)) -> Said {
         answered: Vec::new(),
         ended: Ending::Running,
         reply_ended: None,
+        usage: Vec::new(),
         // **Rested, not merely quiet.** A reply that parked — on a
         // raise, on a `stop` — also leaves no request behind at
         // this layer, because the one that wakes it is the host's
@@ -974,7 +995,10 @@ fn fold(tree: &Tree, events: &[&Event], span: (u64, u64)) -> Said {
             EventPayload::Console { lines } => s.printed.extend(lines.iter().cloned()),
             EventPayload::Result { call, outcome } => s.settled.push((*call, outcome.clone())),
             EventPayload::Answer { question, value } => s.answered.push((*question, value.clone())),
-            EventPayload::ReplyEnd { how, .. } => s.reply_ended = Some(how.clone()),
+            EventPayload::ReplyEnd { how, usage, .. } => {
+                s.reply_ended = Some(how.clone());
+                s.usage.push(usage.clone());
+            }
             EventPayload::Handback { how, site, .. } => {
                 s.ended = ending_of(how, *site);
                 s.handback = Some(e.id);

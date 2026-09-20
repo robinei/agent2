@@ -5793,67 +5793,31 @@ mod tests {
     /// history does not.
     #[test]
     fn fetch_history_reads_a_compacted_post_back_whole() {
-        let (mut tree, mut state) = setup();
-        let out = user_post(
-            &mut state,
-            &mut tree,
-            "the third column is the one that matters",
-        );
-        drain(&mut state, &mut tree, out);
-        let post = state
-            .agent_segment(&tree)
-            .iter()
-            .rev()
-            .find(|e| matches!(e.payload, EventPayload::Post { .. }))
-            .unwrap()
-            .id;
-
-        tree.append(
-            &mut state.spine,
-            EventPayload::Compacted {
-                of: post,
-                text: None,
-                window: None,
-            },
-        )
-        .unwrap();
+        let mut c = Conversation::new();
+        let post = c.user("the third column is the one that matters");
+        c.reply(&format!("```js\nhistory.remove({});\n```\n", post.as_u64()));
         // It really is gone from what the model reads.
-        let doc = crate::document::render(&tree, &state.spine, TEST_BUDGET);
-        let rendered: String = doc.messages.iter().map(|m| m.content.clone()).collect();
-        assert!(!rendered.contains("third column"), "still in the document");
-
-        let before = payload_kinds(&state, &tree).len();
-        let src = format!("history.append(await fetch_history({}));", post.as_u64());
-        let out = state
-            .step(&mut tree, StepInput::LlmResponse(llm_program(&src)))
-            .unwrap();
-        let settled = drain(&mut state, &mut tree, out);
         assert!(
-            !settled
-                .iter()
-                .any(|o| matches!(o, StepOutput::ToolCalls(_))),
-            "served from the log, no call issued"
+            !c.document().contains("third column"),
+            "still in the document"
         );
-        let returned = tree
-            .path_events(state.spine.leaf_id)
-            .iter()
-            .rev()
-            .find_map(|e| match &e.payload {
-                // A reply has no `return`: what it handed forward is its
-                // last `history.append`.
-                EventPayload::Note { value, .. } => Some(value.clone()),
-                _ => None,
-            })
-            .unwrap();
-        assert_eq!(returned, json!("the third column is the one that matters"));
 
+        let r = c.reply(&format!(
+            "```js\nhistory.append(await fetch_history({}));\n```\n",
+            post.as_u64()
+        ));
+        assert_eq!(
+            r.row().value,
+            json!("the third column is the one that matters")
+        );
         // **Reading is free.** The fetch adds nothing of its own: only
         // the program's own events appear, and none of them is a
         // `Call`/`Result` pair for the fetch. That is what lets the
         // menu be an index rather than a replay.
+        assert!(r.calls.is_empty(), "served from the log, no call issued");
         assert_eq!(
-            &payload_kinds(&state, &tree)[before..],
-            ["Reply", "Part", "ReplyEnd", "Note", "Handback", "Console"],
+            r.kinds,
+            ["Reply", "Part", "Note", "ReplyEnd", "Handback", "Console"],
             "the fetch logged something of its own"
         );
     }
@@ -7767,45 +7731,25 @@ mod tests {
     /// altogether depending on whether they had streamed in yet.
     #[test]
     fn a_raise_in_a_cell_lets_the_generation_finish() {
-        let (mut tree, mut state) = setup_under();
-        user_post(&mut state, &mut tree, "go");
-        state.phase = Phase::AwaitingLlm;
-
-        stream_chunks(&mut state, &mut tree, &["```js\nraise(\"which\");\n```\n"]);
-        assert!(matches!(state.phase, Phase::Suspended(..)));
-        assert!(
-            !state.notebook_cancels_generation(),
-            "the rest of the reply is still worth having"
-        );
+        let mut c = Conversation::new();
+        c.user("go");
+        let parked = c.chunk("```js\nraise(\"which\");\n```\n");
+        assert!(matches!(parked.ended, Ending::Raised { .. }));
+        assert_eq!(c.status(), "suspended");
 
         // The rest arrives while the run is parked, and lands on the
         // log as parts of the same reply…
-        stream_chunks(
-            &mut state,
-            &mut tree,
-            &["\n```js\nconsole.log(\"after the raise\");\n```\n"],
-        );
-        state
-            .notebook_stream_end(&mut tree, false, None, None)
-            .unwrap();
-        assert!(
-            matches!(state.phase, Phase::Suspended(..)),
+        c.chunk("\n```js\nconsole.log(\"after the raise\");\n```\n");
+        c.end_reply();
+        assert_eq!(
+            c.status(),
+            "suspended",
             "still parked: the reply ended, the run did not"
         );
 
         // …and runs when the raise is answered.
-        let out = state.resume(&mut tree, json!("that one")).unwrap();
-        drain(&mut state, &mut tree, out);
-        let consoles: Vec<String> = state
-            .agent_segment(&tree)
-            .iter()
-            .filter_map(|e| match &e.payload {
-                EventPayload::Console { lines } => Some(lines.clone()),
-                _ => None,
-            })
-            .flatten()
-            .collect();
-        assert_eq!(consoles, vec!["after the raise"]);
+        let after = c.resume(json!("that one"));
+        assert_eq!(after.printed, ["after the raise"]);
     }
 
     /// A post arriving is the same: it parks the run (rule B), and
@@ -8001,44 +7945,20 @@ mod tests {
     /// session uses and the one the figure used to fall through.
     #[test]
     fn a_streamed_reply_records_its_usage_exactly_once() {
-        let (mut tree, mut state) = setup_under();
-        user_post(&mut state, &mut tree, "go");
-        state.phase = Phase::AwaitingLlm;
-
-        stream_chunks(
-            &mut state,
-            &mut tree,
-            &[
-                "Reading it.\n\n```js\nlet n = 1;\n```\n",
-                "\nNow the sum.\n\n```js\ntell(`n is ${n + 41}`);\n```\n",
-            ],
-        );
-        // Every cell has already run, so there is no `Turn` left for the
+        let mut c = Conversation::new();
+        c.user("go");
+        c.chunk("Reading it.\n\n```js\nlet n = 1;\n```\n");
+        c.chunk("\nNow the sum.\n\n```js\ntell(`n is ${n + 41}`);\n```\n");
+        // Every cell has already run, so there is no cell left for the
         // figure to ride in on.
-        let out = state
-            .step(
-                &mut tree,
-                StepInput::LlmResponse(llm_program_with_usage("", 654)),
-            )
-            .unwrap();
-        drain(&mut state, &mut tree, out);
+        let r = c.end_reply_costing(654);
 
-        let costs: Vec<u64> = state
-            .agent_segment(&tree)
-            .iter()
-            .filter_map(|e| match &e.payload {
-                EventPayload::ReplyEnd { usage, .. } => Some(usage.completion),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(costs, vec![654], "one completion, one cost");
-        assert!(
-            state.agent_segment(&tree).iter().any(
-                |e| matches!(&e.payload, EventPayload::Call(Call::Send { text, .. })
-                    if text == "n is 42")
-            ),
-            "and the reply really ran"
+        assert_eq!(
+            r.usage.iter().map(|u| u.completion).collect::<Vec<_>>(),
+            [654],
+            "one completion, one cost"
         );
+        assert_eq!(r.tells, ["n is 42"], "and the reply really ran");
     }
 
     /// **`programs` counts round trips, not cells.** This is the other
