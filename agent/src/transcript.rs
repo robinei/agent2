@@ -80,6 +80,19 @@ fn line_for(tree: &Tree, path: &[&Event], event: &Event) -> Option<String> {
             let arrow = if matches!(origin, Origin::Sent(_)) { "»" } else { "→" };
             format!("#{id} {who:<7}{arrow} {}", clip(text.trim()))
         }
+        // **The harness asking for room, not the person asking for
+        // work.** A compaction inserts a reply that is about the
+        // document rather than about the task, and leaving it out made
+        // that reply look like the agent wandering off — the one thing
+        // a driver reading this most needs not to misread.
+        EventPayload::Compaction {
+            measured,
+            limit,
+            unit,
+        } => format!(
+            "#{id} harness→ the conversation is {measured} {unit:?} against {limit}; \
+             make room",
+        ),
         EventPayload::Reply => format!("#{id} reply"),
         EventPayload::Restart => format!("#{id} restart"),
         EventPayload::Call(call) => {
@@ -488,6 +501,30 @@ mod tests {
             "and the end, which is usually how it went: {:?}",
             printed.last()
         );
+    }
+
+    /// **A compaction is something that happened.** It inserts a reply
+    /// that is about the document rather than about the task, and
+    /// leaving it out of the transcript made that reply look like the
+    /// agent wandering off — which is the one thing a driver reading
+    /// this most needs not to misread.
+    #[test]
+    fn a_compaction_says_why_the_next_reply_is_not_about_the_task() {
+        let mut c = Conversation::new();
+        c.user("go");
+        c.reply("```js\nhistory.append(\"something\");\n```\n");
+        c.log(EventPayload::Compaction {
+            measured: 40_000,
+            limit: 32_000,
+            unit: crate::types::Measure::Bytes,
+        });
+
+        let out = render(c.tree(), c.runner().spine.leaf_id);
+        assert!(
+            out.contains("40000 Bytes against 32000"),
+            "the numbers it fired on: {out}"
+        );
+        assert!(out.contains("make room"), "and what was asked for: {out}");
     }
 
     /// A value that would take the screen is one line with an id beside

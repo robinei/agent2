@@ -839,6 +839,15 @@ impl Conversation {
         &self.tree
     }
 
+    /// Put an event on this branch directly — for a test that needs one
+    /// the harness would normally write itself, and has no way to make
+    /// it happen from a reply.
+    pub fn log(&mut self, payload: EventPayload) -> EventId {
+        self.tree
+            .append(&mut self.runner.spine, payload)
+            .expect("appended")
+    }
+
     pub fn runner(&self) -> &Runner {
         &self.runner
     }
