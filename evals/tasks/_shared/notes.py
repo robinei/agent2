@@ -28,12 +28,12 @@ NOTES = [
         "answer": "7",
         "thread": [
             ("Raj", "I'd start at 3 and see whether the tail shortens."),
-            ("Ana", "3 is what we had. It is what let the queue drain into the floor."),
+            ("Ana", "That is what we had, and it is what let the queue drain into the floor."),
             ("Ana", "Try 5, then, and hold the backoff where it is."),
             ("Mia", "5 covers the median but not the p99 we actually paged on."),
             ("Ana", "Then 7. That covers the p99 with one retry to spare."),
         ],
-        "decision": "Ana's third figure is what we are going with.",
+        "decision": "Ana's second figure is what we are going with.",
     },
     {
         "file": "incident-2044.md",
