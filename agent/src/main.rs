@@ -32,6 +32,14 @@ const USAGE: &str = "usage: agent <command>
                                     slicer, no session, no LLM.
   session [options] [log.jsonl]     agent session (attached TUI by default)
     --headless                      print events instead of the TUI
+    --stdin                         keep the session alive and take one
+                                    turn per line of stdin, printing
+                                    `--- quiet` when each exchange
+                                    settles. Implies --headless. The
+                                    only way to answer a program that
+                                    is parked on ask(): its VM lives in
+                                    this process, so a turn-per-process
+                                    driver arrives after it is gone.
     --real                          use DeepSeek (needs DEEPSEEK_API_KEY);
                                     the TUI picks it automatically when the
                                     key is set — --headless stays scripted
@@ -94,6 +102,7 @@ fn main() {
         Some("session") => {
             let mut headless = false;
             let mut real = false;
+            let mut stdin_turns = false;
             let mut turn: Option<String> = None;
             let mut log_path: Option<String> = None;
             let mut list_leaves = false;
@@ -124,6 +133,10 @@ fn main() {
             while let Some(arg) = rest.next() {
                 match arg.as_str() {
                     "--headless" => headless = true,
+                    "--stdin" => {
+                        stdin_turns = true;
+                        headless = true;
+                    }
                     "--real" => real = true,
                     "--turn" => turn = Some(next_val(&mut rest, "--turn")),
                     "--list-leaves" => list_leaves = true,
@@ -170,7 +183,7 @@ fn main() {
                 turn,
             };
             let result = if headless {
-                run_session_headless(log_path, use_real, nav)
+                run_session_headless(log_path, use_real, nav, stdin_turns)
             } else {
                 run_session_tui(log_path, use_real, &nav)
             };
@@ -398,30 +411,37 @@ fn queue_nav(session: &host::Session, nav: &SessionNav) {
         h.send(host::SessionCommand::Rename { branch, name });
     }
     if let Some(text) = nav.turn.clone() {
-        // **One gesture: the person typed something.** Whether that is
-        // an answer or a new instruction is not theirs to declare — it
-        // depends on whether the branch is holding a question open, and
-        // the branch is the thing that knows. This is `resolve_submit`
-        // (`debug/attach.rs`), which the TUI has always used; without
-        // it a headless driver could start a conversation and never
-        // continue one, because a `UserTurn` sent to a branch parked on
-        // `ask()` leaves the question open forever and the reply it
-        // was waiting for never arrives.
-        //
-        // A kickoff line is a task instruction, not a question, and the
-        // agent's reply reaches the client either way (18_TARGETING).
-        match session.asking_user_on(branch) {
-            Some(call) => h.send(host::SessionCommand::Reply {
-                branch,
-                call,
-                value: serde_json::Value::String(text),
-            }),
-            None => h.send(host::SessionCommand::UserTurn {
-                branch,
-                text,
-                expects_reply: false,
-            }),
-        }
+        submit(session, text);
+    }
+}
+
+/// **One gesture: the person typed something.**
+///
+/// Whether that is an answer or a new instruction is not theirs to
+/// declare — it depends on whether the branch is holding a question
+/// open, and the branch is the thing that knows. This is
+/// `resolve_submit` (`debug/attach.rs`), which the TUI has always used;
+/// without it a headless driver could start a conversation and never
+/// continue one, because a `UserTurn` sent to a branch parked on
+/// `ask()` leaves the question open forever and the reply it was
+/// waiting for never arrives.
+///
+/// A kickoff line is a task instruction, not a question, and the
+/// agent's reply reaches the client either way (18_TARGETING).
+fn submit(session: &host::Session, text: String) {
+    let h = session.handle();
+    let branch = session.conversation_branch();
+    match session.asking_user_on(branch) {
+        Some(call) => h.send(host::SessionCommand::Reply {
+            branch,
+            call,
+            value: serde_json::Value::String(text),
+        }),
+        None => h.send(host::SessionCommand::UserTurn {
+            branch,
+            text,
+            expects_reply: false,
+        }),
     }
 }
 
@@ -456,6 +476,7 @@ fn run_session_headless(
     log_path: Option<String>,
     real: bool,
     nav: SessionNav,
+    stdin_turns: bool,
 ) -> Result<(), String> {
     let (tx, rx) = std::sync::mpsc::channel();
     // **Whether anything ever ran**, decided by the printer because it
@@ -495,6 +516,36 @@ fn run_session_headless(
         }
         session.handle().send(host::SessionCommand::Shutdown);
         session.run()
+    } else if stdin_turns {
+        // **The session outlives the exchange.** A program parked on
+        // `ask()` holds its VM in this process; a driver that starts a
+        // process per turn arrives after that VM is gone, and the
+        // answer lands as a settlement nobody was waiting for. Reading
+        // turns from stdin keeps the one process, so the answer reaches
+        // the expression that asked.
+        let mut session = build_session(log_path, real, nav.resume, tx)?;
+        // Someone is typing, by construction.
+        session.set_attached(true);
+        queue_nav(&session, &nav);
+        loop {
+            session = session.run();
+            // The exchange is over. A driver reads until this line,
+            // looks at the log, and decides what to say next.
+            println!("--- quiet");
+            use std::io::Write;
+            let _ = std::io::stdout().flush();
+            let mut line = String::new();
+            match std::io::stdin().read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+            let text = line.trim();
+            if text.is_empty() {
+                continue;
+            }
+            submit(&session, text.to_owned());
+        }
+        session
     } else if real || driven || nav.resume.is_some() {
         let mut session = build_session(log_path, real, nav.resume, tx)?;
         if real && !driven {

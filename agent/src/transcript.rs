@@ -140,7 +140,17 @@ fn line_for(tree: &Tree, path: &[&Event], event: &Event) -> Option<String> {
             }
             Handback::Abandoned => format!("#{id}    ⏏ abandoned"),
             Handback::Posted { .. } => format!("#{id}    ⏸ a message arrived"),
-            _ => format!("#{id}    ·"),
+            // **The process died and took the VM with it.** A program
+            // parked on an `ask()` or mid-call does not survive the
+            // process that holds it; the next one to open the log
+            // reconciles it into this. Worth its own line, because it
+            // is the one ending that means "nobody decided anything" —
+            // and because a driver that sees it knows the answer it is
+            // about to give will arrive as a notice rather than into
+            // the expression that asked.
+            Handback::Interrupted => {
+                format!("#{id}    ⏻ interrupted — the run went with the process")
+            }
         },
         _ => return None,
     })
@@ -210,6 +220,10 @@ fn waiting_on(path: &[&Event]) -> String {
         }
         Some(Handback::Raised { name, .. }) => {
             format!("waiting on: a handler for «{name}»")
+        }
+        Some(Handback::Interrupted) => {
+            "waiting on: nothing — the last run went with its process, so say it again"
+                .to_owned()
         }
         _ => "waiting on: nothing".to_owned(),
     }
