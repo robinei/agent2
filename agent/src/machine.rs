@@ -1549,6 +1549,17 @@ impl Runner {
         else {
             panic!("Runner::resume called with nothing suspended — a host bookkeeping bug");
         };
+        // **The halt has been decided, so it is no longer one.**
+        // `stop` marks the run halted and `suspend` carries that flag
+        // into `Phase::Suspended` untouched; without clearing it here
+        // the frame comes back as `Running` with `halted` still set,
+        // and both `pump` and `drive_notebook` refuse to step a halted
+        // run — so resuming a stop produced no rows, no terminal
+        // handback and no error, just a branch that went quiet with a
+        // program still open. Found 2026-09-20 by resuming one: reply
+        // #8 ran `history.append(resume(null))` and logged nothing at
+        // all.
+        run.halted = None;
         match &suspension {
             // Nothing to push: the VM was parked between slices, not
             // stopped at a raise or an error.
