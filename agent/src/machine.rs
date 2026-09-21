@@ -3646,7 +3646,7 @@ impl Runner {
     /// could land on a `Phase::Suspended(run, _)` and drop the parked
     /// run. `Phase` no longer carries a run, so there is nothing to
     /// guard against and the guard is gone.
-    fn await_llm(&mut self) {
+    pub(crate) fn await_llm(&mut self) {
         self.phase = Phase::AwaitingLlm;
     }
 
@@ -6666,6 +6666,42 @@ mod tests {
             )),
             "the displaced program went with no terminal on the log"
         );
+    }
+
+    /// **Typing does not interrupt a turn in flight.** A new message
+    /// queues and is delivered when the generation lands; interrupting
+    /// is the separate, explicit gesture (`x` →
+    /// `SessionCommand::Interrupt`). An unparked branch has always
+    /// worked that way — `needs_prompt` declines while a request is
+    /// out — but a parked one read as `Idle`, took the unseen-post arm
+    /// and asked for a *second* generation over the host's.
+    ///
+    /// The fix is `prompt_suspended` stamping the phase, which was
+    /// impossible while `Phase` carried the parked run: `AwaitingLlm`
+    /// would have dropped it.
+    #[test]
+    fn a_message_typed_during_a_parked_turn_queues_instead_of_superseding() {
+        let (mut tree, mut state) = setup_under();
+        user_post(&mut state, &mut tree, "run it");
+        let out = state
+            .notebook_stream(&mut tree, 1, "```js\nawait tools.bash(\"slow\");\n```\n")
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+        let out = user_post(&mut state, &mut tree, "actually stop");
+        drain(&mut state, &mut tree, out);
+        assert_eq!(state.status(), "suspended");
+
+        // What `prompt_suspended` does: render the request, and say one
+        // is out.
+        let _ = state.render_request(&tree);
+        state.await_llm();
+
+        let out = user_post(&mut state, &mut tree, "and what phase did it reach?");
+        assert!(
+            !out.iter().any(|o| matches!(o, StepOutput::LlmRequest(_))),
+            "typing superseded the turn in flight instead of queueing"
+        );
+        assert_eq!(state.status(), "suspended", "and the frame is untouched");
     }
 
     #[test]

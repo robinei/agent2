@@ -1381,6 +1381,24 @@ impl Session {
         let StepOutput::LlmRequest(request) = state.render_request(&self.tree) else {
             unreachable!("render_request always returns an LlmRequest");
         };
+        // **A request is out, and the branch says so.** This did not
+        // stamp the phase, because it could not: while `Phase` carried
+        // the parked run, `AwaitingLlm` would have dropped it. Now the
+        // frame lives on `Runner::parked` and the stamp is just a fact.
+        //
+        // Without it a parked branch with a generation in flight read
+        // as `Idle`, so a message typed while it was thinking took
+        // `needs_prompt`'s unseen-post arm and asked for a *second*
+        // generation over this one. That is not what typing means: a
+        // new message queues and is delivered when the turn in flight
+        // lands, and interrupting is the separate, explicit gesture
+        // (`x` → `SessionCommand::Interrupt`). An unparked branch has
+        // always behaved that way; this is the parked one catching up.
+        //
+        // The `Idle`-with-a-frame arm in `needs_prompt` keeps its real
+        // job: waking a parked branch that has *nothing* in flight,
+        // which is `d38c416`'s deaf-session fix.
+        state.await_llm();
         // The condition's own report used to be folded in here as an
         // ephemeral tail, because `document::render` dropped every
         // `Pushed` condition. It no longer does: the report is a row of
