@@ -6093,20 +6093,20 @@ mod tests {
         assert_eq!(state.status(), "idle");
     }
 
-    /// **Superseded by 27.1 and then deleted with the verb.**
-    /// `next_program_hands_over_and_its_payload_stays_in_the_document`
-    /// pinned that `next_program(payload)` logs `Handover` rather than
-    /// `Pushed`, so its payload reached the rolling document instead of
-    /// only the one-shot handler prompt — a live run had handed over
-    /// 190KB and the program after next saw none of it.
-    ///
-    /// `return payload` does that job now and does it without a
-    /// condition at all: `a_completed_program_continues_by_default`
-    /// covers the continuation, and 27.7's
-    /// `a_return_value_reaches_the_next_program_whole` covers the
-    /// payload arriving intact, which is the property that test was
-    /// really about. The verb is gone (zero uses across 82 live runs
-    /// once no card named it), so there is nothing left to assert.
+    // **Superseded by 27.1 and then deleted with the verb.**
+    // `next_program_hands_over_and_its_payload_stays_in_the_document`
+    // pinned that `next_program(payload)` logs `Handover` rather than
+    // `Pushed`, so its payload reached the rolling document instead of
+    // only the one-shot handler prompt — a live run had handed over
+    // 190KB and the program after next saw none of it.
+    //
+    // `return payload` does that job now and does it without a
+    // condition at all: `a_completed_program_continues_by_default`
+    // covers the continuation, and 27.7's
+    // `a_return_value_reaches_the_next_program_whole` covers the
+    // payload arriving intact, which is the property that test was
+    // really about. The verb is gone (zero uses across 82 live runs
+    // once no card named it), so there is nothing left to assert.
 
     #[test]
     fn an_id_is_addressable_in_the_form_it_is_displayed() {
