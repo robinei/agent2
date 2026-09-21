@@ -91,6 +91,13 @@ pub enum Pane {
     Stack,
     Promises,
     Console,
+    /// **What you selected**, shown in full — a call's arguments and
+    /// result, or an append's value. It replaced `Source` on the right
+    /// of the chat views: the source is already on the screen (the
+    /// block shows its own cells) and what a reader wants beside it is
+    /// the thing they just clicked. `Source` stays in `FullDebug`,
+    /// where stepping is the point.
+    Detail,
     /// The message/rewrite box (19_UX Step C3) — its own hit-testable
     /// rect, distinct from `Chat`'s transcript, so a click there is
     /// routed correctly instead of misread as a chat-transcript row.
@@ -206,6 +213,7 @@ pub struct AttachedApp {
     pub chat_scroll: Option<usize>,
     pub console_scroll: Option<usize>,
     pub source_scroll: Option<usize>,
+    pub detail_scroll: Option<usize>,
     pub disasm_scroll: Option<usize>,
     pub stack_scroll: Option<usize>,
     pub promises_scroll: Option<usize>,
@@ -279,7 +287,7 @@ impl AttachedApp {
             input: InputBuffer::new(),
             quit: false,
             quit_armed: false,
-            show_source: true,
+            show_source: false,
             show_disasm: false,
             show_stack: false,
             show_promises: false,
@@ -288,6 +296,7 @@ impl AttachedApp {
             chat_scroll: None,
             console_scroll: None,
             source_scroll: None,
+            detail_scroll: None,
             disasm_scroll: None,
             stack_scroll: None,
             promises_scroll: None,
@@ -357,8 +366,11 @@ impl AttachedApp {
             if self.view == View::Chat {
                 self.view = View::Running;
                 // A fresh pop resets to the auto-pop set; later manual
-                // toggles override it until the next pop.
-                self.show_source = true;
+                // toggles override it until the next pop. The source is
+                // not in that set any more — `Pane::Detail` has its
+                // slot, and `1` brings the source back for anyone who
+                // wants it.
+                self.show_source = false;
                 self.show_disasm = false;
                 self.show_stack = false;
                 self.show_promises = false;
@@ -405,6 +417,7 @@ impl AttachedApp {
             Pane::Chat => self.chat_scroll = Some(new),
             Pane::Console => self.console_scroll = Some(new),
             Pane::Source => self.source_scroll = Some(new),
+            Pane::Detail => self.detail_scroll = Some(new),
             Pane::Disasm => self.disasm_scroll = Some(new),
             Pane::Stack => self.stack_scroll = Some(new),
             Pane::Promises => self.promises_scroll = Some(new),
@@ -567,6 +580,7 @@ impl AttachedApp {
     /// that should re-anchor when the visible program changes).
     fn reset_program_scrolls(&mut self) {
         self.source_scroll = None;
+        self.detail_scroll = None;
         self.console_scroll = None;
         self.disasm_scroll = None;
         self.stack_scroll = None;
@@ -586,9 +600,13 @@ impl AttachedApp {
             },
             View::Running => {
                 let mut right = vec![Pane::Navigator];
+                // Off by default now — `1` still brings it back for
+                // anyone who wants it. What sits here instead is the
+                // detail of whatever is selected.
                 if self.show_source {
                     right.push(Pane::Source);
                 }
+                right.push(Pane::Detail);
                 if self.show_disasm {
                     right.push(Pane::Disasm);
                 }
@@ -1530,15 +1548,18 @@ fn render(frame: &mut Frame, app: &mut AttachedApp, session: &Session) {
                         },
                     ));
                 }
+                Pane::Detail => {
+                    let top = render_detail(frame, app, session, pv.as_ref(), *slot);
+                    app.pane_rects.push((
+                        Pane::Detail,
+                        PaneInfo {
+                            area: *slot,
+                            scroll_top: top,
+                        },
+                    ));
+                }
                 Pane::Console => {
-                    let (top, area) = if app.selected_effect.is_some() {
-                        if let Some(ref pv) = pv {
-                            render_subitem(frame, app, session, pv, *slot, app.console_scroll)
-                        } else {
-                            render_placeholder(frame, Pane::Console, *slot);
-                            (0, *slot)
-                        }
-                    } else if let Some(ref pv) = pv {
+                    let (top, area) = if let Some(ref pv) = pv {
                         render_console_from_pv(frame, pv, *slot, app.console_scroll)
                     } else {
                         render_attached_console(frame, app, session, *slot, app.console_scroll)
@@ -2549,14 +2570,22 @@ fn render_console_from_pv(
     (top, area)
 }
 
-fn render_subitem(
+/// **The thing you selected, in full.** A call's arguments and result,
+/// or an append's value — the detail behind a one-line effect row.
+///
+/// This is what sits on the right of the chat views, where the source
+/// pane used to. The source is already on the screen (a block shows
+/// its own cells) and re-showing it there answered a question nobody
+/// was asking; what a reader wants beside the transcript is the thing
+/// they just clicked. `Pane::Source` stays in `FullDebug`, where
+/// stepping through instructions is the point.
+fn render_detail(
     frame: &mut Frame,
     app: &AttachedApp,
     session: &Session,
-    pv: &ProgramView,
+    pv: Option<&ProgramView>,
     area: Rect,
-    scroll: Option<usize>,
-) -> (usize, Rect) {
+) -> usize {
     let mut lines: Vec<Line> = Vec::new();
     let title = match app.selected_effect {
         // **What `history.fetch` would hand back.** The transcript row
@@ -2583,8 +2612,8 @@ fn render_subitem(
             }
             " ▸ appended ".to_string()
         }
-        Some(Effect::Invoke(idx)) => {
-            if let Some(invoke) = pv.invokes.get(idx) {
+        Some(Effect::Invoke(idx)) => match pv.and_then(|pv| pv.invokes.get(idx)) {
+            Some(invoke) => {
                 lines.push(
                     Line::from(format!("⚙ {}", invoke.name))
                         .style(Style::default().fg(Color::Yellow)),
@@ -2610,26 +2639,33 @@ fn render_subitem(
                     lines.push(Line::from(l.to_owned()));
                 }
                 format!(" ⚙ {} ", invoke.name)
-            } else {
-                lines.push(Line::from("(invoke not found)"));
-                " invoke ".to_string()
             }
-        }
+            None => {
+                lines.push(Line::from("(invoke not found)"));
+                " detail ".to_string()
+            }
+        },
+        // Says what to do rather than what is missing: the pane is
+        // empty because nothing is picked, which is a normal state and
+        // not a failure to render something.
         None => {
-            lines.push(Line::from("(no subitem)"));
-            " subitem ".to_string()
+            lines.push(
+                Line::from("click a ⚙ call or a ▸ append to see it here")
+                    .style(Style::default().fg(Color::DarkGray)),
+            );
+            " detail ".to_string()
         }
     };
     let visible = area.height.saturating_sub(2) as usize;
     let default_top = lines.len().saturating_sub(visible);
-    let top = scroll.unwrap_or(default_top).min(default_top);
+    let top = app.detail_scroll.unwrap_or(default_top).min(default_top);
     let end = (top + visible).min(lines.len());
     frame.render_widget(
         Paragraph::new(lines[top..end].to_vec())
             .block(Block::default().borders(Borders::ALL).title(title)),
         area,
     );
-    (top, area)
+    top
 }
 
 fn render_placeholder(frame: &mut Frame, pane: Pane, area: Rect) {
@@ -2641,6 +2677,7 @@ fn render_placeholder(frame: &mut Frame, pane: Pane, area: Rect) {
         Pane::Promises => " promises [4] ",
         Pane::Navigator => " agents ",
         Pane::Console => " console ",
+        Pane::Detail => " detail ",
         Pane::Input => unreachable!("Pane::Input is never a placeholder target"),
     };
     frame.render_widget(
@@ -3602,8 +3639,11 @@ mod tests {
         assert_eq!(app.view, View::Running);
         let panes = app.pane_set();
         assert!(panes.chat);
-        assert!(panes.right.contains(&Pane::Source));
+        // The auto-pop set is detail + console now; the source pane is
+        // off unless `1` asks for it.
+        assert!(panes.right.contains(&Pane::Detail));
         assert!(panes.right.contains(&Pane::Console));
+        assert!(!panes.right.contains(&Pane::Source));
         // The post-mortem VM is still borrowable for those panes.
         let state = session.state(session.conversation_branch()).unwrap();
         assert!(!state.vm_is_live());
@@ -3623,7 +3663,7 @@ mod tests {
             }
         );
         // It is not a one-way door: `c` again from `Chat` reopens the
-        // source/console panes without needing a fresh run_program to
+        // detail/console panes without needing a fresh run_program to
         // re-trigger the auto-pop. Collapsing left focus on `Input`
         // (same as the original direction leaves it), so `Esc` back to
         // `Focus::Debug` first, same as above.
@@ -3632,7 +3672,7 @@ mod tests {
         app.on_key(KeyCode::Char('c').into(), &[], None);
         assert_eq!(app.view, View::Running);
         let panes = app.pane_set();
-        assert!(panes.right.contains(&Pane::Source));
+        assert!(panes.right.contains(&Pane::Detail));
         assert!(panes.right.contains(&Pane::Console));
     }
 
@@ -3708,6 +3748,11 @@ mod tests {
         let mut app = AttachedApp::new(fid(1));
         app.view = View::Running;
         app.focus = Focus::Debug;
+        // The source pane is off in the chat views now — `Detail` has
+        // its slot — and `1` is what brings it back.
+        assert!(!app.pane_set().right.contains(&Pane::Source));
+        assert!(app.pane_set().right.contains(&Pane::Detail));
+        app.on_key(KeyCode::Char('1').into(), &[], None);
         assert!(app.pane_set().right.contains(&Pane::Source));
         app.on_key(KeyCode::Char('1').into(), &[], None);
         assert!(!app.pane_set().right.contains(&Pane::Source));
