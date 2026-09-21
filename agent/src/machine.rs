@@ -313,10 +313,22 @@ const REPLY_SHAPE_TAIL: &str = "Someone has asked you something and you have no 
 ///
 /// **Off unless asked for** (`AGENT2_NO_REHEARSAL_TAIL=1`), because it
 /// is an arm and not yet a finding: whether restating a ban works at
-/// all is exactly what the `↓ history[N]` number casts doubt on. The
-/// measurement is the count of fenced drafts inside `Part::Thinking`,
-/// which was 6 on the baseline run.
-const NO_REHEARSAL_TAIL: &str = "- Nothing you write while reasoning is read back. A block      drafted there is written twice; write it once, in the reply.";
+/// all is exactly what the `↓ history[N]` number casts doubt on.
+///
+/// The measurement is the count of fenced drafts inside
+/// `Part::Thinking`, over `sweep-8` on `deepseek-v4-flash`:
+///
+/// - no tail line: **6** drafts, 24,191 B of reasoning, 137 s
+/// - a factual phrasing ("nothing written while reasoning is read back;
+///   a block drafted there is written twice"): **1** draft, 9,101 B, 53 s
+///
+/// This is the imperative variant. The two are not obviously ordered:
+/// the card already carries the imperative in bold ("do not rehearse a
+/// block — write it") and was ignored six times, so force may be the
+/// thing that already failed, and the explanation may be what worked.
+/// One run per arm either way — this is a probe, not a result.
+const NO_REHEARSAL_TAIL: &str =
+    "- Thinking is for reasoning! Never draft code blocks! One-shot them in the reply.";
 
 /// Whether this reply tried to call a tool in another harness's syntax.
 ///
@@ -927,8 +939,16 @@ pub struct Runner {
     /// is answering a post. A field for the same reason as the line
     /// above: an arm has to be settable per-runner, not per-process.
     reply_shape_tail: bool,
-    /// Whether the tail carries [`NO_REHEARSAL_TAIL`].
-    no_rehearsal_tail: bool,
+    /// The rehearsal-ban line this branch's tail carries, if any.
+    ///
+    /// **Text, not a flag, because the wording is the variable.** The
+    /// question is which phrasing works, and a compiled-in string means
+    /// a rebuild per arm — which in turn means running the arms in
+    /// blocks, so an hour of provider drift lands entirely on one of
+    /// them. `AGENT2_NO_REHEARSAL_TAIL=1` takes
+    /// [`NO_REHEARSAL_TAIL`]; any other value is the line itself, so
+    /// arms can be interleaved from one binary.
+    no_rehearsal_tail: Option<String>,
     /// The last reply called `finish()` and told nobody anything, so it
     /// was not rested. The next request's tail says so — see
     /// [`SILENT_FINISH`].
@@ -1066,7 +1086,12 @@ impl Runner {
             nudge_when_nothing_ran: std::env::var("AGENT2_STOPPED_SHORT_NOTICE")
                 .is_ok_and(|v| v != "0"),
             reply_shape_tail: std::env::var("AGENT2_REPLY_SHAPE_TAIL").is_ok_and(|v| v != "0"),
-            no_rehearsal_tail: std::env::var("AGENT2_NO_REHEARSAL_TAIL").is_ok_and(|v| v != "0"),
+            no_rehearsal_tail: match std::env::var("AGENT2_NO_REHEARSAL_TAIL") {
+                Ok(v) if v == "0" => None,
+                Ok(v) if v == "1" => Some(NO_REHEARSAL_TAIL.to_owned()),
+                Ok(v) => Some(v),
+                Err(_) => None,
+            },
             finish_ignored: false,
             spine,
             agent,
@@ -4086,8 +4111,8 @@ impl Runner {
         if self.reply_shape_tail && self.answering_a_post(tree) {
             lines.push(REPLY_SHAPE_TAIL.to_owned());
         }
-        if self.no_rehearsal_tail {
-            lines.push(NO_REHEARSAL_TAIL.to_owned());
+        if let Some(line) = &self.no_rehearsal_tail {
+            lines.push(line.clone());
         }
         lines.push(if self.attached { PRESENT } else { ABSENT }.to_owned());
         if let Some(n) = self.replies_since_spoken_to(tree) {
@@ -6798,18 +6823,18 @@ mod tests {
         let (mut tree, mut state) = setup_under();
         user_post(&mut state, &mut tree, "do it");
         let off = state.request_tail(&tree).unwrap_or_default();
-        assert!(!off.contains("written twice"), "on by default: {off}");
+        assert!(!off.contains("One-shot"), "on by default: {off}");
 
-        state.no_rehearsal_tail = true;
+        state.no_rehearsal_tail = Some(NO_REHEARSAL_TAIL.to_owned());
         let on = state.request_tail(&tree).unwrap_or_default();
         assert!(
-            on.contains("written twice"),
+            on.contains("Never draft code blocks"),
             "the arm does not reach the tail: {on}"
         );
         assert!(
             on.lines()
-                .any(|l| l.starts_with("- ") && l.contains("read back")),
-            "one terse line like its neighbours: {on}"
+                .any(|l| l.starts_with("- ") && l.contains("One-shot")),
+            "one line like its neighbours: {on}"
         );
     }
 
