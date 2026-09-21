@@ -490,9 +490,15 @@ Acceptance:
 - [x] `Edit` namespace resolves at compile time, arity-checked/linted like other
       namespaced builtins; documented in the dialect card.
 - [x] **Replace, guarded:** `Edit.replaceOnce(text, old, new)` errors with the
-      actual count if matches != 1; `Edit.replaceCount(text, old, new) ->
-      { result, count }` for an intended-N replace; `Edit.count(text, needle) ->
-      number`. `RegExp` forms accepted where they make sense.
+      actual count if matches != 1; `Edit.replaceAll(text, old, new) -> string`
+      for every occurrence; `Edit.count(text, needle) -> number` for how many
+      there are. `RegExp` forms accepted where they make sense.
+
+      `replaceAll` was `replaceCount`, returning `{ result, count }` — the one
+      verb in the family that did not hand back the text. Six traps across five
+      kept runs came from a `.result` taken off a sibling that never had one,
+      surfacing at the *next* call. The count it bundled is `Edit.count`, over
+      the same non-overlapping matches.
 - [x] **Extract, computed not retyped:** `Edit.extractBlock(text, headIndex) ->
       { start, end }` (brace balance), `Edit.extractByIndent(text, lineIndex)`
       (dedent), `Edit.extractEnclosing(text, index, open, close)`. Unbalanced /
@@ -507,7 +513,7 @@ Acceptance:
 - [x] Gate: `cargo fmt && cargo clippy && cargo test` green.
 
 *(Built: `Edit` namespace wired via `for_namespace` like `Math`/`JSON` — 9**
-*builtins in `interp/src/builtin/edit.rs`: `replaceOnce`, `replaceCount`,**
+*builtins in `interp/src/builtin/edit.rs`: `replaceOnce`, `replaceAll`,**
 *`count`, `extractBlock`, `extractByIndent`, `extractEnclosing`, `replaceLines`,*
 *`insertAt`, `applyEdits`. All error on ambiguity as catchable `ValueError`.**
 *Brace + delimiter balancing skips JS string literals and comments to avoid**

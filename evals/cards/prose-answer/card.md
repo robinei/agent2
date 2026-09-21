@@ -146,8 +146,8 @@ declare namespace Edit {
 
   When the text you want to name is not unique — an attribute, a decorator, a `}` — `tools.outline` gives the line of the definition it belongs to, and `replaceLines` takes it from there. */
   function replaceOnce(text: string, old: string, new_: string): string;
-  /** Replace every occurrence, and say how many there were. */
-  function replaceCount(text: string, old: string, new_: string): { result: string; count: number };
+  /** Replace every occurrence. `count` is how many there were, asked separately. */
+  function replaceAll(text: string, old: string, new_: string): string;
   /** How many times `needle` occurs — ask before editing, not after. */
   function count(text: string, needle: string): number;
   /** Many at once: each `old` must occur once, spans disjoint, applied right-to-left so no offset goes stale. */

@@ -9,9 +9,9 @@ const fs = await Promise.all(hits.map((p) => tools.read_file(p)));
 
 ```js
 for (const [i, p] of hits.entries()) {
-  const e = Edit.replaceCount(fs[i].content, "OLD", "NEW");
-  const w = await tools.replace_file(p, e.result, fs[i].version);
-  console.log(`${p} ${e.count}\n${w.diff}`);
+  const text = Edit.replaceAll(fs[i].content, "OLD", "NEW");
+  const w = await tools.replace_file(p, text, fs[i].version);
+  console.log(`${p}\n${w.diff}`);
 }
 const c = await tools.bash("CHECK 2>&1");
 if (c.status !== 0) return `${hits.length} changed, but CHECK fails:\n${c.stdout}`;

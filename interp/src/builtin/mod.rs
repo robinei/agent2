@@ -543,7 +543,7 @@ builtins! {
 
     // ── Edit static ──
     EditReplaceOnce,       BuiltinKind::Namespace("Edit"), "replaceOnce",    3, 3, edit_replace_once,       false, false, false, false, false, false, false, false, false, false;
-    EditReplaceCount,      BuiltinKind::Namespace("Edit"), "replaceCount",   3, 3, edit_replace_count,      false, false, false, false, false, false, false, false, false, false;
+    EditReplaceAll,        BuiltinKind::Namespace("Edit"), "replaceAll",     3, 3, edit_replace_all,        false, false, false, false, false, false, false, false, false, false;
     EditCount,             BuiltinKind::Namespace("Edit"), "count",          2, 2, edit_count,             false, false, false, false, false, false, false, false, false, false;
     EditExtractBlock,      BuiltinKind::Namespace("Edit"), "extractBlock",   2, 2, edit_extract_block,      false, false, false, false, false, false, false, false, false, false;
     EditExtractByIndent,   BuiltinKind::Namespace("Edit"), "extractByIndent",    2, 2, edit_extract_by_indent,   false, false, false, false, false, false, false, false, false, false;

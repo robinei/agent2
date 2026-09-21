@@ -71,8 +71,8 @@ impl VM {
             // **The keys, because the next move is one of them.** An
             // object reaching a string method is nearly always a
             // wrapper the caller forgot to open — a `{ content,
-            // version }` from `read_file`, a `{ result, count }` from
-            // `replaceCount`, a note fetched back whole. "An object
+            // version }` from `read_file`, a note fetched back whole.
+            // "An object
             // with 1 property" says it is the wrong shape; naming the
             // property says which `.` to write. Live on 2026-09-20 a
             // `sweep-200` run fetched a row it had appended as

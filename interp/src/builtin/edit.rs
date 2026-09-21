@@ -10,22 +10,24 @@ use crate::vm::{ErrorKind, RcStr, VM, VMError, Value};
 /// mistake instead of its symptom.
 ///
 /// `vm.string_from` says only "type error", and the value that reaches
-/// it is usually `undefined` produced two lines earlier: `replaceOnce`
-/// returns the new string directly while `replaceCount` returns
-/// `{ result, count }`, so a `.result` on the wrong one is `undefined`
-/// and the *next* call is what fails. Eight traps across the runs of
-/// 2026-09-18 said `in \`replaceOnce\`: type error` while naming a call
-/// that was not the error, which is the least useful thing a message
-/// can do.
+/// it is usually `undefined` produced two lines earlier. Eight traps
+/// across the runs of 2026-09-18 said `in \`replaceOnce\`: type error`
+/// while naming a call that was not the error, which is the least
+/// useful thing a message can do.
+///
+/// Every `Edit.*` returns the new text now, so the commonest source of
+/// that `undefined` is gone with it: a `.result` taken off a verb that
+/// never had one. What is left is an ordinary mistake — the wrong
+/// variable, or the object a tool returned instead of the string
+/// inside it — and both are worth naming precisely.
 fn edit_text(vm: &mut VM, args: &Args, who: &str) -> Result<RcStr, VMError> {
     let v = args.get(vm, 0).clone();
     if matches!(v, Value::Undefined) {
         let msg = format!(
-            "{who}(text, …): `text` is undefined. **Only `replaceCount` returns \
-             `{{ result, count }}`** — `replaceOnce`, `replaceLines`, `insertAt`, \
-             `applyEdits` and the `extract*` pair all return the new text itself — so a \
-             `.result` taken off one of those gives undefined, and this is the next call \
-             along."
+            "{who}(text, …): `text` is undefined. Every `Edit.*` takes the text and \
+             returns the new text, so this is a value that was never a string — a \
+             misspelled variable, or a property the object does not have. The call that \
+             produced it is the one to look at, not this one."
         );
         return Err(vm.fail(ErrorKind::TypeError, msg));
     }
@@ -34,23 +36,36 @@ fn edit_text(vm: &mut VM, args: &Args, who: &str) -> Result<RcStr, VMError> {
     // this catches the `.result` that was never taken. Live on
     // 2026-09-20, a run wrote
     //
-    //   const withSkips = Edit.replaceCount(text, old, "");
+    //   const withSkips = Edit.replaceAll(text, old, "");
     //   Edit.replaceOnce(withSkips, …);
     //
     // and got `in `replaceOnce`: type error` — the whole message —
     // while the object it was handed was sitting there announcing what
     // it was. That cost the run its task.
-    if let Value::Object(p) = &v
-        && vm
+    if let Value::Object(p) = &v {
+        let keys: Vec<String> = vm
             .objects
             .get(*p as usize)
-            .is_some_and(|o| o.map.contains_key("result"))
-    {
-        let msg = format!(
-            "{who}(text, …): `text` is the `{{ result, count }}` object `replaceCount` \
-             returns, not a string. Pass its `.result`."
-        );
-        return Err(vm.fail(ErrorKind::TypeError, msg));
+            .map(|o| o.map.keys().map(|k| k.to_string()).collect())
+            .unwrap_or_default();
+        if !keys.is_empty() {
+            // **Name the way out, not just the fault.** This used to be
+            // specific to the `{ result, count }` object `replaceCount`
+            // returned, which no longer exists — but the shape it
+            // caught does: a tool's result handed over whole where the
+            // string inside it was meant. `read_file` gives
+            // `{ content, version }`, and `Edit.replaceOnce(f, …)` is
+            // the same mistake with a different object.
+            let msg = format!(
+                "{who}(text, …): `text` is an object, not a string — it has {}. Pass the \
+                 property holding the text, not the object.",
+                keys.iter()
+                    .map(|k| format!("`.{k}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            return Err(vm.fail(ErrorKind::TypeError, msg));
+        }
     }
     // Anything else wrong: say which argument and what arrived.
     vm.string_arg(&v, Some("text"))
@@ -268,13 +283,21 @@ pub fn edit_replace_once(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     }
 }
 
-// ── Edit.replaceCount ─────────────────────────────────────────────────────────
+// ── Edit.replaceAll ───────────────────────────────────────────────────────────
 
-/// `Edit.replaceCount(text, old, new)` → `{ result, count }`.
-/// Replace every occurrence of `old` (string or RegExp) with `new` and
-/// return the result string plus the match count.
-pub fn edit_replace_count(vm: &mut VM, args: Args) -> Result<Value, VMError> {
-    let text_s = edit_text(vm, &args, "replaceCount")?;
+/// `Edit.replaceAll(text, old, new)` → string.
+/// Replace every occurrence of `old` (string or RegExp) with `new`.
+///
+/// **Was `replaceCount`, returning `{ result, count }`** — the one verb
+/// in the family that did not hand back the text, which cost six traps
+/// across five runs in the kept corpus: a `.result` taken off a sibling
+/// that never had one, and the `undefined` surfacing at the *next*
+/// call. The count it bundled is `Edit.count(text, old)`, which counts
+/// the same non-overlapping occurrences and was always there. The name
+/// follows JavaScript's own `String.prototype.replaceAll`, which
+/// returns a string, so the shape is the one already expected.
+pub fn edit_replace_all(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    let text_s = edit_text(vm, &args, "replaceAll")?;
     let text = text_s.as_str();
     let replacement = vm.to_js_string(args.get(vm, 2), 0);
     let old_val = args.get(vm, 1);
@@ -282,15 +305,13 @@ pub fn edit_replace_count(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     if let Some(rx) = try_reg_exp(vm, old_val) {
         let mut out = String::new();
         let mut last = 0;
-        let mut count: u64 = 0;
         for m in rx.compiled.find_iter(text) {
             out.push_str(&text[last..m.range.start]);
             out.push_str(replacement.as_str());
             last = m.range.end;
-            count += 1;
         }
         out.push_str(&text[last..]);
-        return obj_result_count(vm, &out, count);
+        return Ok(Value::String(RcStr::from(out.as_str())));
     }
 
     let old_s = vm.to_js_string(old_val, 0);
@@ -298,38 +319,26 @@ pub fn edit_replace_count(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     if old.is_empty() {
         return Err(vm.fail(
             ErrorKind::ValueError,
-            "replaceCount: empty pattern is not supported",
+            "replaceAll: empty pattern is not supported",
         ));
     }
     let mut out = String::with_capacity(text.len());
     let mut last = 0;
-    let mut count: u64 = 0;
     for (pos, _) in text.match_indices(old) {
-        // **Every match, because `replaceCount` applies to every
+        // **Every match, because `replaceAll` applies to every
         // match.** Its siblings check one site; this one had no check
         // at all, and it is the verb a program reaches for to strip a
         // decorator from several methods at once — which is exactly
         // the edit that orphans indentation, once per method.
         if let Some(why) = doubles_indentation(text, pos, old, replacement.as_str()) {
-            return Err(vm.fail(
-                ErrorKind::ValueError,
-                format!("replaceCount: {why}").as_str(),
-            ));
+            return Err(vm.fail(ErrorKind::ValueError, format!("replaceAll: {why}").as_str()));
         }
         out.push_str(&text[last..pos]);
         out.push_str(replacement.as_str());
         last = pos + old.len();
-        count += 1;
     }
     out.push_str(&text[last..]);
-    obj_result_count(vm, &out, count)
-}
-
-fn obj_result_count(vm: &mut VM, result: &str, count: u64) -> Result<Value, VMError> {
-    let mut obj = IndexMap::new();
-    obj.insert(RcStr::from("result"), Value::String(RcStr::from(result)));
-    obj.insert(RcStr::from("count"), Value::PosInt(count));
-    Ok(vm.alloc_object(obj))
+    Ok(Value::String(RcStr::from(out.as_str())))
 }
 
 // ── Edit.count ────────────────────────────────────────────────────────────────
@@ -930,24 +939,27 @@ mod match_count_tests {
         assert_eq!(lines_of(text, [1usize].into_iter()), vec![1]);
     }
 
-    /// **Both halves of the `replaceCount` confusion.** One function
-    /// returns the string, the other returns `{ result, count }`, and
-    /// a program can get it wrong in either direction. Live on
-    /// 2026-09-20 a run passed the object straight in and was told
-    /// only "type error"; the task failed.
+    /// **An object where the text was meant names its own keys.** This
+    /// used to be specific to the `{ result, count }` that
+    /// `replaceCount` returned; every `Edit.*` hands back the text
+    /// now, so the object that turns up here is a tool's result passed
+    /// whole — `read_file`'s `{ content, version }` is the common one —
+    /// and the message says which property to reach for.
     #[test]
-    fn passing_the_wrong_half_of_replace_count_says_which_half() {
+    fn an_object_where_the_text_was_meant_names_its_keys() {
         let forgot = crate::testutil::run_runtime_err(
-            "const r = Edit.replaceCount('aa', 'a', 'b'); Edit.replaceOnce(r, 'b', 'c');",
+            "const f = { content: 'aa', version: 'v1' }; Edit.replaceOnce(f, 'a', 'b');",
         );
         assert_eq!(forgot.kind, crate::ErrorKind::TypeError);
         assert!(
-            forgot.message.contains("`{ result, count }` object"),
+            forgot.message.contains("`.content`") && forgot.message.contains("`.version`"),
             "names what it was handed: {}",
             forgot.message
         );
         assert!(
-            forgot.message.contains("Pass its `.result`"),
+            forgot
+                .message
+                .contains("Pass the property holding the text"),
             "and what to write: {}",
             forgot.message
         );
@@ -1036,7 +1048,7 @@ mod orphaned_indentation_tests {
     fn deleting_a_line_without_its_indentation_is_refused() {
         let file = r#"'class T:\n    @skip("x")\n    def a(self):\n        pass\n'"#;
         for call in [
-            format!(r#"Edit.replaceCount({file}, '@skip("x")\n', "")"#),
+            format!(r#"Edit.replaceAll({file}, '@skip("x")\n', "")"#),
             format!(r#"Edit.replaceOnce({file}, '@skip("x")\n', "")"#),
             format!(r#"Edit.applyEdits({file}, [{{ old: '@skip("x")\n', new: "" }}])"#),
         ] {
@@ -1053,7 +1065,7 @@ mod orphaned_indentation_tests {
     #[test]
     fn deleting_the_whole_line_is_fine() {
         let out = testutil::run_ret(
-            r#"return Edit.replaceCount('class T:\n    @skip("x")\n    def a(self):\n', '    @skip("x")\n', "").result;"#,
+            r#"return Edit.replaceAll('class T:\n    @skip("x")\n    def a(self):\n', '    @skip("x")\n', "");"#,
         );
         assert_eq!(out.as_str().unwrap(), "class T:\n    def a(self):\n");
     }
@@ -1085,19 +1097,22 @@ mod tests {
     }
 
     /// The message names the mistake, not the call that tripped over
-    /// it. `replaceOnce` returns the new text and `replaceCount`
-    /// returns `{ result, count }`, so a `.result` on the former is
-    /// `undefined` and the *next* `Edit` call is where it surfaces.
+    /// it: a `.result` on a verb that returns the text is `undefined`,
+    /// and the *next* `Edit` call is where it surfaces.
     #[test]
-    fn undefined_text_says_which_verb_returns_what() {
+    fn undefined_text_points_at_the_call_that_produced_it() {
         let e = testutil::run_runtime_err(
             "return Edit.replaceOnce(Edit.replaceOnce('a', 'a', 'b').result, 'x', 'y');",
         )
         .message;
         assert!(e.contains("`text` is undefined"), "{e}");
         assert!(
-            e.contains("replaceCount"),
-            "names the sibling that does return an object: {e}"
+            e.contains("returns the new text"),
+            "says what the family does, so the `.result` is obviously wrong: {e}"
+        );
+        assert!(
+            e.contains("not this one"),
+            "and points back at the call that produced it: {e}"
         );
     }
 
@@ -1125,24 +1140,28 @@ mod tests {
         assert_eq!(kind, ErrorKind::ValueError);
     }
 
-    // ── replaceCount ────────────────────────────────────────────────────
+    // ── replaceAll ──────────────────────────────────────────────────────
 
+    /// The text, like every other `Edit.*`. The count it used to bundle
+    /// is `Edit.count`, over the same non-overlapping matches.
     #[test]
-    fn replace_count_success() {
-        let out = testutil::run_ret("return Edit.replaceCount('xaxbx', 'x', 'y');");
-        assert_eq!(out, json!({"result": "yayby", "count": 3}));
+    fn replace_all_returns_the_text() {
+        let out = testutil::run_ret("return Edit.replaceAll('xaxbx', 'x', 'y');");
+        assert_eq!(out, json!("yayby"));
+        let n = testutil::run_ret("return Edit.count('xaxbx', 'x');");
+        assert_eq!(n, json!(3), "the number is a separate question");
     }
 
     #[test]
-    fn replace_count_zero_returns_same() {
-        let out = testutil::run_ret("return Edit.replaceCount('hello', 'x', 'y');");
-        assert_eq!(out, json!({"result": "hello", "count": 0}));
+    fn replace_all_zero_returns_same() {
+        let out = testutil::run_ret("return Edit.replaceAll('hello', 'x', 'y');");
+        assert_eq!(out, json!("hello"));
     }
 
     #[test]
-    fn replace_count_with_regexp() {
-        let out = testutil::run_ret("return Edit.replaceCount('a1 b2 c3', /\\d/g, 'X');");
-        assert_eq!(out, json!({"result": "aX bX cX", "count": 3}));
+    fn replace_all_with_regexp() {
+        let out = testutil::run_ret("return Edit.replaceAll('a1 b2 c3', /\\d/g, 'X');");
+        assert_eq!(out, json!("aX bX cX"));
     }
 
     // ── count ───────────────────────────────────────────────────────────
@@ -1389,7 +1408,7 @@ mod arg_messages {
         ] {
             let e = crate::testutil::run_runtime_err(src);
             assert!(
-                e.message.contains("Only `replaceCount` returns"),
+                e.message.contains("returns the new text"),
                 "{who} should name the mistake, said: {}",
                 e.message
             );

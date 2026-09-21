@@ -1,1 +1,1 @@
-No — it throws rather than guessing, and the error carries the real count, so you widen `old` until it names one place. `Edit.replaceCount` is the one for every occurrence, and it tells you how many there were. Nothing to look up; that is just what the verbs do.
+No — it throws rather than guessing, and the error carries the real count, so you widen `old` until it names one place. `Edit.replaceAll` is the one for every occurrence, and `Edit.count` says how many there were. Nothing to look up; that is just what the verbs do.

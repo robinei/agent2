@@ -568,6 +568,9 @@ four spaces before the `@` survive, the `def` keeps its own, and the
 method ends up defined eight columns in with a body no longer indented
 relative to it.
 
+(`replaceCount` is `Edit.replaceAll` now, and returns the text rather
+than `{ result, count }`; the runs below wrote the older name.)
+
 Two things had to be wrong at once for that to land. `replaceCount`
 had **no indentation check at all** — and it is the verb a program
 reaches for to strip a decorator from several methods at once, which

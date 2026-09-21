@@ -113,8 +113,8 @@ declare function abandon(): Decision;
 declare namespace Edit {
   /** Replace iff `old` occurs exactly once. When the text you want to name is not unique — an attribute, a decorator, a `}` — `tools.outline` gives the line of the definition it belongs to, and `replaceLines` takes it from there. Copy `old` out of the content you are editing — not what you remember it saying — and keep it as small as it can be while still naming one place: the error carries the real count, so widen it when it matches several, and do not pad it with unchanged lines when it already matches one. */
   function replaceOnce(text: string, old: string, new_: string): string;
-  /** Replace every occurrence, and say how many there were. */
-  function replaceCount(text: string, old: string, new_: string): { result: string; count: number };
+  /** Replace every occurrence. `count` is how many there were, asked separately. */
+  function replaceAll(text: string, old: string, new_: string): string;
   /** How many times `needle` occurs — ask before editing, not after. */
   function count(text: string, needle: string): number;
   /** Many at once: each `old` must occur once, spans disjoint, applied right-to-left so no offset goes stale. */
