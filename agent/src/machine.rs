@@ -3558,30 +3558,37 @@ impl Runner {
         if let Some(request) = self.compaction_if_needed(tree, budget, headroom)? {
             return Ok(vec![request]);
         }
-        // **A suspended branch keeps its suspension.** This line used
-        // to be unconditional, which was safe while `needs_prompt`
-        // answered `true` only from `Idle`. `d38c416` taught it to
-        // answer for a `Suspended` branch with an unseen post — the fix
-        // for a branch going deaf after a silent completion — and this
-        // then stamped `AwaitingLlm` over `Phase::Suspended(run, _)`,
-        // dropping the parked `Run` and its VM on the floor.
-        //
-        // Two things went with it. The parked program's in-flight calls
-        // stopped being deliverable (`on_tool_results` routes anything
-        // that lands outside `Running`/`Suspended` to rule C), so a
-        // second line typed while a command was still going turned that
-        // command's result into "settled with no program awaiting it" —
-        // seen in `lab/live2` on 2026-09-21. And the `Posted` handback
-        // on the log still said the program was parked, so the report,
-        // the transcript and the model were all still being offered a
-        // `resume()` of a frame that no longer existed.
-        //
-        // `prompt_suspended` — the host's own wake for a freshly parked
-        // branch — never touched the phase, for exactly this reason.
+        self.await_llm();
+        Ok(vec![self.render_request(tree)])
+    }
+
+    /// **A request is out — unless a program is parked, in which case a
+    /// request is out and a program is still parked.**
+    ///
+    /// This used to be a bare `self.phase = Phase::AwaitingLlm` at both
+    /// of the places below, which was safe while they were reachable
+    /// from `Idle` alone. `d38c416` taught `needs_prompt` to answer for
+    /// a `Suspended` branch with an unseen post — the fix for a branch
+    /// going deaf after a completion that said nothing — and the stamp
+    /// then landed on `Phase::Suspended(run, _)`, dropping the parked
+    /// `Run` and its VM on the floor.
+    ///
+    /// Two things went with it. The parked program's in-flight calls
+    /// stopped being deliverable — `on_tool_results` routes anything
+    /// landing outside `Running`/`Suspended` to rule C — so a second
+    /// line typed while a command was still going turned that command's
+    /// result into "settled with no program awaiting it", seen in
+    /// `lab/live2` on 2026-09-21. And the `Posted` handback on the log
+    /// still said the program was parked, so the report, the transcript
+    /// and the model were all still being offered a `resume()` of a
+    /// frame that no longer existed.
+    ///
+    /// `prompt_suspended` — the host's own wake for a freshly parked
+    /// branch — never touched the phase, for exactly this reason.
+    fn await_llm(&mut self) {
         if !matches!(self.phase, Phase::Suspended(..)) {
             self.phase = Phase::AwaitingLlm;
         }
-        Ok(vec![self.render_request(tree)])
     }
 
     /// Fire a compaction condition if the document has outgrown its
@@ -3713,7 +3720,7 @@ impl Runner {
             },
         )?;
         self.compaction_requested = true;
-        self.phase = Phase::AwaitingLlm;
+        self.await_llm();
         Ok(Some(self.render_request(tree)))
     }
 
