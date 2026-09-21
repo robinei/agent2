@@ -1983,9 +1983,32 @@ impl VM {
     /// bump, sharing the same allocation. The clone sibling of `str_from`; use
     /// it when the builtin must retain the string past a borrow of the VM.
     pub(crate) fn string_from(&self, val: &Value) -> Result<RcStr, VMError> {
+        self.string_arg(val, None)
+    }
+
+    /// [`string_from`](Self::string_from) with the argument's name, when
+    /// the caller has one.
+    ///
+    /// **The message is the whole value of the check.** This used to
+    /// fail with the literal text `"type error"` — no argument, no
+    /// expectation, no value — and a model handed
+    /// `in \`replaceLines\`: type error` cannot tell which of four
+    /// arguments was wrong or what arrived instead. Five traps in the
+    /// kept corpus say exactly that, across four different builtins.
+    ///
+    /// `as_non_neg_usize` in `builtin/edit.rs` had it right all along,
+    /// one line further down the same call: `"start must be a
+    /// non-negative integer, got 2.5"`.
+    pub(crate) fn string_arg(&self, val: &Value, label: Option<&str>) -> Result<RcStr, VMError> {
         match val {
             Value::String(s) => Ok(s.clone()),
-            _ => Err(self.fail(ErrorKind::TypeError, "type error")),
+            other => Err(self.fail(
+                ErrorKind::TypeError,
+                match label {
+                    Some(l) => format!("{l} must be a string, got {}", other.type_name()),
+                    None => format!("expected a string, got {}", other.type_name()),
+                },
+            )),
         }
     }
 

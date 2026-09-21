@@ -21,9 +21,11 @@ fn edit_text(vm: &mut VM, args: &Args, who: &str) -> Result<RcStr, VMError> {
     let v = args.get(vm, 0).clone();
     if matches!(v, Value::Undefined) {
         let msg = format!(
-            "{who}(text, …): `text` is undefined. `replaceOnce` and `applyEdits` return the \
-             new text itself — only `replaceCount` returns `{{ result, count }}` — so a \
-             `.result` on the wrong one gives undefined, and this is the next call along."
+            "{who}(text, …): `text` is undefined. **Only `replaceCount` returns \
+             `{{ result, count }}`** — `replaceOnce`, `replaceLines`, `insertAt`, \
+             `applyEdits` and the `extract*` pair all return the new text itself — so a \
+             `.result` taken off one of those gives undefined, and this is the next call \
+             along."
         );
         return Err(vm.fail(ErrorKind::TypeError, msg));
     }
@@ -50,7 +52,8 @@ fn edit_text(vm: &mut VM, args: &Args, who: &str) -> Result<RcStr, VMError> {
         );
         return Err(vm.fail(ErrorKind::TypeError, msg));
     }
-    vm.string_from(&v)
+    // Anything else wrong: say which argument and what arrived.
+    vm.string_arg(&v, Some("text"))
 }
 
 /// `Edit.replaceOnce(text, old, new)` → string.
@@ -359,7 +362,7 @@ pub fn edit_count(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 /// to return the block range (exclusive end).  Errors if no brace is found
 /// or the braces are unbalanced.
 pub fn edit_extract_block(vm: &mut VM, args: Args) -> Result<Value, VMError> {
-    let text_s = vm.string_from(args.get(vm, 0))?;
+    let text_s = edit_text(vm, &args, "extractBlock")?;
     let text = text_s.as_str();
     let head = as_non_neg_usize(vm, args.get(vm, 1), "headIndex")?;
     if head >= text.len() {
@@ -387,7 +390,7 @@ pub fn edit_extract_block(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 /// range of the block (exclusive end).  Blank lines within the block are
 /// included and do not terminate it.
 pub fn edit_extract_by_indent(vm: &mut VM, args: Args) -> Result<Value, VMError> {
-    let text_s = vm.string_from(args.get(vm, 0))?;
+    let text_s = edit_text(vm, &args, "extractByIndent")?;
     let text = text_s.as_str();
     let line_idx = as_non_neg_usize(vm, args.get(vm, 1), "lineIndex")?;
 
@@ -446,7 +449,7 @@ fn is_blank_line(line: &str) -> bool {
 /// `index` (byte offset).  `open` and `close` must be single characters.
 /// Errors if no enclosing pair is found.
 pub fn edit_extract_enclosing(vm: &mut VM, args: Args) -> Result<Value, VMError> {
-    let text_s = vm.string_from(args.get(vm, 0))?;
+    let text_s = edit_text(vm, &args, "extractEnclosing")?;
     let text = text_s.as_str();
     let idx = as_non_neg_usize(vm, args.get(vm, 1), "index")?;
 
@@ -625,7 +628,7 @@ fn skip_block_comment(bytes: &[u8], start: usize) -> Result<usize, String> {
 /// Replace 1-indexed lines `start` through `end` (inclusive) with `newText`.
 /// Errors on an invalid or reversed range.
 pub fn edit_replace_lines(vm: &mut VM, args: Args) -> Result<Value, VMError> {
-    let text_s = vm.string_from(args.get(vm, 0))?;
+    let text_s = edit_text(vm, &args, "replaceLines")?;
     let text = text_s.as_str();
     let start = as_non_neg_usize(vm, args.get(vm, 1), "start")?;
     let end = as_non_neg_usize(vm, args.get(vm, 2), "end")?;
@@ -662,7 +665,7 @@ pub fn edit_replace_lines(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 /// the last line to append (a trailing newline is added if needed).
 /// Errors on out-of-range.
 pub fn edit_insert_at(vm: &mut VM, args: Args) -> Result<Value, VMError> {
-    let text_s = vm.string_from(args.get(vm, 0))?;
+    let text_s = edit_text(vm, &args, "insertAt")?;
     let text = text_s.as_str();
     let line_no = as_non_neg_usize(vm, args.get(vm, 1), "lineNo")?;
     let new_text = vm.to_js_string(args.get(vm, 2), 0);
@@ -1362,5 +1365,47 @@ mod tests {
         let err = testutil::run_runtime_err("return Edit.replaceOnce('abc', 'zz', '');");
         assert!(err.message.contains("no match"), "{}", err.message);
         assert!(err.message.contains("whitespace"), "{}", err.message);
+    }
+}
+
+#[cfg(test)]
+mod arg_messages {
+    /// **Every `Edit.*` diagnoses the mistake, not its symptom.**
+    ///
+    /// A run on 2026-09-21 wrote
+    /// `const { result } = Edit.replaceLines(content, …)` — `.result`
+    /// taken off a function that returns the string itself — and got
+    /// `in \`replaceLines\`: type error` for its trouble. The helper
+    /// that explains exactly that existed already and only three of the
+    /// nine builtins used it.
+    #[test]
+    fn every_edit_builtin_explains_an_undefined_text() {
+        for (src, who) in [
+            ("Edit.replaceLines(undefined, 1, 2, \"x\");", "replaceLines"),
+            ("Edit.insertAt(undefined, 1, \"x\");", "insertAt"),
+            ("Edit.extractBlock(undefined, 1);", "extractBlock"),
+            ("Edit.replaceOnce(undefined, \"a\", \"b\");", "replaceOnce"),
+            ("Edit.applyEdits(undefined, []);", "applyEdits"),
+        ] {
+            let e = crate::testutil::run_runtime_err(src);
+            assert!(
+                e.message.contains("Only `replaceCount` returns"),
+                "{who} should name the mistake, said: {}",
+                e.message
+            );
+        }
+    }
+
+    /// A wrong *type* still says which argument and what arrived — the
+    /// generic path, for everything that is not `undefined`.
+    #[test]
+    fn a_wrong_type_says_which_argument_and_what() {
+        let e = crate::testutil::run_runtime_err("Edit.insertAt(42, 1, \"x\");");
+        assert!(e.message.contains("text must be a string"), "{}", e.message);
+        assert!(e.message.contains("number"), "{}", e.message);
+
+        // The range errors beside it were already right; they stay.
+        let e = crate::testutil::run_runtime_err("Edit.replaceLines(\"a\\nb\", 3, 1, \"x\");");
+        assert!(e.message.contains("invalid range [3, 1]"), "{}", e.message);
     }
 }
