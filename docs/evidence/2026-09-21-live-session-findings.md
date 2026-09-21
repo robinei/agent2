@@ -162,3 +162,26 @@ Same shape as live2, new binary:
 
 No orphan notice. The result is delivered into the parked program,
 which is still there.
+
+## A generation that never gets a first byte hangs for an hour
+
+`lab/live4`, 2026-09-21 12:35. The branch was parked, a second post drew
+a request, and the process then sat for 27 minutes: `rchar` in
+`/proc/<pid>/io` unchanged over 25s, 1 second of CPU in 30 minutes, one
+thread in `wait_woken` on the socket, no `SessionEvent::Error`. The box
+was healthy throughout (`/models` reported `Qwen3.8-27B -> loaded`), so
+the request was sent and no response header ever came back.
+
+`deepseek.rs` pins both bounds with tests, and they are right about
+themselves: `timeout_recv_body` (`SOCKET_IDLE`, 10 min) is an idle
+bound that restarts on every byte, and `timeout_recv_response`
+(`COMPLETION_CEILING`, 1 hour) caps the whole response, body included.
+
+**Neither bounds time-to-first-byte.** The idle bound only applies once
+the body is being read, so a peer that accepts the connection and sends
+nothing is unguarded until the hour is up — and the branch looks parked
+and silent the whole time, with nothing on the log to say a request is
+out. Lowering `COMPLETION_CEILING` is the wrong fix: the comment above
+it records two real runs killed mid-task by a 10-minute cap. The shape
+that fits is a bound on the first byte specifically, or a host-side
+watchdog over "generation out, zero chunks".
