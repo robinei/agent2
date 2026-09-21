@@ -1501,7 +1501,42 @@ impl Session {
         *epoch += 1;
         let epoch = *epoch;
         let cancel = Cancel::new();
-        self.cancels.insert(branch, cancel.clone());
+        // **Stop the generation this one supersedes.** The epoch bump
+        // above already makes its output unreachable — chunks and its
+        // `LlmDone` are both dropped on arrival — but without cancelling
+        // its token the worker keeps streaming into the void, and keeps
+        // an `llm_permits` slot while it does. Seen on 2026-09-21: a
+        // generation superseded by `prompt_suspended` ran on to its
+        // 8000-token cap with every token already discarded.
+        //
+        // `cancel_generation` does both halves for the interrupt path;
+        // this is the same pair for the supersede path, which had only
+        // the epoch.
+        if let Some(previous) = self.cancels.insert(branch, cancel.clone()) {
+            previous.cancel();
+        }
+        // **And close the reply it was carrying.** A trap or a raise
+        // cancels the generation itself (`notebook_cancels_generation`,
+        // gated on `pause_falsifies_the_rest`), so its reply ends and
+        // the next completion opens one of its own. A rule-B post does
+        // not — deliberately, because the prose still arriving was not
+        // written on a false premise — and so the superseded generation
+        // kept owning `streaming_epoch` while this one ran.
+        //
+        // That is what stranded a branch on 2026-09-21: the new
+        // generation returned no text, `notebook_stream` was never
+        // called, and its completion landed in `notebook_stream_end`
+        // where the stale epoch routed it in as the end of the *old*
+        // reply — taking that reply's `ReplyEnd`, thinking and token
+        // usage with it. Closing here gives the `Posted` path the log
+        // shape the trap path already has: the old reply ends, the new
+        // generation opens its own.
+        if let Some(state) = self.states.get_mut(&branch)
+            && state.notebook_generation_open()
+            && let Ok(outputs) = state.notebook_generation_ended(&mut self.tree)
+        {
+            let _ = self.after_step(branch, outputs);
+        }
         let llm = Arc::clone(&self.llm);
         let permits = Arc::clone(&self.llm_permits);
         let tx = self.tx.clone();

@@ -5110,6 +5110,14 @@ impl Runner {
     /// depend on **provider speed**: if the later fences had already
     /// streamed they ran, and if not they had never been written. Same
     /// reply, same model, different behaviour.
+    /// Whether a streamed reply is open — i.e. whether a generation is
+    /// mid-flight as far as the log is concerned. The host asks before
+    /// superseding one, so the reply it was carrying is closed rather
+    /// than left owning `streaming_epoch`.
+    pub fn notebook_generation_open(&self) -> bool {
+        self.streaming_epoch.is_some()
+    }
+
     pub fn notebook_cancels_generation(&self) -> bool {
         self.streaming_epoch.is_some()
             && matches!(self.phase, Phase::Suspended(..))
