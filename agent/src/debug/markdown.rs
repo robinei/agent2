@@ -44,14 +44,36 @@ impl Format {
 
 struct Frame {
     kind: Format,
+    /// The characters that opened this frame, for the end-of-line
+    /// recovery. `Format::open_marker` can only guess `*`, and guessing
+    /// puts a character in front of the person that the model never
+    /// wrote — which for `_italic_` is the same class of mistake as
+    /// eating the underscores of a snake_case name.
+    marker: String,
     buf: String,
 }
 
 enum State {
     Normal,
-    Stars(usize),
+    /// A run of `*`/`_`. `underscore` is true only while every character
+    /// of the run has been `_`, and `after_word` records whether the
+    /// character before the run was part of a word — together they are
+    /// what [`Parser::feed`] needs to apply CommonMark's intraword rule.
+    Stars {
+        count: usize,
+        underscore: bool,
+        after_word: bool,
+    },
     Code(String),
     Tildes(usize),
+}
+
+/// What counts as "inside a word" for the intraword-underscore rule.
+/// CommonMark words it as flanking by a non-punctuation, non-whitespace
+/// character; alphanumeric is that, for the identifiers this is here to
+/// protect.
+fn is_word(c: char) -> bool {
+    c.is_alphanumeric()
 }
 
 struct Parser {
@@ -60,6 +82,9 @@ struct Parser {
     spans: Vec<Span<'static>>,
     segment: String,
     base: Style,
+    /// The character fed before this one, so a `_` can tell whether it
+    /// sits inside a word. `None` at the start of the line.
+    prev: Option<char>,
 }
 
 impl Parser {
@@ -70,6 +95,7 @@ impl Parser {
             spans: Vec::new(),
             segment: String::new(),
             base,
+            prev: None,
         }
     }
 
@@ -108,6 +134,10 @@ impl Parser {
     }
 
     fn open_format(&mut self, kind: Format) {
+        self.open_format_with(kind, kind.open_marker().to_owned());
+    }
+
+    fn open_format_with(&mut self, kind: Format, marker: String) {
         if let Some(parent) = self.formats.last_mut() {
             let text = std::mem::take(&mut parent.buf);
             if !text.is_empty() {
@@ -118,6 +148,7 @@ impl Parser {
         self.flush_segment();
         self.formats.push(Frame {
             kind,
+            marker,
             buf: String::new(),
         });
     }
@@ -138,7 +169,8 @@ impl Parser {
     /// count is left — a run of `*`/`_` is a toggle, not an open or a
     /// close by itself, so which one it means depends entirely on what's
     /// already active.
-    fn resolve_stars(&mut self, count: usize) {
+    fn resolve_stars(&mut self, count: usize, underscore: bool) {
+        let marker = if underscore { '_' } else { '*' };
         let mut n = count;
         if n % 2 == 1 && self.formats.last().map(|f| f.kind == Format::Italic) == Some(true) {
             self.try_close_format(Format::Italic);
@@ -156,18 +188,18 @@ impl Parser {
                 // text instead of losing the run.
                 let italic = self.formats.pop().unwrap();
                 let parent = self.formats.last_mut().unwrap();
-                parent.buf.push('*');
+                parent.buf.push_str(&italic.marker);
                 parent.buf.push_str(&italic.buf);
             } else {
                 break;
             }
         }
         while n >= 2 {
-            self.open_format(Format::Bold);
+            self.open_format_with(Format::Bold, format!("{marker}{marker}"));
             n -= 2;
         }
         if n >= 1 {
-            self.open_format(Format::Italic);
+            self.open_format_with(Format::Italic, marker.to_string());
         }
     }
 
@@ -185,10 +217,18 @@ impl Parser {
     }
 
     fn feed(&mut self, c: char) {
+        let prev = self.prev;
+        self.prev = Some(c);
         let state = std::mem::replace(&mut self.state, State::Normal);
         match state {
             State::Normal => match c {
-                '*' | '_' => self.state = State::Stars(1),
+                '*' | '_' => {
+                    self.state = State::Stars {
+                        count: 1,
+                        underscore: c == '_',
+                        after_word: prev.is_some_and(is_word),
+                    }
+                }
                 '`' => {
                     self.flush_segment();
                     self.state = State::Code(String::new());
@@ -196,10 +236,39 @@ impl Parser {
                 '~' => self.state = State::Tildes(1),
                 _ => self.push_char(c),
             },
-            State::Stars(count) => match c {
-                '*' | '_' => self.state = State::Stars(count + 1),
+            State::Stars {
+                count,
+                underscore,
+                after_word,
+            } => match c {
+                '*' | '_' => {
+                    self.state = State::Stars {
+                        count: count + 1,
+                        underscore: underscore && c == '_',
+                        after_word,
+                    }
+                }
                 _ => {
-                    self.resolve_stars(count);
+                    // **`invoice_total` is an identifier, not emphasis.**
+                    // CommonMark's intraword rule exists for exactly
+                    // this: a run of `_` flanked by word characters on
+                    // both sides can neither open nor close, so it is
+                    // literal text. Without it the chat pane ate the
+                    // underscores of a snake_case name and italicised
+                    // what lay between two of them — live on
+                    // 2026-09-21 the person read `invoicetotal` and
+                    // `invoice*total` for a function the model had
+                    // correctly called `invoice_total`. Asterisks keep
+                    // the old behaviour: nobody writes `a*b*c` meaning
+                    // multiplication in prose as often as they write
+                    // snake_case, and CommonMark agrees.
+                    if underscore && after_word && is_word(c) {
+                        for _ in 0..count {
+                            self.push_char('_');
+                        }
+                    } else {
+                        self.resolve_stars(count, underscore);
+                    }
                     self.feed(c);
                 }
             },
@@ -229,7 +298,27 @@ impl Parser {
     /// `**oops`, not `oops`.
     fn finish(mut self) -> Vec<Span<'static>> {
         match std::mem::replace(&mut self.state, State::Normal) {
-            State::Stars(count) => self.resolve_stars(count),
+            State::Stars {
+                count,
+                underscore,
+                after_word,
+            } => {
+                // End of line: a run can still *close* what is open —
+                // that is how `__bold__` ends — but an underscore run
+                // at the end of a word with nothing to close is the
+                // `trailing_` case, and is literal text.
+                let closes = self
+                    .formats
+                    .last()
+                    .is_some_and(|f| matches!(f.kind, Format::Bold | Format::Italic));
+                if underscore && after_word && !closes {
+                    for _ in 0..count {
+                        self.push_char('_');
+                    }
+                } else {
+                    self.resolve_stars(count, underscore)
+                }
+            }
             State::Tildes(count) => self.resolve_tildes(count),
             State::Code(buf) => {
                 self.segment.push('`');
@@ -238,7 +327,7 @@ impl Parser {
             State::Normal => {}
         }
         while let Some(frame) = self.formats.pop() {
-            self.segment.push_str(frame.kind.open_marker());
+            self.segment.push_str(&frame.marker);
             self.segment.push_str(&frame.buf);
         }
         self.flush_segment();
@@ -352,6 +441,62 @@ mod tests {
                 plain(base, " c "),
                 Span::styled("gone", base.add_modifier(Modifier::CROSSED_OUT)),
             ]
+        );
+    }
+
+    /// **A snake_case identifier is not emphasis.** Two `_` inside one
+    /// line used to open and close an italic run, eating both
+    /// underscores: `invoice_total(x) then line_total(y)` reached the
+    /// person as `invoicetotal(x) then linetotal(y)`, and an unclosed
+    /// one recovered as `*` — a character the model never wrote. For a
+    /// harness whose whole subject is code, that is the renderer
+    /// telling the person the wrong name.
+    #[test]
+    fn intraword_underscores_are_literal() {
+        let base = Style::default();
+        let text = "call invoice_total(x) then line_total(y)";
+        assert_eq!(inline_spans(text, base), vec![plain(base, text)]);
+    }
+
+    /// The rule is about *position*, not about the character: at a word
+    /// boundary `_` still delimits, and a run inside the emphasis stays
+    /// literal — CommonMark renders `_foo_bar_` as one emphasized
+    /// `foo_bar`.
+    #[test]
+    fn underscores_at_a_word_boundary_still_emphasize() {
+        let base = Style::default();
+        assert_eq!(
+            inline_spans("_foo_bar_", base),
+            vec![Span::styled(
+                "foo_bar".to_owned(),
+                base.add_modifier(Modifier::ITALIC)
+            )]
+        );
+    }
+
+    /// Recovery keeps the character that was actually written. An
+    /// unterminated `_` is `_`, never the `*` that [`Format::open_marker`]
+    /// would hand back.
+    #[test]
+    fn an_unterminated_underscore_recovers_as_itself() {
+        let base = Style::default();
+        assert_eq!(
+            inline_spans("snake_case", base),
+            vec![plain(base, "snake_case")]
+        );
+        assert_eq!(
+            inline_spans("trailing_", base),
+            vec![plain(base, "trailing_")]
+        );
+        // An emphasis that opens and never closes recovers as the
+        // character that opened it, not as `Format::open_marker`'s `*`.
+        assert_eq!(
+            inline_spans("_hello world", base),
+            vec![plain(base, "_hello world")]
+        );
+        assert_eq!(
+            inline_spans("__hello world", base),
+            vec![plain(base, "__hello world")]
         );
     }
 
