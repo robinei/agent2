@@ -95,6 +95,8 @@ declare namespace history {
 
   **And this is how you read something.** A call's result is on the record but not in front of you — the row names the call and its shape, and nothing more. Appending the bytes is what puts them where you can read them: `history.append(f.content)` after a `read_file`, and the next reply has the file in front of it. **Append what you will read; fetch what you will compute with.** A program that only needs to search or edit those bytes calls `history.fetch(id)` and never pays to look at them.
 
+  **Key it by the name the thing already has.** An object key can be a quoted string, so use the real one: `{ "src/shipping.py": f.content }`, not `{ shipping_py: … }` or `{ shipping: … }`. Paths, commands and ids are names; mangling them into something that looks like a variable drops the one thing that ties the row to the call it came from — `read_file("src/shipping.py")` and a row keyed `"src/shipping.py"` are obviously the same file, and `shipping_py` is obviously nothing.
+
   **A row shows its first 4 KB.** More than that and it says how many bytes there are and which id holds them all — and `history.slice(id, 4096)` moves that window onto the next stretch, as often as you like, writing nothing each time. The bytes are already on the record; a window is two numbers.
 
   So there are two ways to read on, and they are for different things. `slice` when you want to *keep going* through one row. `append` a second row when you mean to **keep both** — the section a regex found beside the conclusion you drew from it, `f.content.match(/## Decision[\s\S]+/)[0]`, or `f.content.split("\n").slice(200, 400)`. Cutting by what the thing *is* beats cutting by where you stopped, and it is usually much smaller than a windowful.
