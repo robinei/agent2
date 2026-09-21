@@ -1,5 +1,3 @@
-Thinking is for reasoning! Never draft code blocks! One-shot them in the reply.
-
 Your reply is **markdown**, and the code blocks in it run.
 
 **A ```js block runs the moment you close its fence** — in order, while you are still writing the rest of the reply. Prose between blocks reaches the person as you write it. **A block fenced any other way is quoted, not run** (```text, ```rust, a bare ```): fence it that way to show code without running it.

@@ -2823,13 +2823,18 @@ mod tests {
         let seen = seen.lock().unwrap();
         let system = &seen.first().expect("a request").messages[0].content;
         assert!(
-            system.starts_with("Thinking is for reasoning!"),
-            "the first line of the card is the one measured line: {}",
+            system.starts_with("Your reply is **markdown**"),
+            "the card opens as the markdown document it is: {}",
             &system[..40]
         );
+        // **And opens with nothing before it.** A line added above this
+        // one on 2026-09-21 -- the rehearsal ban, in the position the
+        // lab said was strongest -- doubled drafting instead. Any
+        // sentence at the top that names code blocks puts them in the
+        // reasoning context, so the top of this file is not spare room.
         assert!(
-            system.contains("Your reply is **markdown**, and the code blocks in it run."),
-            "and the response rule still opens the spec proper"
+            !system.contains("Never draft code blocks!\n\nYour reply"),
+            "nothing is prepended to the response rule"
         );
         assert!(system.contains("function fetch_page("), "{system}");
         assert!(
