@@ -2823,9 +2823,13 @@ mod tests {
         let seen = seen.lock().unwrap();
         let system = &seen.first().expect("a request").messages[0].content;
         assert!(
-            system.starts_with("Your reply is **markdown**"),
-            "the card opens as the markdown document it is: {}",
+            system.starts_with("Thinking is for reasoning!"),
+            "the first line of the card is the one measured line: {}",
             &system[..40]
+        );
+        assert!(
+            system.contains("Your reply is **markdown**, and the code blocks in it run."),
+            "and the response rule still opens the spec proper"
         );
         assert!(system.contains("function fetch_page("), "{system}");
         assert!(
@@ -6429,18 +6433,27 @@ mod tests {
         assert_ne!(tail(&away), tail(&here), "only the trailing line flips");
         assert!(tail(&away).contains("No client is attached"));
         assert!(tail(&here).contains("A client is attached"));
-        // Presence goes last **of the per-request facts**. The one
-        // line after it is not one: `REPLY_IS_MARKDOWN` is the standing
-        // shape of the thing being written, and it is last so that it
-        // is what the model is holding as it starts to write.
+        // Presence goes last **of the per-request facts**. The two
+        // lines after it are not: both are the standing shape of the
+        // thing being written, and they sit at the end so they are
+        // what the model is holding as it starts to write. The
+        // rehearsal ban takes the very last slot — a slot measured to
+        // make no difference (p = 0.35 over 80 samples an arm), so it
+        // is there on the weak evidence rather than the strong, and
+        // the rule whose violation is silent is directly above it.
         let here_tail = tail(&here);
         let lines: Vec<&str> = here_tail.lines().collect();
         assert_eq!(
-            lines[lines.len() - 2],
+            lines[lines.len() - 3],
             "- A client is attached; an ask() may be answered promptly."
         );
         assert!(
-            lines[lines.len() - 1].starts_with("- Your reply is markdown"),
+            lines[lines.len() - 2].starts_with("- Your reply is markdown"),
+            "{:?}",
+            lines[lines.len() - 2]
+        );
+        assert!(
+            lines[lines.len() - 1].starts_with("- Thinking is for reasoning!"),
             "{:?}",
             lines.last()
         );

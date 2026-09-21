@@ -311,9 +311,23 @@ const REPLY_SHAPE_TAIL: &str = "Someone has asked you something and you have no 
 /// paragraph of a 22 KB system prompt is a long way from where the
 /// model starts thinking, and the tail is the one position that is not.
 ///
-/// **Off unless asked for** (`AGENT2_NO_REHEARSAL_TAIL=1`), because it
-/// is an arm and not yet a finding: whether restating a ban works at
-/// all is exactly what the `↓ history[N]` number casts doubt on.
+/// **On by default now**, and last; `AGENT2_NO_REHEARSAL_TAIL=0` turns
+/// it off, any other value replaces the text.
+///
+/// It is carried rather than dropped despite the measurement below
+/// finding *nothing* for it. 80 samples an arm against a frozen
+/// context put the tail slot at p = 0.35 against the middle of the
+/// tail, while the same sentence as the card's **first line** took
+/// drafting from 89% of replies to 51%. The position that works is
+/// the front, and this line is not what does the work.
+///
+/// What keeps it here is that one model is not the set of them. The
+/// front-position result is `deepseek-v4-flash`, one task, one
+/// captured state; a model that weights the end of its context more
+/// heavily would be served by this line and costs 80 bytes to
+/// insure. `arm-both` measured exactly that combination and was
+/// indistinguishable from the front alone (p = 1.00 on the rate), so
+/// the insurance is known to be free rather than assumed to be.
 ///
 /// The measurement is the count of fenced drafts inside
 /// `Part::Thinking`, over `sweep-8` on `deepseek-v4-flash`:
@@ -950,14 +964,16 @@ pub struct Runner {
     /// arms can be interleaved from one binary.
     no_rehearsal_tail: Option<String>,
     /// **Position, held apart from wording, because they are two
-    /// questions** (`AGENT2_NO_REHEARSAL_LAST=1`). The line is pushed
-    /// fifth of nine by default, which puts it under the attachment
-    /// status; this pushes it below [`REPLY_IS_MARKDOWN`] instead, into
-    /// the one slot in the whole request that nothing else can reach.
+    /// questions.** Set, the line goes below [`REPLY_IS_MARKDOWN`],
+    /// into the last slot of the request; `AGENT2_NO_REHEARSAL_LAST=0`
+    /// puts it back fifth of nine, under the attachment status.
     ///
-    /// It is an arm because it *costs* something: that slot is already
-    /// spent on the rule whose violation is silent, and demoting it is
-    /// the price of the test.
+    /// Last by default, and the reason is weak on purpose: the slot
+    /// makes no measurable difference (p = 0.35 over 80 samples an
+    /// arm), and 18 task runs with [`REPLY_IS_MARKDOWN`] demoted out
+    /// of it all passed. Given a free choice between two positions
+    /// that measure the same, the end is the one the other evidence in
+    /// this file points at.
     no_rehearsal_last: bool,
     /// The last reply called `finish()` and told nobody anything, so it
     /// was not rested. The next request's tail says so — see
@@ -1100,10 +1116,10 @@ impl Runner {
                 Ok(v) if v == "0" => None,
                 Ok(v) if v == "1" => Some(NO_REHEARSAL_TAIL.to_owned()),
                 Ok(v) => Some(v),
-                Err(_) => None,
+                Err(_) => Some(NO_REHEARSAL_TAIL.to_owned()),
             },
             no_rehearsal_last: std::env::var("AGENT2_NO_REHEARSAL_LAST")
-                .is_ok_and(|v| v != "0"),
+                .map_or(true, |v| v != "0"),
             finish_ignored: false,
             spine,
             agent,
@@ -6836,15 +6852,19 @@ mod tests {
     /// highest number. A `deepseek-v4-flash` smoke run on 2026-09-21
     /// did a whole three-file rename in one reply and was told it had
     /// run three programs.
-    /// The rehearsal ban rides the tail only when asked for, and says
-    /// the fact rather than scolding: reasoning is not read back, so a
-    /// drafted block is written twice.
+    /// The rehearsal ban rides every request now, and can be turned
+    /// off. It says the fact rather than scolding: reasoning is not
+    /// read back, so a drafted block is written twice.
     #[test]
-    fn the_rehearsal_ban_is_an_arm_not_a_default() {
+    fn the_rehearsal_ban_rides_every_request_and_can_be_turned_off() {
         let (mut tree, mut state) = setup_under();
         user_post(&mut state, &mut tree, "do it");
+        let on = state.request_tail(&tree).unwrap_or_default();
+        assert!(on.contains("One-shot"), "off by default: {on}");
+
+        state.no_rehearsal_tail = None;
         let off = state.request_tail(&tree).unwrap_or_default();
-        assert!(!off.contains("One-shot"), "on by default: {off}");
+        assert!(!off.contains("One-shot"), "could not be turned off: {off}");
 
         state.no_rehearsal_tail = Some(NO_REHEARSAL_TAIL.to_owned());
         let on = state.request_tail(&tree).unwrap_or_default();
@@ -6874,18 +6894,18 @@ mod tests {
         user_post(&mut state, &mut tree, "do it");
         state.no_rehearsal_tail = Some(NO_REHEARSAL_TAIL.to_owned());
 
-        let mid = state.request_tail(&tree).unwrap_or_default();
         let last_of = |t: &str| t.lines().last().unwrap_or_default().to_owned();
-        assert!(
-            last_of(&mid).contains("Only a ```js block runs"),
-            "by default the markdown rule has the slot: {mid}"
-        );
-
-        state.no_rehearsal_last = true;
         let end = state.request_tail(&tree).unwrap_or_default();
         assert!(
             last_of(&end).contains("One-shot"),
-            "the arm does not take the last line: {end}"
+            "by default the ban has the last slot: {end}"
+        );
+
+        state.no_rehearsal_last = false;
+        let mid = state.request_tail(&tree).unwrap_or_default();
+        assert!(
+            last_of(&mid).contains("Only a ```js block runs"),
+            "turned off, the markdown rule takes it back: {mid}"
         );
         assert!(
             end.contains("Only a ```js block runs"),
