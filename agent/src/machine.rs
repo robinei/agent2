@@ -1144,11 +1144,31 @@ impl Runner {
     /// resurrect it under a new name. What makes a branch autonomous is
     /// **the program still running**, not extra prompting.
     pub fn needs_prompt(&self, tree: &Tree) -> bool {
-        // Running or suspended: the branch holds a VM. Awaiting an LLM: a
-        // request is already out, and everything logged since will ride
-        // the next one.
-        if !matches!(self.phase, Phase::Idle) {
-            return false;
+        // **Running and suspended are not the same thing.** A running
+        // program is executing, and rule B delivers a post at its next
+        // fuel slice; awaiting an LLM, a request is out and everything
+        // logged since rides the next one. Both are right to decline.
+        //
+        // A parked run is neither. Nothing is executing, and the one
+        // prompt a suspension is owed was sent by the host when it
+        // parked (`prompt_suspended`). If the completion that prompt
+        // earned never opens a reply of its own — all reasoning, no
+        // text, so `notebook_stream` is never called and no `Reply` is
+        // logged — the branch is left `Suspended` with nothing in
+        // flight and every wake closed: `prompt_suspended` needs a
+        // fresh transition, `open_notebook_reply` needs a text chunk,
+        // and this returned `false` for anything but `Idle`. Posts were
+        // logged and ignored, for good.
+        //
+        // An unseen post is the safe discriminator: rendering a request
+        // advances `shown` (`render_request`), so a post that arrived
+        // before the one-shot rides it and only a genuinely later one
+        // asks again. Seen live on 2026-09-21; reproduced by
+        // `a_branch_parked_mid_stream_survives_a_silent_completion`.
+        match &self.phase {
+            Phase::Idle => {}
+            Phase::Suspended(..) => return !self.unseen_posts(tree).is_empty(),
+            _ => return false,
         }
         // Any unseen `Post` is a cause — including one that arrived
         // during a generation, which the turn that just landed could not
@@ -6357,6 +6377,63 @@ mod tests {
             "the charter identifies it: {row}"
         );
         assert!(!row.contains("<unnamed>"), "{row}");
+    }
+
+    /// **A branch parked mid-stream, whose next completion says
+    /// nothing, is still listening.**
+    ///
+    /// The live stall of 2026-09-21. Generation 1 is still streaming
+    /// when a post parks the run (rule B), so `streaming_epoch` still
+    /// names it. The host supersedes it with generation 2, which spends
+    /// its whole budget on reasoning and returns no text at all — so
+    /// `notebook_stream` is never called for it (thinking does not
+    /// reach the runner) and no new `Reply` is ever opened. Its
+    /// completion then lands in `notebook_stream_end`, where
+    /// `streaming_epoch.is_some()` routes it down the path that records
+    /// it as **the end of the reply that parked**, not as a generation
+    /// of its own.
+    ///
+    /// The branch is then `Suspended` with nothing in flight, and every
+    /// wake is closed: `prompt_suspended` needs a fresh transition,
+    /// `open_notebook_reply` needs a text chunk, `needs_prompt` refuses
+    /// anything that is not `Idle`. Post #16 — "are you still there?" —
+    /// drew no reply at all.
+    #[test]
+    fn a_branch_parked_mid_stream_survives_a_silent_completion() {
+        let (mut tree, mut state) = setup_under();
+        user_post(&mut state, &mut tree, "document every file");
+
+        // Generation 1 arrives as a stream and is *not* ended: it is
+        // still in flight, exactly as it was live.
+        let out = state
+            .notebook_stream(
+                &mut tree,
+                1,
+                "```js\nawait tools.read_file(\"a.py\");\n```\n",
+            )
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+
+        // The person speaks; rule B parks the run at its next slice.
+        let out = user_post(&mut state, &mut tree, "actually stop - just do a.py");
+        drain(&mut state, &mut tree, out);
+        assert_eq!(state.status(), "suspended", "rule B parks it");
+
+        // Generation 2: all reasoning, no text, cut off at the cap.
+        let mut turn = crate::host::scripted_program("");
+        turn.source = String::new();
+        turn.thinking = Some("thinking at length and saying nothing".to_owned());
+        turn.truncated = true;
+        let out = state.step(&mut tree, StepInput::LlmResponse(turn)).unwrap();
+        drain(&mut state, &mut tree, out);
+
+        // The person speaks again. This has to reach it.
+        let out = user_post(&mut state, &mut tree, "are you still there?");
+        assert!(
+            out.iter().any(|o| matches!(o, StepOutput::LlmRequest(_))),
+            "the post drew no request — the branch is deaf (status {})",
+            state.status()
+        );
     }
 
     /// **A parked branch that is spoken to is still listening** — the
