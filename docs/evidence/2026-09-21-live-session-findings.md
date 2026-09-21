@@ -185,3 +185,56 @@ out. Lowering `COMPLETION_CEILING` is the wrong fix: the comment above
 it records two real runs killed mid-task by a 10-minute cap. The shape
 that fits is a bound on the first byte specifically, or a host-side
 watchdog over "generation out, zero chunks".
+
+## What the design pass settled
+
+Two coupled questions, put to a scope-limited read-only agent and then
+implemented:
+
+**A parked run is not a phase** (`09c8fa0`). `Phase::Suspended(Run, _)`
+and `Runner::beneath` encoded two facts in one slot — whether a request
+is out, and whether a frame is parked — and that is what let
+`self.phase = Phase::AwaitingLlm` drop a live VM. `Phase` is now
+`Idle | AwaitingLlm | Running(Run)` with every parked frame on
+`Runner::parked`, so the assignment cannot reach a run and `4898a80`'s
+guard is deleted rather than remembered. It also exposed the same
+silent loss in the last slot that still holds a `Run`:
+`open_notebook_reply` dropped a `Running` run displaced by
+`SessionCommand::Restart` — the TUI's rewrite gesture — with no
+handback at all.
+
+Two things the split does not let you write in one expression, both
+caught by a failing test rather than by reading:
+
+- `needs_prompt` — a parked branch reads as `Idle` now, so without its
+  own arm it saw the suspension's own handback as an unshown outcome
+  and asked for a second generation over the host's.
+- `notebook_cancels_generation` — meant "*this* run parked", not "some
+  frame is parked", so a handler running over a parked frame had its
+  own generation cancelled.
+
+**A handback names the program it is about** (`0e35d5d`). The field was
+`reply`, stamped from whichever reply was newest, which for a discard
+is the reply that *decided* rather than the frame going away. Three
+readers disagreed; `programs_for` inverted a supersede, and
+`program_status_survives_reopen` pinned that inversion as intended.
+`depth_after`'s counter became `Frames`, a set, because a counter is
+exact only while every scope closes in order and exactly once — and a
+discard closes a frame that need not be the innermost. `LOG_VERSION` 3.
+
+## Not fixed, and why
+
+- The first-byte hang above. The right shape is a bound in the client
+  worker, which already owns a cancel token; the session loop is the
+  wrong place. Not attempted: it cannot be verified against a real hang
+  on demand, and the constants it sits beside carry a comment recording
+  that a previous tightening killed two live runs mid-task.
+- `prompt_suspended` renders a request without stamping the phase, so a
+  parked branch with a generation in flight reads as `Idle` rather than
+  `AwaitingLlm`. That is why a second message to such a branch spawns a
+  second generation (seen in `live2` and `live4`). The split makes the
+  stamp safe for the first time, so `prompt_suspended` *could* set it
+  and `needs_prompt`'s existing `_ => false` would then cover the case
+  — one fewer wasted generation. Left alone: it is a third behaviour
+  change to the core loop in one sitting, and both models handled the
+  current behaviour correctly.
