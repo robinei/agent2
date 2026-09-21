@@ -181,16 +181,6 @@ pub struct ChatState {
     entries: Vec<Entry>,
     /// `Transport::Notebook`: render each cell's source under its header.
     show_cells: bool,
-    /// Cells the person has opened. **Collapsed is the default** (D13):
-    /// after a cell has run, what matters is its *effects* — the calls it
-    /// made, what they returned — and those are rows this pane already
-    /// draws. The source is how it got there, and the least interesting
-    /// thing on screen for the person who asked a question.
-    ///
-    /// Keyed by the cell's `Turn` id, deliberately not an extension of the
-    /// navigator's per-branch `collapsed: HashSet<BranchId>`: one bit per
-    /// branch cannot express several cells in one reply.
-
     /// Accumulating streamed text per branch, shown until the logged
     /// assistant message replaces it.
     streaming: Vec<(BranchId, String)>,
