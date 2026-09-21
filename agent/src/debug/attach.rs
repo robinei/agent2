@@ -1829,7 +1829,12 @@ fn slab_of(kind: ChatKind, detail: &RowDetail) -> Option<Color> {
         // both are code and both read as one slab. Only the *lid* is
         // particular to a block.
         (ChatKind::Code, _) => Some(SLAB_CODE),
-        (_, RowDetail::Invoke(..)) => Some(SLAB_ATTACHED),
+        // The calls a block made and the values it appended are the
+        // same thing to a reader — effects, attached below the source —
+        // so they share the attached ground. An append that sat on the
+        // pane's own background read as a stray line beside the block
+        // rather than part of it.
+        (_, RowDetail::Invoke(..) | RowDetail::Note(..)) => Some(SLAB_ATTACHED),
         _ => None,
     }
 }
@@ -3744,6 +3749,29 @@ mod tests {
     }
 
     #[test]
+    /// **An append is on the same ground as the calls.** Both are
+    /// effects attached below a block's source, and one of them sitting
+    /// on the pane's own background read as a stray line beside the
+    /// block rather than part of it.
+    #[test]
+    fn an_append_shares_the_attached_slab_with_calls() {
+        let program = EventId::new(3);
+        assert_eq!(
+            slab_of(
+                ChatKind::Program,
+                &RowDetail::Note(program, EventId::new(9))
+            ),
+            slab_of(ChatKind::Program, &RowDetail::Invoke(program, 0)),
+        );
+        assert_eq!(
+            slab_of(
+                ChatKind::Program,
+                &RowDetail::Note(program, EventId::new(9))
+            ),
+            Some(SLAB_ATTACHED),
+        );
+    }
+
     fn manual_toggles_override_auto_pop_set() {
         let mut app = AttachedApp::new(fid(1));
         app.view = View::Running;
