@@ -19,9 +19,11 @@ on the count at p = 0.0054 and on the rate at p = 0.24: the ban did not
 stop replies drafting, it stopped them spiralling. A tool that reported
 only one of those would have told half the story either way.
 
-Both tests are exact and enumerate, so they are honest at n = 8 and
-slow past n = 25 per arm -- at which point the normal approximation is
-fine anyway and the exact test is a luxury.
+Fisher is always exact. Mann-Whitney is exact while enumerating the
+splits is affordable and falls back to the normal approximation with a
+tie correction above that, marked `~` in the output. The cost of the
+exact version is `C(n1+n2, n1)`, not `n1*n2` -- gating on the product
+is how the first run of this tool hung on its own analysis step.
 """
 import json
 import math
@@ -69,19 +71,42 @@ def metrics(r):
 
 
 def mannwhitney(x, y):
-    """Exact two-sided Mann-Whitney U. Returns (U, p)."""
-    n = len(x) * len(y)
+    """Two-sided Mann-Whitney U: exact while that is affordable, else
+    the normal approximation with a tie correction.
+
+    **The cost is `C(n1+n2, n1)`, not `n1*n2`.** Gating on the product
+    let 40-vs-40 through as "1600, fine" when the enumeration it asks
+    for is 10^23 splits, and the first real use of this tool hung on
+    its own analysis step.
+    """
+    n1, n2 = len(x), len(y)
+    n = n1 * n2
     u = sum((a > b) + 0.5 * (a == b) for a in x for b in y)
-    pool = sorted(x + y)
-    tot = hit = 0
-    for c in combinations(range(len(pool)), len(x)):
-        cs = set(c)
-        xs = [pool[k] for k in c]
-        ys = [pool[k] for k in range(len(pool)) if k not in cs]
-        uu = sum((a > b) + 0.5 * (a == b) for a in xs for b in ys)
-        tot += 1
-        hit += abs(uu - n / 2) >= abs(u - n / 2) - 1e-9
-    return u, hit / tot
+    if math.comb(n1 + n2, n1) <= 200_000:
+        pool = sorted(x + y)
+        tot = hit = 0
+        for c in combinations(range(len(pool)), n1):
+            cs = set(c)
+            xs = [pool[k] for k in c]
+            ys = [pool[k] for k in range(len(pool)) if k not in cs]
+            uu = sum((a > b) + 0.5 * (a == b) for a in xs for b in ys)
+            tot += 1
+            hit += abs(uu - n / 2) >= abs(u - n / 2) - 1e-9
+        return u, hit / tot, "exact"
+    # Normal approximation. The tie term matters here: `drafts` is a
+    # small integer and a column of it is mostly ties, which inflates
+    # the variance estimate if left out and understates p.
+    N = n1 + n2
+    counts = {}
+    for v in x + y:
+        counts[v] = counts.get(v, 0) + 1
+    ties = sum(t**3 - t for t in counts.values())
+    var = (n / 12) * ((N + 1) - ties / (N * (N - 1)))
+    if var <= 0:
+        return u, 1.0, "approx"
+    z = (abs(u - n / 2) - 0.5) / math.sqrt(var)
+    p = 2 * (1 - 0.5 * (1 + math.erf(z / math.sqrt(2))))
+    return u, min(max(p, 0.0), 1.0), "approx"
 
 
 def fisher(a, b, c, d):
@@ -127,21 +152,22 @@ def main(paths):
             f"{xb}/{nb} = {100*xb/nb:3.0f}%   Fisher p={fisher(xa, na-xa, xb, nb-xb):.4f}"
         )
         # Counts.
-        big = na * nb > 3_000_000
         for k in keys:
             x = [r[k] for r in arms[a]]
             y = [r[k] for r in arms[b]]
-            if big:
-                print(f"  {k:<16} median {st.median(x):>9.0f} {st.median(y):>9.0f}   (n too large for the exact test)")
-                continue
-            u, pv = mannwhitney(x, y)
+            _, pv, how = mannwhitney(x, y)
             star = " *" if pv < 0.05 else ""
-            print(f"  {k:<16} median {st.median(x):>9.0f} {st.median(y):>9.0f}   p={pv:.4f}{star}")
+            tag = "" if how == "exact" else " ~"
+            print(
+                f"  {k:<16} median {st.median(x):>9.0f} {st.median(y):>9.0f}"
+                f"   p={pv:.4f}{tag}{star}"
+            )
     if len(names) > 2:
         print(
             f"\nNote: {math.comb(len(names), 2)} pairs x {len(keys)+1} metrics were tested. "
             "Decide which comparison is the primary one before reading the stars."
         )
+    print("\n~ = normal approximation with tie correction; the rest are exact.")
 
 
 if __name__ == "__main__":
