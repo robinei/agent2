@@ -3748,7 +3748,6 @@ mod tests {
         assert!(buf.is_empty());
     }
 
-    #[test]
     /// **An append is on the same ground as the calls.** Both are
     /// effects attached below a block's source, and one of them sitting
     /// on the pane's own background read as a stray line beside the
@@ -3772,6 +3771,7 @@ mod tests {
         );
     }
 
+    #[test]
     fn manual_toggles_override_auto_pop_set() {
         let mut app = AttachedApp::new(fid(1));
         app.view = View::Running;
