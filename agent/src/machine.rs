@@ -4088,19 +4088,29 @@ impl Runner {
             .find(|e| matches!(e.payload, EventPayload::Post { .. }))
             .map(|e| e.id.as_u64())
             .unwrap_or(0);
+        // **Programs, not blocks.** This counted `Part::Cell` events,
+        // and a reply's cells are *one* program that pauses between
+        // them — the card's first paragraph says so. So the reply this
+        // line exists to praise, one completion doing grep → edit →
+        // verify in three cells, reported itself as "3 programs run",
+        // and the number meant to catch a branch going nowhere
+        // (`sweep-40`: nine programs, fifty minutes, no convergence)
+        // read highest for the shape that is going somewhere.
+        //
+        // Seen on a `deepseek-v4-flash` smoke run, 2026-09-21: one
+        // `Reply`, one `Handback`, three cells, tail said three.
         let n = segment
             .iter()
             .filter(|e| e.id.as_u64() > last_post)
-            .filter(|e| {
-                matches!(
-                    &e.payload,
-                    EventPayload::Part {
-                        part: crate::types::Part::Cell(_),
-                        ..
-                    }
-                )
+            .filter_map(|e| match &e.payload {
+                EventPayload::Part {
+                    reply,
+                    part: crate::types::Part::Cell(_),
+                } => Some(*reply),
+                _ => None,
             })
-            .count();
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
         (n > 0).then_some(n)
     }
 
@@ -6741,6 +6751,31 @@ mod tests {
             "typing superseded the turn in flight instead of queueing"
         );
         assert_eq!(state.status(), "suspended", "and the frame is untouched");
+    }
+
+    /// **One reply with three cells is one program.** The tail line
+    /// exists to say whether a branch is going anywhere — `sweep-40`
+    /// spent nine programs and fifty minutes without converging — and
+    /// it counted `Part::Cell`, so the shape the card asks for (ask for
+    /// everything you can already name, in one completion) reported the
+    /// highest number. A `deepseek-v4-flash` smoke run on 2026-09-21
+    /// did a whole three-file rename in one reply and was told it had
+    /// run three programs.
+    #[test]
+    fn the_tail_counts_programs_not_blocks() {
+        let mut c = Conversation::new();
+        c.answers("bash", serde_json::json!({ "status": 0, "stdout": "ok\n" }));
+        c.user("rename it everywhere");
+        c.reply(
+            "Finding them.\n\n```js\nconst a = await tools.bash(\"grep -rl OLD .\");\n```\n\
+             \nNow the edits.\n\n```js\nconst b = await tools.bash(\"true\");\n```\n\
+             \nAnd the check.\n\n```js\ntell(\"done\"); finish();\n```\n",
+        );
+        let tail = c.runner().request_tail(c.tree()).unwrap_or_default();
+        assert!(
+            tail.contains("1 program run since"),
+            "three cells of one reply are one program: {tail}"
+        );
     }
 
     #[test]
