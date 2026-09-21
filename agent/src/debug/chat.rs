@@ -540,10 +540,33 @@ impl ChatState {
             // `Handover`, so they fall out of the same check). Exactly
             // `tree::programs_for`'s own `stack` fold, so a chat block's
             // attach point can never disagree with the log projection's.
-            EventPayload::Handback { how, .. } => {
+            EventPayload::Handback { how, reply, .. } => {
                 if how.is_terminal() {
                     self.program_stack.entry(branch).or_default().pop();
                 }
+                // **A reopened log carries no `SessionEvent::ProgramStatus`.**
+                // Those are live signals from the host; replaying a log
+                // emits only `SessionEvent::Event`, so `program_status`
+                // stayed empty and the header's `unwrap_or("running")`
+                // titled *every* block of a finished session `program:
+                // running`. Seen by capturing a real frame of
+                // `lab/conv` on 2026-09-21, whose last program had
+                // completed forty minutes earlier.
+                //
+                // The handback is the authority `ProgramView::status`
+                // already derives from (`tree.rs`); this mirrors that
+                // fold so the incremental model cannot disagree with
+                // the log projection. A live run still emits its own
+                // `ProgramStatus` *after* the event carrying this
+                // handback, so nothing here overrides live state.
+                self.program_status.insert(
+                    *reply,
+                    match how {
+                        h if !h.is_terminal() => ProgramStatus::Suspended,
+                        crate::types::Handback::Completed { .. } => ProgramStatus::Completed,
+                        _ => ProgramStatus::Failed,
+                    },
+                );
             }
             // A note is heard by no one but the branch's own future self
             // — a marker in its own history, same as `append_history`'s
@@ -1469,7 +1492,15 @@ fn status_label(status: ProgramStatus) -> &'static str {
         ProgramStatus::Running => "running",
         ProgramStatus::Suspended => "suspended",
         ProgramStatus::Completed => "completed",
-        ProgramStatus::Failed => "failed",
+        // **Nothing failed.** `ProgramStatus::Failed`'s own doc says
+        // what it means — "abandoned: rewritten away or left suspended
+        // when the agent ended" — and all three handbacks that reach it
+        // (`Abandoned`, `Superseded`, `Interrupted`) are a frame being
+        // dropped, not a program going wrong. Live on 2026-09-21 a
+        // person said "stop, only do alpha.py", the branch abandoned
+        // its parked program exactly as asked, and the block it had
+        // just been told to drop was titled `program: failed`.
+        ProgramStatus::Failed => "discarded",
     }
 }
 
@@ -1491,6 +1522,91 @@ mod tests {
     use super::*;
     use crate::types::{Author, Origin};
     use jiff::Timestamp;
+
+    /// **A reopened log is not a live session.** Replaying one emits
+    /// `SessionEvent::Event` and nothing else — no
+    /// `SessionEvent::ProgramStatus`, which the host only sends while a
+    /// program actually runs. Every block of a finished conversation
+    /// therefore fell through to the header's `unwrap_or("running")`,
+    /// so a session the person had closed hours earlier read as though
+    /// it were still working.
+    #[test]
+    fn a_reopened_log_titles_its_blocks_from_the_handback() {
+        let mut chat = ChatState::new();
+        chat.apply(&ev(
+            1,
+            EventPayload::Agent {
+                name: None,
+                charter: "p".into(),
+                tools: None,
+                system: String::new(),
+                exemplars: Vec::new(),
+            },
+        ));
+        for e in run_program(3) {
+            chat.apply(&e);
+        }
+        // Nothing but log events — exactly what a reload replays.
+        chat.apply(&ev(
+            9,
+            EventPayload::Handback {
+                reply: EventId::new(3),
+                how: crate::types::Handback::Completed {
+                    value: None,
+                    rested: true,
+                },
+                site: 0,
+                stack: Vec::new(),
+            },
+        ));
+        let rows = chat.rows(None, 80, None);
+        assert!(
+            rows.iter()
+                .any(|(k, t, _, _)| *k == ChatKind::Program && t == "program: completed"),
+            "{rows:#?}"
+        );
+    }
+
+    /// **A program the person asked to stop did not fail.** All three
+    /// handbacks that land in `ProgramStatus::Failed` — `Abandoned`,
+    /// `Superseded`, `Interrupted` — are a frame being dropped, which
+    /// is what the variant's own doc says it means.
+    #[test]
+    fn an_abandoned_program_is_titled_discarded_not_failed() {
+        let mut chat = ChatState::new();
+        chat.apply(&ev(
+            1,
+            EventPayload::Agent {
+                name: None,
+                charter: "p".into(),
+                tools: None,
+                system: String::new(),
+                exemplars: Vec::new(),
+            },
+        ));
+        for e in run_program(3) {
+            chat.apply(&e);
+        }
+        chat.apply(&ev(
+            9,
+            EventPayload::Handback {
+                reply: EventId::new(3),
+                how: crate::types::Handback::Abandoned,
+                site: 0,
+                stack: Vec::new(),
+            },
+        ));
+        let rows = chat.rows(None, 80, None);
+        assert!(
+            rows.iter()
+                .any(|(k, t, _, _)| *k == ChatKind::Program && t == "program: discarded"),
+            "{rows:#?}"
+        );
+        assert!(
+            !rows.iter().any(|(_, t, _, _)| t.contains("failed")),
+            "{rows:#?}"
+        );
+    }
 
     fn ev(id: u64, payload: EventPayload) -> SessionEvent {
         ev_on(1, id, None, payload)
