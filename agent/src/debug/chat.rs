@@ -559,14 +559,28 @@ impl ChatState {
                 // the log projection. A live run still emits its own
                 // `ProgramStatus` *after* the event carrying this
                 // handback, so nothing here overrides live state.
-                self.program_status.insert(
-                    *reply,
-                    match how {
-                        h if !h.is_terminal() => ProgramStatus::Suspended,
-                        crate::types::Handback::Completed { .. } => ProgramStatus::Completed,
-                        _ => ProgramStatus::Failed,
-                    },
-                );
+                //
+                // **`Abandoned` and `Superseded` are deliberately not
+                // derived here**, because the log does not say what they
+                // are about. Both are logged against `self.reply_id` —
+                // the reply that *decided* — while the program they
+                // discard is the one beneath it, and the payload has no
+                // field naming it. In `lab/live1` the reply that wrote
+                // `abandon()` went on to run a check and finish, and the
+                // only handback under it is `Abandoned`; the live run
+                // titled it `completed` and the frame it dropped
+                // `discarded`, which is right, and no fold over the log
+                // alone can reach that. Better to leave those two to the
+                // header's own fallback than to assert the wrong one.
+                let derived = match how {
+                    h if !h.is_terminal() => Some(ProgramStatus::Suspended),
+                    crate::types::Handback::Completed { .. } => Some(ProgramStatus::Completed),
+                    crate::types::Handback::Interrupted => Some(ProgramStatus::Failed),
+                    _ => None,
+                };
+                if let Some(status) = derived {
+                    self.program_status.insert(*reply, status);
+                }
             }
             // A note is heard by no one but the branch's own future self
             // — a marker in its own history, same as `append_history`'s
@@ -1570,7 +1584,9 @@ mod tests {
     /// **A program the person asked to stop did not fail.** All three
     /// handbacks that land in `ProgramStatus::Failed` — `Abandoned`,
     /// `Superseded`, `Interrupted` — are a frame being dropped, which
-    /// is what the variant's own doc says it means.
+    /// is what the variant's own doc says it means. The status comes
+    /// from the live run here because the log alone cannot say which
+    /// frame an abandon was about; see the `Handback` arm.
     #[test]
     fn an_abandoned_program_is_titled_discarded_not_failed() {
         let mut chat = ChatState::new();
@@ -1587,15 +1603,12 @@ mod tests {
         for e in run_program(3) {
             chat.apply(&e);
         }
-        chat.apply(&ev(
-            9,
-            EventPayload::Handback {
-                reply: EventId::new(3),
-                how: crate::types::Handback::Abandoned,
-                site: 0,
-                stack: Vec::new(),
-            },
-        ));
+        chat.apply(&SessionEvent::ProgramStatus {
+            agent: EventId::new(1),
+            branch: EventId::new(1),
+            program: EventId::new(3),
+            status: ProgramStatus::Failed,
+        });
         let rows = chat.rows(None, 80, None);
         assert!(
             rows.iter()
