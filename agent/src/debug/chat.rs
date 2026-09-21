@@ -42,7 +42,7 @@ use crate::tree::Frames;
 use crate::types::{Address, Call, Event, EventId, EventPayload, Outcome};
 
 /// How many lines of a cell's source show while it is collapsed (D13).
-pub const CELL_COLLAPSED_LINES: usize = 5;
+pub const CELL_COLLAPSED_LINES: usize = 3;
 
 /// A cell's source without its fences, and the dialect they named.
 ///
@@ -3400,7 +3400,7 @@ mod tests {
 
     /// **Collapsed by default**: five lines and a count of the rest (D13).
     #[test]
-    fn a_cell_shows_five_lines_and_a_count_when_collapsed() {
+    fn a_cell_shows_the_capped_lines_and_a_count_when_collapsed() {
         let mut chat = ChatState::new();
         chat.apply(&agent_event());
         chat.set_show_cells(true);
@@ -3416,12 +3416,16 @@ mod tests {
         assert_eq!(
             rows.len(),
             CELL_COLLAPSED_LINES + 1,
-            "five lines and a count"
+            "the capped lines and a count"
         );
         assert_eq!(rows[0], "line1();");
-        assert_eq!(rows[CELL_COLLAPSED_LINES - 1], "line5();");
         assert_eq!(
-            rows[CELL_COLLAPSED_LINES], "… 3 more lines — click to open",
+            rows[CELL_COLLAPSED_LINES - 1],
+            format!("line{CELL_COLLAPSED_LINES}();")
+        );
+        assert_eq!(
+            rows[CELL_COLLAPSED_LINES],
+            format!("… {} more lines — click to open", 8 - CELL_COLLAPSED_LINES),
             "the row says how much is hidden and how to see it"
         );
     }

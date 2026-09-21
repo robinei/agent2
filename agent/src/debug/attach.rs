@@ -607,6 +607,9 @@ impl AttachedApp {
                     right.push(Pane::Source);
                 }
                 right.push(Pane::Detail);
+                // No separate console pane: `Detail` is showing it
+                // until something is selected, and two of them in a
+                // two-fifths column left neither enough room.
                 if self.show_disasm {
                     right.push(Pane::Disasm);
                 }
@@ -616,7 +619,6 @@ impl AttachedApp {
                 if self.show_promises {
                     right.push(Pane::Promises);
                 }
-                right.push(Pane::Console);
                 PaneSet {
                     chat: true,
                     console_left: false,
@@ -1474,7 +1476,9 @@ fn render(frame: &mut Frame, app: &mut AttachedApp, session: &Session) {
     let (left, right) = if panes.right.is_empty() {
         (main, None)
     } else {
-        let [l, r] = Layout::horizontal([Constraint::Percentage(45), Constraint::Percentage(55)])
+        // Two fifths. The transcript is what is being read; the right
+        // column is what is being referred to.
+        let [l, r] = Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)])
             .areas(main);
         (l, Some(r))
     };
@@ -1514,13 +1518,18 @@ fn render(frame: &mut Frame, app: &mut AttachedApp, session: &Session) {
 
     if let Some(right) = right {
         let (vm, pv) = resolve_program(app, session);
-        // Old programs (no live VM, from the log) strip VM-only panes
-        // and force source + console (plan Step 5).
+        // Old programs (no live VM, from the log) strip the VM-only
+        // panes — there is no VM to disassemble or walk. What is left
+        // is the navigator and the detail of whatever is selected;
+        // this used to force the *source* pane in here, which is how
+        // it kept coming back after being taken out of the auto-pop
+        // set: a completed program has no live VM, so every block you
+        // finished reading re-opened it.
         let mut right_panes = panes.right.clone();
         if vm.is_none() && pv.is_some() {
-            right_panes.retain(|p| matches!(p, Pane::Navigator | Pane::Source | Pane::Console));
-            if !right_panes.contains(&Pane::Source) {
-                right_panes.insert(1, Pane::Source);
+            right_panes.retain(|p| matches!(p, Pane::Navigator | Pane::Source | Pane::Detail));
+            if !right_panes.contains(&Pane::Source) && !right_panes.contains(&Pane::Detail) {
+                right_panes.insert(1, Pane::Detail);
             }
         }
         // Uncapped, a deep fork/spawn tree would grow the navigator to
@@ -1549,11 +1558,25 @@ fn render(frame: &mut Frame, app: &mut AttachedApp, session: &Session) {
                     ));
                 }
                 Pane::Detail => {
-                    let top = render_detail(frame, app, session, pv.as_ref(), *slot);
+                    // **Console until you pick something.** The source
+                    // is already in the transcript — a block shows its
+                    // own cells — so what belongs beside it is the
+                    // program's output, and then the detail of whatever
+                    // you click instead.
+                    let (top, area) = if app.selected_effect.is_some() {
+                        (
+                            render_detail(frame, app, session, pv.as_ref(), *slot),
+                            *slot,
+                        )
+                    } else if let Some(ref pv) = pv {
+                        render_console_from_pv(frame, pv, *slot, app.detail_scroll)
+                    } else {
+                        render_attached_console(frame, app, session, *slot, app.detail_scroll)
+                    };
                     app.pane_rects.push((
                         Pane::Detail,
                         PaneInfo {
-                            area: *slot,
+                            area,
                             scroll_top: top,
                         },
                     ));
@@ -3647,7 +3670,7 @@ mod tests {
         // The auto-pop set is detail + console now; the source pane is
         // off unless `1` asks for it.
         assert!(panes.right.contains(&Pane::Detail));
-        assert!(panes.right.contains(&Pane::Console));
+        assert!(!panes.right.contains(&Pane::Console));
         assert!(!panes.right.contains(&Pane::Source));
         // The post-mortem VM is still borrowable for those panes.
         let state = session.state(session.conversation_branch()).unwrap();
@@ -3668,7 +3691,7 @@ mod tests {
             }
         );
         // It is not a one-way door: `c` again from `Chat` reopens the
-        // detail/console panes without needing a fresh run_program to
+        // detail pane without needing a fresh run_program to
         // re-trigger the auto-pop. Collapsing left focus on `Input`
         // (same as the original direction leaves it), so `Esc` back to
         // `Focus::Debug` first, same as above.
@@ -3678,7 +3701,6 @@ mod tests {
         assert_eq!(app.view, View::Running);
         let panes = app.pane_set();
         assert!(panes.right.contains(&Pane::Detail));
-        assert!(panes.right.contains(&Pane::Console));
     }
 
     #[test]
