@@ -1096,6 +1096,68 @@ mod tests {
         }
     }
 
+    /// **The card cannot name an `Edit` verb the runtime does not
+    /// have, nor miss one it does.**
+    ///
+    /// Nothing checked this, and the card is edited by hand. Renaming
+    /// `Edit.replaceCount` to `replaceAll` meant touching this card and
+    /// three eval card variants; a miss would have left an arm calling
+    /// a verb that does not exist — a whole run's worth of garbage,
+    /// visible only in a live session, and attributed to the model.
+    ///
+    /// Both directions, because a verb the card never names is a verb
+    /// the model never writes: it is dead weight in the binary and a
+    /// capability nobody has.
+    #[test]
+    fn the_card_declares_exactly_the_edit_verbs_that_exist() {
+        use std::collections::BTreeSet;
+        let registered: BTreeSet<&str> = interp::builtin::Builtin::namespace_statics()
+            .filter(|(ns, _, _)| *ns == "Edit")
+            .map(|(_, name, _)| name)
+            .collect();
+
+        let edit_verbs = |text: &str| -> BTreeSet<String> {
+            let start = text
+                .find("declare namespace Edit {")
+                .expect("the card declares the Edit namespace");
+            let block = &text[start..];
+            let end = block.find("\n}").expect("the namespace block closes");
+            block[..end]
+                .lines()
+                .filter_map(|l| l.trim().strip_prefix("function "))
+                .filter_map(|l| l.split('(').next())
+                .map(str::to_owned)
+                .collect()
+        };
+        let registered: BTreeSet<String> = registered.iter().map(|s| (*s).to_owned()).collect();
+
+        // The shipping card, and every eval arm — an arm is a *copy* of
+        // this file, so it is the one that gets forgotten, and an arm
+        // calling a verb that does not exist spoils a whole run while
+        // looking like the model's fault.
+        for (what, text) in [
+            ("the card", card()),
+            (
+                "evals/cards/program",
+                include_str!("../../evals/cards/program/card.md").to_owned(),
+            ),
+            (
+                "evals/cards/prose-answer",
+                include_str!("../../evals/cards/prose-answer/card.md").to_owned(),
+            ),
+            (
+                "evals/cards/ts",
+                include_str!("../../evals/cards/ts/card.md").to_owned(),
+            ),
+        ] {
+            assert_eq!(
+                edit_verbs(&text),
+                registered,
+                "{what} and the `Edit` builtins disagree"
+            );
+        }
+    }
+
     #[test]
     fn the_card_names_every_bare_verb() {
         for verb in [
