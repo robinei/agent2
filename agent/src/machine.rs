@@ -5796,6 +5796,26 @@ mod tests {
     /// `finish(text)` is the one thing that rests the branch: the mirror
     /// image of the test above, same shape, only the program's text
     /// differs.
+    #[test]
+    fn finish_ends_the_conversation() {
+        let (mut tree, mut state) = setup_under();
+        user_post(&mut state, &mut tree, "go");
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::LlmResponse(llm_program("tell(\"ok\"); finish();\n")),
+            )
+            .unwrap();
+        let settled = drain(&mut state, &mut tree, out);
+        assert!(
+            !settled
+                .iter()
+                .any(|o| matches!(o, StepOutput::LlmRequest(_))),
+            "finish(text) ends the conversation with no further request: {settled:?}"
+        );
+        assert!(state.is_idle());
+    }
+
     /// **A second message while a program is parked must not destroy
     /// it.** Live in `lab/live2` on 2026-09-21: a `bash` was in flight,
     /// "actually stop" parked the program at its next fuel slice, a
@@ -5845,26 +5865,6 @@ mod tests {
             !dump.contains("settled with no program awaiting it"),
             "the parked program's own call was orphaned:\n{dump}"
         );
-    }
-
-    #[test]
-    fn finish_ends_the_conversation() {
-        let (mut tree, mut state) = setup_under();
-        user_post(&mut state, &mut tree, "go");
-        let out = state
-            .step(
-                &mut tree,
-                StepInput::LlmResponse(llm_program("tell(\"ok\"); finish();\n")),
-            )
-            .unwrap();
-        let settled = drain(&mut state, &mut tree, out);
-        assert!(
-            !settled
-                .iter()
-                .any(|o| matches!(o, StepOutput::LlmRequest(_))),
-            "finish(text) ends the conversation with no further request: {settled:?}"
-        );
-        assert!(state.is_idle());
     }
 
     /// `finish(text)` settles at dispatch (like `spawn`/`fork`), so it is
