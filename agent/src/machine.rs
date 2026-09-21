@@ -4893,17 +4893,28 @@ impl Runner {
         tree: &mut Tree,
         epoch: Option<u64>,
         author: Author,
-    ) -> io::Result<bool> {
+    ) -> io::Result<()> {
         self.finish_notebook_generation(tree, None, None)?;
-        let mut vm =
-            match VM::for_incremental(self.spine.context().input(tree), serde_json::Value::Null) {
-                Ok(vm) => vm,
-                Err(_) => return Ok(false),
-            };
-        let notebook = match crate::notebook::Notebook::new(&mut vm) {
-            Ok(nb) => nb,
-            Err(_) => return Ok(false),
-        };
+        // **A reply that cannot be opened is an error, not a `false`.**
+        // Both of these used to swallow the failure and return
+        // `Ok(false)` — and both callers discard the `bool`, so the
+        // branch would keep `streaming_epoch` and `reply_id` pointing
+        // at the *previous* reply and append the new completion's parts
+        // to it. That reply has already handed back; the log then says
+        // a reply grew after it ended, and every later chunk retries the
+        // open, fails again, and appends again.
+        //
+        // Nothing in the corpus proves this ever fired — `Ok(false)` is
+        // unreachable-or-silent, which is exactly why it has to stop
+        // being silent. If it never happens, nothing changes; if it
+        // does, the host surfaces an error instead of quietly
+        // corrupting the record.
+        let mut vm = VM::for_incremental(self.spine.context().input(tree), serde_json::Value::Null)
+            .map_err(|e| {
+                io::Error::other(format!("could not start a VM for the next reply: {e:?}"))
+            })?;
+        let notebook = crate::notebook::Notebook::new(&mut vm)
+            .map_err(|e| io::Error::other(format!("could not open the next reply: {e}")))?;
         if let Phase::Suspended(mut old, resume_with) =
             std::mem::replace(&mut self.phase, Phase::Idle)
         {
@@ -4944,7 +4955,7 @@ impl Runner {
             notebook: Some(notebook),
         });
         self.streaming_epoch = epoch.or(Some(u64::MAX));
-        Ok(true)
+        Ok(())
     }
 
     /// Record what the generation being assembled cost and said, and stop
