@@ -1,0 +1,28 @@
+#1 agent  «You are a capable general-purpose agent. Solve the user's task.»
+#2 you    → add a docstring to every function in every .py file here, one file at a time
+#3 reply
+#5    → read_file("alpha.py") ok
+#7    → outline("alpha.py") ok
+#9    ▸ {"alpha_funcs":["alpha_one","alpha_two","alpha_three"]}
+#10 you    → actually stop - just do alpha.py and leave the rest alone
+#11    ⏸ a message arrived
+#16 you    → are you still there? just do alpha.py
+
+waiting on: the next reply, to resume the parked program or replace it
+
+--- what the session did after this point ---
+
+  --- quiet
+  [branch 1 · #16] post: [16] are you still there? just do alpha.py
+  --- quiet
+
+No reply was ever generated for #16. The process stayed alive.
+
+Reply #13-#15 was Prose 297B + Thinking 28171B + ReplyEnd Truncated
+(8000 out) — no cell, so no program ran and the frame parked at #11
+was never resolved.
+
+NOT REPRODUCED. `machine::tests::a_parked_branch_is_still_listening`
+walks the same sequence — park by rule B, cell-less truncated reply,
+post — and recovers. Something about the live path differs; the cause
+is open.

@@ -1980,7 +1980,16 @@ pub(crate) mod tests {
             expects_reply: false,
         });
         session = session.run();
+        eprintln!(
+            "status after 2nd post: {:?}",
+            session.state(branch).map(|s| s.status())
+        );
         let events: Vec<host::SessionEvent> = rx.try_iter().collect();
+        for e in &events {
+            if let host::SessionEvent::Error { message, .. } = e {
+                eprintln!("ERR: {message}");
+            }
+        }
         let outcome = fold(session, collect_errors(&events));
         let tree = outcome.tree();
         assert_eq!(

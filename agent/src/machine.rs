@@ -6348,6 +6348,58 @@ mod tests {
         assert!(!row.contains("<unnamed>"), "{row}");
     }
 
+    /// **A parked branch that is spoken to is still listening** — the
+    /// contract, pinned.
+    ///
+    /// A suspension gets exactly one prompt, sent when it parks
+    /// (`host::prompt_suspended`, whose own comment says "without it …
+    /// the branch sits `Suspended` forever, since nothing else ever
+    /// asks it for a decision"), so what happens to *later* posts is
+    /// worth a test of its own.
+    ///
+    /// **It does not reproduce the stall seen live on 2026-09-21**, and
+    /// is not claimed to: a run interrupted mid-task parked correctly,
+    /// spent its one prompt on a reply truncated inside 28 KB of
+    /// reasoning, went quiet, and then ignored "are you still there?"
+    /// entirely. This sequence — park, cell-less truncated reply, post
+    /// — recovers here. The live log is kept; the cause is open.
+    #[test]
+    fn a_parked_branch_is_still_listening() {
+        let (mut tree, mut state) = setup_under();
+        user_post(&mut state, &mut tree, "document every file");
+        // A program that parks on a call it never gets an answer to.
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::LlmResponse(llm_program("await tools.read_file(\"a.py\");")),
+            )
+            .unwrap();
+        let _ = out;
+
+        // Speaking to a running program parks it at its next fuel
+        // slice (rule B) — the slice `deliver` asks for.
+        let out = user_post(&mut state, &mut tree, "actually stop - just do a.py");
+        drain(&mut state, &mut tree, out);
+        assert_eq!(state.status(), "suspended", "rule B parks it");
+
+        // Its one prompt is spent on a reply with no cell at all.
+        let mut turn = crate::host::scripted_program("");
+        turn.source = "Let me think about which one.\n".to_owned();
+        turn.truncated = true;
+        let out = state.step(&mut tree, StepInput::LlmResponse(turn)).unwrap();
+        let _ = out;
+
+        // The person speaks again. This has to reach it.
+        let before = tree.events.len();
+        let out = user_post(&mut state, &mut tree, "are you still there?");
+        assert!(
+            out.iter().any(|o| matches!(o, StepOutput::LlmRequest(_))),
+            "the post drew no request — the branch is deaf (status {}, {} events)",
+            state.status(),
+            tree.events.len() - before
+        );
+    }
+
     /// **A program with the fence left off is caught, and prose is
     /// not.** The reply `delegate-direct` actually produced twice on
     /// 2026-09-20 was two statements and nothing else; it ran nothing,
