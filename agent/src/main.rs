@@ -5,6 +5,9 @@ mod host;
 mod machine;
 mod notebook;
 mod report;
+// The prompt lab: capture a request, edit it, resample it. A binary
+// path reaches this one, so it is not test-gated.
+mod lab;
 // Fixtures and scripted end-to-end runs: test-only, and compiled only
 // for `cargo test` now that no binary path reaches them.
 #[cfg(test)]
@@ -80,7 +83,19 @@ const USAGE: &str = "usage: agent <command>
                                     in and out, reasoning, and the time
                                     inside completions split from the
                                     time everywhere else. JSON per log,
-                                    so a before/after is diff or jq.";
+                                    so a before/after is diff or jq.
+  capture <log.jsonl> [id] [-o f]   the same document, written so it
+                                    reads back byte-identical. Edit any
+                                    part of it — the card, one turn, the
+                                    ephemeral tail — and sample the
+                                    result. Prints to stdout with no -o.
+  sample <file> [-n N] [-j C]       ask the provider for the next reply
+          [-o out.jsonl]            N times against that fixed document,
+                                    one JSON row each: source, thinking,
+                                    usage, ms. Nothing runs and nothing
+                                    is logged. Holding the context still
+                                    is what makes the difference between
+                                    two prompts measurable at all.";
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -206,6 +221,18 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Some("capture") => {
+            if let Err(e) = capture_document(&args[2..]) {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        }
+        Some("sample") => {
+            if let Err(e) = sample_document(&args[2..]) {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        }
         _ => {
             eprintln!("{USAGE}");
             std::process::exit(2);
@@ -286,6 +313,175 @@ fn print_document(log: Option<&str>, at: Option<&String>) -> Result<(), String> 
             "─".repeat(28)
         );
         println!("{}\n", m.content);
+    }
+    Ok(())
+}
+
+/// A tiny `--flag value` reader. Not worth a dependency: these two
+/// commands have four options between them.
+fn opt<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
+    args.iter()
+        .position(|a| a == name)
+        .and_then(|i| args.get(i + 1))
+        .map(String::as_str)
+}
+
+/// **Capture the request at one point of one session, as an editable
+/// file** (see `lab.rs`).
+///
+/// The same rendering `agent document` prints, written in a form that
+/// reads back byte-identical — including the ephemeral tail, which is
+/// the part no log holds and the only part that has yet produced a
+/// measurable effect.
+fn capture_document(args: &[String]) -> Result<(), String> {
+    let path = args
+        .first()
+        .filter(|a| !a.starts_with('-'))
+        .ok_or("usage: agent capture <log.jsonl> [event-id] [-o file]")?;
+    let at = args.get(1).filter(|a| !a.starts_with('-'));
+    let file = std::fs::File::open(path).map_err(|e| format!("{path}: {e}"))?;
+    let tree = types::Tree::open(file).map_err(|e| format!("{path}: {e}"))?;
+    let leaf = match at {
+        Some(raw) => {
+            let n: u64 = raw
+                .trim_start_matches('#')
+                .parse()
+                .map_err(|_| format!("event id must be a positive number, got `{raw}`"))?;
+            *tree
+                .events
+                .keys()
+                .find(|id| id.as_u64() == n)
+                .ok_or_else(|| format!("no event #{n} in {path}"))?
+        }
+        None => *tree
+            .events
+            .keys()
+            .max_by_key(|id| id.as_u64())
+            .ok_or("the log is empty")?,
+    };
+    let spine = tree.spine_at(leaf);
+    let state = machine::Runner::with_spine(&tree, tree.spine_at(leaf));
+    let doc = document::render(&tree, &spine, 64 * 1024);
+    let doc = match state.request_tail(&tree) {
+        Some(tail) => doc.with_tail(&tail),
+        None => doc,
+    };
+    let text = lab::write(&doc);
+    match opt(args, "-o") {
+        Some(out) => {
+            std::fs::write(out, &text).map_err(|e| format!("{out}: {e}"))?;
+            let bytes: usize = doc.messages.iter().map(|m| m.content.len()).sum();
+            eprintln!(
+                "{out}: {} messages, {bytes} bytes, at #{}",
+                doc.messages.len(),
+                leaf.as_u64()
+            );
+        }
+        None => print!("{text}"),
+    }
+    Ok(())
+}
+
+/// **Sample the same request many times and write one line per
+/// completion.**
+///
+/// Nothing is executed and nothing is logged: this asks the provider
+/// for the next reply and records it. That is the whole point — the
+/// observation is one completion against a fixed context, so the
+/// between-run variance that has swamped every task-level A/B here is
+/// not merely reduced but absent.
+///
+/// Errors are written as rows too rather than aborting the batch. A
+/// provider that fails one request in forty should cost one sample, and
+/// a run that dies at sample 38 having written nothing is how an
+/// afternoon gets lost.
+fn sample_document(args: &[String]) -> Result<(), String> {
+    use host::{Cancel, LlmClient};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let path = args
+        .first()
+        .filter(|a| !a.starts_with('-'))
+        .ok_or("usage: agent sample <file.doc> [-n 40] [-j 4] [-o out.jsonl]")?;
+    let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
+    let doc = lab::parse(&text).map_err(|e| format!("{path}: {e}"))?;
+    let n: usize = opt(args, "-n").unwrap_or("40").parse().map_err(|_| "-n")?;
+    let jobs: usize = opt(args, "-j").unwrap_or("4").parse().map_err(|_| "-j")?;
+    let jobs = jobs.max(1).min(n.max(1));
+
+    let client = host::DeepSeekClient::from_env()?;
+    let bytes: usize = doc.messages.iter().map(|m| m.content.len()).sum();
+    eprintln!(
+        "{n} samples, {jobs} at a time — {} messages, {bytes} bytes each  [this bills]",
+        doc.messages.len()
+    );
+
+    let next = AtomicUsize::new(0);
+    let done = AtomicUsize::new(0);
+    let out = std::sync::Mutex::new(Vec::<lab::Sample>::with_capacity(n));
+    std::thread::scope(|s| {
+        for _ in 0..jobs {
+            s.spawn(|| {
+                loop {
+                    let i = next.fetch_add(1, Ordering::SeqCst);
+                    if i >= n {
+                        return;
+                    }
+                    let started = std::time::Instant::now();
+                    let mut thinking = String::new();
+                    let cancel = Cancel::new();
+                    let turn = client.complete(&doc, &cancel, &mut |chunk| {
+                        if let host::LlmChunk::Thinking(t) = chunk {
+                            thinking.push_str(&t);
+                        }
+                    });
+                    let ms = started.elapsed().as_millis();
+                    let sample = match turn {
+                        Ok(t) => lab::Sample {
+                            i,
+                            ms,
+                            source: t.source,
+                            // The client reports thinking both ways; the
+                            // accumulated chunks are the fallback for a
+                            // transport that only streams it.
+                            thinking: t.thinking.unwrap_or(thinking),
+                            truncated: t.truncated,
+                            usage: t.usage,
+                            error: None,
+                        },
+                        Err(e) => lab::Sample {
+                            i,
+                            ms,
+                            source: String::new(),
+                            thinking,
+                            truncated: false,
+                            usage: None,
+                            error: Some(e),
+                        },
+                    };
+                    out.lock().expect("samples").push(sample);
+                    let d = done.fetch_add(1, Ordering::SeqCst) + 1;
+                    eprint!("\r{d}/{n}");
+                }
+            });
+        }
+    });
+    eprintln!();
+
+    let mut samples = out.into_inner().expect("samples");
+    samples.sort_by_key(|s| s.i);
+    let failed = samples.iter().filter(|s| s.error.is_some()).count();
+    let mut body = String::new();
+    for s in &samples {
+        body.push_str(&serde_json::to_string(s).map_err(|e| e.to_string())?);
+        body.push('\n');
+    }
+    match opt(args, "-o") {
+        Some(dest) => {
+            std::fs::write(dest, &body).map_err(|e| format!("{dest}: {e}"))?;
+            eprintln!("{dest}: {} samples, {failed} failed", samples.len());
+        }
+        None => print!("{body}"),
     }
     Ok(())
 }
