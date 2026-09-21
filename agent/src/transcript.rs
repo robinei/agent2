@@ -268,11 +268,51 @@ fn waiting_on(path: &[&Event]) -> String {
         Some(Handback::Posted { .. }) => {
             "waiting on: the next reply, to resume the parked program or replace it".to_owned()
         }
+        // **Every non-terminal handback is holding a program open**, and
+        // the `Posted` note above is the general case: a trap or a cell
+        // that would not compile leaves the branch suspended with a
+        // repair owed, and read `nothing` here. Asking `is_terminal`
+        // rather than naming three more variants is also what keeps a
+        // variant added later from silently defaulting to "nothing".
+        Some(h) if !h.is_terminal() => {
+            "waiting on: the next reply, to repair the stopped program or replace it".to_owned()
+        }
         Some(Handback::Interrupted) => {
             "waiting on: nothing — the last run went with its process, so say it again".to_owned()
         }
-        _ => "waiting on: nothing".to_owned(),
+        // **A post with no reply under it is not a rest.** The fold
+        // above reads only the newest `Handback`, so a message that
+        // landed *after* the last program ended left this line saying
+        // `nothing` while the branch owed a turn — which is the exact
+        // way the `Posted` arm above says a driver comes to conclude a
+        // run is over. Seen in `lab/live1` on 2026-09-21: the person
+        // said "ok fine, go ahead and do the other three after all",
+        // and the only line a driver is told to read said the branch
+        // wanted nothing.
+        _ => match unanswered_post(path) {
+            Some(id) => format!(
+                "waiting on: nothing — #{} landed after the last reply and has not been \
+                 taken up yet",
+                id.as_u64()
+            ),
+            None => "waiting on: nothing".to_owned(),
+        },
     }
+}
+
+/// The newest `Post` on this path with no `Reply` logged after it — the
+/// branch has been spoken to and has not started answering.
+fn unanswered_post(path: &[&Event]) -> Option<EventId> {
+    let last_reply = path
+        .iter()
+        .rev()
+        .find(|e| matches!(e.payload, EventPayload::Reply))
+        .map(|e| e.id);
+    path.iter()
+        .rev()
+        .find(|e| matches!(e.payload, EventPayload::Post { .. }))
+        .filter(|post| last_reply.is_none_or(|r| post.id > r))
+        .map(|e| e.id)
 }
 
 /// The `Send { to: user, expects_reply }` on this path with no `Result`
@@ -375,6 +415,43 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
 mod tests {
     use super::*;
     use crate::testkit::Conversation;
+
+    /// **A message with no reply under it is not a rest.** The fold
+    /// reads only the newest `Handback`, so a post that landed after
+    /// the last program ended used to leave this line saying `nothing`
+    /// while the branch owed a turn — the exact misreading the
+    /// `Posted` arm exists to prevent one level up. Seen in
+    /// `lab/live1` on 2026-09-21.
+    #[test]
+    fn a_post_with_no_reply_under_it_is_named() {
+        let mut c = Conversation::new();
+        c.user("is it green?");
+        c.reply("Yes.\n\n```js\ntell(\"green.\"); finish();\n```\n");
+        let settled = render(c.tree(), c.runner().spine.leaf_id);
+        assert!(settled.ends_with("waiting on: nothing\n"), "{settled}");
+
+        c.user("ok, now do the other three");
+        let out = render(c.tree(), c.runner().spine.leaf_id);
+        assert!(
+            out.contains("has not been taken up yet"),
+            "a post nobody has replied to reads as a rest: {out}"
+        );
+    }
+
+    /// A trap leaves the branch suspended with a repair owed, exactly as
+    /// a rule-B pause does — and used to read `nothing` because the fold
+    /// named `Raised` and `Posted` and defaulted the rest.
+    #[test]
+    fn a_trapped_program_is_still_holding_the_branch() {
+        let mut c = Conversation::new();
+        c.user("write it");
+        c.reply("```js\nnope.missing();\n```\n");
+        let out = render(c.tree(), c.runner().spine.leaf_id);
+        assert!(
+            out.contains("to repair the stopped program or replace it"),
+            "{out}"
+        );
+    }
 
     /// The shape of it, over a run that reads, says something and
     /// finishes: what it said, what it ran, how it ended, and that
