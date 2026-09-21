@@ -596,6 +596,12 @@ enum ResumeWith {
     Continue,
 }
 
+// `Running` is the only variant carrying data now that the parked run
+// has moved to `Runner::parked`, so the size gap is stark — but there is
+// exactly one `Phase` per branch, never a collection of them, and boxing
+// it would put an allocation and a deref on the hottest match in the
+// file to save nothing measurable.
+#[allow(clippy::large_enum_variant)]
 enum Phase {
     /// No in-flight request; waiting for a `UserTurn` (or `kickoff`).
     Idle,
@@ -603,25 +609,26 @@ enum Phase {
     AwaitingLlm,
     /// A program is executing (waiting for `Tick`/`ToolResults`).
     Running(Run),
-    /// A condition report went out; waiting for a direct
-    /// [`Runner::resume`]/[`Runner::abandon`] call from the host.
-    ///
-    /// There is still only ever **one** parked run in this variant —
-    /// `Phase` itself never represents nesting. What changed in C0a
-    /// (23_ONE_AGENT.md) is where a *new* program starting on top of
-    /// this one goes: not straight into `crate::types::Handback::Abandoned`, but onto
-    /// [`Runner::beneath`], a stack of exactly these frozen `(Run,
-    /// ResumeWith)` pairs. That stack, not another dimension on this
-    /// enum, is "the handler stack is a host-side structure of
-    /// independently-stepped VMs" (DESIGN.md's load-bearing property):
-    /// only `phase`'s own run is ever stepped, everything in `beneath`
-    /// is inert data until its turn to be reactivated, and no VM here
-    /// is ever on another VM's stack. (An earlier version of this
-    /// comment said nesting would be built from multiple `Runner`
-    /// instances instead — a design this file never actually needed:
-    /// a handler's own `Turn` runs on the very same branch, so it
-    /// belongs on the very same `Runner`.)
-    Suspended(Run, ResumeWith),
+}
+
+/// **A program parked mid-flight**, frozen exactly where it stopped.
+///
+/// `Phase` used to carry one of these in a `Suspended(Run, ResumeWith)`
+/// variant *and* keep the rest on a separate stack, which made "a
+/// request is out" and "a frame is parked" the same slot. They are not
+/// the same fact — a parked branch does have a request out, which is
+/// what `prompt_suspended` (`host/mod.rs`) has always done and what
+/// `d38c416` made true of `prompt_if_needed` too — and encoding both in
+/// one enum is what let `self.phase = Phase::AwaitingLlm` drop a live
+/// VM on the floor (`4898a80`). With the run out of `Phase`, that
+/// assignment cannot reach one, so the guard that used to stand in
+/// front of it is gone rather than remembered.
+struct Parked {
+    run: Run,
+    resume_with: ResumeWith,
+    /// The generation this run's still-pending calls were dispatched
+    /// under, so [`Runner::resume`] can re-stamp them (see its own doc).
+    generation: u64,
 }
 
 /// One call in flight, keyed by the `Call` event logged at dispatch.
@@ -917,7 +924,7 @@ pub struct Runner {
     /// "abandon", ..}` tag routes to [`Runner::resume`]/
     /// [`Runner::abandon`]; anything else is a genuine rewrite, and the
     /// frame is discarded (`crate::types::Handback::Abandoned`) instead.
-    beneath: Vec<(Run, ResumeWith, u64)>,
+    parked: Vec<Parked>,
 }
 
 enum SuspendCause {
@@ -1057,7 +1064,7 @@ impl Runner {
             // history: a fork born at its `Fork` root speaks only when
             // spoken to, and a re-opened branch waits to be addressed.
             shown: leaf.as_u64(),
-            beneath: Vec::new(),
+            parked: Vec::new(),
         }
     }
 
@@ -1101,16 +1108,24 @@ impl Runner {
 
     /// Whether the agent can accept a `UserTurn` right now.
     pub fn is_idle(&self) -> bool {
-        matches!(self.phase, Phase::Idle)
+        matches!(self.phase, Phase::Idle) && self.parked.is_empty()
     }
 
     /// One-word phase description for agent lists / status lines.
     pub fn status(&self) -> &'static str {
+        // Parked outranks idle-or-waiting: a branch holding a frame is
+        // suspended whether or not it also has a request out, which is
+        // the reading every caller had when `Phase` carried the run.
+        if matches!(self.phase, Phase::Running(_)) {
+            return "running";
+        }
+        if !self.parked.is_empty() {
+            return "suspended";
+        }
         match self.phase {
             Phase::Idle => "idle",
             Phase::AwaitingLlm => "awaiting llm",
-            Phase::Running(_) => "running",
-            Phase::Suspended(..) => "suspended",
+            Phase::Running(_) => unreachable!("returned above"),
         }
     }
 
@@ -1166,8 +1181,24 @@ impl Runner {
         // asks again. Seen live on 2026-09-21; reproduced by
         // `a_branch_parked_mid_stream_survives_a_silent_completion`.
         match &self.phase {
-            Phase::Idle => {}
-            Phase::Suspended(..) => return !self.unseen_posts(tree).is_empty(),
+            // Nothing running, nothing parked, nothing in flight: the
+            // ordinary rules below decide.
+            Phase::Idle if self.parked.is_empty() => {}
+            // **A parked branch's wake belongs to the host.**
+            // `prompt_suspended` sends the one prompt a suspension is
+            // owed, and the branch reads as `Idle` now that the frame
+            // lives on `parked` rather than in `phase` — so without
+            // this it would fall through to the rules below, see the
+            // suspension's own `Handback` as an unshown outcome, and
+            // ask for a *second* generation over the host's. Two
+            // spawns, an epoch bump between them, and the completion
+            // that mattered dropped on arrival.
+            //
+            // An unseen post is still a cause: that is `d38c416`, the
+            // fix for a branch going deaf after a completion that said
+            // nothing, and it is the same rule it always was — only
+            // keyed on the frame instead of on the phase.
+            Phase::Idle => return !self.unseen_posts(tree).is_empty(),
             _ => return false,
         }
         // Any unseen `Post` is a cause — including one that arrived
@@ -1450,16 +1481,16 @@ impl Runner {
     /// one while a program runs or is suspended, else the last run's
     /// final state (sticky post-mortem panes).
     pub fn vm(&self) -> Option<&VM> {
-        match &self.phase {
-            Phase::Running(run) | Phase::Suspended(run, _) => Some(&run.vm),
-            _ => self.last_vm.as_ref(),
+        match self.run_ref() {
+            Some(run) => Some(&run.vm),
+            None => self.last_vm.as_ref(),
         }
     }
 
     /// Whether `vm()` is the live, executing program (vs a post-mortem
     /// snapshot).
     pub fn vm_is_live(&self) -> bool {
-        matches!(self.phase, Phase::Running(_) | Phase::Suspended(..))
+        self.run_ref().is_some()
     }
 
     /// Start the conversation without a user turn — how child contexts
@@ -1578,11 +1609,6 @@ impl Runner {
                 self.phase = Phase::Idle;
                 self.prompt_if_needed(tree)
             }
-            // A suspended branch is waiting on a direct host decision
-            // (`resume`/`abandon`), not a rendered request — nothing to
-            // interrupt here that isn't already the host's own call to
-            // make.
-            Phase::Suspended(..) => Ok(Vec::new()),
             // Rule B delivers to a running program at its next fuel
             // slice, so an interrupt's job is to **be a cause** for one.
             // If nothing is unseen, the harness says so itself — in a
@@ -1696,9 +1722,13 @@ impl Runner {
         _tree: &mut Tree,
         value: serde_json::Value,
     ) -> io::Result<Vec<StepOutput>> {
-        let Phase::Suspended(mut run, suspension) = std::mem::replace(&mut self.phase, Phase::Idle)
+        let Some(Parked {
+            mut run,
+            resume_with: suspension,
+            ..
+        }) = self.parked.pop()
         else {
-            panic!("Runner::resume called with nothing suspended — a host bookkeeping bug");
+            panic!("Runner::resume called with nothing parked — a host bookkeeping bug");
         };
         // **The halt has been decided, so it is no longer one.**
         // `stop` marks the run halted and `suspend` carries that flag
@@ -1755,8 +1785,8 @@ impl Runner {
     /// the depth the raise had incremented, so every later event rendered
     /// inside a scope nothing would ever close.
     pub fn abandon(&mut self, tree: &mut Tree) -> io::Result<Vec<StepOutput>> {
-        let Phase::Suspended(run, _) = std::mem::replace(&mut self.phase, Phase::Idle) else {
-            panic!("Runner::abandon called with nothing suspended — a host bookkeeping bug");
+        let Some(Parked { run, .. }) = self.parked.pop() else {
+            panic!("Runner::abandon called with nothing parked — a host bookkeeping bug");
         };
         self.note_status(run.program_id, ProgramStatus::Failed);
         // `Handover`: this condition closes the frame that decided, it
@@ -1843,9 +1873,7 @@ impl Runner {
                 }
                 continue;
             };
-            if pending.generation != self.generation
-                || !matches!(self.phase, Phase::Running(_) | Phase::Suspended(..))
-            {
+            if pending.generation != self.generation || self.run_ref().is_none() {
                 if !is_unwaited_tell {
                     unawaited.push((tr.call, result));
                 }
@@ -1932,10 +1960,7 @@ impl Runner {
     /// The VM a landing `Result` settles into — live while running or
     /// suspended (a suspended run's results land for later).
     fn settling_vm(&mut self) -> &mut VM {
-        match &mut self.phase {
-            Phase::Running(run) | Phase::Suspended(run, _) => &mut run.vm,
-            _ => unreachable!("no VM to settle into"),
-        }
+        &mut self.run_mut().expect("no VM to settle into").vm
     }
 
     fn on_tick(&mut self, tree: &mut Tree, fuel: u64) -> io::Result<Vec<StepOutput>> {
@@ -3139,10 +3164,17 @@ impl Runner {
             _ => value_json,
         };
         let decision = value_json.get("__decision").and_then(|v| v.as_str());
-        if matches!(decision, Some("resume") | Some("abandon")) && !self.beneath.is_empty() {
+        if matches!(decision, Some("resume") | Some("abandon")) && !self.parked.is_empty() {
             let decision = decision.expect("checked Some above").to_owned();
-            let (old_run, resume_with, home_generation) =
-                self.beneath.pop().expect("checked non-empty above");
+            // The frame stays on `parked` for `resume`/`abandon` to take.
+            // It used to be popped here and written straight back into
+            // `Phase::Suspended` so those two could read it out again —
+            // a write whose only reader was the next line.
+            let home_generation = self
+                .parked
+                .last()
+                .expect("checked non-empty above")
+                .generation;
             // This program's own execution genuinely happened — its
             // status is `Completed` and its final VM is kept for the
             // sticky debugger pane like any other — but it gets no
@@ -3187,7 +3219,6 @@ impl Runner {
             // completion — and fire a spurious prompt for an exchange
             // the branch has already fully seen.
             self.shown = self.spine.leaf_id.as_u64();
-            self.phase = Phase::Suspended(old_run, resume_with);
             let decision_value = value_json
                 .get("value")
                 .cloned()
@@ -3213,7 +3244,7 @@ impl Runner {
         // silently replacing a suspended one" case `apply_turn` used to
         // close eagerly, moved here because the deciding fact (did this
         // program decide, or not) isn't known until this point.
-        if let Some((old_run, _resume_with, _home_generation)) = self.beneath.pop() {
+        if let Some(Parked { run: old_run, .. }) = self.parked.pop() {
             self.note_status(old_run.program_id, ProgramStatus::Failed);
             self.last_vm = Some(old_run.vm);
             tree.append(
@@ -3450,7 +3481,16 @@ impl Runner {
             self.phase = Phase::Idle;
             self.note_status(program_id, ProgramStatus::Completed);
         } else {
-            self.phase = Phase::Suspended(run, suspension);
+            // The branch itself is idle — nothing is executing and no
+            // request is out yet; the host's `prompt_suspended` is what
+            // puts one out, and it can now say so in `phase` without
+            // touching the frame.
+            self.phase = Phase::Idle;
+            self.parked.push(Parked {
+                run,
+                resume_with: suspension,
+                generation: self.generation,
+            });
             self.note_status(program_id, ProgramStatus::Suspended);
         }
         // The outcome carries the site and the stack because those were
@@ -3562,33 +3602,15 @@ impl Runner {
         Ok(vec![self.render_request(tree)])
     }
 
-    /// **A request is out — unless a program is parked, in which case a
-    /// request is out and a program is still parked.**
+    /// A request is out.
     ///
-    /// This used to be a bare `self.phase = Phase::AwaitingLlm` at both
-    /// of the places below, which was safe while they were reachable
-    /// from `Idle` alone. `d38c416` taught `needs_prompt` to answer for
-    /// a `Suspended` branch with an unseen post — the fix for a branch
-    /// going deaf after a completion that said nothing — and the stamp
-    /// then landed on `Phase::Suspended(run, _)`, dropping the parked
-    /// `Run` and its VM on the floor.
-    ///
-    /// Two things went with it. The parked program's in-flight calls
-    /// stopped being deliverable — `on_tool_results` routes anything
-    /// landing outside `Running`/`Suspended` to rule C — so a second
-    /// line typed while a command was still going turned that command's
-    /// result into "settled with no program awaiting it", seen in
-    /// `lab/live2` on 2026-09-21. And the `Posted` handback on the log
-    /// still said the program was parked, so the report, the transcript
-    /// and the model were all still being offered a `resume()` of a
-    /// frame that no longer existed.
-    ///
-    /// `prompt_suspended` — the host's own wake for a freshly parked
-    /// branch — never touched the phase, for exactly this reason.
+    /// This was a bare `self.phase = Phase::AwaitingLlm` at both call
+    /// sites, then briefly a guarded one (`4898a80`) because the stamp
+    /// could land on a `Phase::Suspended(run, _)` and drop the parked
+    /// run. `Phase` no longer carries a run, so there is nothing to
+    /// guard against and the guard is gone.
     fn await_llm(&mut self) {
-        if !matches!(self.phase, Phase::Suspended(..)) {
-            self.phase = Phase::AwaitingLlm;
-        }
+        self.phase = Phase::AwaitingLlm;
     }
 
     /// Fire a compaction condition if the document has outgrown its
@@ -4058,7 +4080,7 @@ impl Runner {
         // though a post arrived — `request_tail` runs at render time,
         // by which point the phase has already left `Idle`, so this
         // asks what is parked rather than what the phase is.
-        let parked = matches!(self.phase, Phase::Suspended(..)) || !self.beneath.is_empty();
+        let parked = !self.parked.is_empty();
         posted_since && !agent_waiting && !parked
     }
 
@@ -4760,12 +4782,33 @@ impl Runner {
         self.drive_notebook(tree)
     }
 
-    /// The run this branch holds, running or parked.
+    /// The run this branch holds: the one executing, else the most
+    /// recently parked one. The single answer to what used to be
+    /// written `Phase::Running(run) | Phase::Suspended(run, _)` in nine
+    /// places, and it targets the same frame that arm did.
     fn run_mut(&mut self) -> Option<&mut Run> {
-        match &mut self.phase {
-            Phase::Running(run) | Phase::Suspended(run, _) => Some(run),
-            _ => None,
+        if let Phase::Running(run) = &mut self.phase {
+            return Some(run);
         }
+        self.parked.last_mut().map(|p| &mut p.run)
+    }
+
+    /// **A frame is parked and nothing is executing** — what
+    /// `Phase::Suspended` used to say on its own.
+    ///
+    /// The distinction the split makes explicit: a handler running over
+    /// a parked frame is *not* this, which `!self.parked.is_empty()`
+    /// alone would have said it was.
+    fn is_suspended(&self) -> bool {
+        !self.parked.is_empty() && !matches!(self.phase, Phase::Running(_))
+    }
+
+    /// [`Runner::run_mut`] without the borrow.
+    fn run_ref(&self) -> Option<&Run> {
+        if let Phase::Running(run) = &self.phase {
+            return Some(run);
+        }
+        self.parked.last().map(|p| &p.run)
     }
 
     /// Take text into the reply and record whatever parts it completed —
@@ -4833,8 +4876,8 @@ impl Runner {
         // for the `Suspended` arm of the match and put *after* the
         // guard that makes the arm unreachable.
         if self.streaming_epoch.is_none() {
-            if let Phase::Suspended(run, _) = &mut self.phase {
-                let tail = match run.notebook.as_mut() {
+            if self.is_suspended() {
+                let tail = match self.run_mut().and_then(|r| r.notebook.as_mut()) {
                     Some(notebook) => notebook.end_truncated(truncated),
                     None => Vec::new(),
                 };
@@ -4857,12 +4900,12 @@ impl Runner {
         if truncated {
             self.reply_ended = Some(ReplyEnd::Truncated);
         }
-        let tail = match &mut self.phase {
-            Phase::Running(run) | Phase::Suspended(run, _) => match run.notebook.as_mut() {
+        let tail = match self.run_mut() {
+            Some(run) => match run.notebook.as_mut() {
                 Some(notebook) => notebook.end_truncated(truncated),
                 None => Vec::new(),
             },
-            _ => return Ok(Some(Vec::new())),
+            None => return Ok(Some(Vec::new())),
         };
         self.log_parts(tree, &tail)?;
         // **The end is logged last.** Trailing prose only becomes a
@@ -4964,27 +5007,52 @@ impl Runner {
             })?;
         let notebook = crate::notebook::Notebook::new(&mut vm)
             .map_err(|e| io::Error::other(format!("could not open the next reply: {e}")))?;
-        if let Phase::Suspended(mut old, resume_with) =
-            std::mem::replace(&mut self.phase, Phase::Idle)
+        // **A running program displaced by a new one.** Reachable from
+        // `SessionCommand::Restart` — the TUI's rewrite gesture
+        // (`debug/attach.rs`) — with a program mid-flight: `cmd_restart`
+        // cancels the generation, not the run, and nothing on the path
+        // to here checks the phase. This used to drop the `Run` on the
+        // floor: no handback, no status, no `last_vm`, so the log went
+        // on saying the program was running and its VM was simply gone.
+        // The same silent loss `4898a80` fixed on the other door, in the
+        // one slot that still holds a `Run`.
+        //
+        // `Superseded` is what happened, and it names the reply whose
+        // program it was, because `reply_id` is still that reply here —
+        // the new one is logged a few lines below.
+        if let Phase::Running(run) = std::mem::replace(&mut self.phase, Phase::Idle) {
+            self.note_status(run.program_id, ProgramStatus::Failed);
+            tree.append(
+                &mut self.spine,
+                EventPayload::Handback {
+                    reply: self.reply_id,
+                    how: Handback::Superseded,
+                    site: 0,
+                    stack: Vec::new(),
+                },
+            )?;
+            self.last_vm = Some(run.vm);
+        }
+        // **A parked run's reply is over — a new one is arriving.** A run
+        // parked by a raise or a trap never saw `notebook_stream_end`:
+        // the host does not deliver a completion into a parked frame, so
+        // this is the only thing that closes that reply out.
+        //
+        // A notebook that has not ended never closes its run. When the
+        // handler decided and the original resumed, its last cell
+        // finished, `advance_notebook` found no more pieces and asked
+        // whether the reply was over — the answer was "no", forever. The
+        // branch sat at `Running` with no terminal, no `Return`, no
+        // `Console`: a raise could be answered and the program it
+        // belonged to could never finish.
+        //
+        // `is_ended` guards the repeat: the frame stays on `parked`
+        // across as many replies as it takes to decide about it, where
+        // it used to be moved off `phase` exactly once.
+        if let Some(notebook) = self.parked.last_mut().and_then(|p| p.run.notebook.as_mut())
+            && !notebook.is_ended()
         {
-            // **Its reply is over — a new one is arriving.** A run parked
-            // by a raise or a trap never saw `notebook_stream_end`: the
-            // host does not deliver a completion to a suspended branch,
-            // so the only thing that closes that reply out is this, and
-            // until now this pushed the run away with its notebook still
-            // open.
-            //
-            // A notebook that has not ended never closes its run. When
-            // the handler decided and the original resumed, its last
-            // cell finished, `advance_notebook` found no more pieces and
-            // asked whether the reply was over — the answer was "no",
-            // forever. The branch sat at `Running` with no terminal, no
-            // `Return`, no `Console`: a raise could be answered and the
-            // program it belonged to could never finish.
-            if let Some(notebook) = old.notebook.as_mut() {
-                notebook.end();
-            }
-            self.beneath.push((old, resume_with, self.generation));
+            notebook.end();
         }
         self.generation += 1;
         // **The reply is logged before a byte of it arrives** (28).
@@ -5068,7 +5136,7 @@ impl Runner {
     fn log_parts(&mut self, tree: &mut Tree, pieces: &[crate::notebook::Piece]) -> io::Result<()> {
         let reply = self.reply_id;
         let outer: Vec<Part> = {
-            let (Phase::Running(run) | Phase::Suspended(run, _)) = &self.phase else {
+            let Some(run) = self.run_ref() else {
                 return Ok(());
             };
             let Some(nb) = run.notebook.as_ref() else {
@@ -5105,9 +5173,7 @@ impl Runner {
         // last of its own reply would wait forever: cancellation is the
         // one ending that does not come through `notebook_stream_end`,
         // which is where every other reply gets its `end()`.
-        if let Phase::Running(run) | Phase::Suspended(run, _) = &mut self.phase
-            && let Some(notebook) = run.notebook.as_mut()
-        {
+        if let Some(notebook) = self.run_mut().and_then(|r| r.notebook.as_mut()) {
             let tail = notebook.end();
             self.log_parts(tree, &tail)?;
         }
@@ -5148,9 +5214,7 @@ impl Runner {
     }
 
     pub fn notebook_cancels_generation(&self) -> bool {
-        self.streaming_epoch.is_some()
-            && matches!(self.phase, Phase::Suspended(..))
-            && self.pause_falsifies_the_rest
+        self.streaming_epoch.is_some() && self.is_suspended() && self.pause_falsifies_the_rest
     }
 }
 
@@ -5176,11 +5240,9 @@ impl Runner {
     /// subtracted here, at log time. Nothing downstream sees an absolute
     /// offset, and no other transport is touched.
     fn rebase_site(&self, raw: u32) -> u32 {
-        match &self.phase {
-            Phase::Running(run) | Phase::Suspended(run, _) => {
-                run.notebook.as_ref().map_or(raw, |nb| nb.rebase_site(raw))
-            }
-            _ => raw,
+        match self.run_ref() {
+            Some(run) => run.notebook.as_ref().map_or(raw, |nb| nb.rebase_site(raw)),
+            None => raw,
         }
     }
 
@@ -6486,6 +6548,43 @@ mod tests {
     /// `open_notebook_reply` needs a text chunk, `needs_prompt` refuses
     /// anything that is not `Idle`. Post #16 — "are you still there?" —
     /// drew no reply at all.
+    /// **A rewrite over a running program leaves a terminal on the
+    /// log.** `SessionCommand::Restart` — the TUI's rewrite gesture —
+    /// reaches `take_turn` with no phase check on the path, and
+    /// `open_notebook_reply` used to `std::mem::replace` the phase and
+    /// handle only the `Suspended` case: a `Running` run was dropped
+    /// with no handback, no status and no `last_vm`, so the log went on
+    /// saying the program was running and its VM was simply gone.
+    ///
+    /// Found by the audit that produced the `Phase` split, in the one
+    /// slot that still holds a `Run`.
+    #[test]
+    fn a_rewrite_over_a_running_program_says_so_on_the_log() {
+        let (mut tree, mut state) = setup_under();
+        user_post(&mut state, &mut tree, "do it");
+        let out = state
+            .notebook_stream(&mut tree, 1, "```js\nawait tools.bash(\"slow\");\n```\n")
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+        assert_eq!(state.status(), "running", "the call is still in flight");
+
+        let out = state
+            .take_turn(&mut tree, "tell(\"instead\");".to_owned())
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+
+        assert!(
+            tree.events.values().any(|e| matches!(
+                &e.payload,
+                EventPayload::Handback {
+                    how: Handback::Superseded,
+                    ..
+                }
+            )),
+            "the displaced program went with no terminal on the log"
+        );
+    }
+
     #[test]
     fn a_branch_parked_mid_stream_survives_a_silent_completion() {
         let (mut tree, mut state) = setup_under();
@@ -8663,10 +8762,7 @@ mod tests {
             &mut tree,
             &["```js\nundefined_thing_here();\n```\n"],
         );
-        assert!(
-            matches!(state.phase, Phase::Suspended(..)),
-            "the trap parked the run"
-        );
+        assert!(!state.parked.is_empty(), "the trap parked the run");
         assert!(
             state.notebook_cancels_generation(),
             "so the harness stops reading the completion"
@@ -8769,10 +8865,7 @@ mod tests {
         let _ = state
             .step(&mut tree, StepInput::Tick { fuel: TICK_FUEL })
             .unwrap();
-        assert!(
-            matches!(state.phase, Phase::Suspended(..)),
-            "the post parked the run"
-        );
+        assert!(!state.parked.is_empty(), "the post parked the run");
         assert!(
             !state.notebook_cancels_generation(),
             "a message arriving falsifies nothing the model wrote"
@@ -9433,7 +9526,7 @@ mod tests {
             1,
             "```js\nconst files = 1;\nundefined_thing_here();\n```\n",
         );
-        assert!(matches!(state.phase, Phase::Suspended(..)), "it trapped");
+        assert!(!state.parked.is_empty(), "it trapped");
 
         // Reply 2 declares the same name. A fresh VM has never heard of it.
         stream_reply(
@@ -9560,7 +9653,7 @@ mod tests {
             1,
             "```js\nconst pick = raise(\"which\");\nconsole.log(`picked ${pick}`);\n```\n",
         );
-        assert!(matches!(state.phase, Phase::Suspended(..)), "it raised");
+        assert!(!state.parked.is_empty(), "it raised");
 
         // The handler's own reply arrives while the branch is still
         // suspended — which is the only time a handler's reply ever
