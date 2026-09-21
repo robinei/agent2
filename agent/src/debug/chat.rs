@@ -33,7 +33,7 @@
 //! obligations* and this pane never reaches past the protocol into the
 //! `Tree` to get it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use unicode_width::UnicodeWidthStr;
 
@@ -124,6 +124,14 @@ pub enum RowDetail {
     Program(EventId),
     /// An invoke row — clicking selects the program + that invoke.
     Invoke(EventId, usize),
+    /// An `history.append` row — the program it belongs to, then the
+    /// note's own event id.
+    ///
+    /// Addressed by id, not by an index: the index in
+    /// [`RowDetail::Invoke`] counts into `ProgramView::invokes`, and an
+    /// append is not one. Numbering them together would shift every
+    /// call after the first append and show the wrong detail on click.
+    Note(EventId, EventId),
 }
 
 /// One transcript entry. A `Header` computes its text live from the
@@ -207,6 +215,12 @@ pub struct ChatState {
     /// `disposition` is `Handover`. Its top is where the branch's next
     /// `Call` attaches, handler nesting included.
     program_stack: HashMap<BranchId, Vec<EventId>>,
+    /// Rows that are an `history.append` rather than a call, so the
+    /// grouped-effect pass can give them their own `RowDetail` without
+    /// consuming an invoke index. A side set for the same reason
+    /// `compacted` is one: it marks a handful of rows without a field
+    /// on every `Entry::Line` in the file.
+    appends: HashSet<EventId>,
     /// Per branch, the handler-nesting depth in effect right now —
     /// `tree::depth_after`'s fold, replayed here from the same
     /// `SessionEvent` stream `tree::programs_for` derives it from over
@@ -571,14 +585,45 @@ impl ChatState {
             // — a marker in its own history, same as `append_history`'s
             // own doc in `types.rs` describes.
             EventPayload::Note { value, .. } => {
-                let text = &crate::machine::note_text(value);
-                self.push_entry(Entry::Line {
-                    branch,
-                    id,
-                    kind: ChatKind::Marker,
-                    text: format!("appended: {text}"),
-                    program: None,
-                });
+                // **An effect of the program that wrote it, one line
+                // long.** `history.append` is how a program carries
+                // something to its next reply, so it belongs under that
+                // program's block beside the `⚙` calls — not loose in
+                // the transcript, and not at its full length. A run
+                // that appended a file for the next turn put the whole
+                // file in the chat: the value is shown whole in the
+                // *document*, which is the model's evidence of what
+                // `history.fetch` will hand back, and that is a
+                // different reader with a different need.
+                let program = self
+                    .program_stack
+                    .get(&branch)
+                    .and_then(|stack| stack.last())
+                    .copied();
+                let preview = appended_line(value);
+                self.appends.insert(id);
+                match program {
+                    Some(program) => {
+                        let depth = self.branch_depth.get(&branch).map_or(0, Frames::depth);
+                        let indent = "  ".repeat(depth);
+                        self.push_entry(Entry::Line {
+                            branch,
+                            id,
+                            kind: ChatKind::Program,
+                            text: format!("{indent}▸ {preview}"),
+                            program: Some(program),
+                        });
+                    }
+                    // Nothing to sit under — kept where it fell rather
+                    // than dropped, the way an ungrouped call would be.
+                    None => self.push_entry(Entry::Line {
+                        branch,
+                        id,
+                        kind: ChatKind::Marker,
+                        text: preview,
+                        program: None,
+                    }),
+                }
             }
             // Never its own row — it replaces its target's rendering in
             // place, per its own doc in `types.rs` ("never removes the
@@ -935,9 +980,14 @@ impl ChatState {
                         let Entry::Line { id, text, .. } = &self.entries[i] else {
                             continue;
                         };
-                        let idx = invoke_index.entry(*program).or_insert(0);
-                        let detail = RowDetail::Invoke(*program, *idx);
-                        *idx += 1;
+                        let detail = if self.appends.contains(id) {
+                            RowDetail::Note(*program, *id)
+                        } else {
+                            let idx = invoke_index.entry(*program).or_insert(0);
+                            let detail = RowDetail::Invoke(*program, *idx);
+                            *idx += 1;
+                            detail
+                        };
                         for (k, line) in
                             self.entry_lines(i, ChatKind::Program, text, render_markdown, width)
                         {
@@ -964,10 +1014,14 @@ impl ChatState {
                     }
                     let detail = if *kind == ChatKind::Program {
                         if let Some(pid) = program {
-                            let idx = invoke_index.entry(*pid).or_insert(0);
-                            let d = RowDetail::Invoke(*pid, *idx);
-                            *idx += 1;
-                            d
+                            if self.appends.contains(id) {
+                                RowDetail::Note(*pid, *id)
+                            } else {
+                                let idx = invoke_index.entry(*pid).or_insert(0);
+                                let d = RowDetail::Invoke(*pid, *idx);
+                                *idx += 1;
+                                d
+                            }
                         } else {
                             RowDetail::None
                         }
@@ -1500,6 +1554,33 @@ fn status_label(status: ProgramStatus) -> &'static str {
     }
 }
 
+/// How much of an appended value the transcript shows before saying
+/// how big it was. Wide enough for a sentence-long conclusion — which
+/// is what the card asks for — and short enough that a file is
+/// obviously a file.
+const NOTE_PREVIEW: usize = 72;
+
+/// **One line, whatever was appended.** Newlines and runs of spaces
+/// collapse, the tail is replaced by its size, and the result is a
+/// single row under the program that wrote it.
+fn appended_line(value: &serde_json::Value) -> String {
+    let full = crate::machine::note_text(value);
+    let flat = full.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= NOTE_PREVIEW {
+        return format!("appended {flat}");
+    }
+    let head: String = flat.chars().take(NOTE_PREVIEW).collect();
+    format!("appended {head}… ({})", size_of(full.len()))
+}
+
+/// Bytes, for a reader rather than for arithmetic.
+fn size_of(bytes: usize) -> String {
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    format!("{:.1} KB", bytes as f64 / 1024.0)
+}
+
 /// A compact one-line preview of an inner call's result.
 fn short(v: &serde_json::Value) -> String {
     let s = v.to_string();
@@ -1600,6 +1681,112 @@ mod tests {
         assert!(
             !rows.iter().any(|(_, t, _, _)| t.contains("failed")),
             "{rows:#?}"
+        );
+    }
+
+    /// **An append is one line, under the program that wrote it.** It
+    /// used to be a loose `Marker` row carrying the whole value, so a
+    /// run that appended a file for its next reply put the file in the
+    /// chat.
+    #[test]
+    fn an_append_is_a_single_effect_line_under_its_program() {
+        let mut chat = ChatState::new();
+        chat.apply(&ev(
+            1,
+            EventPayload::Agent {
+                name: None,
+                charter: "p".into(),
+                tools: None,
+                system: String::new(),
+                exemplars: Vec::new(),
+            },
+        ));
+        for e in run_program(3) {
+            chat.apply(&e);
+        }
+        chat.apply(&ev(
+            9,
+            EventPayload::Note {
+                value: serde_json::json!("x".repeat(4096)),
+                site: 0,
+                site_end: 0,
+            },
+        ));
+        let rows = chat.rows(None, 200, None);
+        let note = rows
+            .iter()
+            .find(|(_, t, _, _)| t.contains("appended"))
+            .expect("the append is on the transcript");
+        assert_eq!(note.0, ChatKind::Program, "it is an effect, not a marker");
+        assert_eq!(
+            note.2,
+            RowDetail::Note(EventId::new(3), EventId::new(9)),
+            "grouped under the program that wrote it, and selectable as itself"
+        );
+        assert!(
+            note.1.chars().count() < 120,
+            "a 4 KB value became a {}-char row: {}",
+            note.1.chars().count(),
+            note.1
+        );
+        assert!(
+            note.1.contains("4.0 KB"),
+            "and it says how big it was: {}",
+            note.1
+        );
+    }
+
+    /// **An append does not renumber the calls around it.** The index
+    /// in `RowDetail::Invoke` counts into `ProgramView::invokes`, so a
+    /// row that is not an invoke must not consume one — otherwise
+    /// clicking the call after an append opens the call before it.
+    #[test]
+    fn an_append_between_two_calls_does_not_shift_their_indices() {
+        let mut chat = ChatState::new();
+        chat.apply(&ev(
+            1,
+            EventPayload::Agent {
+                name: None,
+                charter: "p".into(),
+                tools: None,
+                system: String::new(),
+                exemplars: Vec::new(),
+            },
+        ));
+        for e in run_program(3) {
+            chat.apply(&e);
+        }
+        chat.apply(&invoke(7, "read_file"));
+        chat.apply(&ev(
+            9,
+            EventPayload::Note {
+                value: serde_json::json!("a conclusion"),
+                site: 0,
+                site_end: 0,
+            },
+        ));
+        chat.apply(&invoke(11, "bash"));
+
+        let rows = chat.rows(None, 200, None);
+        let detail_of = |needle: &str| {
+            rows.iter()
+                .find(|(_, t, _, _)| t.contains(needle))
+                .unwrap_or_else(|| panic!("no row for {needle}"))
+                .2
+                .clone()
+        };
+        assert_eq!(
+            detail_of("read_file"),
+            RowDetail::Invoke(EventId::new(3), 0)
+        );
+        assert_eq!(
+            detail_of("bash"),
+            RowDetail::Invoke(EventId::new(3), 1),
+            "the append took an invoke index and shifted the call after it"
+        );
+        assert_eq!(
+            detail_of("appended"),
+            RowDetail::Note(EventId::new(3), EventId::new(9))
         );
     }
 

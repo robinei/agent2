@@ -71,6 +71,17 @@ pub enum Focus {
     Debug,
 }
 
+/// What is selected inside a program block — the thing the detail pane
+/// shows. Two shapes because they are addressed differently: a call by
+/// its position in `ProgramView::invokes`, an append by its own event
+/// id (it is not an invoke, and numbering them together would shift
+/// every call after the first append).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Effect {
+    Invoke(usize),
+    Append(EventId),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Pane {
     Chat,
@@ -164,10 +175,11 @@ pub struct AttachedApp {
     /// selected branch's most-recent program (the default); a click on an
     /// older chat block pins a specific one by its own `Turn` event id.
     pub selected_program: Option<EventId>,
-    /// An invoke selected within the selected program (its index into
+    /// The effect selected within the selected program — what the
+    /// detail pane shows. An invoke is addressed by its index into
     /// `ProgramView.invokes`), shown in the right panel instead of the
     /// program console.
-    pub selected_subitem: Option<usize>,
+    pub selected_effect: Option<Effect>,
     /// Branches whose `System` block is folded to its header (decision 7).
     collapsed: HashSet<BranchId>,
     pub input: InputBuffer,
@@ -262,7 +274,7 @@ impl AttachedApp {
             focus: Focus::Input,
             selected: Some(root),
             selected_program: None,
-            selected_subitem: None,
+            selected_effect: None,
             collapsed: HashSet::new(),
             input: InputBuffer::new(),
             quit: false,
@@ -494,14 +506,23 @@ impl AttachedApp {
                         }
                         RowDetail::Program(pid) => {
                             self.selected_program = Some(*pid);
-                            self.selected_subitem = None;
+                            self.selected_effect = None;
                             self.reset_program_scrolls();
                         }
                         RowDetail::Invoke(pid, idx) => {
+                            let want = Effect::Invoke(*idx);
                             let toggle_off = self.selected_program == Some(*pid)
-                                && self.selected_subitem == Some(*idx);
+                                && self.selected_effect == Some(want);
                             self.selected_program = Some(*pid);
-                            self.selected_subitem = if toggle_off { None } else { Some(*idx) };
+                            self.selected_effect = if toggle_off { None } else { Some(want) };
+                            self.reset_program_scrolls();
+                        }
+                        RowDetail::Note(pid, note) => {
+                            let want = Effect::Append(*note);
+                            let toggle_off = self.selected_program == Some(*pid)
+                                && self.selected_effect == Some(want);
+                            self.selected_program = Some(*pid);
+                            self.selected_effect = if toggle_off { None } else { Some(want) };
                             self.reset_program_scrolls();
                         }
                     }
@@ -1510,9 +1531,9 @@ fn render(frame: &mut Frame, app: &mut AttachedApp, session: &Session) {
                     ));
                 }
                 Pane::Console => {
-                    let (top, area) = if app.selected_subitem.is_some() {
+                    let (top, area) = if app.selected_effect.is_some() {
                         if let Some(ref pv) = pv {
-                            render_subitem(frame, app, pv, *slot, app.console_scroll)
+                            render_subitem(frame, app, session, pv, *slot, app.console_scroll)
                         } else {
                             render_placeholder(frame, Pane::Console, *slot);
                             (0, *slot)
@@ -2050,7 +2071,9 @@ fn render_chat(
         // the background, because a block's lid and its source are
         // different backgrounds and the same panel.
         let block = match detail {
-            RowDetail::Program(pid) | RowDetail::Invoke(pid, _) => Some(*pid),
+            RowDetail::Program(pid) | RowDetail::Invoke(pid, _) | RowDetail::Note(pid, _) => {
+                Some(*pid)
+            }
             RowDetail::None => None,
         };
         if prev_speaker.is_some_and(|p| p != speaker)
@@ -2091,9 +2114,11 @@ fn render_chat(
         // row once a sub-item is picked out, which is then the finer
         // thing being pointed at.
         let in_block = block.is_some() && block == app.selected_program;
-        let selected = match app.selected_subitem {
-            Some(sel) => matches!(detail, RowDetail::Invoke(pid, idx)
+        let selected = match app.selected_effect {
+            Some(Effect::Invoke(sel)) => matches!(detail, RowDetail::Invoke(pid, idx)
                 if app.selected_program == Some(*pid) && *idx == sel),
+            Some(Effect::Append(note)) => matches!(detail, RowDetail::Note(pid, nid)
+                if app.selected_program == Some(*pid) && *nid == note),
             None => in_block,
         } || app.last_clicked_event == Some(*id);
         let before = lines.len();
@@ -2527,13 +2552,38 @@ fn render_console_from_pv(
 fn render_subitem(
     frame: &mut Frame,
     app: &AttachedApp,
+    session: &Session,
     pv: &ProgramView,
     area: Rect,
     scroll: Option<usize>,
 ) -> (usize, Rect) {
     let mut lines: Vec<Line> = Vec::new();
-    let title = match app.selected_subitem {
-        Some(idx) => {
+    let title = match app.selected_effect {
+        // **What `history.fetch` would hand back.** The transcript row
+        // is one line and says how big the value was; this is where the
+        // value itself is, whole, for the person who asked to see it.
+        Some(Effect::Append(note)) => {
+            match session.tree().events.get(&note).map(|e| &e.payload) {
+                Some(EventPayload::Note { value, .. }) => {
+                    lines.push(
+                        Line::from(format!("▸ appended  #{}", note.as_u64()))
+                            .style(Style::default().fg(Color::Yellow)),
+                    );
+                    lines.push(Line::from(""));
+                    let body = match value {
+                        serde_json::Value::String(t) => t.clone(),
+                        other => serde_json::to_string_pretty(other)
+                            .unwrap_or_else(|_| other.to_string()),
+                    };
+                    for l in body.lines() {
+                        lines.push(Line::from(l.to_owned()));
+                    }
+                }
+                _ => lines.push(Line::from("(append not found)")),
+            }
+            " ▸ appended ".to_string()
+        }
+        Some(Effect::Invoke(idx)) => {
             if let Some(invoke) = pv.invokes.get(idx) {
                 lines.push(
                     Line::from(format!("⚙ {}", invoke.name))
@@ -2899,7 +2949,7 @@ mod tests {
         let before = plain.backgrounds(call_row)[1].0;
 
         app.selected_program = Some(EventId::new(3));
-        app.selected_subitem = Some(0);
+        app.selected_effect = Some(Effect::Invoke(0));
         let screen = Screen::chat(&app, 64, 26);
         let y = screen.find("⚙ read_file").expect("still there");
         assert!(
@@ -2928,7 +2978,7 @@ mod tests {
         let before = column_of(&Screen::chat(&app, 64, 26), '⚙');
 
         app.selected_program = Some(EventId::new(3));
-        app.selected_subitem = Some(0);
+        app.selected_effect = Some(Effect::Invoke(0));
         let screen = Screen::chat(&app, 64, 26);
         assert!(
             column_of(&screen, '▌').is_some(),
