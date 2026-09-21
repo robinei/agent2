@@ -163,28 +163,46 @@ Same shape as live2, new binary:
 No orphan notice. The result is delivered into the parked program,
 which is still there.
 
-## A generation that never gets a first byte hangs for an hour
+## Correction: what I called a first-byte hang was not one
 
-`lab/live4`, 2026-09-21 12:35. The branch was parked, a second post drew
-a request, and the process then sat for 27 minutes: `rchar` in
-`/proc/<pid>/io` unchanged over 25s, 1 second of CPU in 30 minutes, one
-thread in `wait_woken` on the socket, no `SessionEvent::Error`. The box
-was healthy throughout (`/models` reported `Qwen3.8-27B -> loaded`), so
-the request was sent and no response header ever came back.
+I recorded, in this file and in `63b184b`, that a generation could be
+sent and never get a response header — "three sessions out of five hung
+this way" — and inferred it from `rchar` in `/proc/<pid>/io` staying
+flat, near-zero CPU, a thread in `wait_woken`, and no new log rows over
+many minutes, while a concurrent `curl` to the box answered in 2-3s.
 
-`deepseek.rs` pins both bounds with tests, and they are right about
-themselves: `timeout_recv_body` (`SOCKET_IDLE`, 10 min) is an idle
-bound that restarts on every byte, and `timeout_recv_response`
-(`COMPLETION_CEILING`, 1 hour) caps the whole response, body included.
+**That inference was wrong.** Putting a logging TCP relay between the
+harness and the box (`lab/live9`, same scenario that "hung" three
+times) shows the second request going out at 13:49:40 and the response
+headers coming back at **13:49:44** — four seconds. The connection then
+streamed **386,713 bytes over 4m06s** and the task completed normally.
+Nothing hung; I was watching a long generation with instruments that
+cannot see one.
 
-**Neither bounds time-to-first-byte.** The idle bound only applies once
-the body is being read, so a peer that accepts the connection and sends
-nothing is unguarded until the hour is up — and the branch looks parked
-and silent the whole time, with nothing on the log to say a request is
-out. Lowering `COMPLETION_CEILING` is the wrong fix: the comment above
-it records two real runs killed mid-task by a 10-minute cap. The shape
-that fits is a bound on the first byte specifically, or a host-side
-watchdog over "generation out, zero chunks".
+Why the instruments lied:
+
+- **A reply logs nothing until a part completes.** A multi-minute
+  thinking block produces no row, so `wc -l` on the log is flat for the
+  whole generation.
+- `ps -o time=` has one-second granularity, and parsing a few hundred KB
+  of SSE costs less than that. "Zero CPU" meant nothing.
+- Sampling `rchar` over a 15-25s window can straddle gaps in a slow
+  stream.
+- The `curl` comparison proved only that the box had a free slot at
+  that instant, not that our request was absent from it.
+
+I also disabled ureq's connection pooling on the strength of the wrong
+theory. It fixed nothing (`lab/live8` stalled identically) and has been
+reverted.
+
+**What is actually true, and was the whole reason I went wrong:**
+during a generation the harness emits no signal at all — not a row, not
+a timestamp, nothing on `agent transcript` — so *slow* and *stalled*
+are indistinguishable to the person watching, and were indistinguishable
+to me with the log in front of me. `COMPLETION_CEILING` is an hour and
+`SOCKET_IDLE`'s tight 10-minute bound only applies once the body is
+being read, so a genuine stall would indeed be invisible for an hour;
+I have no evidence that one ever happened.
 
 ## What the design pass settled
 
