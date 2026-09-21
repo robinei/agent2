@@ -90,7 +90,7 @@ impl ProgramView {
 /// The log's format version. Bump it when the event vocabulary changes
 /// in a way an older build would misread; nothing migrates, because a
 /// misread log is worse than a refused one.
-pub const LOG_VERSION: u64 = 2;
+pub const LOG_VERSION: u64 = 3;
 
 /// The log's first line: a version header, never an event.
 #[derive(Serialize, Deserialize)]
@@ -98,59 +98,49 @@ struct LogHeader {
     version: u64,
 }
 
-/// Update the derived handler-nesting counter for one path event — the
-/// single fold both `programs_for`'s attach-target stack and
-/// `document::render`'s depth-0 filter apply, so the two consumers can
-/// never silently disagree about what depth an event ran at. Doc 22 is
-/// explicit about the stakes: "if the log doesn't say [which raise
-/// pushed a handler and which handed over], every subsequent depth is
-/// wrong — and with it the document's `depth > 0` filter and the
-/// decision/completion reading of `Return`."
+/// **The programs open at a point on the spine**, innermost last — the
+/// single fold `programs_for`'s attach target and `document::render`'s
+/// depth-0 filter both apply, so the two consumers can never silently
+/// disagree about what depth an event ran at. Doc 22 is explicit about
+/// the stakes: "if the log doesn't say [which raise pushed a handler
+/// and which handed over], every subsequent depth is wrong — and with
+/// it the document's `depth > 0` filter and the decision/completion
+/// reading of `Return`."
 ///
-/// - `Condition{disposition: Pushed}`: the raising frame is still on
-///   the stack, suspended, waiting on the handler that runs next —
-///   depth increases by one for whatever follows.
-/// - `Condition{disposition: Handover}`: the raising frame was popped
-///   *before* the handler was built (a real tail call — `stack.rs`'s
-///   old `ProgramStack::push`/`apply_decision` semantics, now derived
-///   instead of stored), so depth is unchanged: the handler that
-///   follows opens at exactly the depth the raise happened at, not one
-///   deeper.
-/// - `Return`: settles exactly one frame — the frame that just decided,
-///   however many chained handovers it took to get there (`stack.rs`'s
-///   `apply_decision` does exactly one `frames.pop()` per decision) —
-///   so depth decreases by one. Saturating: a depth-0 program's own
-///   ordinary `return`, with no raise anywhere in its history, is the
-///   common case and must not underflow.
-/// - `Condition{cause: Abandoned}`: `return abandon()` discarded the
-///   suspended run, which settles exactly one frame the same way a
-///   `Return` does — so depth decreases by one, **whatever the
-///   condition's own disposition says.** The disposition describes the
-///   raise that opened a scope; this cause describes a decision that
-///   closes one, so it is matched first. Without this arm an abandoned
-///   run never decrements and every later event on the branch renders
-///   as though still inside a scope nothing will ever close.
-/// - `Condition{cause: Interrupted}`: the process died and the VM went
-///   with it — reconciliation's repair (`host/mod.rs`'s `reconcile`)
-///   gives the run an outcome "like any other" precisely so it settles
-///   the same way a `Return` or an `Abandoned` does, **whatever
-///   disposition the repair stamped on it** (`Disposition::Pushed`,
-///   the type's own safe default — nothing is actually about to run at
-///   a deeper level, there is no handler "that runs next" for a crash).
-///   Matched before the disposition arms for the identical reason
-///   `Abandoned` is: without this, a crash below depth 0 would leave
-///   every later event on the branch permanently misrendered as still
-///   inside a scope nothing will ever close.
-/// - anything else leaves depth unaffected.
-pub fn depth_after(depth: usize, payload: &EventPayload) -> usize {
-    // **Derived, where `Disposition` used to be stored.** A handback
-    // that pauses opens a scope, because a reply is about to run inside
-    // it; a handback that ends closes one. The two were encoded in two
-    // places and could disagree — 28 keeps one.
-    match payload {
-        EventPayload::Handback { how, .. } if how.is_terminal() => depth.saturating_sub(1),
-        EventPayload::Handback { .. } => depth + 1,
-        _ => depth,
+/// This was a bare counter (`depth_after`), which is exact only while
+/// every open scope is closed in order and exactly once. Neither holds.
+/// A discard closes a frame that need not be the innermost — A raises,
+/// B raises, C abandons B, and the counter reads 0 with A still parked
+/// — and a decision logs both the discard and the decider's own ending,
+/// two decrements for one increment. Naming the frame is what turns the
+/// fold from arithmetic into a set operation, and it is only possible
+/// because a `Handback` names the program it is about.
+///
+/// A pause opens a scope, because a reply is about to run inside it; a
+/// terminal closes the one it names. Nothing else moves it — in
+/// particular a `Reply` does not, so a program that never pauses is
+/// never in the set and its own ending removes nothing.
+#[derive(Default, Clone, Debug, PartialEq, Eq)]
+pub struct Frames(Vec<EventId>);
+
+impl Frames {
+    /// How deep the *next* event runs.
+    pub fn depth(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Fold one path event in. Path order, oldest first.
+    pub fn after(&mut self, payload: &EventPayload) {
+        let EventPayload::Handback { how, program, .. } = payload else {
+            return;
+        };
+        if how.is_terminal() {
+            self.0.retain(|open| open != program);
+        } else if !self.0.contains(program) {
+            // A program can pause more than once — trap, resume, trap
+            // again — and it is one open frame however often it does.
+            self.0.push(*program);
+        }
     }
 }
 
@@ -720,7 +710,7 @@ impl Tree {
         // pushed on every `Turn`, popped on every `Return` and every
         // `Handover` `Condition`, left alone on a `Pushed` one.
         let mut stack: Vec<usize> = Vec::new();
-        let mut depth: usize = 0;
+        let mut frames = Frames::default();
         // The program a `Console` event should attach to. `machine.rs`
         // logs `Console` immediately *after* the `Return`/`Condition`
         // that ends a run (`suspend`'s own doc: "the console is a
@@ -757,7 +747,7 @@ impl Tree {
                         outcome: None,
                         condition: None,
                         console: Vec::new(),
-                        depth,
+                        depth: frames.depth(),
                     });
                     stack.push(programs.len() - 1);
                 }
@@ -804,8 +794,15 @@ impl Tree {
                         iv.outcome = Some(outcome.clone());
                     }
                 }
-                EventPayload::Handback { how, .. } => {
-                    if let Some(&idx) = stack.last() {
+                EventPayload::Handback { how, program, .. } => {
+                    // **The program it names, not the innermost open
+                    // one.** These agreed for every handback except the
+                    // two that matter: a discard names the frame it
+                    // discarded, and attaching it by position put a
+                    // `Superseded` on the superseding program and the
+                    // `Completed` after it on the superseded one —
+                    // exactly inverted.
+                    if let Some(idx) = programs.iter().position(|p| p.id == *program) {
                         let p = &mut programs[idx];
                         p.outcome = Some(ev.id);
                         p.condition = Some(how.clone());
@@ -814,10 +811,10 @@ impl Tree {
                         }
                         last_outcome_idx = Some(idx);
                     }
-                    // A terminal handback closes the reply's scope; a
+                    // A terminal handback closes that program's scope; a
                     // pause leaves it open for whatever decides it.
                     if how.is_terminal() {
-                        stack.pop();
+                        stack.retain(|&i| programs[i].id != *program);
                     }
                 }
                 EventPayload::Console { lines } => {
@@ -827,7 +824,7 @@ impl Tree {
                 }
                 _ => {}
             }
-            depth = depth_after(depth, &ev.payload);
+            frames.after(&ev.payload);
         }
         programs
     }
@@ -1193,9 +1190,9 @@ mod tests {
         ]
     }
 
-    fn returned(_value: serde_json::Value) -> EventPayload {
+    fn returned(program: EventId) -> EventPayload {
         EventPayload::Handback {
-            reply: EventId::new(1),
+            program,
             how: crate::types::Handback::Completed {
                 value: None,
                 rested: false,
@@ -1205,9 +1202,9 @@ mod tests {
         }
     }
 
-    fn raised(name: &str) -> EventPayload {
+    fn raised(program: EventId, name: &str) -> EventPayload {
         EventPayload::Handback {
-            reply: EventId::new(1),
+            program,
             how: crate::types::Handback::Raised {
                 name: name.into(),
                 payload: None,
@@ -1238,7 +1235,7 @@ mod tests {
             let mut spine = tree.start_agent(None, None, "root", None, "", Vec::new())?;
             agent = spine.leaf_id; // the Agent id is the agent id
             let [reply, cell] = assistant_msg("console.log('hi'); history.append(42);");
-            tree.append(&mut spine, reply)?;
+            let rid = tree.append(&mut spine, reply)?;
             tree.append(&mut spine, cell)?;
             let bash = tree.append(
                 &mut spine,
@@ -1255,7 +1252,7 @@ mod tests {
                     outcome: Outcome::Delivered(json!("file.txt")),
                 },
             )?;
-            tree.append(&mut spine, returned(json!(42)))?;
+            tree.append(&mut spine, returned(rid))?;
             tree.append(
                 &mut spine,
                 EventPayload::Console {
@@ -1296,9 +1293,17 @@ mod tests {
 
     /// A raise that is later resumed to completion is one program, but
     /// **two handbacks**: each logs its own outcome, and the program's
-    /// status walks Suspended → Completed as they land. That the split is
-    /// readable from a reopened log at all is what one-outcome-per-handback
-    /// buys (`protocol.rs` used to say it was not inferable).
+    /// status walks Suspended → Completed as they land.
+    ///
+    /// **This test used to pin the inversion.** It asserted that the
+    /// raiser "stays `Suspended` — the log never says anything more
+    /// about it once the handler's `resume(...)` takes over" and that
+    /// the *handler* carried the eventual completion. That was a
+    /// description of the bug, not of the design: the completion being
+    /// attributed was the raiser's own, and `programs_for` put it on
+    /// the handler because it attached by stack position rather than by
+    /// the program the handback names. Now the handback says which, and
+    /// each program ends as itself.
     #[test]
     fn program_status_survives_reopen() -> io::Result<()> {
         use crate::host::ProgramStatus;
@@ -1306,9 +1311,9 @@ mod tests {
         let mut spine = tree.start_agent(None, None, "root", None, "", Vec::new())?;
         let agent = spine.leaf_id;
         let [reply, cell] = assistant_msg("raise('x');");
-        tree.append(&mut spine, reply)?;
+        let raiser = tree.append(&mut spine, reply)?;
         tree.append(&mut spine, cell)?;
-        tree.append(&mut spine, raised("x"))?; // first handback: suspended
+        tree.append(&mut spine, raised(raiser, "x"))?; // first handback: suspended
         let suspended_leaf = spine.leaf_id;
         assert_eq!(
             tree.programs_for(agent, suspended_leaf)[0].status(),
@@ -1317,11 +1322,18 @@ mod tests {
         );
 
         let [reply, cell] = assistant_msg("history.append(resume(null));");
-
-        tree.append(&mut spine, reply)?;
-
-        tree.append(&mut spine, cell)?; // continues the same program
-        tree.append(&mut spine, returned(json!("done")))?; // second handback
+        let handler = tree.append(&mut spine, reply)?;
+        tree.append(&mut spine, cell)?;
+        // The handler's own ending, then the raiser's once it has been
+        // resumed and run on — the shape `finish_program` logs.
+        tree.append(&mut spine, returned(handler))?;
+        tree.append(
+            &mut spine,
+            EventPayload::Console {
+                lines: vec!["decided".into()],
+            },
+        )?;
+        tree.append(&mut spine, returned(raiser))?;
         tree.append(
             &mut spine,
             EventPayload::Console {
@@ -1331,32 +1343,30 @@ mod tests {
         let leaf = spine.leaf_id;
 
         // Handler programs get their own entry, not folded into the
-        // raiser's (`programs_for`'s own doc: "every one is independently
-        // addressable by its own id"). The raiser (`progs[0]`) stays
-        // `Suspended` — the log never says anything more about it once
-        // the handler's `resume(...)` takes over — and the handler
-        // (`progs[1]`, "history.append(resume(null));") is the one that carries
-        // the eventual completion: its `Return`/`Console` are the next
-        // events on the spine, with no further `Turn` in between.
+        // raiser's (`programs_for`'s own doc: "every one is
+        // independently addressable by its own id"). Both ended, and
+        // each carries its own console.
         let progs = tree.programs_for(agent, leaf);
         assert_eq!(progs.len(), 2, "the handler is its own program entry");
-        assert_eq!(progs[0].status(), ProgramStatus::Suspended);
-        assert_eq!(progs[1].result, Some(serde_json::Value::Null));
+        assert_eq!(progs[0].status(), ProgramStatus::Completed);
         assert_eq!(
-            progs[1].console,
-            vec!["before".to_string(), "after".to_string()]
+            progs[0].console,
+            vec!["before".to_string(), "after".to_string()],
+            "the raiser's own console, not the handler's"
         );
+        assert_eq!(progs[1].result, Some(serde_json::Value::Null));
+        assert_eq!(progs[1].console, vec!["decided".to_string()]);
         assert_eq!(progs[1].status(), ProgramStatus::Completed);
 
         // A compile failure never ran, so it is Failed, not Suspended.
         let mut other = tree.start_agent(Some(agent), None, "child", None, "", Vec::new())?;
         let [reply, cell] = assistant_msg("let = ;");
-        tree.append(&mut other, reply)?;
+        let broken = tree.append(&mut other, reply)?;
         tree.append(&mut other, cell)?;
         tree.append(
             &mut other,
             EventPayload::Handback {
-                reply: EventId::new(1),
+                program: broken,
                 how: crate::types::Handback::CellFailed {
                     message: "compile error".into(),
                 },
@@ -1548,7 +1558,7 @@ mod tests {
         let result_id = tree.append(
             &mut spine,
             EventPayload::Handback {
-                reply: EventId::new(1),
+                program: EventId::new(1),
                 how: crate::types::Handback::Completed {
                     value: None,
                     rested: false,
@@ -1763,11 +1773,11 @@ mod tests {
             let mut spine = tree.start_agent(None, None, "root", None, "", Vec::new())?;
             tree.append(&mut spine, user_msg("go"))?;
             let [reply, cell] = assistant_msg("history.append(1);");
-            tree.append(&mut spine, reply)?;
+            let rid = tree.append(&mut spine, reply)?;
             tree.append(&mut spine, cell)?;
             tree.sync()?;
             // A step in progress: these are written but not yet synced.
-            tree.append(&mut spine, returned(json!(1)))?;
+            tree.append(&mut spine, returned(rid))?;
         }
 
         // Cut mid-record, the way a crash inside a step would.
@@ -1790,7 +1800,7 @@ mod tests {
         tree.append(
             &mut spine,
             EventPayload::Handback {
-                reply: EventId::new(1),
+                program: EventId::new(1),
                 how: crate::types::Handback::Interrupted,
                 site: 0,
                 stack: Vec::new(),

@@ -136,7 +136,22 @@ pub enum EventPayload {
     /// `Cause`'s own doc said and the type contradicted by calling them
     /// all outcomes. `how` says which this is.
     Handback {
-        reply: EventId,
+        /// **The program this is about** — `Run::program_id`, which for
+        /// a fresh program is its own `Reply` and for a resumed one
+        /// stays the reply that first ran it.
+        ///
+        /// It used to be `reply: EventId`, stamped from whichever reply
+        /// was newest, and for `Abandoned`/`Superseded` that is the
+        /// reply that *decided* rather than the program being
+        /// discarded — so nothing on the log named the frame that went.
+        /// Three readers disagreed about it: `programs_for` ignored the
+        /// field and attached to the innermost open program,
+        /// `debug/chat.rs` keyed on it and had to refuse the two
+        /// discard variants outright, and `testkit`'s invariant
+        /// enforced the reply reading. The reply is recoverable by
+        /// position (the nearest `Reply` above, which `report.rs` and
+        /// `Tree::unmatched` already do); the program is not.
+        program: EventId,
         how: Handback,
         /// Byte offset into the reply where it happened (28.A: sites are
         /// reply-absolute).

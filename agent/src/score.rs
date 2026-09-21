@@ -455,7 +455,7 @@ mod tests {
             ),
             (
                 5_050,
-                r#"{"Handback":{"reply":3,"how":{"Completed":{}},"site":0,"stack":[]}}"#,
+                r#"{"Handback":{"program":3,"how":{"Completed":{}},"site":0,"stack":[]}}"#,
             ),
         ]);
         let tree = crate::open_tree_read_only(log.path().to_str().unwrap()).unwrap();
@@ -494,7 +494,7 @@ mod tests {
             (20, r#""Reply""#),
             (
                 30,
-                r#"{"Handback":{"reply":3,"how":{"Completed":{"value":"CHECK still fails"}},"site":0,"stack":[]}}"#,
+                r#"{"Handback":{"program":3,"how":{"Completed":{"value":"CHECK still fails"}},"site":0,"stack":[]}}"#,
             ),
         ]);
         let tree = crate::open_tree_read_only(log.path().to_str().unwrap()).unwrap();

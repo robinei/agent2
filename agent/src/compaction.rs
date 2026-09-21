@@ -363,7 +363,7 @@ mod tests {
         tree.append(
             &mut spine,
             EventPayload::Handback {
-                reply: EventId::new(1),
+                program: EventId::new(1),
                 how: crate::types::Handback::Completed {
                     value: None,
                     rested: false,
@@ -443,7 +443,7 @@ mod tests {
             .append(
                 &mut spine,
                 EventPayload::Handback {
-                    reply,
+                    program: reply,
                     how: crate::types::Handback::Completed {
                         value: None,
                         rested: false,

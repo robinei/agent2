@@ -125,11 +125,21 @@ pub enum Invariant {
     /// text the model actually wrote. This is what makes the log a
     /// record of the reply rather than a summary of it.
     PartsConcatenate,
-    /// **Every `Handback` names a reply on this branch.** An outcome
+    /// **Every `Handback` names the program it is about.** An outcome
     /// that names something else, or nothing, cannot be attributed —
     /// and "completed ⇒ a terminal `Handback`" is what makes recovery
     /// decidable from the log alone.
-    HandbackNamesTheReply,
+    ///
+    /// **Not necessarily this reply's own program**, which is what the
+    /// rule used to say. Three handbacks can land inside one reply's
+    /// scope and name three different programs: its own ending, the
+    /// discard of a frame it displaced (`Abandoned`/`Superseded` are
+    /// *about* that frame, and naming it is the whole point of the
+    /// field), and the eventual ending of a frame it resumed. What has
+    /// to hold is that the name resolves — an outcome naming nothing
+    /// cannot be attributed, and "completed ⇒ a terminal `Handback`"
+    /// is what makes recovery decidable from the log alone.
+    HandbackNamesItsProgram,
     /// **A prose send is synthetic.** No instruction issued it — the
     /// model wrote a paragraph, not a call — so there is no source
     /// expression to point a cursor at, and zero width is the
@@ -1158,19 +1168,18 @@ impl Conversation {
                 "the parts must put the reply back together (docs/28)"
             );
         }
-        if self.enforced(Invariant::HandbackNamesTheReply) {
-            let reply = events
-                .iter()
-                .find(|e| matches!(e.payload, EventPayload::Reply | EventPayload::Restart))
-                .map(|e| e.id);
+        if self.enforced(Invariant::HandbackNamesItsProgram) {
             for e in &events {
-                if let EventPayload::Handback { reply: named, .. } = &e.payload {
-                    assert_eq!(
-                        Some(*named),
-                        reply,
-                        "a Handback names a reply that is not this one: {named:?}"
-                    );
-                }
+                let EventPayload::Handback { program: named, .. } = &e.payload else {
+                    continue;
+                };
+                let names_a_program = self.tree().events.get(named).is_some_and(|e| {
+                    matches!(e.payload, EventPayload::Reply | EventPayload::Restart)
+                });
+                assert!(
+                    names_a_program,
+                    "a Handback names {named:?}, which is not a program on this branch"
+                );
             }
         }
         if self.enforced(Invariant::ProseIsSynthetic) {

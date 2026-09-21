@@ -1788,7 +1788,8 @@ impl Runner {
         let Some(Parked { run, .. }) = self.parked.pop() else {
             panic!("Runner::abandon called with nothing parked — a host bookkeeping bug");
         };
-        self.note_status(run.program_id, ProgramStatus::Failed);
+        let discarded = run.program_id;
+        self.note_status(discarded, ProgramStatus::Failed);
         // `Handover`: this condition closes the frame that decided, it
         // does not open one. `depth_after` matches the cause ahead of the
         // disposition for exactly this reason, so the value here is
@@ -1796,7 +1797,7 @@ impl Runner {
         tree.append(
             &mut self.spine,
             EventPayload::Handback {
-                reply: self.reply_id,
+                program: discarded,
                 how: Handback::Abandoned,
                 site: 0,
                 stack: Vec::new(),
@@ -3132,6 +3133,10 @@ impl Runner {
         // rather than arriving as a `StepResult`. That is what lets a
         // `finish()` written before the last `tell` rest the branch and
         // still let the `tell` go out.
+        // **Whose program this is**, kept before `run` is consumed: it
+        // is what every handback below names, and after a resume it is
+        // the reply that first ran the frame rather than the newest one.
+        let finishing = run.program_id;
         self.finished = run.vm.finished;
         let value_json = if matches!(value, interp::Value::Undefined) {
             serde_json::Value::Null
@@ -3184,8 +3189,39 @@ impl Runner {
             // fixes this exact shape — the resumed run's *own* eventual
             // `Return`/`Console` are what a report is derived from, not
             // this one's.
-            self.note_status(run.program_id, ProgramStatus::Completed);
+            self.note_status(finishing, ProgramStatus::Completed);
+            // **A decision is still an ending.** Until now this program
+            // logged no terminal of its own — the only handback under
+            // it was the discard, which names the frame it discarded —
+            // so nothing on the log said how *it* ended and a reopened
+            // session read it as running for good. Its console went the
+            // same way.
+            //
+            // The implicit-supersede path below has always logged both
+            // (a `Superseded`, then its own `Completed`), and that is
+            // the common case: 93 of 95 traps in the kept corpus were
+            // answered by rewriting rather than by deciding. This is
+            // the rare path catching up with the ordinary one, so what
+            // the model reads gets *less* varied, not more.
+            let console =
+                run.vm.console_lines[run.console_logged.min(run.vm.console_lines.len())..].to_vec();
             self.last_vm = Some(run.vm);
+            tree.append(
+                &mut self.spine,
+                EventPayload::Handback {
+                    program: finishing,
+                    how: Handback::Completed {
+                        // The decision is not a result for anybody: it
+                        // is an instruction to the harness, and the
+                        // frame it names says what it did.
+                        value: None,
+                        rested: false,
+                    },
+                    site: 0,
+                    stack: Vec::new(),
+                },
+            )?;
+            tree.append(&mut self.spine, EventPayload::Console { lines: console })?;
             if decision == "resume" {
                 // Revive the old run's own in-flight calls. They were
                 // dispatched under `home_generation`, which this
@@ -3245,12 +3281,13 @@ impl Runner {
         // close eagerly, moved here because the deciding fact (did this
         // program decide, or not) isn't known until this point.
         if let Some(Parked { run: old_run, .. }) = self.parked.pop() {
-            self.note_status(old_run.program_id, ProgramStatus::Failed);
+            let discarded = old_run.program_id;
+            self.note_status(discarded, ProgramStatus::Failed);
             self.last_vm = Some(old_run.vm);
             tree.append(
                 &mut self.spine,
                 EventPayload::Handback {
-                    reply: self.reply_id,
+                    program: discarded,
                     // **Superseded, not abandoned.** Nothing decided
                     // this: the reply simply wrote a new program over a
                     // suspended one. Saying a handler abandoned it
@@ -3287,7 +3324,7 @@ impl Runner {
         let outcome = tree.append(
             &mut self.spine,
             EventPayload::Handback {
-                reply: self.reply_id,
+                program: finishing,
                 how: Handback::Completed {
                     value: returned,
                     rested,
@@ -3499,7 +3536,7 @@ impl Runner {
         let outcome = tree.append(
             &mut self.spine,
             EventPayload::Handback {
-                reply: self.reply_id,
+                program: program_id,
                 how: cause,
                 site,
                 stack,
@@ -5021,11 +5058,12 @@ impl Runner {
         // program it was, because `reply_id` is still that reply here —
         // the new one is logged a few lines below.
         if let Phase::Running(run) = std::mem::replace(&mut self.phase, Phase::Idle) {
-            self.note_status(run.program_id, ProgramStatus::Failed);
+            let discarded = run.program_id;
+            self.note_status(discarded, ProgramStatus::Failed);
             tree.append(
                 &mut self.spine,
                 EventPayload::Handback {
-                    reply: self.reply_id,
+                    program: discarded,
                     how: Handback::Superseded,
                     site: 0,
                     stack: Vec::new(),
@@ -6558,6 +6596,51 @@ mod tests {
     ///
     /// Found by the audit that produced the `Phase` split, in the one
     /// slot that still holds a `Run`.
+    /// **The log and the live run agree about which program ended
+    /// how.** They did not: `programs_for` attached a handback to the
+    /// innermost open program while the event named the reply that was
+    /// newest, and for a supersede those are different frames — so a
+    /// reopened log put the `Superseded` on the superseding program and
+    /// the `Completed` after it on the superseded one, exactly
+    /// inverted.
+    ///
+    /// No fold could have been written to pass this on the old log: the
+    /// event said nothing about which frame it was about.
+    #[test]
+    fn a_reopened_log_agrees_with_the_run_about_who_ended_how() {
+        use crate::host::ProgramStatus;
+        let mut c = Conversation::new();
+        c.allow(Invariant::HandbackNamesItsProgram);
+        c.user("go");
+        // Parks on a raise.
+        let raiser = c.reply("```js\nraise(\"x\");\n```\n").reply;
+        assert_eq!(c.status(), "suspended");
+        // A rewrite: it neither resumes nor abandons, so the parked
+        // frame is superseded and this program completes.
+        let rewrite = c.reply("```js\ntell(\"instead\"); finish();\n```\n").reply;
+
+        let agent = c.runner().agent_id();
+        let leaf = c.runner().spine.leaf_id;
+        let progs = c.tree().programs_for(agent, leaf);
+        let status = |id| {
+            progs
+                .iter()
+                .find(|p| p.id == id)
+                .unwrap_or_else(|| panic!("no program view for {id:?}"))
+                .status()
+        };
+        assert_eq!(
+            status(raiser),
+            ProgramStatus::Failed,
+            "the superseded frame is the one that was discarded"
+        );
+        assert_eq!(
+            status(rewrite),
+            ProgramStatus::Completed,
+            "the program that wrote over it completed"
+        );
+    }
+
     #[test]
     fn a_rewrite_over_a_running_program_says_so_on_the_log() {
         let (mut tree, mut state) = setup_under();

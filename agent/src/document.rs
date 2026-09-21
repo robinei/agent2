@@ -1501,7 +1501,7 @@ mod tests {
         tree.append(
             &mut spine,
             EventPayload::Handback {
-                reply: EventId::new(1),
+                program: EventId::new(1),
                 how: crate::types::Handback::Completed {
                     value: None,
                     rested: false,
@@ -1578,7 +1578,7 @@ mod tests {
         tree.append(
             &mut spine,
             EventPayload::Handback {
-                reply: EventId::new(1),
+                program: EventId::new(1),
                 how: crate::types::Handback::Raised {
                     name: "x".into(),
                     payload: None,
@@ -1593,7 +1593,7 @@ mod tests {
         tree.append(
             &mut spine,
             EventPayload::Handback {
-                reply: EventId::new(1),
+                program: EventId::new(1),
                 how: crate::types::Handback::Completed {
                     value: None,
                     rested: false,
@@ -1607,7 +1607,7 @@ mod tests {
         tree.append(
             &mut spine,
             EventPayload::Handback {
-                reply: EventId::new(1),
+                program: EventId::new(1),
                 how: crate::types::Handback::Completed {
                     value: None,
                     rested: false,
@@ -1660,7 +1660,7 @@ mod tests {
         tree.append(
             &mut spine,
             EventPayload::Handback {
-                reply: EventId::new(1),
+                program: EventId::new(1),
                 how: crate::types::Handback::Trapped {
                     kind: "ReferenceError".into(),
                     message: "fmt is not defined".into(),
@@ -1675,7 +1675,7 @@ mod tests {
         tree.append(
             &mut spine,
             EventPayload::Handback {
-                reply: EventId::new(1),
+                program: EventId::new(1),
                 how: crate::types::Handback::Completed {
                     value: None,
                     rested: false,
@@ -2016,7 +2016,7 @@ mod tests {
         tree.append(
             &mut spine,
             EventPayload::Handback {
-                reply: EventId::new(1),
+                program: EventId::new(1),
                 how: crate::types::Handback::Completed {
                     value: None,
                     rested: false,
@@ -2071,7 +2071,7 @@ mod tests {
         tree.append(
             &mut spine,
             EventPayload::Handback {
-                reply: EventId::new(1),
+                program: EventId::new(1),
                 how: crate::types::Handback::Completed {
                     value: None,
                     rested: false,
@@ -2166,7 +2166,7 @@ mod tests {
             tree.append(
                 &mut spine,
                 EventPayload::Handback {
-                    reply: EventId::new(1),
+                    program: EventId::new(1),
                     how: crate::types::Handback::Completed {
                         value: None,
                         rested: false,
@@ -2239,7 +2239,7 @@ mod tests {
         tree.append(
             &mut spine,
             EventPayload::Handback {
-                reply: EventId::new(1),
+                program: EventId::new(1),
                 how: crate::types::Handback::Completed {
                     value: None,
                     rested: false,

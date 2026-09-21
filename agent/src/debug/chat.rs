@@ -38,7 +38,7 @@ use std::collections::HashMap;
 use unicode_width::UnicodeWidthStr;
 
 use crate::host::{AgentId, BranchId, ProgramStatus, SessionEvent};
-use crate::tree::depth_after;
+use crate::tree::Frames;
 use crate::types::{Address, Call, Event, EventId, EventPayload, Outcome};
 
 /// How many lines of a cell's source show while it is collapsed (D13).
@@ -218,7 +218,7 @@ pub struct ChatState {
     /// closed a scope the fork point was still inside (a cosmetic risk
     /// in this debug view only, never a correctness issue for the
     /// session itself, which derives depth fresh from the log).
-    branch_depth: HashMap<BranchId, usize>,
+    branch_depth: HashMap<BranchId, Frames>,
     /// Live status per program block, titling its header.
     program_status: HashMap<EventId, ProgramStatus>,
     /// Every event's own branch, by id — including events that never
@@ -393,7 +393,11 @@ impl ChatState {
                         .cloned()
                         .unwrap_or_default();
                     self.program_stack.insert(branch, stack);
-                    let depth = *self.branch_depth.get(&parent_branch).unwrap_or(&0);
+                    let depth = self
+                        .branch_depth
+                        .get(&parent_branch)
+                        .cloned()
+                        .unwrap_or_default();
                     self.branch_depth.insert(branch, depth);
                 }
                 self.push_entry(Entry::Line {
@@ -428,7 +432,7 @@ impl ChatState {
                 // always opens a fresh block, nested under whatever
                 // program is currently deliberating on this branch (`depth`).
                 let by_user = matches!(event.payload, EventPayload::Restart);
-                let depth = *self.branch_depth.get(&branch).unwrap_or(&0);
+                let depth = self.branch_depth.get(&branch).map_or(0, Frames::depth);
                 self.push_entry(Entry::Header {
                     branch,
                     program: id,
@@ -492,7 +496,7 @@ impl ChatState {
                             Call::Spawn { .. } => "spawn".to_owned(),
                             Call::Fork { .. } => "fork".to_owned(),
                         };
-                        let depth = *self.branch_depth.get(&branch).unwrap_or(&0);
+                        let depth = self.branch_depth.get(&branch).map_or(0, Frames::depth);
                         let indent = "  ".repeat(depth);
                         self.push_entry(Entry::Line {
                             branch,
@@ -530,7 +534,7 @@ impl ChatState {
             // `Handover`, so they fall out of the same check). Exactly
             // `tree::programs_for`'s own `stack` fold, so a chat block's
             // attach point can never disagree with the log projection's.
-            EventPayload::Handback { how, reply, .. } => {
+            EventPayload::Handback { how, program, .. } => {
                 if how.is_terminal() {
                     self.program_stack.entry(branch).or_default().pop();
                 }
@@ -550,27 +554,18 @@ impl ChatState {
                 // `ProgramStatus` *after* the event carrying this
                 // handback, so nothing here overrides live state.
                 //
-                // **`Abandoned` and `Superseded` are deliberately not
-                // derived here**, because the log does not say what they
-                // are about. Both are logged against `self.reply_id` —
-                // the reply that *decided* — while the program they
-                // discard is the one beneath it, and the payload has no
-                // field naming it. In `lab/live1` the reply that wrote
-                // `abandon()` went on to run a check and finish, and the
-                // only handback under it is `Abandoned`; the live run
-                // titled it `completed` and the frame it dropped
-                // `discarded`, which is right, and no fold over the log
-                // alone can reach that. Better to leave those two to the
-                // header's own fallback than to assert the wrong one.
-                let derived = match how {
-                    h if !h.is_terminal() => Some(ProgramStatus::Suspended),
-                    crate::types::Handback::Completed { .. } => Some(ProgramStatus::Completed),
-                    crate::types::Handback::Interrupted => Some(ProgramStatus::Failed),
-                    _ => None,
-                };
-                if let Some(status) = derived {
-                    self.program_status.insert(*reply, status);
-                }
+                // Every variant derives now. `Abandoned` and
+                // `Superseded` used to be refused here because the
+                // field named the reply that *decided* and nothing
+                // named the frame it discarded; it names the frame.
+                self.program_status.insert(
+                    *program,
+                    match how {
+                        h if !h.is_terminal() => ProgramStatus::Suspended,
+                        crate::types::Handback::Completed { .. } => ProgramStatus::Completed,
+                        _ => ProgramStatus::Failed,
+                    },
+                );
             }
             // A note is heard by no one but the branch's own future self
             // — a marker in its own history, same as `append_history`'s
@@ -688,13 +683,10 @@ impl ChatState {
                 }
             }
         }
-        self.branch_depth.insert(
-            branch,
-            depth_after(
-                *self.branch_depth.get(&branch).unwrap_or(&0),
-                &event.payload,
-            ),
-        );
+        self.branch_depth
+            .entry(branch)
+            .or_default()
+            .after(&event.payload);
     }
 
     /// The ancestor chain from `target` back to its root-most branch,
@@ -1554,7 +1546,7 @@ mod tests {
         chat.apply(&ev(
             9,
             EventPayload::Handback {
-                reply: EventId::new(3),
+                program: EventId::new(3),
                 how: crate::types::Handback::Completed {
                     value: None,
                     rested: true,
@@ -1786,7 +1778,7 @@ mod tests {
         chat.apply(&ev(
             5,
             EventPayload::Handback {
-                reply: EventId::new(1),
+                program: EventId::new(1),
                 how: crate::types::Handback::Completed {
                     value: None,
                     rested: false,

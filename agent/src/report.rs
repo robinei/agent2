@@ -2015,7 +2015,7 @@ mod tests {
             .append(
                 &mut spine,
                 EventPayload::Handback {
-                    reply,
+                    program: reply,
                     how: HandbackHow::CellFailed {
                         message: "12:7: `lib` is already declared".into(),
                     },
@@ -2071,7 +2071,7 @@ mod tests {
         tree.append(
             &mut spine,
             EventPayload::Handback {
-                reply: first,
+                program: first,
                 how: crate::types::Handback::Completed {
                     value: None,
                     rested: false,
@@ -2094,7 +2094,7 @@ mod tests {
             .append(
                 &mut spine,
                 EventPayload::Handback {
-                    reply: second,
+                    program: second,
                     how: HandbackHow::Trapped {
                         kind: "ReferenceError".into(),
                         message: "f is not defined".into(),
@@ -2142,7 +2142,7 @@ mod tests {
     /// counter (not this renderer) reads it.
     fn condition(cause: HandbackHow, site: u32, stack: Vec<String>) -> EventPayload {
         EventPayload::Handback {
-            reply: EventId::new(1),
+            program: EventId::new(1),
             how: cause,
             site,
             stack,
@@ -2160,7 +2160,7 @@ mod tests {
         let (tree, o) = fixture(
             "return 1;",
             EventPayload::Handback {
-                reply: EventId::new(1),
+                program: EventId::new(1),
                 how: crate::types::Handback::Completed {
                     value: None,
                     rested: false,
@@ -2266,7 +2266,7 @@ mod tests {
             .append(
                 &mut spine,
                 EventPayload::Handback {
-                    reply,
+                    program: reply,
                     how: crate::types::Handback::Completed {
                         value: None,
                         rested: false,
@@ -2413,7 +2413,7 @@ mod tests {
                 tree.append(
                     &mut spine,
                     EventPayload::Handback {
-                        reply: EventId::new(1),
+                        program: EventId::new(1),
                         how: crate::types::Handback::Completed {
                             value: None,
                             rested: false,

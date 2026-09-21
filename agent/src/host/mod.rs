@@ -516,7 +516,12 @@ impl Session {
                                 // parked on `choose()` was reopened by
                                 // the next process, and the repair it
                                 // logged read `reply: 1`.
-                                reply: turn,
+                                //
+                                // The field names the *program* now, and
+                                // a program whose VM died with its
+                                // process is named by the reply that ran
+                                // it — which is what `turn` already is.
+                                program: turn,
                                 how: crate::types::Handback::Interrupted,
                                 site: 0,
                                 stack: Vec::new(),
@@ -3878,7 +3883,7 @@ mod tests {
         tree.append(
             spine,
             EventPayload::Handback {
-                reply,
+                program: reply,
                 how: crate::types::Handback::Completed {
                     value: None,
                     rested: false,
@@ -4403,9 +4408,9 @@ mod tests {
             .find_map(|e| match &e.payload {
                 EventPayload::Handback {
                     how: crate::types::Handback::Interrupted,
-                    reply,
+                    program,
                     ..
-                } => Some(*reply),
+                } => Some(*program),
                 _ => None,
             })
             .expect("the interrupted run was given an outcome");
@@ -5843,12 +5848,18 @@ mod tests {
         // parent's own `Return` is the ask's real result, the same
         // value the child returned.
         assert_eq!(appended(tree, root_leaf(&session)), json!("read PLAN.md"));
+        // The `Handback`/`Console` pair after the handler's `ReplyEnd`
+        // is the handler's *own* ending. A decision used to log none —
+        // the only handback under the deciding reply was the discard,
+        // which names the frame it discarded — so nothing on the log
+        // said how the decider itself ended and its console went with
+        // it. The last pair is the resumed parent's.
         assert_eq!(
             kinds(tree, root_leaf(&session)),
             [
                 "Agent", "Post", "Reply", "Part", "Call", "ReplyEnd", "Result", "Call", "Post",
-                "Handback", "Console", "Reply", "Part", "Answer", "ReplyEnd", "Result", "Note",
-                "Handback", "Console",
+                "Handback", "Console", "Reply", "Part", "Answer", "ReplyEnd", "Handback",
+                "Console", "Result", "Note", "Handback", "Console",
             ]
         );
         // Both #14 (the upward question) and #10 (the parent's original
@@ -6927,7 +6938,7 @@ mod tests {
         tree.append(
             &mut root,
             EventPayload::Handback {
-                reply,
+                program: reply,
                 how: crate::types::Handback::Completed {
                     value: None,
                     rested: false,
