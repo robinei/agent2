@@ -295,6 +295,29 @@ const REPLY_SHAPE_TAIL: &str = "Someone has asked you something and you have no 
      own outstanding. If answering needs nothing run, answer in prose and stop — a reply with \
      no ```js block in it is a complete answer, and it rests the branch.";
 
+/// **The card's "do not rehearse a block" line, at the recency end.**
+///
+/// The card says it already — "Thinking is not writing, and only
+/// writing survives... So do not rehearse a block — write it" — and on
+/// `sweep-8` against `deepseek-v4-flash` the model drafted the program
+/// **six times** inside one 23 KB reasoning block before emitting it
+/// once. That is the largest single component of the reasoning premium
+/// over a tool loop (`docs/evidence/2026-09-21-code-vs-pi-sweep8.md`),
+/// and it is a card line losing to the shape of the work, the same way
+/// 15.2% of prose parts still copy back a `↓ history[N]` the card
+/// forbids.
+///
+/// Same argument as [`REPLY_IS_MARKDOWN`]: a sentence in the first
+/// paragraph of a 22 KB system prompt is a long way from where the
+/// model starts thinking, and the tail is the one position that is not.
+///
+/// **Off unless asked for** (`AGENT2_NO_REHEARSAL_TAIL=1`), because it
+/// is an arm and not yet a finding: whether restating a ban works at
+/// all is exactly what the `↓ history[N]` number casts doubt on. The
+/// measurement is the count of fenced drafts inside `Part::Thinking`,
+/// which was 6 on the baseline run.
+const NO_REHEARSAL_TAIL: &str = "- Nothing you write while reasoning is read back. A block      drafted there is written twice; write it once, in the reply.";
+
 /// Whether this reply tried to call a tool in another harness's syntax.
 ///
 /// Deliberately a short list of shapes that are **actions**, not prose:
@@ -904,6 +927,8 @@ pub struct Runner {
     /// is answering a post. A field for the same reason as the line
     /// above: an arm has to be settable per-runner, not per-process.
     reply_shape_tail: bool,
+    /// Whether the tail carries [`NO_REHEARSAL_TAIL`].
+    no_rehearsal_tail: bool,
     /// The last reply called `finish()` and told nobody anything, so it
     /// was not rested. The next request's tail says so — see
     /// [`SILENT_FINISH`].
@@ -1041,6 +1066,7 @@ impl Runner {
             nudge_when_nothing_ran: std::env::var("AGENT2_STOPPED_SHORT_NOTICE")
                 .is_ok_and(|v| v != "0"),
             reply_shape_tail: std::env::var("AGENT2_REPLY_SHAPE_TAIL").is_ok_and(|v| v != "0"),
+            no_rehearsal_tail: std::env::var("AGENT2_NO_REHEARSAL_TAIL").is_ok_and(|v| v != "0"),
             finish_ignored: false,
             spine,
             agent,
@@ -4060,6 +4086,9 @@ impl Runner {
         if self.reply_shape_tail && self.answering_a_post(tree) {
             lines.push(REPLY_SHAPE_TAIL.to_owned());
         }
+        if self.no_rehearsal_tail {
+            lines.push(NO_REHEARSAL_TAIL.to_owned());
+        }
         lines.push(if self.attached { PRESENT } else { ABSENT }.to_owned());
         if let Some(n) = self.replies_since_spoken_to(tree) {
             lines.push(format!(
@@ -6761,6 +6790,29 @@ mod tests {
     /// highest number. A `deepseek-v4-flash` smoke run on 2026-09-21
     /// did a whole three-file rename in one reply and was told it had
     /// run three programs.
+    /// The rehearsal ban rides the tail only when asked for, and says
+    /// the fact rather than scolding: reasoning is not read back, so a
+    /// drafted block is written twice.
+    #[test]
+    fn the_rehearsal_ban_is_an_arm_not_a_default() {
+        let (mut tree, mut state) = setup_under();
+        user_post(&mut state, &mut tree, "do it");
+        let off = state.request_tail(&tree).unwrap_or_default();
+        assert!(!off.contains("written twice"), "on by default: {off}");
+
+        state.no_rehearsal_tail = true;
+        let on = state.request_tail(&tree).unwrap_or_default();
+        assert!(
+            on.contains("written twice"),
+            "the arm does not reach the tail: {on}"
+        );
+        assert!(
+            on.lines()
+                .any(|l| l.starts_with("- ") && l.contains("read back")),
+            "one terse line like its neighbours: {on}"
+        );
+    }
+
     #[test]
     fn the_tail_counts_programs_not_blocks() {
         let mut c = Conversation::new();
