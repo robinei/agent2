@@ -242,11 +242,14 @@ discard closes a frame that need not be the innermost. `LOG_VERSION` 3.
 
 ## Not fixed, and why
 
-- The first-byte hang above. The right shape is a bound in the client
-  worker, which already owns a cancel token; the session loop is the
-  wrong place. Not attempted: it cannot be verified against a real hang
-  on demand, and the constants it sits beside carry a comment recording
-  that a previous tightening killed two live runs mid-task.
+- **No signal while a generation is in flight.** This is what the
+  correction above leaves standing, and it is the real gap: the log
+  gets no row until a part completes, so four minutes of thinking and a
+  dead socket look the same on `agent transcript` and in the headless
+  printer. A person cannot tell, and neither could I with the log open.
+  Not fixed here because the cheap version (a heartbeat row) would put
+  noise on the log, and the right version — a UI-only "generating, Ns"
+  signal — belongs to the attached client rather than the record.
 - `prompt_suspended` renders a request without stamping the phase, so a
   parked branch with a generation in flight reads as `Idle` rather than
   `AwaitingLlm`. That is why a second message to such a branch spawns a
