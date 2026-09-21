@@ -1198,14 +1198,14 @@ impl Runner {
             // fix for a branch going deaf after a completion that said
             // nothing, and it is the same rule it always was — only
             // keyed on the frame instead of on the phase.
-            Phase::Idle => return !self.unseen_posts(tree).is_empty(),
+            Phase::Idle => return !self.unseen_demanding_posts(tree).is_empty(),
             _ => return false,
         }
         // Any unseen `Post` is a cause — including one that arrived
         // during a generation, which the turn that just landed could not
         // have answered (its binding was fixed at `shown`), and including
         // a tell, which owes no answer but must still be seen.
-        if !self.unseen_posts(tree).is_empty() {
+        if !self.unseen_demanding_posts(tree).is_empty() {
             return true;
         }
         // **A reply that stopped short is not a rest.** The note
@@ -1220,6 +1220,45 @@ impl Runner {
         // most recent `Turn` is a cause even with no `Post` to find.
         self.last_turn_outcome(tree)
             .is_some_and(|id| id.as_u64() > self.shown)
+    }
+
+    /// Unseen posts that are a **reason to answer**, as opposed to ones
+    /// that are merely new.
+    ///
+    /// A harness post that expects no reply is bookkeeping: the
+    /// settlement notice for a call nobody awaited says, in its own
+    /// words, "Nothing is owed in reply". It used to wake a branch that
+    /// had already rested, and the branch spent a completion agreeing —
+    /// `intr3` on 2026-09-21: the person said "actually never mind,
+    /// forget it", the model said "Alright, forgot about it", the
+    /// cancelled `bash` timed out thirty seconds later, and the notice
+    /// bought one more turn saying "Understood, I've discarded the
+    /// result." Two replies to a person who had said to stop.
+    ///
+    /// Nothing is lost by not waking: the notice is on the log and in
+    /// the document the moment anything else asks for a turn.
+    ///
+    /// **Only the wake is narrowed, not rule B.** A post still suspends
+    /// a *running* program at its next fuel slice whoever wrote it —
+    /// `INTERRUPT_NOTICE` is a harness post expecting no reply, and
+    /// being a cause is its entire purpose.
+    fn unseen_demanding_posts(&self, tree: &Tree) -> Vec<EventId> {
+        self.agent_segment(tree)
+            .iter()
+            .filter(|e| e.id.as_u64() > self.shown)
+            .filter(|e| match &e.payload {
+                EventPayload::Post {
+                    from: Author::Harness,
+                    origin,
+                } => tree
+                    .resolve(origin)
+                    .direct()
+                    .is_some_and(|(_, _, expects_reply)| expects_reply),
+                EventPayload::Post { .. } => true,
+                _ => false,
+            })
+            .map(|e| e.id)
+            .collect()
     }
 
     /// Posts logged on this branch that its LLM has not been shown — the

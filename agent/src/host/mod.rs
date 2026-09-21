@@ -6514,12 +6514,22 @@ mod tests {
     /// awaiting it is logged as an artifact *and* surfaced as a harness
     /// post — a tell, so the branch notices without owing an answer.
     ///
-    /// The post is what makes waking legal: the rule is not "never wake a
-    /// branch" but "never wake one without a cause event you can name in
-    /// the log", and this cause is logged, visible, and renders
-    /// identically forever.
+    /// **Notices without owing an answer, and so does not answer.** This
+    /// used to buy a turn: the notice woke the branch and the model
+    /// spent a completion acknowledging it. `intr3` on 2026-09-21 is
+    /// what that costs in front of a person — they said "actually never
+    /// mind, forget it", the model said "Alright, forgot about it", the
+    /// cancelled `bash` timed out thirty seconds later, and the notice
+    /// bought one more reply saying "Understood, I've discarded the
+    /// result."
+    ///
+    /// The post is still what makes a wake *legal* — the rule is
+    /// "never wake without a cause you can name in the log" — but legal
+    /// is not mandatory, and this one says in its own words that
+    /// nothing is owed. It is on the log and in the document the moment
+    /// anything else asks for a turn.
     #[test]
-    fn unawaited_result_wakes_the_branch_as_a_harness_post() {
+    fn an_unawaited_result_is_logged_without_buying_a_turn() {
         let mut registry = ToolRegistry::new();
         let (gate_tx, gate_rx) = channel::<()>();
         let gate = Mutex::new(gate_rx);
@@ -6534,10 +6544,9 @@ mod tests {
             registry,
             Box::new(ScriptedLlm::new(vec![
                 scripted_program("history.append(await tools.slow());"),
-                // The rewrite's completion report prompts this…
+                // The rewrite's completion report prompts this. Nothing
+                // prompts a third: the harness notice is not a cause.
                 scripted_text("moved on"),
-                // …and the harness post prompts this.
-                scripted_text("noted the late answer"),
             ])),
             tx,
         )
@@ -6618,21 +6627,23 @@ mod tests {
         // tool call above did: no VM survives to receive its own settle.
         // Before C0b (23_ONE_AGENT.md) that made Rule C fire *again*,
         // costing a second wake and a second completion for the crime of
-        // using the card's own idiom — the regression this whole step
-        // exists to close. Now a `tell`'s settlement is never a rule-C
-        // surprise (`Call::Send { expects_reply: false, .. }` is
+        // using the card's own idiom. Now a `tell`'s settlement is never
+        // a rule-C surprise (`Call::Send { expects_reply: false, .. }` is
         // recognized on both `unawaited` paths in `on_tool_results`), so
-        // this second `tell` settles quietly: an artifact (`Call`,
-        // `Result`) with no harness post and no further wake. The tail is
-        // `Handback, Console, Result` — the program's own ordinary
-        // completion, then the `tell`'s delivery receipt landing
-        // separately (dispatched from `finish_program`'s `unstarted`
-        // handling, settled by a later `on_tool_results`) — not a second
-        // `Post`.
-        assert!(
-            kinds(session.tree(), leaf).ends_with(&["Handback", "Console", "Result"]),
-            "{:?}",
-            kinds(session.tree(), leaf)
+        // it settles quietly: an artifact with no harness post.
+        //
+        // **And the log ends at the notice.** No `Reply` follows it —
+        // the branch was told, and had nothing to say back.
+        let tail = kinds(session.tree(), leaf);
+        assert!(tail.ends_with(&["Result", "Result", "Post"]), "{tail:?}");
+        let notice_at = tail
+            .iter()
+            .rposition(|k| *k == "Post")
+            .expect("the notice is logged");
+        assert_eq!(
+            notice_at,
+            tail.len() - 1,
+            "the notice bought a turn — something follows it: {tail:?}"
         );
         let notice_count = path
             .iter()
