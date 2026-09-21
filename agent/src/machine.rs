@@ -3558,7 +3558,29 @@ impl Runner {
         if let Some(request) = self.compaction_if_needed(tree, budget, headroom)? {
             return Ok(vec![request]);
         }
-        self.phase = Phase::AwaitingLlm;
+        // **A suspended branch keeps its suspension.** This line used
+        // to be unconditional, which was safe while `needs_prompt`
+        // answered `true` only from `Idle`. `d38c416` taught it to
+        // answer for a `Suspended` branch with an unseen post — the fix
+        // for a branch going deaf after a silent completion — and this
+        // then stamped `AwaitingLlm` over `Phase::Suspended(run, _)`,
+        // dropping the parked `Run` and its VM on the floor.
+        //
+        // Two things went with it. The parked program's in-flight calls
+        // stopped being deliverable (`on_tool_results` routes anything
+        // that lands outside `Running`/`Suspended` to rule C), so a
+        // second line typed while a command was still going turned that
+        // command's result into "settled with no program awaiting it" —
+        // seen in `lab/live2` on 2026-09-21. And the `Posted` handback
+        // on the log still said the program was parked, so the report,
+        // the transcript and the model were all still being offered a
+        // `resume()` of a frame that no longer existed.
+        //
+        // `prompt_suspended` — the host's own wake for a freshly parked
+        // branch — never touched the phase, for exactly this reason.
+        if !matches!(self.phase, Phase::Suspended(..)) {
+            self.phase = Phase::AwaitingLlm;
+        }
         Ok(vec![self.render_request(tree)])
     }
 
@@ -5767,6 +5789,57 @@ mod tests {
     /// `finish(text)` is the one thing that rests the branch: the mirror
     /// image of the test above, same shape, only the program's text
     /// differs.
+    /// **A second message while a program is parked must not destroy
+    /// it.** Live in `lab/live2` on 2026-09-21: a `bash` was in flight,
+    /// "actually stop" parked the program at its next fuel slice, a
+    /// second line arrived before the command finished, and when the
+    /// result landed the harness announced it as "settled with no
+    /// program awaiting it".
+    ///
+    /// The cause was `prompt_if_needed` stamping `AwaitingLlm` over
+    /// `Phase::Suspended`, which dropped the parked `Run`. The
+    /// orphaned result is the visible half; the invisible half was that
+    /// the `Posted` handback on the log still offered a `resume()` of a
+    /// frame that had ceased to exist.
+    #[test]
+    fn a_second_post_leaves_the_parked_program_where_it_was() {
+        let mut c = Conversation::new();
+        c.never_answers("bash");
+        c.user("run it");
+        c.reply(
+            "Running it.\n\n```js\nconst r = await tools.bash(\"./slow.sh\");\n\
+             tell(r.stdout);\nfinish();\n```\n",
+        );
+        c.user("actually stop");
+        assert_eq!(c.status(), "suspended");
+        c.user("and tell me what phase it got to");
+        assert_eq!(
+            c.status(),
+            "suspended",
+            "a second post threw the suspension away"
+        );
+
+        let bash = c
+            .tree()
+            .events
+            .values()
+            .find(|e| {
+                matches!(&e.payload, EventPayload::Call(crate::types::Call::Invoke { name, .. })
+                    if name == "bash")
+            })
+            .map(|e| e.id)
+            .expect("the program issued a bash call");
+        c.settle(
+            bash,
+            Ok(serde_json::json!({"status": 0, "stdout": "phase 5 of 5\n", "stderr": ""})),
+        );
+        let dump = crate::transcript::render(c.tree(), c.runner().spine.leaf_id);
+        assert!(
+            !dump.contains("settled with no program awaiting it"),
+            "the parked program's own call was orphaned:\n{dump}"
+        );
+    }
+
     #[test]
     fn finish_ends_the_conversation() {
         let (mut tree, mut state) = setup_under();
