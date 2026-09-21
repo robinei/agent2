@@ -511,8 +511,21 @@ impl AttachedApp {
                         // than the tool-call rows, which already have
                         // their own click behaviour (inspect the call).
                         RowDetail::None => {
+                            // **Only if it names a branch that exists.**
+                            // `agent_reference_in` matches the word
+                            // "agent" followed by digits, and prose is
+                            // full of those — this project is *called*
+                            // agent2, so a sentence mentioning it
+                            // yielded `2`, and `select_branch` took the
+                            // id on trust. Event #2 is usually the
+                            // first user post, so selecting it pointed
+                            // the whole UI at something that is not a
+                            // branch: the navigator highlighted
+                            // nothing and the transcript emptied, which
+                            // reads as the branch being deselected.
                             if let Some(n) = agent_reference_in(text)
                                 && n != 0
+                                && branches.contains(&EventId::new(n))
                             {
                                 self.select_branch(EventId::new(n));
                             }
@@ -4669,6 +4682,71 @@ mod tests {
         assert!(!app.ask_armed);
         assert_eq!(app.last_clicked_event, None);
         assert_eq!(app.input.to_string(), "half-typed", "draft survives");
+    }
+
+    /// **A sentence is not a branch reference.**
+    /// `agent_reference_in` matches the word "agent" followed by
+    /// digits, which ordinary prose is full of — this project is
+    /// called agent2, so a line mentioning it yields `2`. Following
+    /// that unchecked pointed `selected` at an event that is not a
+    /// branch (#2 is usually the first user post), and the navigator
+    /// highlighted nothing while the transcript emptied: the branch
+    /// looked deselected.
+    #[test]
+    fn prose_naming_something_that_is_not_a_branch_leaves_the_selection_alone() {
+        let (tx, rx) = channel();
+        let session = Session::new(
+            Tree::new(None),
+            "a test agent",
+            ToolRegistry::new(),
+            Box::new(ScriptedLlm::new([scripted_markdown(
+                "agent2 keeps the whole log, so nothing is lost.\n",
+            )])),
+            tx,
+        )
+        .unwrap();
+        session.handle().send(SessionCommand::UserTurn {
+            branch: session.conversation_branch(),
+            text: "where does it all go?".into(),
+            expects_reply: true,
+        });
+        let session = session.run();
+        let branch = session.conversation_branch();
+        let mut app = AttachedApp::new(branch);
+        for event in rx.try_iter() {
+            app.apply(&event);
+        }
+
+        let rows = app.chat.rows(Some(branch), 200, None);
+        let prose = rows
+            .iter()
+            .position(|(_, t, d, _)| t.contains("agent2") && *d == RowDetail::None)
+            .expect("the reply is on the transcript");
+        assert_eq!(agent_reference_in(&rows[prose].1), Some(2));
+        assert!(
+            !session.tree().branches().iter().any(|(b, _)| *b == fid(2)),
+            "#2 is on the log but is not a branch — which is the whole point"
+        );
+
+        app.pane_rects.push((
+            Pane::Chat,
+            PaneInfo {
+                area: Rect {
+                    x: 0,
+                    y: 0,
+                    width: 200,
+                    height: 60,
+                },
+                scroll_top: 0,
+            },
+        ));
+        app.chat_line_rows = (0..rows.len()).collect();
+        app.on_click(0, prose as u16 + 1, &[branch]);
+        assert_eq!(
+            app.selected,
+            Some(branch),
+            "a prose click moved the selection off the branch"
+        );
     }
 
     /// Clicking a chat row selects it, clicking the same row again
