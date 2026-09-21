@@ -259,3 +259,27 @@ discard closes a frame that need not be the innermost. `LOG_VERSION` 3.
   — one fewer wasted generation. Left alone: it is a third behaviour
   change to the core loop in one sitting, and both models handled the
   current behaviour correctly.
+
+## An agent can kill its own session with an ordinary cleanup command
+
+`lab/q1`, 2026-09-21. Told to stop, the model tidied up after the
+script it had started:
+
+    bash("pkill -f '[s]low.sh'; echo rc=$?")
+
+The `[s]` trick is the right idiom — it stops the pattern matching the
+`pkill` process itself. What it does not stop is matching the *harness*,
+whose command line is
+
+    agent session --stdin --real --turn "run ./slow.sh and tell me what it says" …
+
+`pkill -f` matches the whole command line, `[s]low.sh` matches the
+`slow.sh` inside the turn text, and the session died mid-program: the
+`bash` call at `#34` has no `Result`, the branch is left `Running`
+forever, and the log simply stops.
+
+Not a harness bug, and deliberately not a harness concern — sandboxing
+belongs to whoever runs it (standing rule). Worth knowing for two
+reasons: it is indistinguishable in the log from a stalled tool call,
+and the eval driver puts the task text on the agent's own argv, so any
+task mentioning a process name is one `pkill` away from this.
