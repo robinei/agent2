@@ -949,6 +949,16 @@ pub struct Runner {
     /// [`NO_REHEARSAL_TAIL`]; any other value is the line itself, so
     /// arms can be interleaved from one binary.
     no_rehearsal_tail: Option<String>,
+    /// **Position, held apart from wording, because they are two
+    /// questions** (`AGENT2_NO_REHEARSAL_LAST=1`). The line is pushed
+    /// fifth of nine by default, which puts it under the attachment
+    /// status; this pushes it below [`REPLY_IS_MARKDOWN`] instead, into
+    /// the one slot in the whole request that nothing else can reach.
+    ///
+    /// It is an arm because it *costs* something: that slot is already
+    /// spent on the rule whose violation is silent, and demoting it is
+    /// the price of the test.
+    no_rehearsal_last: bool,
     /// The last reply called `finish()` and told nobody anything, so it
     /// was not rested. The next request's tail says so — see
     /// [`SILENT_FINISH`].
@@ -1092,6 +1102,8 @@ impl Runner {
                 Ok(v) => Some(v),
                 Err(_) => None,
             },
+            no_rehearsal_last: std::env::var("AGENT2_NO_REHEARSAL_LAST")
+                .is_ok_and(|v| v != "0"),
             finish_ignored: false,
             spine,
             agent,
@@ -4111,7 +4123,9 @@ impl Runner {
         if self.reply_shape_tail && self.answering_a_post(tree) {
             lines.push(REPLY_SHAPE_TAIL.to_owned());
         }
-        if let Some(line) = &self.no_rehearsal_tail {
+        if let Some(line) = &self.no_rehearsal_tail
+            && !self.no_rehearsal_last
+        {
             lines.push(line.clone());
         }
         lines.push(if self.attached { PRESENT } else { ABSENT }.to_owned());
@@ -4123,6 +4137,13 @@ impl Runner {
             lines.push(WORK_UNDER_WAY.to_owned());
         }
         lines.push(REPLY_IS_MARKDOWN.to_owned());
+        // Below the rule whose violation is silent, which is the whole
+        // point of the arm: the two lines are competing for one slot.
+        if let Some(line) = &self.no_rehearsal_tail
+            && self.no_rehearsal_last
+        {
+            lines.push(line.clone());
+        }
         Some(lines.join("\n"))
     }
 
@@ -6835,6 +6856,45 @@ mod tests {
             on.lines()
                 .any(|l| l.starts_with("- ") && l.contains("One-shot")),
             "one line like its neighbours: {on}"
+        );
+    }
+
+    /// **Position is its own arm, and it costs something.**
+    ///
+    /// The default puts the ban fifth of nine, under the attachment
+    /// status; `AGENT2_NO_REHEARSAL_LAST` puts it below
+    /// [`REPLY_IS_MARKDOWN`], the only slot nothing else can reach.
+    /// Both facts are asserted because the second is the price of the
+    /// first: the rule whose violation is silent gets demoted, and a
+    /// reorder that quietly dropped one of the two lines would read as
+    /// a win.
+    #[test]
+    fn the_rehearsal_ban_can_be_moved_below_the_markdown_rule() {
+        let (mut tree, mut state) = setup_under();
+        user_post(&mut state, &mut tree, "do it");
+        state.no_rehearsal_tail = Some(NO_REHEARSAL_TAIL.to_owned());
+
+        let mid = state.request_tail(&tree).unwrap_or_default();
+        let last_of = |t: &str| t.lines().last().unwrap_or_default().to_owned();
+        assert!(
+            last_of(&mid).contains("Only a ```js block runs"),
+            "by default the markdown rule has the slot: {mid}"
+        );
+
+        state.no_rehearsal_last = true;
+        let end = state.request_tail(&tree).unwrap_or_default();
+        assert!(
+            last_of(&end).contains("One-shot"),
+            "the arm does not take the last line: {end}"
+        );
+        assert!(
+            end.contains("Only a ```js block runs"),
+            "and the rule it displaced is still in the tail: {end}"
+        );
+        assert_eq!(
+            mid.lines().count(),
+            end.lines().count(),
+            "a reorder, not an addition or a loss"
         );
     }
 

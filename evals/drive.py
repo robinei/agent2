@@ -707,6 +707,12 @@ def fingerprint(card: Path | None) -> dict:
             "DEEPSEEK_REASONING_EFFORT",
             "DEEPSEEK_NO_THINKING",
             "AGENT2_TRANSPORT",
+            # The request-tail arms. `_TAIL` is the wording and `_LAST`
+            # the position, and two arms can differ by the second alone
+            # — same binary, same card, identical stamp — which is the
+            # case this dict exists to prevent.
+            "AGENT2_NO_REHEARSAL_TAIL",
+            "AGENT2_NO_REHEARSAL_LAST",
         )
         if k in os.environ
     }
