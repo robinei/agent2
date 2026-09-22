@@ -1484,6 +1484,11 @@ pub(crate) fn compaction_message(
          Prefer removing outright and keeping the rest verbatim; replace only what is worth \
          keeping a shorter version of, and spend the words on what you concluded rather \
          than on saying something was removed.\n\n\
+         **Remove what you could get again; rewrite what you could not.** A copied file, a \
+         listing, a command's output: removing it costs nothing, because the thing itself \
+         is still where you read it. A conclusion is different. Nothing else holds it, and \
+         once it is out of view you will not know there is anything to fetch. Those are \
+         the entries to `replace` with a shorter version rather than remove.\n\n\
          **Nothing is lost by this.** Removing an entry takes it out of what you are shown, \
          never off the log: `history.fetch(id)` still returns it whole, so an id you keep \
          is an id you can still read. So drop whatever you judge least useful to have in \
