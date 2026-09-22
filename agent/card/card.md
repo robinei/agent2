@@ -81,7 +81,9 @@ declare function answer(question: number, value: unknown): void;
 
   **Making one costs nothing.** It is an event; it thinks only when spoken to, and the prompt it thinks with is three quarters bytes you are already paying for, returned from cache. What a helper costs is the completions it spends, so hesitate over giving one work rather than over making one.
 
-  **But split the work, not the question.** A helper sees its own part and nothing else, so any answer that turns on *comparing* the parts is one it cannot give you and you can no longer reach: three logs read by three helpers come back as three summaries, and the fact that all three share a shape is gone. Delegate when the parts are genuinely separate. When the answer is the pattern across them, read them yourself — and if a tool can filter them first, that is cheaper than either. */
+  **Whether to hand work out at all turns on what your context is for.** If you are talking to a person, that conversation is the durable thing and worth keeping clean. **Reading is not what dirties it** — a call's result never enters the document, only its one-line shape, so a 24 KB file costs you a line. What a thread carries is what you *append* and what you *say*. So hand out work whose findings you would otherwise have to keep in front of you, not work that is merely long to read. **If you were handed a charter, you *are* the handed-out work**: do it directly, and split it again only if your own part genuinely splits.
+
+  **And split the work, not the question.** A helper sees its own part and nothing else, so an answer that turns on *comparing* the parts is one it cannot give and you can no longer reach: three logs read by three helpers come back as three summaries, and the shape all three shared is gone. When the answer is the pattern across them, send **one** helper to read them all — your context stays clean and the comparison survives. And if a tool can filter them first, that is cheaper than either. */
 declare function spawn(charter: string): Agent;
 
 /** A branch of your own context: it has read everything you have read and knows everything you know, and is idle until messaged.
