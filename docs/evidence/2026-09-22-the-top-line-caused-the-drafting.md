@@ -40,12 +40,43 @@ two are combined with Cochran–Mantel–Haenszel rather than pooled raw —
 their baselines are too far apart for a naive pool to mean anything.
 Both strata point the same way.
 
-**The mechanism is priming, not instruction.** A sentence at the top
-that names code blocks puts code blocks in the reasoning context, and
-the model obliges. The worst of the seven arms, `v3-redirect`, is the
-one that mentions code most while forbidding it least. The A split was
-found after the fact; the B arms were fixed before those samples
-existed.
+**The mechanism is not priming**, though that is what this file said
+first. The objection that killed it: the card is already saturated
+with what the ban names — its opening line *is* "Your reply is
+**markdown**, and the code blocks in it run", the five exemplars are
+```js blocks, and `REPLY_IS_MARKDOWN` names ```js in the tail. If
+mentioning code blocks caused drafting, one more sentence could not
+double it.
+
+## What it is instead: naming the behaviour you are suppressing
+
+A 2x2 on the same top slot, same document, same register, n=24 each
+(`v0`/`v1` pooled to n=48 across all rounds):
+
+| top line | names code | forbids the behaviour | drafted | drafts | thinking B |
+|---|---|---|---|---|---|
+| `v0-shipped` "Never draft code blocks!" | yes | yes | 71% | 2.0 | 10,967 |
+| `v8-positive` "Code blocks belong in the reply, where they run" | yes | no | 58% | 1.0 | 9,982 |
+| `v1-none` | – | – | 52% | 1.0 | 6,515 |
+| `v7-neutral` "Never guess at what you can check!" | no | yes | 42% | 0.0 | 7,669 |
+
+- the ban vs nothing: **drafts p = 0.0061, thinking p = 0.0079**
+- the ban vs a same-register negation about something else:
+  **drafts p = 0.0146, rate p = 0.022**
+- forbidding something else vs nothing: p = 0.46 / 0.76 / 0.22 — nothing
+- naming code without forbidding vs nothing: rate p = 0.80, drafts p = 0.38
+
+So it is not the slot (`v7` sits at nothing), not the imperative
+register, not negation as such (`v7` negates too), and not naming code
+(`v8` is indistinguishable from nothing on rate and count). What is
+left is **naming the specific behaviour to be suppressed**, which is
+the ironic-process result rather than a priming one.
+
+**And the rate/volume split matters.** Pooling every top-line arm
+against none, the drafting *rate* is 60% against 58%, p = 1.00 — but
+thinking volume is 10,310 B against 6,248 B, p = 0.0041. A sentence at
+the top does not change how often a reply drafts. It changes how long
+the reply thinks.
 
 ## And the task level agrees, which is the part that was missing
 
