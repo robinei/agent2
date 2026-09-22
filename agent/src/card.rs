@@ -150,9 +150,15 @@ fn the_card_teaches_the_markers_the_document_uses() {
         card.contains(&format!("/* {left} history[")),
         "and the call annotation as it renders: {left}"
     );
+    // **The fact, not the phrasing.** This used to require the exact
+    // words "Every `↓` and `←`", so rewriting the sentence to say the
+    // same thing more plainly failed it. What has to be true is that
+    // one line names both markers and says whose they are.
     assert!(
-        card.contains(&format!("Every `{down}` and `{left}`")),
-        "and says both were added by the harness"
+        card.lines().any(|l| {
+            l.contains(down) && l.contains(left) && l.contains("harness")
+        }),
+        "one line names both markers and attributes them to the harness"
     );
 }
 
@@ -881,7 +887,7 @@ mod tests {
         // `card()` shows up as a diff review must look at, not a byte
         // count that silently drifts. Comparing full text (not just a
         // hash) so the diff itself is legible in a failure message.
-        const EXPECTED_LEN: usize = 21149;
+        const EXPECTED_LEN: usize = 20706;
         assert_eq!(
             card().len(),
             EXPECTED_LEN,
