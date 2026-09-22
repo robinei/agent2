@@ -164,6 +164,8 @@ pub(crate) fn parse_events(
     let mut usage = Usage::default();
     let mut incomplete = false;
     let mut ended = false;
+    // Which output item the last text delta belonged to.
+    let mut item: Option<u64> = None;
 
     for line in reader.lines() {
         if cancel.is_cancelled() {
@@ -198,6 +200,27 @@ pub(crate) fn parse_events(
                 thinking.push_str(t);
                 chunk(LlmChunk::Thinking(t.to_owned()));
             } else if kind.contains("output_text") {
+                // **A new output item starts a new line.**
+                //
+                // A turn can hold several `message` items and their
+                // text is concatenated here. Joined with nothing, the
+                // seam lands mid-line: `sweep-8` on 2026-09-22 produced
+                // `…after the edit.```js` and the fence, no longer at
+                // the start of a line, was not a fence — `split_cells`
+                // saw prose, the program never ran, and the task failed
+                // with the model looking to blame. Another run repeated
+                // a sentence with no space between the copies.
+                //
+                // One newline, not two: separate items are not always
+                // separate paragraphs, and a soft break is enough to
+                // put a fence where a fence can be seen.
+                let index = event["output_index"].as_u64();
+                if item.is_some() && index != item && !source.is_empty() && !source.ends_with('\n')
+                {
+                    source.push('\n');
+                    chunk(LlmChunk::Text("\n".to_owned()));
+                }
+                item = index;
                 source.push_str(t);
                 chunk(LlmChunk::Text(t.to_owned()));
             }
@@ -438,6 +461,50 @@ mod tests {
             (u.prompt, u.cached, u.completion, u.reasoning),
             (120, 64, 40, 12)
         );
+    }
+
+    /// **A turn's output items are joined at a line boundary.**
+    ///
+    /// Live on `sweep-8`, 2026-09-22: two items concatenated with
+    /// nothing between them produced `…after the edit.```js`, the fence
+    /// was no longer at the start of a line, `split_cells` found no
+    /// cell, and the run did nothing while looking like the model's
+    /// fault. The task failed for a missing newline.
+    #[test]
+    fn output_items_do_not_run_into_each_other() {
+        let stream = sse(&[
+            r#"{"type":"response.output_text.delta","output_index":0,"delta":"Reading them first."}"#,
+            r#"{"type":"response.output_text.delta","output_index":1,"delta":"```js\nreturn 1;\n```"}"#,
+            r#"{"type":"response.completed","response":{"status":"completed","usage":{}}}"#,
+        ]);
+        let mut streamed = String::new();
+        let turn = parse_events(stream.as_bytes(), &Cancel::new(), &mut |c| {
+            if let LlmChunk::Text(t) = c {
+                streamed.push_str(&t);
+            }
+        })
+        .expect("parses");
+        assert_eq!(turn.source, "Reading them first.\n```js\nreturn 1;\n```");
+        assert_eq!(
+            crate::notebook::split_cells(&turn.source).len(),
+            1,
+            "the fence was not at a line start: {:?}",
+            turn.source
+        );
+        assert_eq!(streamed, turn.source, "the session would see something else");
+    }
+
+    /// And one item's deltas are never broken up — the separator is
+    /// between items, not between chunks.
+    #[test]
+    fn deltas_of_one_item_are_joined_verbatim() {
+        let stream = sse(&[
+            r#"{"type":"response.output_text.delta","output_index":0,"delta":"half a "}"#,
+            r#"{"type":"response.output_text.delta","output_index":0,"delta":"sentence"}"#,
+            r#"{"type":"response.completed","response":{"status":"completed","usage":{}}}"#,
+        ]);
+        let turn = parse_events(stream.as_bytes(), &Cancel::new(), &mut |_| {}).expect("parses");
+        assert_eq!(turn.source, "half a sentence");
     }
 
     /// Running out of output budget is a truncation, and `types.rs`
