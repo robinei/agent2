@@ -15,27 +15,54 @@ Everything measured, nothing assumed.
   +94.4 s with `wait_until` between — a real loop, and the rows carried
   `parent`, `status` and `open`.
 
-## What does not
+## What does not — retracted
 
-**`status` is too coarse to supervise on.** Every poll returned
-`idle`, and it was right each time: a child between steps is
-indistinguishable from one with nothing to do. The model said so
-itself —
+The first version of this file said `status` was too coarse to
+supervise on, because every poll in the first probe returned `idle`.
+That was a non-observation generalised into a finding: the parent's
+loop had a 47-second gap and **no poll ever overlapped the work**, so
+`idle` was correct each time and nothing was ever learned about a busy
+child.
 
-> The first poll happened before either helper had begun processing its
-> instruction, so that timeline was premature.
+Polled tightly, `status` is exact:
 
-`branch_status` reports what the *runner* is doing this instant
-(`running`, `thinking`, `suspended`, `idle`, `dormant`), and a child
-spends most of its life between those. Polling it yields a timeline
-that mostly says nothing.
+    +12.6s  idle       told, not yet started
+    +15.1s  thinking   awaiting a completion
+    +17.6s  running    and stays running for the whole 25s job
+    +40.2s  running
 
-**So a supervision task must turn on `open`, not on `status`.** A child
-blocked on a question is unambiguously stuck, unambiguously its
-parent's problem, and the count is exact. That is the field the card
-did not declare until today, and the reason it now says: *a supervisor
-that polls `status` alone sees a stalled child as merely quiet.*
+It reports `idle` only when a child is genuinely idle.
 
+## The five statuses, and the one the card invented
+
+| status | `Runner::status` | means |
+|---|---|---|
+| `running` | `Phase::Running` | a program of its own is executing |
+| `suspended` | parked frames | a program stopped part-way, waiting for an answer |
+| `thinking` | `Phase::AwaitingLlm` | waiting on a completion |
+| `idle` | `Phase::Idle` | a live runner with nothing to do |
+| `dormant` | no runner at all | not loaded this session; wakes when spoken to |
+
+`idle` and `dormant` differ in whether the branch is *loaded*, not in
+whether it has work. A child that finished and reported is `idle`; one
+never yet spoken to, or from a session rebuilt off a log, is
+`dormant`, and nothing is lost either way.
+
+The card briefly listed a sixth, `"returned above"` — which is the
+panic message in `Runner::status`'s `unreachable!()` arm, scraped out
+of the function as though it were a value. A test now refuses it.
+
+## What this means for the task
+
+**`suspended` and `open` are the supervision signals**, and they agree:
+a child parked on `ask("parent", …)` holds a frame *and* carries an
+open question. `running` says it is fine; `suspended` with `open > 0`
+says it is stuck and the parent is the one holding it up.
+
+Which still points the same way the first version did, for a better
+reason: the task wants children that **get stuck and ask**, not
+children that merely take a long time. Long work alone is answered by
+`Promise.all`, as `supervise-builds` measured.
 ## What the task therefore needs
 
 Children that **get stuck and ask**, not children that merely take a

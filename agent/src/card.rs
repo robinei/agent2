@@ -1069,7 +1069,7 @@ mod tests {
         // `card()` shows up as a diff review must look at, not a byte
         // count that silently drifts. Comparing full text (not just a
         // hash) so the diff itself is legible in a failure message.
-        const EXPECTED_LEN: usize = 16254;
+        const EXPECTED_LEN: usize = 16361;
         assert_eq!(
             card().len(),
             EXPECTED_LEN,
@@ -1264,12 +1264,20 @@ mod tests {
             "the card's `list_agents` row and what `serve_agents` builds disagree"
         );
         // And the status words a supervisor branches on.
+        // **The statuses that exist.** `Runner::status`'s
+        // `unreachable!("returned above")` is a panic message, not a
+        // status, and scraping string literals out of that function put
+        // it in the card as one.
         for word in ["running", "thinking", "suspended", "idle", "dormant"] {
             assert!(
                 card.contains(&format!("`\"{word}\"`")),
                 "the card does not name the status `{word}`"
             );
         }
+        assert!(
+            !card.contains("returned above"),
+            "`returned above` is a panic message in an unreachable arm, not a status"
+        );
     }
 
     #[test]

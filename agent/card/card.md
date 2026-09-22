@@ -81,7 +81,7 @@ declare function spawn(charter: string): Agent;
 declare function fork(): Agent;
 /** Every agent in this subtree and what each is doing — the verb a supervisor polls.
 
-  `status` is one of `"running"` (a program of its own is executing), `"thinking"` (waiting on a completion), `"suspended"`, `"idle"`, `"returned above"`, or `"dormant"` (no runner in this session; nothing is lost, it wakes when spoken to).
+  `status` is one of: `"running"` — a program of its own is executing; `"suspended"` — a program of its own stopped part-way and is waiting for an answer; `"thinking"` — waiting on a completion; `"idle"` — awake with nothing to do; `"dormant"` — not loaded in this session, which is not a problem and not a loss: it wakes when spoken to.
 
   **`open` is the one to watch.** It counts the questions that agent is blocked on, and a child that stopped to ask cannot go on until somebody answers it — `answer(question, value)`, by the id the report gives. `last_answer` is what it was told most recently. A supervisor that polls `status` alone sees a stalled child as merely quiet. */
 declare function list_agents(opts?: { under?: number; deep?: boolean }):
