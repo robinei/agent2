@@ -1141,12 +1141,76 @@ fn agent_reference_in(text: &str) -> Option<u64> {
 /// has a pending ask to you"). Pure — takes the navigator's own
 /// `branch_infos` snapshot rather than a session, so it is directly
 /// testable.
+/// **A name from the first words of what was said.** A branch nobody
+/// named reads as `branch #42` in the navigator, which is an address
+/// rather than a reminder. The message that opened it is the best
+/// short description anyone has, and it costs nothing to take.
+///
+/// Cut on a word boundary where there is one, so a name ends in a word
+/// rather than mid-syllable, and cleaned of the whitespace a pasted
+/// message carries.
+pub fn name_from_message(text: &str) -> Option<String> {
+    const MAX: usize = 32;
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.is_empty() {
+        return None;
+    }
+    if flat.len() <= MAX {
+        return Some(flat);
+    }
+    let cut = flat[..MAX].rfind(' ').unwrap_or(MAX);
+    Some(format!("{}…", flat[..cut].trim_end()))
+}
+
+/// `/fork <message>` and `/spawn <message>` — hand work out in the one
+/// gesture that makes the helper and tells it what it is for.
+///
+/// **Why they exist even though the model can do this itself.** It
+/// often does not: on a thread worth protecting, asked something whose
+/// findings it would have to hold, it hands the work out in 0 of 20
+/// samples without a worked example to imitate
+/// (`docs/evidence/`). The person watching the thread
+/// fill up should not have to negotiate about it.
+///
+/// `/fork` is for work that needs what this thread already knows;
+/// `/spawn` for work that needs none of it. Anything else is a message.
+fn slash_command(branch: BranchId, leaf: Option<EventId>, text: &str) -> Option<SessionCommand> {
+    let (verb, rest) = text.split_once(char::is_whitespace)?;
+    let rest = rest.trim();
+    if rest.is_empty() {
+        return None;
+    }
+    let name = name_from_message(rest);
+    match verb {
+        "/fork" => Some(SessionCommand::Fork {
+            from: leaf?,
+            name,
+            text: Some(rest.to_owned()),
+        }),
+        "/spawn" => Some(SessionCommand::Spawn {
+            parent: branch,
+            name,
+            charter: rest.to_owned(),
+            text: None,
+        }),
+        _ => None,
+    }
+}
+
 fn resolve_submit(
     infos: &[BranchInfo],
     branch: BranchId,
     text: String,
     expects_reply: bool,
 ) -> SessionCommand {
+    // **A slash command is not an answer.** Checked before the
+    // asking-user branch below: a person typing `/fork …` while a
+    // question is open means to hand that work out, not to answer with
+    // the literal text "/fork …".
+    let leaf = infos.iter().find(|b| b.branch == branch).map(|b| b.leaf);
+    if let Some(cmd) = slash_command(branch, leaf, &text) {
+        return cmd;
+    }
     let asking = infos
         .iter()
         .find(|b| b.branch == branch)
@@ -1432,6 +1496,7 @@ pub fn run_attached(mut session: Session, events_rx: Receiver<SessionEvent>) -> 
                                 handle.send(SessionCommand::Fork {
                                     from: at,
                                     name: None,
+                                    text: None,
                                 });
                             }
                         }
@@ -1439,6 +1504,7 @@ pub fn run_attached(mut session: Session, events_rx: Receiver<SessionEvent>) -> 
                             handle.send(SessionCommand::Fork {
                                 from: at,
                                 name: None,
+                                text: None,
                             });
                         }
                         KeyAction::Interrupt => {
@@ -3164,6 +3230,66 @@ mod tests {
                 screen.dump()
             );
         }
+    }
+
+    /// **`/fork` and `/spawn` hand work out in one gesture.**
+    ///
+    /// The model often will not: on a thread worth keeping, asked
+    /// something whose findings it would have to hold, it hands the
+    /// work out in 0 of 20 samples unless a worked example shows it.
+    /// The person watching their thread fill up should not have to
+    /// negotiate about it.
+    #[test]
+    fn slash_fork_and_spawn_hand_work_out_and_name_themselves() {
+        let branch = fid(1);
+        let leaf = Some(EventId::new(9));
+
+        let Some(SessionCommand::Fork { from, name, text }) =
+            slash_command(branch, leaf, "/fork should we pull this patch?")
+        else {
+            panic!("/fork makes a fork");
+        };
+        assert_eq!(from, EventId::new(9), "forked from where the branch is");
+        assert_eq!(name.as_deref(), Some("should we pull this patch?"));
+        assert_eq!(
+            text.as_deref(),
+            Some("should we pull this patch?"),
+            "and it is told what it is for in the same gesture"
+        );
+
+        let Some(SessionCommand::Spawn { charter, name, .. }) =
+            slash_command(branch, leaf, "/spawn run the suite and say what fails")
+        else {
+            panic!("/spawn makes an agent");
+        };
+        assert_eq!(charter, "run the suite and say what fails");
+        // Exactly at the bound, so it is kept whole.
+        assert_eq!(name.as_deref(), Some("run the suite and say what fails"));
+
+        // **Only these two, and only with something to say.** Anything
+        // else is a message: a person writing about `/fork` in prose is
+        // not issuing one.
+        assert!(slash_command(branch, leaf, "/fork").is_none());
+        assert!(slash_command(branch, leaf, "/fork   ").is_none());
+        assert!(slash_command(branch, leaf, "/rename x").is_none());
+        assert!(slash_command(branch, leaf, "what does /fork do?").is_none());
+    }
+
+    /// A name is a reminder, not an address: it comes from the first
+    /// words of the message and stops on a word.
+    #[test]
+    fn a_derived_name_stops_on_a_word() {
+        assert_eq!(name_from_message("short one"), Some("short one".into()));
+        assert_eq!(
+            name_from_message("  ragged\n  whitespace   collapses "),
+            Some("ragged whitespace collapses".into())
+        );
+        let long = name_from_message("judge whether the retry refactor is wired in correctly")
+            .expect("a name");
+        assert!(long.len() <= 35, "bounded: {long:?}");
+        assert!(long.ends_with('…'), "says it was cut: {long:?}");
+        assert!(!long.contains("  "), "no ragged edge: {long:?}");
+        assert_eq!(name_from_message("   "), None);
     }
 
     /// **Something is happening, and the pane says so.**

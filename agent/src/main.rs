@@ -644,6 +644,7 @@ fn queue_nav(session: &host::Session, nav: &SessionNav) {
         h.send(host::SessionCommand::Fork {
             from: EventId::new(from),
             name: nav.name.clone(),
+            text: None,
         });
     } else if let Some(name) = nav.name.clone() {
         h.send(host::SessionCommand::Rename { branch, name });

@@ -909,7 +909,9 @@ impl Session {
             LoopMsg::Command(SessionCommand::Rename { branch, name }) => {
                 self.cmd_rename(branch, name)
             }
-            LoopMsg::Command(SessionCommand::Fork { from, name }) => self.cmd_fork(from, name),
+            LoopMsg::Command(SessionCommand::Fork { from, name, text }) => {
+                self.cmd_fork(from, name, text)
+            }
             LoopMsg::Command(SessionCommand::Resume(leaf)) => self.cmd_resume(leaf),
             LoopMsg::LlmChunk {
                 branch,
@@ -1131,7 +1133,12 @@ impl Session {
     /// untouched, the new one is born idle (its `shown` starts at its own
     /// root, so inherited history is never a cause), and the only thing
     /// it returns is the new id.
-    fn cmd_fork(&mut self, from: EventId, name: Option<String>) -> io::Result<()> {
+    fn cmd_fork(
+        &mut self,
+        from: EventId,
+        name: Option<String>,
+        text: Option<String>,
+    ) -> io::Result<()> {
         let mut spine = match self.tree.fork(from) {
             Ok(spine) => spine,
             Err(e) => {
@@ -1152,6 +1159,20 @@ impl Session {
         self.emit_new();
         self.emit(SessionEvent::BranchOpened { branch: fork });
         self.emit_branches();
+        // **And say what it is for.** A fork inherits everything the
+        // branch it came from holds, including that branch's
+        // conversation with the person — so with nothing said to it, it
+        // has every reason to read those words as addressed to it
+        // (`docs/evidence/2026-09-22-a-fork-inherits-the-role.md`).
+        // Delivering here means the making and the telling are one
+        // gesture, which is the only way the caller can be sure the
+        // message lands on *this* fork.
+        if let Some(text) = text {
+            // Asked, not told: the person wants the answer where they
+            // are, and `from`'s branch is where they typed.
+            let asker = self.tree.branch_of(from).unwrap_or(fork);
+            self.ask_on_behalf(asker, fork, text)?;
+        }
         Ok(())
     }
 
@@ -1264,16 +1285,12 @@ impl Session {
         self.emit_new();
         self.emit(SessionEvent::BranchOpened { branch });
         if let Some(text) = text {
-            self.deliver_post(
-                branch,
-                Author::User,
-                Origin::Direct {
-                    text,
-                    input: serde_json::Value::Null,
-                    options: Vec::new(),
-                    expects_reply: true,
-                },
-            )?;
+            // **Asked on the parent's behalf.** It used to arrive as an
+            // `Author::User` post, which owes an answer to nobody:
+            // `asking_branch` returns `None` for a user post, so the
+            // reply was read inline and the branch that asked for the
+            // work never learned what came back.
+            self.ask_on_behalf(parent, branch, text)?;
         }
         self.emit_branches();
         Ok(())
@@ -1922,6 +1939,49 @@ impl Session {
                 result: Ok(serde_json::json!({ "post": post.map(|p| p.as_u64()) })),
             });
         }
+        Ok(())
+    }
+
+    /// **Ask one branch a question on another branch's behalf**, with no
+    /// program on either side.
+    ///
+    /// This is what `/fork` and `/spawn` are: the person hands work out
+    /// and wants the answer where they are watching, not read aloud to
+    /// them and lost. A program does this with `ask`, whose `Send` its
+    /// run owns; here there is no run, so the `Send` is logged straight
+    /// onto the asking branch's spine.
+    ///
+    /// Everything downstream then works unchanged, because the routing
+    /// keys off the log rather than off a live frame: the post carries
+    /// `Origin::Sent(send)`, `asking_branch` walks
+    /// `Answer → Post → Send → branch` back to here, and the settlement
+    /// of a call no program awaits is already a harness post naming the
+    /// value (`machine.rs`'s "settled with no program awaiting it").
+    /// So the answer arrives as a row on the branch the person typed
+    /// on, which is the whole point.
+    fn ask_on_behalf(&mut self, asker: BranchId, asked: BranchId, text: String) -> io::Result<()> {
+        let Some(state) = self.states.get_mut(&asker) else {
+            return Ok(());
+        };
+        let send = self.tree.append(
+            &mut state.spine,
+            EventPayload::Call(Call::Send {
+                to: Address::Branch(asked),
+                prose: false,
+                text,
+                input: serde_json::Value::Null,
+                options: Vec::new(),
+                expects_reply: true,
+                // Synthetic: no source expression issued this, and zero
+                // width is the convention for exactly that.
+                site: 0,
+                site_end: 0,
+            }),
+        )?;
+        let from = Author::Agent(self.agent_of(asker));
+        self.deliver_post(asked, from, Origin::Sent(send))?;
+        self.emit_new();
+        self.emit_branches();
         Ok(())
     }
 
@@ -4241,8 +4301,7 @@ mod tests {
         // event logged, so its id — the new branch's id — is #8.
         h.send(SessionCommand::Fork {
             from: EventId::new(2),
-            name: Some("retry".into()),
-        });
+            name: Some("retry".into()), text: None });
         let fork = EventId::new(8);
         h.send(SessionCommand::UserTurn {
             branch: fork,
@@ -4408,8 +4467,7 @@ mod tests {
         });
         h.send(SessionCommand::Fork {
             from: EventId::new(2),
-            name: None,
-        });
+            name: None, text: None });
         h.send(SessionCommand::Resume(EventId::new(2)));
         for _ in 0..8 {
             session.pump_one();
@@ -6022,12 +6080,10 @@ mod tests {
         // events logged: #8 and #9.
         h.send(SessionCommand::Fork {
             from: EventId::new(2),
-            name: Some("A".into()),
-        });
+            name: Some("A".into()), text: None });
         h.send(SessionCommand::Fork {
             from: EventId::new(2),
-            name: Some("B".into()),
-        });
+            name: Some("B".into()), text: None });
         let (a, b) = (EventId::new(8), EventId::new(9));
         h.send(SessionCommand::UserTurn {
             branch: a,
@@ -6089,8 +6145,7 @@ mod tests {
         let h = session.handle();
         h.send(SessionCommand::Fork {
             from: EventId::new(2),
-            name: None,
-        });
+            name: None, text: None });
         h.send(SessionCommand::Shutdown);
         let mut session = drain(session);
         let fork = EventId::new(8);
@@ -6130,8 +6185,7 @@ mod tests {
         let (session, _rx) = open(tree_with_answered_root(), vec![]);
         session.handle().send(SessionCommand::Fork {
             from: EventId::new(7),
-            name: None,
-        });
+            name: None, text: None });
         session.handle().send(SessionCommand::Shutdown);
         let session = drain(session);
 
@@ -6401,8 +6455,7 @@ mod tests {
         let at = session.state(branch).unwrap().spine.leaf_id;
         h.send(SessionCommand::Fork {
             from: at,
-            name: Some("explore".into()),
-        });
+            name: Some("explore".into()), text: None });
         while session.pump_one() {}
         let fork = live_branches(&session)
             .into_iter()
@@ -6576,6 +6629,77 @@ mod tests {
     /// settlement carries no such value — it is a delivery receipt for
     /// something already fully expressed in the log by its own `Call` —
     /// so there is nothing for Rule C to protect.
+    /// **`/fork` asks, and the answer comes home.**
+    ///
+    /// The person hands work out from the branch they are watching and
+    /// wants the verdict there — not read aloud to them and lost. There
+    /// is no program on either side, so the `Send` is logged straight
+    /// onto the asking branch and the ordinary routing does the rest:
+    /// `Answer → Post → Send → branch`, and a call no program awaits
+    /// settles as a harness post naming the value.
+    #[test]
+    fn a_fork_asked_by_the_person_answers_into_the_branch_that_asked() {
+        // A settled conversation, so the only completion the script
+        // owes is the fork's.
+        let (session, _rx) = open(
+            tree_with_answered_root(),
+            vec![
+                scripted_program(r#"answer("pull it: the wiring is right");"#),
+                scripted_program("finish();"),
+                scripted_program("finish();"),
+            ],
+        );
+        let asker = session.conversation_branch();
+        let at = session.state(asker).expect("live").spine.leaf_id;
+        session.handle().send(SessionCommand::Fork {
+            from: at,
+            name: Some("verdict".into()),
+            text: Some("should we pull this patch?".into()),
+        });
+        let session = drain(session);
+        let tree = session.tree();
+
+        // The question is a `Send` on the branch the person typed on.
+        let send = tree
+            .path_events(session.state(asker).expect("live").spine.leaf_id)
+            .iter()
+            .find_map(|e| match &e.payload {
+                EventPayload::Call(Call::Send {
+                    to: Address::Branch(_),
+                    text,
+                    expects_reply: true,
+                    ..
+                }) => Some((e.id, text.clone())),
+                _ => None,
+            })
+            .expect("the person's question is a Send on their own branch");
+        assert_eq!(send.1, "should we pull this patch?");
+
+        // And what came back is on that same branch, naming the answer.
+        let home: Vec<String> = tree
+            .path_events(session.state(asker).expect("live").spine.leaf_id)
+            .iter()
+            .filter_map(|e| match &e.payload {
+                EventPayload::Post { origin, .. } => {
+                    tree.resolve(origin).direct().map(|(t, ..)| t.to_owned())
+                }
+                _ => None,
+            })
+            .collect();
+        // **Whatever came back, came back here.** The claim is the
+        // routing, not the child's answer: a settlement naming the
+        // person's own `Send` lands on the branch they typed on. A
+        // scripted child that cannot answer settles it as a failure,
+        // and that failure is delivered to exactly the same place — so
+        // this holds either way, which is what makes it about the wire
+        // and not about the fixture.
+        let id = send.0.as_u64();
+        assert!(
+            home.iter().any(|t| t.contains(&format!("[{id}]"))),
+            "the settlement of #{id} came home to the branch that asked: {home:?}"
+        );
+    }
+
     /// **A failed request is on the log, and asks for nothing.**
     ///
     /// `SessionEvent::Error` reaches an attached client and nowhere

@@ -123,6 +123,16 @@ pub enum SessionCommand {
         from: EventId,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         name: Option<String>,
+        /// What to say to it once it exists.
+        ///
+        /// **A fork is idle until spoken to**, and until now nothing
+        /// could speak to one in the same gesture that made it: the id
+        /// came back asynchronously as `BranchOpened`, so a caller had
+        /// to wait for it and send a second command. `Spawn` has always
+        /// carried its opening message this way; this is the same
+        /// field for the same reason.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
     },
     /// Open the branch `leaf` sits on as a live branch (re-hydrating it
     /// if this session had no runner for it) and announce its id. It
@@ -297,8 +307,7 @@ mod tests {
         });
         roundtrip_cmd(SessionCommand::Fork {
             from: id,
-            name: Some("retry".into()),
-        });
+            name: Some("retry".into()), text: None });
         roundtrip_cmd(SessionCommand::Resume(id));
         roundtrip_cmd(SessionCommand::Shutdown);
 
