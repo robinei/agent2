@@ -314,9 +314,54 @@ fn waiting_on(path: &[&Event]) -> String {
                  taken up yet",
                 id.as_u64()
             ),
-            (None, _) => "waiting on: nothing".to_owned(),
+            // **Nothing owed, or owed and never delivered.** A log
+            // that ends where the trigger rule would have asked is a
+            // log whose completion never came back — the one shape
+            // that otherwise reads exactly like a finished run.
+            (None, _) => match owed_completion(path) {
+                Some(why) => format!(
+                    "waiting on: nothing — but {why} here, and the completion that \
+                     answers it never arrived"
+                ),
+                None => "waiting on: nothing".to_owned(),
+            },
         },
     }
+}
+
+/// **A completion this log was owed and did not get.**
+///
+/// Nothing records that a request went out — the `Reply` is opened by
+/// its first text chunk, so a completion that hangs or dies with the
+/// process leaves no event at all. But it does not have to: the trigger
+/// rule is a function of the log, so a path that *ends* in a state the
+/// rule prompts on is a path that was owed a completion. If one had
+/// arrived it would be here.
+///
+/// Two causes, both unambiguous about having asked:
+/// `compaction_if_needed` appends its `Compaction` and renders the
+/// request in the same breath, and a program that completed without
+/// resting is `needs_prompt`'s outcome clause. Walking back stops at
+/// the first `Reply`/`Restart` — one arrived, so the debt was paid —
+/// or at a `RequestFailed`, which says what happened and is reported
+/// by [`last_failure`] instead.
+///
+/// `try23.jsonl` is the case: a compaction was asked for at #57 and the
+/// log has 744 seconds of nothing after it.
+fn owed_completion(path: &[&Event]) -> Option<&'static str> {
+    for event in path.iter().rev() {
+        match &event.payload {
+            EventPayload::Reply | EventPayload::Restart => return None,
+            EventPayload::RequestFailed { .. } => return None,
+            EventPayload::Compaction { .. } => return Some("a compaction was asked for"),
+            EventPayload::Handback {
+                how: Handback::Completed { rested, .. },
+                ..
+            } if !rested => return Some("its program completed"),
+            _ => {}
+        }
+    }
+    None
 }
 
 /// The failure of the most recent request, if nothing has been replied
@@ -468,6 +513,41 @@ mod tests {
         assert!(
             out.contains("has not been taken up yet"),
             "a post nobody has replied to reads as a rest: {out}"
+        );
+    }
+
+    /// **A log that ends owing a completion says so.**
+    ///
+    /// Nothing records that a request went out, so a completion that
+    /// hangs or dies with the process leaves no event — and the log
+    /// then reads exactly like a run that finished. It need not: the
+    /// trigger rule is a function of the log, so a path that ends where
+    /// the rule would have asked is a path whose answer never came back.
+    ///
+    /// A program that rests is the control: `finish()` means the next
+    /// thing to happen is whatever the person says, so nothing is owed
+    /// and the line stays quiet.
+    #[test]
+    fn a_log_that_ends_owing_a_completion_does_not_read_as_finished() {
+        let mut rested = Conversation::new();
+        rested.user("is it green?");
+        rested.reply("Yes.\n\n```js\ntell(\"green.\"); finish();\n```\n");
+        let out = render(rested.tree(), rested.runner().spine.leaf_id);
+        assert!(
+            out.ends_with("waiting on: nothing\n"),
+            "a branch that rested is owed nothing: {out}"
+        );
+
+        // The same run without the `finish()`: the program completed,
+        // which is the trigger rule's outcome clause, so a completion
+        // was owed — and this log does not have one.
+        let mut owed = Conversation::new();
+        owed.user("is it green?");
+        owed.reply("Yes.\n\n```js\ntell(\"green.\");\n```\n");
+        let out = render(owed.tree(), owed.runner().spine.leaf_id);
+        assert!(
+            out.contains("never arrived"),
+            "a log cut off mid-flight reads as finished: {out}"
         );
     }
 
