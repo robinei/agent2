@@ -248,9 +248,17 @@ impl IncrementalAnalyzer {
                 // second read and hide the waste, which is also why
                 // this diagnostic is worth having rather than quietly
                 // shadowing.
+                // **"Earlier in this reply", not "earlier".** It used to
+                // say "what ran before it", which reads as everything
+                // that has ever run — and across replies no scope is
+                // shared at all, so a reader taking it that way would
+                // expect a binding from a previous reply to still be
+                // there and get a `ReferenceError` instead. The scope
+                // this shares is one reply's, and the message has to
+                // say which.
                 message: format!(
-                    "`{name}` is already declared — this code shares one scope with what \
-                     ran before it, so `{name}` is still bound to whatever the earlier code \
+                    "`{name}` is already declared — the blocks of one reply share a scope, \
+                     so `{name}` is still bound to whatever an earlier block *in this reply* \
                      gave it. If that is the value you want, use it; it does not need \
                      fetching twice. If you want a different one, give it a different name."
                 ),
