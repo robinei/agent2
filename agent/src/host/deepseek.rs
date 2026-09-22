@@ -93,6 +93,13 @@ pub struct DeepSeekClient {
     /// the difference. That is the whole of the transport: a wrapper
     /// on the wire, unwrapped on arrival.
     run_program: bool,
+    /// **This endpoint is OpenAI's own**, which takes a different shape
+    /// for two fields: it rejects the `thinking` object DeepSeek and
+    /// opencode want, and it refuses `max_tokens` on the reasoning
+    /// models in favour of `max_completion_tokens`. Derived from the
+    /// base URL rather than configured, because it is a fact about
+    /// where the request is going, not a choice anyone makes.
+    openai_shape: bool,
     agent: ureq::Agent,
     // Stable for the client's lifetime (one per session): the "OpenCode
     // Go" endpoint requires `x-opencode-session` to route a conversation
@@ -184,6 +191,7 @@ impl DeepSeekClient {
     }
 
     pub fn new(api_key: String, model: String, base_url: String, thinking: bool) -> Self {
+        let openai_shape = base_url.contains("api.openai.com");
         // Completions stream for minutes, so the body read cannot be
         // held to a short deadline — but "no deadline at all" means a
         // dead socket hangs the branch forever, with the TUI showing a
@@ -232,6 +240,7 @@ impl DeepSeekClient {
             effort: None,
             max_tokens: None,
             run_program: false,
+            openai_shape,
             agent: config.into(),
             session_id: uuid::Uuid::new_v4().to_string(),
         }
@@ -268,6 +277,7 @@ impl LlmClient for DeepSeekClient {
             self.effort.as_deref(),
             self.max_tokens,
             self.run_program,
+            self.openai_shape,
         );
         // **Retried only before a single byte has been streamed.**
         // Everything below this loop hands chunks straight to the
@@ -497,6 +507,7 @@ fn request_body(
     effort: Option<&str>,
     max_tokens: Option<u32>,
     run_program: bool,
+    openai_shape: bool,
 ) -> serde_json::Value {
     let messages: Vec<serde_json::Value> = request.messages.iter().map(message_json).collect();
     let mut body = serde_json::json!({
@@ -514,9 +525,18 @@ fn request_body(
         body["tools"] = serde_json::json!([run_program_tool()]);
     }
     if let Some(n) = max_tokens {
-        body["max_tokens"] = serde_json::json!(n);
+        body[if openai_shape { "max_completion_tokens" } else { "max_tokens" }] =
+            serde_json::json!(n);
     }
-    if !thinking {
+    if openai_shape {
+        // No `thinking` object at all — OpenAI errors on the unknown
+        // field. `reasoning_effort` is its own knob there and is sent
+        // on its own; the levels this harness may pass that OpenAI does
+        // not know (`xhigh`, `max`) are the caller's problem to avoid.
+        if let Some(effort) = effort.filter(|_| thinking) {
+            body["reasoning_effort"] = serde_json::json!(effort);
+        }
+    } else if !thinking {
         // Exactly what `pi` sends to disable on this provider, so
         // "both off" is the same request on both sides.
         body["thinking"] = serde_json::json!({ "type": "disabled" });
@@ -856,7 +876,7 @@ mod tests {
             msg(ChatRole::Assistant, "return 1;"),
             msg(ChatRole::User, "## program completed"),
         ]);
-        let body = request_body(&request, "deepseek-v4-pro", true, None, None, false);
+        let body = request_body(&request, "deepseek-v4-pro", true, None, None, false, false);
 
         assert_eq!(body["model"], "deepseek-v4-pro");
         assert_eq!(body["stream"], true);
@@ -886,14 +906,14 @@ mod tests {
             messages: vec![ChatMessage { role: ChatRole::System, content: "c".into(), call: None, result_for: None, thinking: None }],
             preamble: 0,
         };
-        let body = request_body(&request, "deepseek-v4-flash", true, Some("medium"), None, false);
+        let body = request_body(&request, "deepseek-v4-flash", true, Some("medium"), None, false, false);
         assert_eq!(body["reasoning_effort"], json!("medium"));
         // The level needs the enable flag beside it; alone it is a
         // request the API may answer at whatever default it likes.
         assert_eq!(body["thinking"], json!({ "type": "enabled" }));
 
         // Unpinned: no field at all, and the API picks.
-        let body = request_body(&request, "deepseek-v4-flash", true, None, None, false);
+        let body = request_body(&request, "deepseek-v4-flash", true, None, None, false, false);
         assert!(body.get("reasoning_effort").is_none());
     }
 
@@ -904,16 +924,16 @@ mod tests {
     #[test]
     fn max_tokens_is_sent_only_when_asked_for() {
         let request = doc(vec![]);
-        let without = request_body(&request, "m", true, None, None, false);
+        let without = request_body(&request, "m", true, None, None, false, false);
         assert!(without.get("max_tokens").is_none());
-        let with = request_body(&request, "m", true, None, Some(4096), false);
+        let with = request_body(&request, "m", true, None, Some(4096), false, false);
         assert_eq!(with["max_tokens"], json!(4096));
     }
 
     #[test]
     fn request_body_disables_thinking_on_request() {
         let request = doc(vec![]);
-        let body = request_body(&request, "deepseek-v4-flash", false, None, None, false);
+        let body = request_body(&request, "deepseek-v4-flash", false, None, None, false, false);
         assert_eq!(body["thinking"], json!({ "type": "disabled" }));
     }
 
@@ -1205,6 +1225,52 @@ mod tests {
         assert_eq!(report["tool_call_id"], *id);
     }
 
+    /// **OpenAI takes a different shape for two fields.**
+    ///
+    /// It errors on the `thinking` object every other endpoint here
+    /// wants, and it refuses `max_tokens` on its reasoning models. Both
+    /// are facts about where the request is going, so both follow the
+    /// base URL rather than a flag anyone has to remember.
+    #[test]
+    fn the_openai_endpoint_gets_the_shape_it_accepts() {
+        let request = doc(vec![msg(ChatRole::System, "card")]);
+
+        let ds = request_body(&request, "m", true, Some("high"), Some(4096), false, false);
+        assert_eq!(ds["thinking"]["type"], "enabled");
+        assert_eq!(ds["max_tokens"], 4096);
+        assert!(ds.get("max_completion_tokens").is_none());
+
+        let oa = request_body(&request, "gpt-5", true, Some("high"), Some(4096), false, true);
+        assert!(oa.get("thinking").is_none(), "OpenAI rejects it: {oa}");
+        assert_eq!(oa["max_completion_tokens"], 4096);
+        assert!(oa.get("max_tokens").is_none());
+        assert_eq!(oa["reasoning_effort"], "high");
+
+        // Thinking off means no effort either, not "disabled".
+        let off = request_body(&request, "gpt-5", false, Some("high"), None, false, true);
+        assert!(off.get("thinking").is_none(), "{off}");
+        assert!(off.get("reasoning_effort").is_none(), "{off}");
+    }
+
+    /// And the flag is derived, not configured.
+    #[test]
+    fn the_endpoint_decides_its_own_shape() {
+        let oa = DeepSeekClient::new(
+            "k".into(),
+            "gpt-5".into(),
+            "https://api.openai.com/v1".into(),
+            true,
+        );
+        assert!(oa.openai_shape);
+        let ds = DeepSeekClient::new(
+            "k".into(),
+            "deepseek-v4-flash".into(),
+            "https://opencode.ai/zen/go/v1".into(),
+            true,
+        );
+        assert!(!ds.openai_shape);
+    }
+
     /// **Two calls in one turn are two cells, not one corrupt one.**
     ///
     /// The delta carries an `index`; reading `tool_calls[0]` of each
@@ -1403,9 +1469,9 @@ mod tests {
     #[test]
     fn the_tool_is_offered_only_when_asked_for() {
         let request = doc(vec![msg(ChatRole::System, "card")]);
-        let off = request_body(&request, "m", true, None, None, false);
+        let off = request_body(&request, "m", true, None, None, false, false);
         assert!(off.get("tools").is_none(), "{off}");
-        let on = request_body(&request, "m", true, None, None, true);
+        let on = request_body(&request, "m", true, None, None, true, false);
         assert_eq!(on["tools"][0]["function"]["name"], "run_program");
         assert_eq!(
             on["tools"][0]["function"]["parameters"]["required"][0], "source",
