@@ -6057,6 +6057,8 @@ mod tests {
                     "# NEW EVENTS\n\n[harness] fork of branch #1 at #7 — questions before \
                  this line are being handled there; do not redo its work unless asked."
                         .to_owned(),
+                call: None,
+                result_for: None,
             }),
             "{doc:?}"
         );

@@ -251,6 +251,16 @@ impl LlmClient for DeepSeekClient {
         // the body we build and the SSE shape we expect back cannot
         // disagree with it. Both used to read `AGENT2_TRANSPORT`
         // independently and were kept in agreement only by a comment.
+        // The one place the transport touches the document. Everything
+        // upstream rendered markdown; this hands the model its own past
+        // programs in the shape it emits them, exemplars included.
+        let shaped;
+        let request = if self.run_program {
+            shaped = request.clone().into_tool_calls();
+            &shaped
+        } else {
+            request
+        };
         let body = request_body(
             request,
             &self.model,
@@ -531,6 +541,34 @@ fn request_body(
 /// every `User` message is a post or the harness's own report, and every
 /// `Assistant` message is the model's reply verbatim.
 fn message_json(message: &ChatMessage) -> serde_json::Value {
+    // A turn the call transport lifted: the program goes back as the
+    // call it was, so the model's own history shows it acting the way
+    // it is being told to act.
+    if let Some((id, source)) = &message.call {
+        return serde_json::json!({
+            "role": "assistant",
+            "content": message.content,
+            "tool_calls": [{
+                "id": id,
+                "type": "function",
+                "function": {
+                    "name": "run_program",
+                    "arguments": serde_json::json!({ "source": source }).to_string(),
+                }
+            }]
+        });
+    }
+    // And the report that answers one goes back in the `tool` role. The
+    // API requires a tool message after a tool call; a bare user turn
+    // there is rejected by some providers and, worse, accepted by
+    // others as a turn the model never took.
+    if let Some(id) = &message.result_for {
+        return serde_json::json!({
+            "role": "tool",
+            "tool_call_id": id,
+            "content": message.content,
+        });
+    }
     let role = match message.role {
         ChatRole::System => "system",
         ChatRole::User => "user",
@@ -750,6 +788,8 @@ mod tests {
         ChatMessage {
             role,
             content: content.into(),
+            call: None,
+            result_for: None,
         }
     }
 
@@ -788,10 +828,7 @@ mod tests {
         // exactly is what makes `DESIGN.md`'s M5 a comparison of two
         // harnesses rather than of two reasoning budgets.
         let request = Document {
-            messages: vec![ChatMessage {
-                role: ChatRole::System,
-                content: "c".into(),
-            }],
+            messages: vec![ChatMessage { role: ChatRole::System, content: "c".into(), call: None, result_for: None }],
             preamble: 0,
         };
         let body = request_body(&request, "deepseek-v4-flash", true, Some("medium"), None, false);
@@ -1058,6 +1095,74 @@ mod tests {
         }
         out.push_str("data: [DONE]\n\n");
         out
+    }
+
+    /// **The model's history shows it acting the way it is told to.**
+    ///
+    /// Rendered the ordinary way, a past turn comes back as an
+    /// assistant message holding a ```js block — so under the call
+    /// transport the card says "code written in the reply does nothing"
+    /// while the model looks at its own replies, full of code, that
+    /// evidently ran. The first live run of this arm did exactly that,
+    /// and in this codebase the example beats the rule every time it
+    /// has been measured.
+    ///
+    /// The rewrite is also what lets the **exemplars** stay. They are
+    /// authored once, in fences, and rendered in whichever shape the
+    /// session is using — so neither arm has to give up the worked
+    /// examples to be measured.
+    #[test]
+    fn a_past_program_goes_back_as_the_call_it_was() {
+        let doc = doc(vec![
+            msg(ChatRole::System, "card"),
+            msg(ChatRole::User, "do it"),
+            msg(ChatRole::Assistant, "Reading it.\n\n```js\nreturn 1;\n```\n"),
+            msg(ChatRole::User, "## program completed"),
+        ])
+        .into_tool_calls();
+
+        let turn = &doc.messages[2];
+        assert_eq!(turn.content, "Reading it.", "the prose is kept, the fence is not");
+        let (id, source) = turn.call.as_ref().expect("the turn became a call");
+        // The cell keeps its trailing newline; the program is the
+        // bytes between the fences, not a trimmed version of them.
+        assert_eq!(source, "return 1;\n");
+        assert_eq!(
+            doc.messages[3].result_for.as_deref(),
+            Some(id.as_str()),
+            "the report that follows is that call's result"
+        );
+
+        let body = message_json(turn);
+        assert_eq!(body["role"], "assistant");
+        assert_eq!(body["tool_calls"][0]["function"]["name"], "run_program");
+        let args: serde_json::Value =
+            serde_json::from_str(body["tool_calls"][0]["function"]["arguments"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(args["source"], "return 1;\n");
+        assert!(
+            !body.to_string().contains("```js"),
+            "a fence still reaches the model: {body}"
+        );
+
+        let report = message_json(&doc.messages[3]);
+        assert_eq!(report["role"], "tool", "{report}");
+        assert_eq!(report["tool_call_id"], *id);
+    }
+
+    /// A turn with no cell is left alone — a resting reply is prose and
+    /// nothing else, and inventing an empty call for it would tell the
+    /// model it had run something.
+    #[test]
+    fn a_reply_that_ran_nothing_stays_a_plain_turn() {
+        let doc = doc(vec![
+            msg(ChatRole::System, "card"),
+            msg(ChatRole::User, "what is it"),
+            msg(ChatRole::Assistant, "Four files, all live."),
+        ])
+        .into_tool_calls();
+        assert!(doc.messages[2].call.is_none());
+        assert_eq!(message_json(&doc.messages[2])["role"], "assistant");
     }
 
     /// **The whole of the `run_program` transport, asserted.**

@@ -122,6 +122,8 @@ pub fn parse(text: &str) -> Result<Document, String> {
                 messages.push(ChatMessage {
                     role,
                     content: body.join("\n"),
+                    call: None,
+                    result_for: None,
                 });
             }
             open = Some((role_of(name.trim())?, Vec::new()));
@@ -136,6 +138,8 @@ pub fn parse(text: &str) -> Result<Document, String> {
         messages.push(ChatMessage {
             role,
             content: body.join("\n"),
+            call: None,
+            result_for: None,
         });
     }
     if messages.is_empty() {
@@ -181,6 +185,8 @@ mod tests {
         ChatMessage {
             role,
             content: content.to_owned(),
+            call: None,
+            result_for: None,
         }
     }
 

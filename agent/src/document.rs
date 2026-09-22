@@ -42,6 +42,14 @@ pub enum ChatRole {
 pub struct ChatMessage {
     pub role: ChatRole,
     pub content: String,
+    /// Under the call transport: `(call id, program)`, lifted out of
+    /// this turn's fences by [`Document::as_tool_calls`]. `content`
+    /// keeps whatever prose stood beside it. `None` everywhere else,
+    /// which is every path but `host/deepseek.rs`'s request builder.
+    pub call: Option<(String, String)>,
+    /// The id of the call this message reports on, so the report goes
+    /// back in the `tool` role rather than as a bare user turn.
+    pub result_for: Option<String>,
 }
 
 impl ChatMessage {
@@ -49,6 +57,8 @@ impl ChatMessage {
         ChatMessage {
             role,
             content: content.into(),
+            call: None,
+            result_for: None,
         }
     }
 }
@@ -84,6 +94,66 @@ impl Document {
     /// a latent break in anything that means "the first real turn."
     pub fn conversation(&self) -> &[ChatMessage] {
         &self.messages[self.preamble.min(self.messages.len())..]
+    }
+
+    /// **Re-shape this document so programs are calls, not fences.**
+    ///
+    /// Under `AGENT2_RUN_PROGRAM` the model acts by calling
+    /// `run_program`, and its own history has to show that. Rendered
+    /// the ordinary way it does not: a past turn comes back as an
+    /// assistant message containing a ```js block, so the model is told
+    /// "code written in the reply does nothing" while looking at its
+    /// own replies, full of code, that evidently ran. In this codebase
+    /// the example beats the rule every time it has been measured, so
+    /// that contradiction is not cosmetic — it is the transport being
+    /// taught away one turn after it is taught.
+    ///
+    /// This lifts each turn's cells into a call and marks the report
+    /// that follows as that call's result. It runs over the whole
+    /// document, **exemplars included**, which is what lets the worked
+    /// examples stay: they are written once, in fences, and rendered in
+    /// whichever shape the session is actually using.
+    ///
+    /// A pure function of a rendered document, applied by the request
+    /// builder and nowhere else — so the log, the runner and the TUI go
+    /// on seeing markdown, and the transport stays one file wide.
+    pub fn into_tool_calls(mut self) -> Document {
+        let mut pending: Option<String> = None;
+        for (i, m) in self.messages.iter_mut().enumerate() {
+            if let Some(id) = pending.take()
+                && m.role == ChatRole::User
+            {
+                m.result_for = Some(id);
+                continue;
+            }
+            if m.role != ChatRole::Assistant {
+                continue;
+            }
+            let cells = crate::notebook::split_cells(&m.content);
+            if cells.is_empty() {
+                continue;
+            }
+            let source = cells
+                .iter()
+                .map(|c| c.slice(&m.content))
+                .collect::<Vec<_>>()
+                .join("\n");
+            // The prose is what is left once the fenced blocks are cut
+            // out — kept, because it is the half the person reads and
+            // the half the card tells the model to write.
+            let mut prose = String::new();
+            let mut at = 0usize;
+            for c in &cells {
+                prose.push_str(&m.content[at..c.outer_start]);
+                at = c.outer_end;
+            }
+            prose.push_str(&m.content[at..]);
+            let id = format!("call_{i}");
+            m.content = prose.trim().to_owned();
+            m.call = Some((id.clone(), source));
+            pending = Some(id);
+        }
+        self
     }
 
     /// Append ephemeral, one-request-only content to the open turn
