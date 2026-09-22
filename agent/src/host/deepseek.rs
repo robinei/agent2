@@ -628,9 +628,19 @@ struct Accumulated {
     /// the call is complete) is an ordinary, finished turn.
     finish_reason: Option<String>,
     usage: Usage,
-    /// `run_program` only: `delta.tool_calls[0].function.arguments`,
-    /// which arrives in fragments and is only valid JSON once whole.
-    tool_args: String,
+    /// `run_program` only: each call's `function.arguments`, keyed by
+    /// the delta's `index` and in that order.
+    ///
+    /// **Keyed, because a turn may hold more than one call.** Read as
+    /// `tool_calls[0]` of each delta — ignoring `index` — a second call
+    /// appends its fragments to the first one's buffer, and what was
+    /// two programs becomes one string of invalid JSON. The turn then
+    /// fails with a complaint about the JSON, which is the last place
+    /// anyone would look.
+    ///
+    /// Two calls are two cells, which is what the notebook has always
+    /// called a reply that runs more than one thing.
+    tool_args: std::collections::BTreeMap<u64, String>,
 }
 
 /// Parse a chat-completions SSE stream into the final assistant turn,
@@ -721,10 +731,18 @@ fn parse_sse(
             acc.source.push_str(t);
         }
         if run_program
-            && let Some(t) = delta["tool_calls"][0]["function"]["arguments"].as_str()
-            && !t.is_empty()
+            && let Some(calls) = delta["tool_calls"].as_array()
         {
-            acc.tool_args.push_str(t);
+            for call in calls {
+                let Some(t) = call["function"]["arguments"].as_str() else {
+                    continue;
+                };
+                if t.is_empty() {
+                    continue;
+                }
+                let index = call["index"].as_u64().unwrap_or(0);
+                acc.tool_args.entry(index).or_default().push_str(t);
+            }
         }
     }
 
@@ -757,11 +775,18 @@ fn parse_sse(
     // JSON string that will not parse, and `Cause::Truncated` must be
     // reported rather than masked by a parse error about it.
     let source = if run_program && !truncated && !acc.tool_args.is_empty() {
-        let args: serde_json::Value = serde_json::from_str(&acc.tool_args)
-            .map_err(|e| format!("run_program arguments are not JSON: {e}: {}", acc.tool_args))?;
-        let program = args["source"]
-            .as_str()
-            .ok_or_else(|| format!("run_program call has no `source` string: {}", acc.tool_args))?;
+        let mut fences = String::new();
+        for raw in acc.tool_args.values() {
+            let args: serde_json::Value = serde_json::from_str(raw)
+                .map_err(|e| format!("run_program arguments are not JSON: {e}: {raw}"))?;
+            let program = args["source"]
+                .as_str()
+                .ok_or_else(|| format!("run_program call has no `source` string: {raw}"))?;
+            if !fences.is_empty() {
+                fences.push('\n');
+            }
+            fences.push_str(&format!("```js\n{program}\n```\n"));
+        }
         // **And the cell has to go through `chunk` too**, because the
         // session never reads the value this function returns: it feeds
         // the notebook from the deltas as they arrive
@@ -777,9 +802,9 @@ fn parse_sse(
         // arrive as fragments of an escaped JSON string, so there is no
         // prefix of them that is a program.
         let suffix = if acc.source.trim().is_empty() {
-            format!("```js\n{program}\n```\n")
+            fences
         } else {
-            format!("\n\n```js\n{program}\n```\n")
+            format!("\n\n{fences}")
         };
         chunk(LlmChunk::Text(suffix.clone()));
         format!("{}{suffix}", acc.source)
@@ -1178,6 +1203,39 @@ mod tests {
         let report = message_json(&doc.messages[3]);
         assert_eq!(report["role"], "tool", "{report}");
         assert_eq!(report["tool_call_id"], *id);
+    }
+
+    /// **Two calls in one turn are two cells, not one corrupt one.**
+    ///
+    /// The delta carries an `index`; reading `tool_calls[0]` of each
+    /// chunk and ignoring it appends the second call's fragments to the
+    /// first call's buffer. The result is one string of invalid JSON,
+    /// and the turn dies complaining about JSON — which says nothing
+    /// about the two programs that were lost.
+    #[test]
+    fn two_calls_in_a_turn_become_two_cells() {
+        let stream = sse(&[
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"source\":\"const a = 1;\"}"}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":1,"function":{"arguments":"{\"source\":\"const b = a + 1;\"}"}}]}}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+        ]);
+        let mut streamed = String::new();
+        let turn = parse_sse(
+            stream.as_bytes(),
+            &Cancel::new(),
+            &mut |c| {
+                if let LlmChunk::Text(t) = c {
+                    streamed.push_str(&t);
+                }
+            },
+            true,
+        )
+        .unwrap();
+        let cells = crate::notebook::split_cells(&turn.source);
+        assert_eq!(cells.len(), 2, "{:?}", turn.source);
+        assert_eq!(cells[0].slice(&turn.source).trim(), "const a = 1;");
+        assert_eq!(cells[1].slice(&turn.source).trim(), "const b = a + 1;");
+        assert_eq!(streamed, turn.source, "the session would see something else");
     }
 
     /// **Reasoning goes back only when asked for, and the default is

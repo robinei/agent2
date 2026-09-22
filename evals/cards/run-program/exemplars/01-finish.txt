@@ -1,0 +1,1 @@
+the old hostname is still in the config — sort it out

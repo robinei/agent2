@@ -1149,6 +1149,13 @@ mod tests {
                 "evals/cards/ts",
                 include_str!("../../evals/cards/ts/card.md").to_owned(),
             ),
+            // The `run_program` arm. A copy like the others, and the
+            // one most likely to rot: it is edited only when the
+            // transport is being measured, which is rarely.
+            (
+                "evals/cards/run-program",
+                include_str!("../../evals/cards/run-program/card.md").to_owned(),
+            ),
         ] {
             assert_eq!(
                 edit_verbs(&text),
@@ -1156,6 +1163,52 @@ mod tests {
                 "{what} and the `Edit` builtins disagree"
             );
         }
+    }
+
+    /// **The call card may not describe the other transport.**
+    ///
+    /// It is made by transforming the notebook card, and the first time
+    /// that was done twelve paragraphs survived the transform: `return`
+    /// "ends the reply, not just the block it sits in ... not the
+    /// blocks below", prose "emitted before the block beneath it runs",
+    /// "from inside a block", "stops the block". The batching argument
+    /// — the one sentence that says a program may do many things — was
+    /// dropped entirely. Five runs failed identically before anyone
+    /// read the card, and the failure looked like the transport's
+    /// fault.
+    ///
+    /// `Edit.extractBlock` and `extractByIndent` are about text, not
+    /// cells, and are allowed their word.
+    #[test]
+    fn the_call_card_says_nothing_about_blocks_or_cells() {
+        let card = include_str!("../../evals/cards/run-program/card.md");
+        // **Whole words.** `blocked on` and `extractBlock` both hold
+        // the substring and neither is about a cell; matching loosely
+        // makes the guard cry wolf and get deleted.
+        let allowed = ["brace-delimited block", "indented block", "A fenced block"];
+        let offenders: Vec<&str> = card
+            .lines()
+            .filter(|l| {
+                let words: Vec<String> = l
+                    .split(|c: char| !c.is_ascii_alphanumeric())
+                    .map(|w| w.to_ascii_lowercase())
+                    .collect();
+                let stale = words.iter().any(|w| matches!(w.as_str(), "block" | "blocks" | "cell" | "cells"))
+                    || l.contains("this reply")
+                    || l.contains("next reply");
+                stale && !allowed.iter().any(|a| l.contains(a))
+            })
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "the call card still describes the notebook: {offenders:#?}"
+        );
+        // And it must carry the argument that a call is not one step,
+        // which is what stops the model reverting to short hops.
+        assert!(
+            card.contains("One call carries a whole program, not one step."),
+            "the batching argument is missing from the call card"
+        );
     }
 
     #[test]
