@@ -2531,12 +2531,29 @@ impl Runner {
                 // `tools.spawn` (a registry-configured capability, if
                 // the agent has one) is the escape hatch for those.
                 let args = self.call_args_json(&call.args);
+                // **A second argument names the agent.**
+                //
+                // `Call::Spawn` has carried a `name` since the branch
+                // vocabulary existed, `list_agents` reports it and the
+                // TUI titles branches with it — and `spawn` passed
+                // `None` regardless, so every agent a program made was
+                // anonymous. That is survivable for one helper and
+                // useless for a tree: a person reading a roster of
+                // `agent 8`, `agent 11`, `agent 14` cannot tell the
+                // testing manager from the parity one, and cannot
+                // address either without counting.
+                let name = args
+                    .get(1)
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|n| !n.is_empty())
+                    .map(str::to_owned);
                 match args.first().and_then(|v| v.as_str()) {
                     Some(charter) => {
                         let spawn = self.issue_call(
                             tree,
                             Call::Spawn {
-                                name: None,
+                                name,
                                 charter: charter.to_owned(),
                                 tools: None,
                                 site: self.rebase_site(call.site),
@@ -2557,10 +2574,17 @@ impl Runner {
                 // and settles with its handle. What the child should do
                 // is said afterwards, in its own `tell` or `ask` —
                 // creating is not messaging (`22_ONE_VOCABULARY.md`).
+                let name = self
+                    .call_args_json(&call.args)
+                    .first()
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|n| !n.is_empty())
+                    .map(str::to_owned);
                 let fork = self.issue_call(
                     tree,
                     Call::Fork {
-                        name: None,
+                        name,
                         site: self.rebase_site(call.site),
                     },
                     Slot::Settle,
