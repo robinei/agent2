@@ -1062,13 +1062,24 @@ def main():
     # Each agent authenticates its own way: ours from the environment,
     # pi from its own config under PI_HOME.
     where = os.environ.get("AGENT2_BASE_URL", os.environ.get("DEEPSEEK_BASE_URL", CLIENT_DEFAULT_BASE_URL))
+    # Three ways to be authorised, and the guard has to know all of
+    # them or it refuses a run that would have worked. The third is a
+    # stored subscription token, which `agent login` writes and the
+    # harness reads for the ChatGPT backend — there is no key to set.
+    signed_in = (Path(os.environ.get("AGENT2_STATE_DIR", Path.home() / ".agent2"))
+                 / "openai-codex.json").exists()
     if (
         args.agent == "code"
+        and "AGENT2_API_KEY" not in os.environ
         and "DEEPSEEK_API_KEY" not in os.environ
         and not endpoint_is_local(where)
+        and not ("chatgpt.com/backend-api" in where and signed_in)
     ):
-        print(f"DEEPSEEK_API_KEY is not set, and {where} is not on this machine",
-              file=sys.stderr)
+        print(
+            f"No credential for {where}: set AGENT2_API_KEY, or run `agent login` "
+            "for a ChatGPT subscription endpoint.",
+            file=sys.stderr,
+        )
         return 2
 
     # **Say which endpoint is about to be billed.** `DEEPSEEK_BASE_URL`
