@@ -97,6 +97,13 @@ fn line_for(tree: &Tree, path: &[&Event], event: &Event) -> Option<String> {
             "#{id} harness→ the conversation is {measured} {unit:?} against {limit}; \
              make room",
         ),
+        // **A request that never came back.** Without this the
+        // transcript jumps from one event to the next with nothing
+        // between them, which is what a stall looks like from the
+        // outside and gives no way to tell it from a slow model.
+        EventPayload::RequestFailed { message } => {
+            format!("#{id}    ✗ request failed: {}", clip(message.trim()))
+        }
         EventPayload::Reply => format!("#{id} reply"),
         EventPayload::Restart => format!("#{id} restart"),
         EventPayload::Call(call) => {
@@ -289,15 +296,41 @@ fn waiting_on(path: &[&Event]) -> String {
         // said "ok fine, go ahead and do the other three after all",
         // and the only line a driver is told to read said the branch
         // wanted nothing.
-        _ => match unanswered_post(path) {
-            Some(id) => format!(
+        // **And say when it is not waiting but stopped.** A post with
+        // no reply reads the same whether the branch has yet to be
+        // given a completion or was given one that failed — and only
+        // the second means nothing further will happen on its own. The
+        // failure is already a row above; this is the line a driver is
+        // told to read, so it says so here too.
+        _ => match (unanswered_post(path), last_failure(path)) {
+            (Some(id), Some(why)) => format!(
+                "waiting on: nothing — #{} is unanswered and the last request failed \
+                 ({}); it will not retry on its own",
+                id.as_u64(),
+                clip(why.trim())
+            ),
+            (Some(id), None) => format!(
                 "waiting on: nothing — #{} landed after the last reply and has not been \
                  taken up yet",
                 id.as_u64()
             ),
-            None => "waiting on: nothing".to_owned(),
+            (None, _) => "waiting on: nothing".to_owned(),
         },
     }
+}
+
+/// The failure of the most recent request, if nothing has been replied
+/// since — `None` once any `Reply` follows it, because then the branch
+/// recovered and the old failure is history.
+fn last_failure<'a>(path: &[&'a Event]) -> Option<&'a str> {
+    for event in path.iter().rev() {
+        match &event.payload {
+            EventPayload::RequestFailed { message } => return Some(message),
+            EventPayload::Reply | EventPayload::Restart => return None,
+            _ => {}
+        }
+    }
+    None
 }
 
 /// The newest `Post` on this path with no `Reply` logged after it — the

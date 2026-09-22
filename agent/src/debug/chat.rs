@@ -721,6 +721,19 @@ impl ChatState {
                 self.thinking_streaming.retain(|(b, _)| *b != branch);
             }
             EventPayload::Compaction { .. } => {}
+            // **A failed request is on the transcript, not just in the
+            // status line.** The pane is the person's record of what
+            // happened; a branch that went quiet because the provider
+            // errored should say so where they are reading.
+            EventPayload::RequestFailed { message } => {
+                self.push_entry(Entry::Line {
+                    branch,
+                    id,
+                    kind: ChatKind::Error,
+                    text: format!("request failed: {message}"),
+                    program: None,
+                });
+            }
             // A rename is a record: it changes the navigator, never the
             // transcript, and never wakes the branch.
             EventPayload::Rename { .. } => {}

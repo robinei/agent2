@@ -87,6 +87,31 @@ pub enum EventPayload {
         usage: crate::host::Usage,
     },
 
+    /// **A request went out and came back an error.** Parent: the
+    /// owning agent's spine. Renders to chat: no — the model is not
+    /// told that the provider failed, because it never saw the request
+    /// and the next one carries the same document anyway.
+    ///
+    /// Logged so the *log* can say what happened. `SessionEvent::Error`
+    /// goes to the attached client and nowhere else, so a branch that
+    /// went quiet after a failed generation left a hole: no `Reply`
+    /// (that is opened by the first text chunk, and there was none), no
+    /// `ReplyEnd`, no trace of an attempt. Reading `try23.jsonl` after
+    /// the fact, a hung provider, an HTTP error and a completion that
+    /// spent its whole budget on reasoning were indistinguishable —
+    /// twelve minutes of silence between two events and nothing to say
+    /// why.
+    ///
+    /// **Inert for the trigger rule**, deliberately. It renders to
+    /// nothing, so it is not a `Message` and `needs_prompt` cannot see
+    /// it: the branch goes idle with the failure on the record and
+    /// waits to be spoken to. Retrying is a policy decision with a
+    /// loop in it — a provider that is down stays down — and belongs
+    /// with the autonomous-progress work, not here.
+    RequestFailed {
+        message: String,
+    },
+
     /// **The conversation is full and a compaction was asked for**
     /// (28). Parent: the owning agent's spine. Renders to chat: no — the
     /// directive rides the ephemeral request tail, because an expired

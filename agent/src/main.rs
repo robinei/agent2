@@ -925,6 +925,9 @@ fn print_session_event(event: &SessionEvent) {
                         .unwrap_or_default();
                     println!("{head} agent{name}: {charter}");
                 }
+                EventPayload::RequestFailed { message } => {
+                    println!("{head} request failed: {message}");
+                }
                 EventPayload::Fork { name } => {
                     let name = name
                         .as_deref()

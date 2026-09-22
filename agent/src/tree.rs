@@ -495,7 +495,8 @@ impl Tree {
             | EventPayload::Reply
             | EventPayload::Restart
             | EventPayload::Part { .. }
-            | EventPayload::Compaction { .. } => {}
+            | EventPayload::Compaction { .. }
+            | EventPayload::RequestFailed { .. } => {}
         }
     }
 

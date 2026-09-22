@@ -1288,6 +1288,7 @@ fn kind_of(p: &EventPayload) -> &'static str {
         EventPayload::Answer { .. } => "Answer",
         EventPayload::Post { .. } => "Post",
         EventPayload::Reply => "Reply",
+        EventPayload::RequestFailed { .. } => "RequestFailed",
         EventPayload::Compaction { .. } => "Compaction",
         EventPayload::Part { .. } => "Part",
         EventPayload::ReplyEnd { .. } => "ReplyEnd",

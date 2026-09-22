@@ -960,6 +960,36 @@ impl Session {
                             branch: Some(branch),
                             message: message.clone(),
                         });
+                        // **And put it on the log.** The emit above
+                        // reaches an attached client and nothing else,
+                        // so a failed generation left no trace at all:
+                        // the `Reply` is opened by the first text chunk
+                        // and there was none, so there is no `Reply`, no
+                        // `ReplyEnd`, nothing. `try23.jsonl` has twelve
+                        // minutes of silence between two events and no
+                        // way to tell a dead provider from a completion
+                        // that returned only reasoning.
+                        //
+                        // `RequestFailed` renders to nothing, so the
+                        // branch does not re-ask on the strength of it
+                        // — it goes idle with the failure on the record
+                        // and waits to be spoken to.
+                        if let Some(state) = self.states.get_mut(&branch) {
+                            let _ = self.tree.append(
+                                &mut state.spine,
+                                EventPayload::RequestFailed {
+                                    message: message.clone(),
+                                },
+                            );
+                            // **And hand it to the client.** This arm
+                            // returns without going through
+                            // `step_branch`, so nothing else pumps the
+                            // new event out: the log would have the
+                            // failure and the pane would not, which is
+                            // the same half-told story in the other
+                            // direction.
+                            self.emit_new();
+                        }
                         // The branch is not thinking any more, whatever
                         // it believes: leaving it `AwaitingLlm` with
                         // nothing in flight is a state nothing can ever
@@ -2262,6 +2292,7 @@ fn leaf_summary(tree: &Tree, leaf: EventId) -> String {
         EventPayload::Answer { question, value } => {
             format!("Answer to #{}: {value}", question.as_u64())
         }
+        EventPayload::RequestFailed { message } => format!("request failed: {message}"),
         EventPayload::Post { from, origin } => {
             format!(
                 "Post: {}",
@@ -2658,6 +2689,7 @@ mod tests {
                 EventPayload::Answer { .. } => "Answer",
                 EventPayload::Post { .. } => "Post",
                 EventPayload::Reply => "Reply",
+                EventPayload::RequestFailed { .. } => "RequestFailed",
                 EventPayload::Restart => "Restart",
                 EventPayload::Part { .. } => "Part",
                 EventPayload::Call(_) => "Call",
@@ -2749,6 +2781,9 @@ mod tests {
                 // landing; the reply ends where the text stopped, which
                 // here is after its one cell had already dispatched.
                 "Call", "Call", "ReplyEnd", "Result", "Result", "Note", "Handback", "Console",
+                // The script is spent: the next request fails, and the
+                // branch records that rather than going quiet.
+                "RequestFailed",
             ]
         );
         // Both fan-out results landed (order is completion order).
@@ -4511,7 +4546,7 @@ mod tests {
         );
         let kinds = kinds(session.tree(), root_leaf(&session));
         assert!(
-            kinds.ends_with(&["Part", "Note", "ReplyEnd", "Handback", "Console"]),
+            kinds.ends_with(&["Part", "Note", "ReplyEnd", "Handback", "Console", "RequestFailed"]),
             "the rewrite ran to completion and the branch went idle: {kinds:?}"
         );
         assert!(session.quiet());
@@ -5882,6 +5917,8 @@ mod tests {
             [
                 "Agent", "Post", "Reply", "Part", "Call", "ReplyEnd", "Result", "Answer", "Note",
                 "Handback", "Console",
+                // The script is spent; the failed request is recorded.
+                "RequestFailed",
             ],
         );
         // **C0a lands here.** The handler's `answer(...); return
@@ -6501,6 +6538,51 @@ mod tests {
     /// settlement carries no such value — it is a delivery receipt for
     /// something already fully expressed in the log by its own `Call` —
     /// so there is nothing for Rule C to protect.
+    /// **A failed request is on the log, and asks for nothing.**
+    ///
+    /// `SessionEvent::Error` reaches an attached client and nowhere
+    /// else, and a generation that returns no text opens no `Reply` —
+    /// so a branch whose request failed used to leave *no trace at
+    /// all*. `try23.jsonl` has twelve minutes of silence between two
+    /// events, and a dead provider, an HTTP error and a completion
+    /// that spent its budget on reasoning are indistinguishable in it.
+    ///
+    /// The branch stays idle afterwards, deliberately: retrying is a
+    /// policy with a loop in it (a provider that is down stays down),
+    /// and belongs with the autonomous-progress work rather than here.
+    #[test]
+    fn a_failed_request_is_logged_and_does_not_re_ask() {
+        // An empty script: the first request has nothing to return.
+        let (session, _events) = run_session(ToolRegistry::new(), Vec::new(), "go");
+        let leaf = root_leaf(&session);
+        let tree = session.tree();
+
+        let failures: Vec<&str> = tree
+            .path_events(leaf)
+            .iter()
+            .filter_map(|e| match &e.payload {
+                EventPayload::RequestFailed { message } => Some(message.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            failures.len(),
+            1,
+            "exactly one failure on the record: {:?}",
+            kinds(tree, leaf)
+        );
+
+        // **And it asked no more.** One failure, not a retry loop: the
+        // event renders to nothing, so `needs_prompt` cannot see it.
+        assert_eq!(
+            kinds(tree, leaf),
+            ["Agent", "Post", "RequestFailed"],
+            "the branch went idle with the failure on the log"
+        );
+        let state = session.state(session.conversation_branch()).expect("live");
+        assert!(state.is_idle(), "idle, not stuck awaiting a completion");
+    }
+
     #[test]
     fn unawaited_tell_produces_no_post_and_no_extra_wake() {
         let script = vec![scripted_program(
@@ -6518,7 +6600,9 @@ mod tests {
             kinds(tree, leaf),
             [
                 "Agent", "Post", "Reply", "Part", "Note", "Call", "ReplyEnd", "Handback",
-                "Console", "Result"
+                "Console", "Result",
+                // The script is spent; the failed request is recorded.
+                "RequestFailed"
             ]
         );
         assert_eq!(appended(tree, leaf), json!(1));
@@ -6890,7 +6974,9 @@ mod tests {
         assert_eq!(
             kinds(session.tree(), worker.spine.leaf_id),
             [
-                "Agent", "Post", "Reply", "Part", "Answer", "ReplyEnd", "Handback", "Console"
+                "Agent", "Post", "Reply", "Part", "Answer", "ReplyEnd", "Handback", "Console",
+                // The script is spent; the failed request is recorded.
+                "RequestFailed"
             ],
             "the lost post was appended, and the worker answered it"
         );
