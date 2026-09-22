@@ -702,6 +702,15 @@ def fingerprint(card: Path | None) -> dict:
     knobs = {
         k: os.environ[k]
         for k in (
+            # The provider is named by AGENT2_* now, with DEEPSEEK_* kept
+            # as the older spelling. Both are recorded, because a result
+            # file that says "Qwen3.8-27B" while a frontier model
+            # answered is worse than one that says nothing.
+            "AGENT2_BASE_URL",
+            "AGENT2_MODEL",
+            "AGENT2_PROVIDER",
+            "AGENT2_REASONING_EFFORT",
+            "AGENT2_REASONING_SUMMARY",
             "DEEPSEEK_MODEL",
             "DEEPSEEK_BASE_URL",
             "DEEPSEEK_REASONING_EFFORT",
@@ -1052,7 +1061,7 @@ def main():
 
     # Each agent authenticates its own way: ours from the environment,
     # pi from its own config under PI_HOME.
-    where = os.environ.get("DEEPSEEK_BASE_URL", CLIENT_DEFAULT_BASE_URL)
+    where = os.environ.get("AGENT2_BASE_URL", os.environ.get("DEEPSEEK_BASE_URL", CLIENT_DEFAULT_BASE_URL))
     if (
         args.agent == "code"
         and "DEEPSEEK_API_KEY" not in os.environ
@@ -1070,7 +1079,9 @@ def main():
     # say where the numbers came from either. One line, before anything
     # runs, because an arm is 14 runs and the moment to notice is now.
     if args.agent == "code":
-        model = os.environ.get("DEEPSEEK_MODEL", CLIENT_DEFAULT_MODEL)
+        model = os.environ.get(
+            "AGENT2_MODEL", os.environ.get("DEEPSEEK_MODEL", CLIENT_DEFAULT_MODEL)
+        )
         print(
             f"{model} at {where}"
             + ("" if endpoint_is_local(where) else "   [remote — this bills]"),

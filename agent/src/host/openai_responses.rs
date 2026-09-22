@@ -47,6 +47,16 @@ pub struct OpenAiResponses {
     thinking: bool,
     effort: Option<String>,
     max_tokens: Option<u32>,
+    /// **One id for this process, sent on every request.**
+    ///
+    /// The backend routes by it, and a prompt cache is only a cache if
+    /// requests keep landing on the same machine. Measured on
+    /// 2026-09-22: without these headers, six identical 7.3k-token
+    /// requests hit once, at 47%. With them, five of six hit at 98%.
+    session_id: String,
+    /// From the token's own claims. Part of the same routing, not of
+    /// authorisation — the request is accepted without it.
+    account_id: Option<String>,
     agent: ureq::Agent,
 }
 
@@ -59,6 +69,8 @@ impl OpenAiResponses {
             thinking: config.thinking,
             effort: config.effort.clone(),
             max_tokens: config.max_tokens,
+            session_id: uuid::Uuid::new_v4().to_string(),
+            account_id: super::openai_oauth::account_id(),
             agent: ureq::Agent::config_builder()
                 .timeout_connect(Some(CONNECT_TIMEOUT))
                 .timeout_recv_body(Some(IDLE_TIMEOUT))
@@ -254,18 +266,30 @@ impl LlmClient for OpenAiResponses {
         } else {
             format!("{base}/responses")
         };
-        let body = request_body(
+        let mut body = request_body(
             request,
             &self.model,
             self.thinking,
             self.effort.as_deref(),
             self.max_tokens,
         );
-        let got = self
+        // The same id in the body and the headers: one asks for the
+        // prefix to be cached, the others ask for this request to reach
+        // the machine holding it.
+        body["prompt_cache_key"] = serde_json::json!(self.session_id);
+        let mut req = self
             .agent
             .post(&url)
             .header("Authorization", &format!("Bearer {}", self.api_key))
             .header("User-Agent", "agent2/0.1")
+            .header("originator", "agent2")
+            .header("session_id", &self.session_id)
+            .header("x-client-request-id", &self.session_id)
+            .header("x-session-affinity", &self.session_id);
+        if let Some(account) = &self.account_id {
+            req = req.header("chatgpt-account-id", account);
+        }
+        let got = req
             .send_json(&body)
             .map_err(|e| format!("responses request failed: {e}"))?;
         let status = got.status();

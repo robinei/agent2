@@ -122,6 +122,42 @@ pub fn save(tokens: &Tokens) -> Result<(), String> {
     Ok(())
 }
 
+/// The account the stored token belongs to, out of its own claims.
+///
+/// **Needed for cache affinity, not for authorisation.** The backend
+/// accepts a request without it; what it does not do is route the
+/// request anywhere in particular, and a prompt cache you land on one
+/// request in six is not a cache. See `openai_responses`.
+pub fn account_id() -> Option<String> {
+    let token = load()?.access_token;
+    let payload = token.split('.').nth(1)?;
+    let claims: serde_json::Value = serde_json::from_slice(&b64url_decode(payload)?).ok()?;
+    claims["https://api.openai.com/auth"]["chatgpt_account_id"]
+        .as_str()
+        .map(str::to_owned)
+}
+
+/// Base64url in, bytes out. Padding optional, as JWT omits it.
+fn b64url_decode(s: &str) -> Option<Vec<u8>> {
+    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut acc: u32 = 0;
+    let mut bits = 0u32;
+    let mut out = Vec::with_capacity(s.len() * 3 / 4);
+    for c in s.bytes() {
+        if c == b'=' {
+            break;
+        }
+        let v = A.iter().position(|&a| a == c)? as u32;
+        acc = acc << 6 | v;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    Some(out)
+}
+
 /// Base64url without padding, per RFC 7636. Fifteen lines, and the
 /// alternative was a dependency for an alphabet swap.
 pub fn b64url(bytes: &[u8]) -> String {
@@ -376,6 +412,26 @@ mod tests {
             challenge_for(verifier),
             "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
         );
+    }
+
+    /// Round-trips, because the decode side is what reads a JWT's
+    /// claims and a wrong alphabet there fails as "no account id"
+    /// rather than as an error.
+    #[test]
+    fn base64url_decodes_what_it_encodes() {
+        for case in [
+            &b""[..],
+            b"f",
+            b"fo",
+            b"foo",
+            b"foobar",
+            &[0xfb, 0xff],
+            br#"{"https://api.openai.com/auth":{"chatgpt_account_id":"abc-123"}}"#,
+        ] {
+            assert_eq!(b64url_decode(&b64url(case)).as_deref(), Some(case), "{case:?}");
+        }
+        assert_eq!(b64url_decode("Zm9vYmFy==").as_deref(), Some(&b"foobar"[..]));
+        assert!(b64url_decode("not valid!").is_none());
     }
 
     #[test]
