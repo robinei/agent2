@@ -1,19 +1,15 @@
-One helper per package: each suite takes minutes, and its output belongs in their context rather than mine.
+One helper per package: the suites take minutes, so they run at once, and their output stays out of my context.
 
 ```js
 const names = (await tools.bash("ls packages")).stdout.split("\n").filter(Boolean);
-for (const n of names) {
-  tell(spawn(`Run the suite for ${n}. Report failures with tell("parent", ...), naming it.`), "Begin.");
-}
+const crew = names.map((n) => spawn(`Run the suite for ${n}. Say what failed, or that nothing did.`));
 ```
 
-Ending the turn here would leave nobody watching, so the program waits instead.
+`ask` is the waiting: each settles when its helper answers, so the verdicts arrive without polling.
 
 ```js
-let busy;
-do {
-  await tools.wait_until(Date.now() + 15000);
-  busy = list_agents().filter((r) => r.status === "running" || r.status === "thinking");
-} while (busy.length);
-history.append({ supervising: names });
+const said = await Promise.all(crew.map((h, i) => ask(h, `Result for ${names[i]}?`)));
+const bad = said.map((v, i) => [names[i], v]).filter(([, v]) => /fail/i.test(v));
+tell(bad.length ? bad.map(([n, v]) => `${n}: ${v}`).join("\n") : `All ${names.length} pass.`);
+finish();
 ```

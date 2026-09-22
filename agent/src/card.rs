@@ -1806,6 +1806,30 @@ mod tests {
         // appends would be 200 permanent rows, which is the firehose
         // the card warns about, while the console's display is bounded
         // and its record stays whole and fetchable.
+        // **The sixth forks and points; the seventh spawns and waits.**
+        //
+        // Both were written wrong first. The sixth keyed its row `{a,
+        // b, c}` while the card two inches above says to use the name
+        // the thing already has — and an exemplar beats a rule, so it
+        // would have taught the opposite. The seventh waited by polling
+        // `list_agents` until nothing was `running`, which a freshly
+        // told helper answers `queued` at best and, before that status
+        // existed, `idle`: it decided the work was done before it had
+        // begun. `ask` is the wait, and it cannot race.
+        assert!(
+            ex[5].assistant.contains("fork()")
+                && ex[5].assistant.contains("history.fetch(${row})")
+                && ex[5].assistant.contains("\"svc-a.yaml\""),
+            "the sixth forks, points at a row, and keys it by name: {}",
+            ex[5].assistant
+        );
+        assert!(
+            ex[6].assistant.contains("spawn(")
+                && ex[6].assistant.contains("ask(")
+                && !ex[6].assistant.contains("list_agents"),
+            "the seventh waits with ask, not by polling a roster: {}",
+            ex[6].assistant
+        );
         assert!(
             ex[3].assistant.contains("console.log") && !ex[3].assistant.contains("history.append"),
             "the loop prints per item rather than appending: {}",
