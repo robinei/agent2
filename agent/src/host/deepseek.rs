@@ -83,6 +83,16 @@ pub struct DeepSeekClient {
     /// the field off and lets the API choose.
     effort: Option<String>,
     max_tokens: Option<u32>,
+    /// **Offer `run_program` and let the program ride in the call**
+    /// (`AGENT2_RUN_PROGRAM`), instead of being the reply itself.
+    ///
+    /// Only this file changes. The call's `source` argument is wrapped
+    /// back into a ```js cell before it leaves `parse_sse`, so every
+    /// path below — the notebook splitter, the runner, the document,
+    /// the log — receives an ordinary markdown reply and cannot tell
+    /// the difference. That is the whole of the transport: a wrapper
+    /// on the wire, unwrapped on arrival.
+    run_program: bool,
     agent: ureq::Agent,
     // Stable for the client's lifetime (one per session): the "OpenCode
     // Go" endpoint requires `x-opencode-session` to route a conversation
@@ -138,9 +148,11 @@ impl DeepSeekClient {
         let effort = std::env::var("DEEPSEEK_REASONING_EFFORT")
             .ok()
             .or_else(|| Some(DEFAULT_EFFORT.to_owned()));
+        let run_program = std::env::var("AGENT2_RUN_PROGRAM").is_ok_and(|v| v != "0");
         Ok(Self::new(api_key, model, base_url, thinking)
             .with_effort(effort)
-            .with_max_tokens(max_tokens))
+            .with_max_tokens(max_tokens)
+            .with_run_program(run_program))
     }
 
     /// Pin the reasoning level (builder form, so `new`'s signature is
@@ -163,6 +175,11 @@ impl DeepSeekClient {
 
     pub fn with_effort(mut self, effort: Option<String>) -> Self {
         self.effort = effort;
+        self
+    }
+
+    pub fn with_run_program(mut self, run_program: bool) -> Self {
+        self.run_program = run_program;
         self
     }
 
@@ -214,6 +231,7 @@ impl DeepSeekClient {
             thinking,
             effort: None,
             max_tokens: None,
+            run_program: false,
             agent: config.into(),
             session_id: uuid::Uuid::new_v4().to_string(),
         }
@@ -239,6 +257,7 @@ impl LlmClient for DeepSeekClient {
             self.thinking,
             self.effort.as_deref(),
             self.max_tokens,
+            self.run_program,
         );
         // **Retried only before a single byte has been streamed.**
         // Everything below this loop hands chunks straight to the
@@ -290,7 +309,7 @@ impl LlmClient for DeepSeekClient {
                             wrote |= matches!(c, LlmChunk::Text(_));
                             chunk(c);
                         };
-                        match parse_sse(reader, cancel, &mut counting) {
+                        match parse_sse(reader, cancel, &mut counting, self.run_program) {
                             Ok(turn) => return Ok(turn),
                             Err(e) if last || wrote => return Err(e),
                             Err(_) => {}
@@ -437,12 +456,37 @@ fn backoff(attempt: usize) -> std::time::Duration {
 /// choice to reply at all, and a forced call would make a refusal or a
 /// clarifying question (both real, both already handled elsewhere)
 /// impossible to express on the wire.
+/// The one tool offered under `run_program`. The description says as
+/// little as possible: the card is still the surface, and every rule
+/// about what a program may contain lives there. This says only where
+/// the program goes.
+fn run_program_tool() -> serde_json::Value {
+    serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": "run_program",
+            "description": "Run a program. This is the only way to do anything.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "source": {
+                        "type": "string",
+                        "description": "The program, as JavaScript."
+                    }
+                },
+                "required": ["source"]
+            }
+        }
+    })
+}
+
 fn request_body(
     request: &Document,
     model: &str,
     thinking: bool,
     effort: Option<&str>,
     max_tokens: Option<u32>,
+    run_program: bool,
 ) -> serde_json::Value {
     let messages: Vec<serde_json::Value> = request.messages.iter().map(message_json).collect();
     let mut body = serde_json::json!({
@@ -456,6 +500,9 @@ fn request_body(
         // unavailable from this provider at all.
         "stream_options": { "include_usage": true },
     });
+    if run_program {
+        body["tools"] = serde_json::json!([run_program_tool()]);
+    }
     if let Some(n) = max_tokens {
         body["max_tokens"] = serde_json::json!(n);
     }
@@ -529,6 +576,9 @@ struct Accumulated {
     /// the call is complete) is an ordinary, finished turn.
     finish_reason: Option<String>,
     usage: Usage,
+    /// `run_program` only: `delta.tool_calls[0].function.arguments`,
+    /// which arrives in fragments and is only valid JSON once whole.
+    tool_args: String,
 }
 
 /// Parse a chat-completions SSE stream into the final assistant turn,
@@ -559,6 +609,7 @@ fn parse_sse(
     reader: impl BufRead,
     cancel: &Cancel,
     chunk: &mut dyn FnMut(LlmChunk),
+    run_program: bool,
 ) -> Result<LlmTurn, String> {
     let mut acc = Accumulated::default();
     // Whether the stream said it was over, rather than simply stopping.
@@ -617,6 +668,12 @@ fn parse_sse(
             chunk(LlmChunk::Text(t.to_owned()));
             acc.source.push_str(t);
         }
+        if run_program
+            && let Some(t) = delta["tool_calls"][0]["function"]["arguments"].as_str()
+            && !t.is_empty()
+        {
+            acc.tool_args.push_str(t);
+        }
     }
 
     // **A connection that just stops has not finished.** SSE ends with
@@ -637,7 +694,31 @@ fn parse_sse(
         ));
     }
     let truncated = acc.finish_reason.as_deref() == Some("length");
-    let source = acc.source;
+    // **Unwrap the call into the reply it stands for.** Under
+    // `run_program` the program arrived as a JSON string argument and
+    // the `content` deltas were prose beside it; a markdown reply with
+    // that prose and one ```js cell is the same thing in the shape
+    // every path below this one already reads. So the transport is
+    // this function and nothing else.
+    //
+    // A truncated completion is left alone: the arguments are a cut-off
+    // JSON string that will not parse, and `Cause::Truncated` must be
+    // reported rather than masked by a parse error about it.
+    let source = if run_program && !truncated && !acc.tool_args.is_empty() {
+        let args: serde_json::Value = serde_json::from_str(&acc.tool_args)
+            .map_err(|e| format!("run_program arguments are not JSON: {e}: {}", acc.tool_args))?;
+        let program = args["source"]
+            .as_str()
+            .ok_or_else(|| format!("run_program call has no `source` string: {}", acc.tool_args))?;
+        let prose = acc.source.trim();
+        if prose.is_empty() {
+            format!("```js\n{program}\n```\n")
+        } else {
+            format!("{prose}\n\n```js\n{program}\n```\n")
+        }
+    } else {
+        acc.source
+    };
 
     Ok(LlmTurn {
         source,
@@ -680,7 +761,7 @@ mod tests {
             msg(ChatRole::Assistant, "return 1;"),
             msg(ChatRole::User, "## program completed"),
         ]);
-        let body = request_body(&request, "deepseek-v4-pro", true, None, None);
+        let body = request_body(&request, "deepseek-v4-pro", true, None, None, false);
 
         assert_eq!(body["model"], "deepseek-v4-pro");
         assert_eq!(body["stream"], true);
@@ -713,14 +794,14 @@ mod tests {
             }],
             preamble: 0,
         };
-        let body = request_body(&request, "deepseek-v4-flash", true, Some("medium"), None);
+        let body = request_body(&request, "deepseek-v4-flash", true, Some("medium"), None, false);
         assert_eq!(body["reasoning_effort"], json!("medium"));
         // The level needs the enable flag beside it; alone it is a
         // request the API may answer at whatever default it likes.
         assert_eq!(body["thinking"], json!({ "type": "enabled" }));
 
         // Unpinned: no field at all, and the API picks.
-        let body = request_body(&request, "deepseek-v4-flash", true, None, None);
+        let body = request_body(&request, "deepseek-v4-flash", true, None, None, false);
         assert!(body.get("reasoning_effort").is_none());
     }
 
@@ -731,16 +812,16 @@ mod tests {
     #[test]
     fn max_tokens_is_sent_only_when_asked_for() {
         let request = doc(vec![]);
-        let without = request_body(&request, "m", true, None, None);
+        let without = request_body(&request, "m", true, None, None, false);
         assert!(without.get("max_tokens").is_none());
-        let with = request_body(&request, "m", true, None, Some(4096));
+        let with = request_body(&request, "m", true, None, Some(4096), false);
         assert_eq!(with["max_tokens"], json!(4096));
     }
 
     #[test]
     fn request_body_disables_thinking_on_request() {
         let request = doc(vec![]);
-        let body = request_body(&request, "deepseek-v4-flash", false, None, None);
+        let body = request_body(&request, "deepseek-v4-flash", false, None, None, false);
         assert_eq!(body["thinking"], json!({ "type": "disabled" }));
     }
 
@@ -979,6 +1060,78 @@ mod tests {
         out
     }
 
+    /// **The whole of the `run_program` transport, asserted.**
+    ///
+    /// The program rides in the call's `source` argument and comes out
+    /// as a markdown reply with one ```js cell, because that is the
+    /// shape every path below this file already reads. If this holds,
+    /// the notebook splitter, the runner, the document and the log need
+    /// no knowledge of the transport at all — which is the entire
+    /// reason it is 40 lines and not a second implementation.
+    #[test]
+    fn a_run_program_call_arrives_as_a_notebook_reply() {
+        let stream = sse(&[
+            r#"{"choices":[{"delta":{"content":"Reading the four files."}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"function":{"name":"run_program","arguments":"{\"source\":\"const f = "}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"function":{"arguments":"await tools.read_file(\\\"a.py\\\");\"}"}}]}}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+        ]);
+        let turn = parse_sse(stream.as_bytes(), &Cancel::new(), &mut |_| {}, true).unwrap();
+        assert_eq!(
+            turn.source,
+            "Reading the four files.\n\n```js\nconst f = await tools.read_file(\"a.py\");\n```\n",
+            "the call did not come back as prose plus one cell"
+        );
+        assert!(!turn.truncated);
+        // And the cell splitter agrees, which is the claim that matters.
+        let cells = crate::notebook::split_cells(&turn.source);
+        assert_eq!(cells.len(), 1, "one cell: {:?}", turn.source);
+    }
+
+    /// A call with no prose beside it is a reply that is only a cell —
+    /// no leading blank lines, which would otherwise show up as an
+    /// empty prose part on the log.
+    #[test]
+    fn a_run_program_call_without_prose_is_only_the_cell() {
+        let stream = sse(&[
+            r#"{"choices":[{"delta":{"tool_calls":[{"function":{"arguments":"{\"source\":\"finish();\"}"}}]}}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+        ]);
+        let turn = parse_sse(stream.as_bytes(), &Cancel::new(), &mut |_| {}, true).unwrap();
+        assert_eq!(turn.source, "```js\nfinish();\n```\n");
+    }
+
+    /// **A truncated call is reported as truncated, not as bad JSON.**
+    ///
+    /// Cut-off arguments will not parse, and the tempting error message
+    /// is about the JSON. `Cause::Truncated` is the one that must
+    /// survive: `types.rs` says a truncated completion must never reach
+    /// the compiler, and a parse error here would hide why.
+    #[test]
+    fn a_truncated_run_program_call_stays_truncated() {
+        let stream = sse(&[
+            r#"{"choices":[{"delta":{"tool_calls":[{"function":{"arguments":"{\"source\":\"const x = "}}]}}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"length"}]}"#,
+        ]);
+        let turn = parse_sse(stream.as_bytes(), &Cancel::new(), &mut |_| {}, true).unwrap();
+        assert!(turn.truncated, "the length stop was lost");
+    }
+
+    /// Off by default: no `tools` key at all, which is what keeps the
+    /// notebook request byte-identical to what it was.
+    #[test]
+    fn the_tool_is_offered_only_when_asked_for() {
+        let request = doc(vec![msg(ChatRole::System, "card")]);
+        let off = request_body(&request, "m", true, None, None, false);
+        assert!(off.get("tools").is_none(), "{off}");
+        let on = request_body(&request, "m", true, None, None, true);
+        assert_eq!(on["tools"][0]["function"]["name"], "run_program");
+        assert_eq!(
+            on["tools"][0]["function"]["parameters"]["required"][0], "source",
+            "{on}"
+        );
+    }
+
     #[test]
     fn parse_sse_accumulates_text_and_thinking() {
         let stream = sse(&[
@@ -994,7 +1147,7 @@ mod tests {
                 LlmChunk::Text(t) => format!("T:{t}"),
                 LlmChunk::Thinking(t) => format!("R:{t}"),
             });
-        })
+        }, false)
         .unwrap();
 
         assert_eq!(turn.source, "const x = 42;");
@@ -1067,7 +1220,7 @@ mod tests {
             r#"{"choices":[{"delta":{"content":"const x = "}}]}"#,
             r#"{"choices":[{"delta":{},"finish_reason":"length"}]}"#,
         ]);
-        let turn = parse_sse(stream.as_bytes(), &Cancel::new(), &mut |_| {}).unwrap();
+        let turn = parse_sse(stream.as_bytes(), &Cancel::new(), &mut |_| {}, false).unwrap();
         assert!(
             turn.truncated,
             "max_tokens was hit before the model stopped"
@@ -1083,14 +1236,14 @@ mod tests {
             r#"{"choices":[{"delta":{"content":"1;"}}]}"#,
             r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
         ]);
-        let turn = parse_sse(stream.as_bytes(), &Cancel::new(), &mut |_| {}).unwrap();
+        let turn = parse_sse(stream.as_bytes(), &Cancel::new(), &mut |_| {}, false).unwrap();
         assert!(!turn.truncated);
     }
 
     #[test]
     fn parse_sse_surfaces_stream_errors() {
         let stream = "data: {\"error\":{\"message\":\"rate limited\"}}\n\n";
-        let err = parse_sse(stream.as_bytes(), &Cancel::new(), &mut |_| {}).unwrap_err();
+        let err = parse_sse(stream.as_bytes(), &Cancel::new(), &mut |_| {}, false).unwrap_err();
         assert!(err.contains("rate limited"), "{err}");
     }
 

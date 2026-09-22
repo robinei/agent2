@@ -252,6 +252,20 @@ const WORK_UNDER_WAY: &str =
 const REPLY_IS_MARKDOWN: &str = "- Your reply is markdown and reaches the person as written. \
      Only a ```js block runs; ```text and unfenced code do nothing.";
 
+/// The same rule under `AGENT2_RUN_PROGRAM`, where the program rides in
+/// a tool call instead of a fence. The line exists because its
+/// violation is silent either way — a reply that meant to act and made
+/// no call runs nothing and rests the branch — so the transport that
+/// changes *how* to act has to change this sentence with it, or the
+/// strongest slot in the request is spent telling the model to do
+/// something that no longer works.
+const REPLY_IS_A_CALL: &str = "- Your prose reaches the person as written. \
+     Only a run_program call runs; code written in the reply does nothing.";
+
+/// [`WORK_UNDER_WAY`] under the same knob.
+const WORK_UNDER_WAY_CALL: &str =
+    "- A reply with no run_program call ends here: nothing runs, and the person speaks next.";
+
 /// **A `finish()` that told nobody anything is not honoured**, and this
 /// is the request that says so.
 ///
@@ -975,6 +989,11 @@ pub struct Runner {
     /// that measure the same, the end is the one the other evidence in
     /// this file points at.
     no_rehearsal_last: bool,
+    /// The program rides in a `run_program` call rather than a fence
+    /// (`AGENT2_RUN_PROGRAM`). Read here only to keep the two tail
+    /// lines about response shape true; the wire format itself is
+    /// `host/deepseek.rs`'s business and nothing between them knows.
+    run_program: bool,
     /// The last reply called `finish()` and told nobody anything, so it
     /// was not rested. The next request's tail says so — see
     /// [`SILENT_FINISH`].
@@ -1120,6 +1139,7 @@ impl Runner {
             },
             no_rehearsal_last: std::env::var("AGENT2_NO_REHEARSAL_LAST")
                 .map_or(true, |v| v != "0"),
+            run_program: std::env::var("AGENT2_RUN_PROGRAM").is_ok_and(|v| v != "0"),
             finish_ignored: false,
             spine,
             agent,
@@ -4150,9 +4170,13 @@ impl Runner {
                 "- {n} program{} run since you were last spoken to.",
                 if n == 1 { "" } else { "s" }
             ));
-            lines.push(WORK_UNDER_WAY.to_owned());
+            lines.push(
+                if self.run_program { WORK_UNDER_WAY_CALL } else { WORK_UNDER_WAY }.to_owned(),
+            );
         }
-        lines.push(REPLY_IS_MARKDOWN.to_owned());
+        lines.push(
+            if self.run_program { REPLY_IS_A_CALL } else { REPLY_IS_MARKDOWN }.to_owned(),
+        );
         // Below the rule whose violation is silent, which is the whole
         // point of the arm: the two lines are competing for one slot.
         if let Some(line) = &self.no_rehearsal_tail
@@ -6876,6 +6900,32 @@ mod tests {
             on.lines()
                 .any(|l| l.starts_with("- ") && l.contains("One-shot")),
             "one line like its neighbours: {on}"
+        );
+    }
+
+    /// **The two shape lines follow the transport.**
+    ///
+    /// They are the lines whose violation is silent — a reply that
+    /// meant to act and produced nothing runs nothing, rests the
+    /// branch, and reports success — so under `run_program` they have
+    /// to name the call rather than the fence. Asserted both ways
+    /// because the failure is invisible: a request telling the model to
+    /// write a ```js block when only a tool call runs costs a whole
+    /// turn and looks like the model's fault.
+    #[test]
+    fn the_shape_lines_name_whichever_transport_is_running() {
+        let (mut tree, mut state) = setup_under();
+        user_post(&mut state, &mut tree, "do it");
+        let fenced = state.request_tail(&tree).unwrap_or_default();
+        assert!(fenced.contains("Only a ```js block runs"), "{fenced}");
+        assert!(!fenced.contains("run_program"), "{fenced}");
+
+        state.run_program = true;
+        let called = state.request_tail(&tree).unwrap_or_default();
+        assert!(called.contains("Only a run_program call runs"), "{called}");
+        assert!(
+            !called.contains("Only a ```js block runs"),
+            "both rules at once: {called}"
         );
     }
 

@@ -60,7 +60,9 @@ A 2x2 on the same top slot, same document, same register, n=24 each
 | `v1-none` | – | – | 52% | 1.0 | 6,515 |
 | `v7-neutral` "Never guess at what you can check!" | no | yes | 42% | 0.0 | 7,669 |
 
-- the ban vs nothing: **drafts p = 0.0061, thinking p = 0.0079**
+- the ban vs nothing: **drafts p = 0.0144, thinking p = 0.0116** (n = 72
+  an arm, three rounds of 24 — at two rounds these read 0.0061 and
+  0.0079, so the third weakened them without changing the verdict)
 - the ban vs a same-register negation about something else:
   **drafts p = 0.0146, rate p = 0.022**
 - forbidding something else vs nothing: p = 0.46 / 0.76 / 0.22 — nothing
@@ -71,6 +73,20 @@ register, not negation as such (`v7` negates too), and not naming code
 (`v8` is indistinguishable from nothing on rate and count). What is
 left is **naming the specific behaviour to be suppressed**, which is
 the ironic-process result rather than a priming one.
+
+**The rate does not survive, and the volume does.** Pooled over three
+rounds the drafting *rate* is 71% against 61% at **p = 0.29** — at two
+rounds it was 0.093, and the third round reversed the direction outright
+(71% against 79%). What holds is the count and the bytes. So the claim
+is narrower than "the ban makes replies draft": it makes the replies
+that draft go on longer.
+
+**Rounds of 24 are not stable on rate.** The same arm on the same
+document ran 46%, 58% and 79% across three rounds over about two hours.
+An earlier check had found the same document exchangeable over 30–40
+minutes on everything but wall clock; over a longer window the rate
+moves too. Any rate reported from a single round of 24 here should be
+read as a wide interval.
 
 **And the rate/volume split matters.** Pooling every top-line arm
 against none, the drafting *rate* is 60% against 58%, p = 1.00 — but

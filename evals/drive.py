@@ -713,6 +713,10 @@ def fingerprint(card: Path | None) -> dict:
             # case this dict exists to prevent.
             "AGENT2_NO_REHEARSAL_TAIL",
             "AGENT2_NO_REHEARSAL_LAST",
+            # The transport. Same binary, same card directory shape --
+            # only this says whether the program rode in a fence or in a
+            # tool call, so without it the two arms stamp identically.
+            "AGENT2_RUN_PROGRAM",
         )
         if k in os.environ
     }
