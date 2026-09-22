@@ -77,7 +77,9 @@ declare function answer(question: number, value: unknown): void;
 
 /** A new agent with a clean context. Creating is not messaging: it is idle until you `tell` or `ask` the handle.
 
-  **For work whose mess you do not want.** The charter is all it gets, so anything it reads stays in its context and never in yours — which is the point when the reading is long and the answer is short. */
+  **For work whose mess you do not want.** The charter is all it gets, so anything it reads stays in its context and never in yours — which is the point when the reading is long and the answer is short.
+
+  **Making one costs nothing.** It is an event; it thinks only when spoken to, and the prompt it thinks with is three quarters bytes you are already paying for, returned from cache. What a helper costs is the completions it spends. So hesitate over giving one work, never over making one — whenever a second context or a second worker is the right shape, take it. */
 declare function spawn(charter: string): Agent;
 
 /** A branch of your own context: it has read everything you have read and knows everything you know, and is idle until messaged.
@@ -86,7 +88,7 @@ declare function spawn(charter: string): Agent;
 
   **Row ids carry across.** The history is the same history, so `history.fetch(9)` in the fork means the row *you* appended as 9 — you can point at what you found rather than repeat it, and the bytes are not copied or re-sent.
 
-  So: **`spawn` to keep a mess out of your context; `fork` to share the understanding already in it.** A fork is not free — it carries everything you carry, and pays for it on every turn of its own — so fork when the context is the valuable part, and spawn when it is the expensive part. */
+  So: **`spawn` to keep a mess out of your context; `fork` to share the understanding already in it.** Neither is dear: a fork carries everything you carry, but carries it as the same bytes, and those are the ones that cache. Fork when the context is the valuable part and spawn when it is the expensive part — and reach for either the moment the shape calls for it. */
 declare function fork(): Agent;
 /** Every agent in this subtree and what each is doing — the verb a supervisor polls.
 
