@@ -86,7 +86,20 @@ pub const CONSOLE_MAX_BYTES: usize = 256 * 1024;
 /// and what a program hands on it hands on through `history.append`.
 /// A number standing on a deleted idea reads as though it were derived
 /// from something.
-pub const CONSOLE_SECTION_MAX_BYTES: usize = 4096;
+/// **Sized against the document budget, and it moved.** 4096 was
+/// 6.25% of `DEFAULT_DOCUMENT_BUDGET`'s 64 KB, which was proportionate.
+/// The budget is now the model's own window (`provider::CONTEXT_WINDOWS`,
+/// capped at `DEFAULT_MAX_DOCUMENT_TOKENS`), and 4 KB of that is under
+/// one percent — so a reply could see four kilobytes of whatever it had
+/// read, however much it read, and the only way through a large file
+/// was to read it again.
+///
+/// Measured on 2026-09-22: one task re-read `machine.rs` eight times,
+/// `report.rs` seven and `transcript.rs` five, spending 24 replies and
+/// never reaching the edit. Twenty of its seventy-one results were over
+/// the cap. The comment on `render_console` below records the same
+/// failure from a `sweep-40` run without connecting it to the size.
+pub const CONSOLE_SECTION_MAX_BYTES: usize = 32 * 1024;
 /// Artifact-menu entries shown (most recent kept; older ids stay valid).
 pub const MENU_MAX_ENTRIES: usize = 20;
 /// Max bytes of the annotated program source in a post-condition report.
@@ -114,7 +127,10 @@ pub const PREVIEW_MAX_BYTES: usize = 256;
 /// Clipped at render and never on the log, like every other bound here,
 /// so one `history.append(f.content)` is a bounded view *and* a whole
 /// value that `history.fetch` still hands back.
-pub const NOTE_ROW_MAX_BYTES: usize = 4096;
+/// Kept equal to [`CONSOLE_SECTION_MAX_BYTES`]: printing a thing and
+/// appending it are the two ways to put it in front of the next reply,
+/// and a model choosing between them should not be choosing a budget.
+pub const NOTE_ROW_MAX_BYTES: usize = CONSOLE_SECTION_MAX_BYTES;
 
 /// One artifact-menu entry: a `Call` (settled or still pending) or a
 /// `ProgramResult`, named by its event id and fetchable via
@@ -2514,7 +2530,14 @@ mod tests {
         );
 
         // And bytes are what bind when something really is too big.
-        let fat: Vec<String> = (0..10).map(|i| format!("{i}{}", "z".repeat(900))).collect();
+        //
+        // **Sized off the budget, not off a number.** These were ten
+        // 900-byte lines, which overflowed 4096 and stopped doing so
+        // the moment the cap was raised to keep its proportion to the
+        // document budget — a test that silently stops testing is worse
+        // than one that breaks.
+        let line = CONSOLE_SECTION_MAX_BYTES / 8;
+        let fat: Vec<String> = (0..10).map(|i| format!("{i}{}", "z".repeat(line))).collect();
         let rendered = render_console(&fat, Some(7)).expect("lines present");
         assert!(
             rendered.contains("of 10 lines; `history.fetch(7)` for all of them"),
@@ -2528,15 +2551,19 @@ mod tests {
 
         // Past the budget, the oldest of the tail goes rather than every
         // line losing its end.
+        // Same reason as above: the lines have to actually exceed the
+        // budget, whatever the budget currently is.
         let fat: Vec<String> = (0..10)
-            .map(|i| format!("{i}") + &"z".repeat(1000))
+            .map(|i| format!("{i}") + &"z".repeat(line))
             .collect();
         let rendered = render_console(&fat, None).expect("lines present");
-        let kept = rendered.lines().count() - 1;
+        // **Whole lines go, from the oldest.** Counting rendered lines
+        // counts the heading and the fences too, which made this pass
+        // or fail on the wrapper rather than on the budget.
         assert!(
-            kept < fat.len(),
-            "the budget drops whole lines: kept {kept} of {}",
-            fat.len()
+            !rendered.contains(&("0".to_owned() + &"z".repeat(line))),
+            "the oldest whole line is dropped, not every line's end: {}",
+            &rendered[..120.min(rendered.len())]
         );
         assert!(
             rendered.len() <= CONSOLE_SECTION_MAX_BYTES + 200,
@@ -2544,7 +2571,7 @@ mod tests {
             rendered.len()
         );
         assert!(
-            rendered.contains(&("9".to_owned() + &"z".repeat(1000))),
+            rendered.contains(&("9".to_owned() + &"z".repeat(line))),
             "the newest line is the one guaranteed to survive"
         );
     }
