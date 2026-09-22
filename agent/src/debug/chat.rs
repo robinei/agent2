@@ -726,11 +726,37 @@ impl ChatState {
             // happened; a branch that went quiet because the provider
             // errored should say so where they are reading.
             EventPayload::RequestFailed { message } => {
+                let text = format!("request failed: {message}");
+                // **The same failure, not a second one.** The host
+                // emits `SessionEvent::Error` and then logs this, so
+                // both arrive; the live row is untied to any log
+                // position and vanishes on reopen, the logged one
+                // stays. Replacing the live row in place leaves one
+                // row that says the thing, and it is the durable one.
+                let live = self.entries.iter().rposition(|e| {
+                    matches!(
+                        e,
+                        Entry::Line { kind: ChatKind::Error, id, text: t, .. }
+                            if id.as_u64() == u64::MAX && t.ends_with(message.as_str())
+                    )
+                });
+                if let Some(row) = live {
+                    self.entries[row] = Entry::Line {
+                        branch,
+                        id,
+                        kind: ChatKind::Error,
+                        text,
+                        program: None,
+                    };
+                    self.classified_line_cache.get_mut()[row] = None;
+                    self.raw_line_cache.get_mut()[row] = None;
+                    return;
+                }
                 self.push_entry(Entry::Line {
                     branch,
                     id,
                     kind: ChatKind::Error,
-                    text: format!("request failed: {message}"),
+                    text,
                     program: None,
                 });
             }
@@ -1954,6 +1980,47 @@ mod tests {
                 },
             },
         )
+    }
+
+    /// **One failure, one row.** The host emits a live
+    /// `SessionEvent::Error` and then logs `RequestFailed`, so both
+    /// reach this pane; without collapsing them the person reads the
+    /// same failure twice, once in a row that disappears on reopen.
+    #[test]
+    fn a_failed_request_does_not_say_itself_twice() {
+        let mut chat = ChatState::new();
+        chat.apply(&agent_event());
+        chat.apply(&post(2, "go"));
+        chat.apply(&SessionEvent::Error {
+            branch: Some(EventId::new(1)),
+            message: "http 503 Service Unavailable".into(),
+        });
+        chat.apply(&ev(
+            3,
+            EventPayload::RequestFailed {
+                message: "http 503 Service Unavailable".into(),
+            },
+        ));
+
+        let rows = chat.rows(None, 80, None);
+        let failures: Vec<&str> = rows
+            .iter()
+            .filter(|(k, ..)| *k == ChatKind::Error)
+            .map(|(_, t, ..)| t.as_str())
+            .collect();
+        assert_eq!(
+            failures.len(),
+            1,
+            "the live row was replaced, not doubled: {failures:?}"
+        );
+        assert!(failures[0].starts_with("request failed:"), "{failures:?}");
+        // And it is the logged one, so it survives a reopen: its row
+        // carries the event's own id rather than the live sentinel.
+        let (_, _, _, id) = rows
+            .iter()
+            .find(|(k, ..)| *k == ChatKind::Error)
+            .expect("the row");
+        assert_eq!(id.as_u64(), 3, "the durable row won");
     }
 
     /// **A result completes a call row, and must not touch prose.**

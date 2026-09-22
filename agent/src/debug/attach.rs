@@ -210,6 +210,24 @@ pub struct AttachedApp {
     /// always has the raw text to fall back to (`rows_raw`), so this
     /// never loses anything, only re-derives from source on demand.
     pub show_markdown: bool,
+    /// **What the selected branch is doing, while it is doing it** —
+    /// the word from `branch_infos()` (`thinking`, `running`,
+    /// `queued`), and when it started.
+    ///
+    /// Set each tick from live session state rather than from
+    /// `SessionEvent`s, because it is not a fact about the transcript:
+    /// `ChatState` is fed only by the protocol and nothing live leaks
+    /// into it (that module's own doc), and a spinner is live by
+    /// definition.
+    ///
+    /// **Why it exists.** A model that spends its whole budget on
+    /// reasoning writes nothing to the pane — reasoning rows are hidden
+    /// unless Ctrl-T is on, and no `Reply` is logged until the first
+    /// *text* chunk — so a completion that is working hard and a dead
+    /// socket looked exactly alike: a static pane. `try23.jsonl` has
+    /// twelve minutes of that, ended by the person quitting, and the
+    /// completion it was waiting on reported 11,318 reasoning tokens.
+    pub busy: Option<(String, Instant)>,
     pub chat_scroll: Option<usize>,
     pub console_scroll: Option<usize>,
     pub source_scroll: Option<usize>,
@@ -292,6 +310,7 @@ impl AttachedApp {
             show_stack: false,
             show_promises: false,
             show_thinking: false,
+            busy: None,
             show_markdown: true,
             chat_scroll: None,
             console_scroll: None,
@@ -1329,6 +1348,22 @@ pub fn run_attached(mut session: Session, events_rx: Receiver<SessionEvent>) -> 
         // (decision 8), not just the live `states`. Kept around this tick
         // for the input line's ask-vs-reply decision and the `w` jump.
         let infos = session.branch_infos();
+        // **The spinner's clock starts when the work does, not when the
+        // pane notices.** Kept across ticks while the word is unchanged
+        // so the elapsed count is the age of *this* wait; cleared the
+        // moment the branch is anything else, so it never outlives what
+        // it describes. Keyed on the selected branch, which is the one
+        // the pane is showing.
+        let busy_now = app
+            .selected
+            .and_then(|b| infos.iter().find(|i| i.branch == b))
+            .map(|i| i.status.clone())
+            .filter(|s| matches!(s.as_str(), "thinking" | "running" | "queued"));
+        app.busy = match (busy_now, app.busy.take()) {
+            (Some(now), Some((was, since))) if was == now => Some((was, since)),
+            (Some(now), _) => Some((now, Instant::now())),
+            (None, _) => None,
+        };
         let ordered = ordered_branches(infos.clone());
         let branches: Vec<BranchId> = ordered.iter().map(|b| b.branch).collect();
         // Render *before* resolving this tick's inputs, not after: a click
@@ -2074,6 +2109,43 @@ fn wrap_input(input: &InputBuffer, show_cursor: bool, width: usize) -> (Vec<Stri
     (rows, cursor_visual_row)
 }
 
+/// The spinner row, when the branch is doing something.
+///
+/// Braille frames at ~12/s off the elapsed time rather than a counter,
+/// so it does not depend on being called at any particular rate — the
+/// loop redraws every 30ms, and a missed tick just skips a frame.
+fn spinner_line(app: &AttachedApp) -> Option<Line<'static>> {
+    const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    let (what, since) = app.busy.as_ref()?;
+    // What the word means, said plainly: the status vocabulary is for
+    // `list_agents`, not for a person watching a pane.
+    let label = match what.as_str() {
+        "thinking" => "waiting for the model",
+        "running" => "running a program",
+        "queued" => "starting",
+        other => other,
+    };
+    let elapsed = since.elapsed();
+    let frame = FRAMES[(elapsed.as_millis() / 80) as usize % FRAMES.len()];
+    let secs = elapsed.as_secs();
+    // Under a second there is no number worth printing, and a reply
+    // that lands promptly should not flash one.
+    let time = if secs == 0 {
+        String::new()
+    } else if secs < 60 {
+        format!(" · {secs}s")
+    } else {
+        format!(" · {}m{:02}s", secs / 60, secs % 60)
+    };
+    let style = Style::default()
+        .fg(Color::Rgb(130, 130, 130))
+        .add_modifier(Modifier::ITALIC);
+    Some(Line::from(vec![
+        Span::raw(" "),
+        Span::styled(format!("{frame} {label}{time}"), style),
+    ]))
+}
+
 fn render_chat(
     frame: &mut Frame,
     app: &AttachedApp,
@@ -2274,6 +2346,20 @@ fn render_chat(
             line.spans.push(Span::raw(" "));
         }
         row_at_line.resize(lines.len(), row_idx);
+    }
+    // **Something is happening, and here is where it will land.** Last
+    // of all, on the line the next message will occupy, for exactly as
+    // long as the branch is busy.
+    //
+    // Reasoning is hidden unless Ctrl-T is on and no `Reply` is logged
+    // until the first *text* chunk, so a model thinking hard wrote
+    // nothing here at all — indistinguishable from a dead socket, which
+    // is a distinction the person cannot make any other way and the
+    // one they most need. The elapsed count is the point: a spinner
+    // alone says "busy", a spinner and `47s` says which kind.
+    if let Some(line) = spinner_line(app) {
+        lines.push(line);
+        row_at_line.resize(lines.len(), rows.len().saturating_sub(1));
     }
     let visible = transcript_area.height.saturating_sub(2) as usize;
     let default_top = lines.len().saturating_sub(visible);
@@ -3046,6 +3132,49 @@ mod tests {
         );
     }
 
+    /// **Something is happening, and the pane says so.**
+    ///
+    /// The whole point is the case where nothing else moves: reasoning
+    /// rows are hidden unless Ctrl-T is on and no `Reply` is logged
+    /// until the first text chunk, so a model thinking for minutes drew
+    /// an unchanging pane — identical to a dead socket.
+    #[test]
+    fn a_spinner_marks_the_wait_where_the_next_message_will_land() {
+        let mut app = a_session_with_one_of_everything();
+        assert!(
+            Screen::chat(&app, 64, 26).find("waiting for the model").is_none(),
+            "nothing is happening, so nothing is claimed"
+        );
+
+        app.busy = Some(("thinking".into(), Instant::now() - std::time::Duration::from_secs(47)));
+        let screen = Screen::chat(&app, 64, 26);
+        let row = screen
+            .find("waiting for the model")
+            .expect("the wait is on the pane");
+        assert!(
+            screen.inner(row).contains("47s"),
+            "and how long it has been waiting: {:?}",
+            screen.inner(row)
+        );
+
+        // **Last of all**: it marks where the answer will appear, so
+        // every row of the conversation is above it.
+        let last = screen.find("a.txt is 5 characters").expect("the final prose");
+        assert!(row > last, "the spinner is below the transcript");
+
+        // A running program says what it is, not the same word.
+        app.busy = Some(("running".into(), Instant::now()));
+        let screen = Screen::chat(&app, 64, 26);
+        assert!(screen.find("running a program").is_some());
+        // Under a second, no number: a prompt reply must not flash one.
+        let row = screen.find("running a program").unwrap();
+        assert!(!screen.inner(row).contains('s'), "{:?}", screen.inner(row));
+
+        // And it goes when the work does.
+        app.busy = None;
+        assert!(Screen::chat(&app, 64, 26).find("running a program").is_none());
+    }
+
     /// **Air falls between turns, and never inside one.** A turn is the
     /// person's message and the one model response to it; that response
     /// is a block, the prose it spoke, and the calls it made.
@@ -3200,6 +3329,10 @@ mod tests {
         // the two states are one gesture apart and worth seeing together.
         app.selected_program = Some(EventId::new(3));
         println!("--- with the block selected:");
+        println!("{}", Screen::chat(&app, 64, 26).dump());
+        app.selected_program = None;
+        app.busy = Some(("thinking".into(), Instant::now() - std::time::Duration::from_secs(47)));
+        println!("--- waiting on the model:");
         println!("{}", Screen::chat(&app, 64, 26).dump());
     }
     use crate::host::{
