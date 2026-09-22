@@ -1,0 +1,1 @@
+run the integration suite for every package and tell me which ones fail

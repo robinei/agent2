@@ -90,7 +90,11 @@ declare function spawn(charter: string): Agent;
 declare function fork(): Agent;
 /** Every agent in this subtree and what each is doing — the verb a supervisor polls.
 
-  `status` is one of: `"running"` — a program of its own is executing; `"suspended"` — a program of its own stopped part-way and is waiting for an answer; `"thinking"` — waiting on a completion; `"idle"` — awake with nothing to do; `"dormant"` — not loaded in this session, which is not a problem and not a loss: it wakes when spoken to.
+  **`"idle"` is the only status that means finished.** Branch on that, not on a list of the busy ones: `"queued"` — told something and not yet started; `"thinking"` — waiting on a completion; `"running"` — a program of its own is executing; `"suspended"` — a program of its own stopped part-way and is waiting for an answer. A helper you have just spoken to is `"queued"` before it is anything else, so a loop that waits while `running || thinking` decides it has finished before it has begun.
+
+  **And wait once before you look.** `tell` hands the message to the outbox, which is flushed when your program next awaits — poll in the same breath and you can be answered before your own message has landed, and see a helper that has not been given anything yet.
+
+  `"dormant"` is the sixth, and it is not about work: nothing is loaded for that agent in this session. Nothing is lost — it wakes when spoken to.
 
   **`open` is what that agent owes**, not what it is waiting for: the count of questions *put to it* that it has not answered. A child waiting on an answer from you is not in it — that debt is yours, and it reaches you the ordinary way, as a post on your own branch with an `[id]`, which `answer(id, value)` discharges. `last_answer` is what that agent was told most recently.
 

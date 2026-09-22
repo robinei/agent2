@@ -63,6 +63,8 @@ pub fn embedded() -> Card {
             exemplar!("03-ask"),
             exemplar!("04-many"),
             exemplar!("05-keep"),
+            exemplar!("06-fork"),
+            exemplar!("07-supervise"),
         ],
     }
 }
@@ -1069,7 +1071,7 @@ mod tests {
         // `card()` shows up as a diff review must look at, not a byte
         // count that silently drifts. Comparing full text (not just a
         // hash) so the diff itself is legible in a failure message.
-        const EXPECTED_LEN: usize = 17675;
+        const EXPECTED_LEN: usize = 18247;
         assert_eq!(
             card().len(),
             EXPECTED_LEN,
@@ -1268,7 +1270,7 @@ mod tests {
         // `unreachable!("returned above")` is a panic message, not a
         // status, and scraping string literals out of that function put
         // it in the card as one.
-        for word in ["running", "thinking", "suspended", "idle", "dormant"] {
+        for word in ["running", "thinking", "suspended", "idle", "dormant", "queued"] {
             assert!(
                 card.contains(&format!("`\"{word}\"`")),
                 "the card does not name the status `{word}`"
@@ -1430,6 +1432,15 @@ mod tests {
             "replace_file" | "write_file" | "create_file" => json!({ "version": "v2" }),
             "ask" => json!("4"),
             "spawn" | "fork" => json!({ "agent": 2 }),
+            // **Idle, so a supervision loop ends.** The seventh
+            // exemplar waits while helpers work; against a roster that
+            // never settles it would run until the test harness gave
+            // up, which is a hang rather than a failure and reads as
+            // neither.
+            "list_agents" => json!([{
+                "agent": 2, "branch": 2, "name": null, "charter": "",
+                "parent": 1, "status": "idle", "open": 0, "last_answer": null,
+            }]),
             _ => json!(null),
         }
     }
@@ -1737,7 +1748,7 @@ mod tests {
     #[test]
     fn the_exemplars_demonstrate_the_endings_and_the_shapes() {
         let ex = exemplars();
-        assert_eq!(ex.len(), 5, "five, and each earns its place");
+        assert_eq!(ex.len(), 7, "seven, and each earns its place");
         assert!(
             ex[0].assistant.contains("finish()") && ex[0].assistant.contains("tell("),
             "the first ends a finished task, and says the answer on its way out: {}",
@@ -1918,7 +1929,7 @@ mod tests {
             return;
         }
         let card = load_from(&dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
-        assert_eq!(card.exemplars.len(), 5, "five, each keeping its own job");
+        assert_eq!(card.exemplars.len(), 7, "seven, each keeping its own job");
 
         for ex in &card.exemplars {
             let cells = crate::notebook::split_cells(&ex.assistant);

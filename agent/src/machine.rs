@@ -7954,23 +7954,48 @@ mod tests {
     /// terminates for an N larger than the floor. Sizing the budget to
     /// the branch instead of the branch to the budget avoids an
     /// infinite loop that cost a test run to find.
+    /// A document over budget, with a budget compaction can actually
+    /// reach.
+    ///
+    /// **The filler has to outweigh the preamble**, and for a long time
+    /// it did by accident. The budget here is half the rendered
+    /// document, and compaction can only shrink the *conversation* —
+    /// the card and its worked examples are fixed. Once the preamble is
+    /// more than half, no program can get under budget however good it
+    /// is, and every test built on this fixture quietly stops measuring
+    /// what it names: `fires_over_budget` sees a give-up instead of a
+    /// request, and `gives_up_rather_than_looping` passes for the wrong
+    /// reason. Two exemplars added on 2026-09-22 crossed that line, and
+    /// twenty posts of filler was simply the number that happened to be
+    /// enough before.
+    ///
+    /// So it is measured rather than guessed: fill until the whole is
+    /// three times the preamble, which leaves half the document
+    /// reachable with room to spare.
     fn crowded() -> (Tree, Runner, usize) {
         let (mut tree, mut state) = setup();
-        for _ in 0..20 {
-            tree.append(
-                &mut state.spine,
-                EventPayload::Post {
-                    from: Author::User,
-                    origin: direct(&"filler ".repeat(40), false),
-                },
-            )
-            .unwrap();
+        let rendered = |tree: &Tree, state: &Runner| {
+            crate::compaction::rendered_size(&crate::document::render(
+                tree,
+                &state.spine,
+                64 * 1024,
+            ))
+        };
+        let preamble = rendered(&tree, &state);
+        let mut size = preamble;
+        while size < preamble * 3 {
+            for _ in 0..20 {
+                tree.append(
+                    &mut state.spine,
+                    EventPayload::Post {
+                        from: Author::User,
+                        origin: direct(&"filler ".repeat(40), false),
+                    },
+                )
+                .unwrap();
+            }
+            size = rendered(&tree, &state);
         }
-        let size = crate::compaction::rendered_size(&crate::document::render(
-            &tree,
-            &state.spine,
-            64 * 1024,
-        ));
         (tree, state, size / 2)
     }
 

@@ -2099,10 +2099,25 @@ impl Session {
     /// in this session — nothing is lost, it is re-hydrated when spoken
     /// to (C1/C2); `thinking` is the model-facing name for awaiting-LLM.
     fn branch_status(&self, branch: EventId) -> &'static str {
-        match self.states.get(&branch).map(|s| s.status()) {
-            Some("awaiting llm") => "thinking",
-            Some(word) => word,
-            None => "dormant",
+        let Some(state) = self.states.get(&branch) else {
+            return "dormant";
+        };
+        match state.status() {
+            "awaiting llm" => "thinking",
+            // **Told, and not yet started, is not idle.**
+            //
+            // A branch the loop has not reached yet sits in
+            // `Phase::Idle` holding a post it has not answered, and
+            // said `idle` for as long as that took — measured at 12.6
+            // seconds on 2026-09-22. A supervisor polling for "are they
+            // done" saw every helper finished before any had begun, and
+            // the race was invisible because the answer was a plausible
+            // word rather than an error.
+            //
+            // `needs_prompt` is the same predicate the loop schedules
+            // on, so this cannot disagree with what is about to happen.
+            "idle" if state.needs_prompt(&self.tree) => "queued",
+            word => word,
         }
     }
 
