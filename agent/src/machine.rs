@@ -2949,6 +2949,40 @@ impl Runner {
         if to.as_str() == Some("user") {
             return Ok(Address::User);
         }
+        // **`"parent"`, because a handle only points downwards.**
+        //
+        // `spawn()` hands the caller a handle to the child; nothing
+        // hands the child one to whoever spawned it. So a child with a
+        // question it cannot settle had exactly one address — `"user"`
+        // — which reaches the person driving the session and nobody
+        // else. In a headless run there is no such person, and the
+        // child waits until the timeout.
+        //
+        // That is most of why steering a running child has never been
+        // written: the child could not reach the only party watching
+        // it. Everything after the address already worked — the post
+        // lands on the parent's branch, arrives in its `# NEW EVENTS`
+        // with an `[id]`, is counted by `list_agents`'s `open`, and is
+        // discharged by `answer(question, value)`.
+        //
+        // The root has no parent, and saying so is better than quietly
+        // meaning the user: a root that writes `ask("parent", …)` has
+        // misunderstood where it sits, and a silent redirect would hide
+        // that until the answer came back from the wrong mind.
+        if to.as_str() == Some("parent") {
+            let parent = tree
+                .events
+                .get(&self.agent)
+                .and_then(|e| e.parent_id)
+                .and_then(|p| tree.enclosing_agent(p));
+            return match parent {
+                Some(agent) => Ok(Address::Branch(agent)),
+                None => Err(
+                    "this agent has no parent — it is the root, and \"user\" is who it answers to"
+                        .into(),
+                ),
+            };
+        }
         // A handle, as `spawn()`/`fork()` hand it back — `{"agent": id}`.
         // Accepted whole, so `const h = spawn(...); await ask(h, ...)`
         // works, which is what the card teaches and an exemplar
@@ -6910,6 +6944,33 @@ mod tests {
                 .any(|l| l.starts_with("- ") && l.contains("One-shot")),
             "one line like its neighbours: {on}"
         );
+    }
+
+    /// **A child can address whoever spawned it.**
+    ///
+    /// `spawn()` hands the caller a handle to the child and nothing
+    /// hands the child one back, so before `"parent"` a child with a
+    /// question had one address — `"user"` — which reaches the person
+    /// driving the session and, in a headless run, nobody. Everything
+    /// after the address already worked; the address was the gap.
+    #[test]
+    fn a_child_can_ask_its_parent_and_the_root_cannot() {
+        let (mut tree, mut state) = setup_under();
+        user_post(&mut state, &mut tree, "go");
+
+        // The root's parent is nobody, and it says so rather than
+        // quietly meaning the user.
+        let err = state
+            .resolve_address(&tree, Some(&json!("parent")))
+            .unwrap_err();
+        assert!(err.contains("no parent"), "{err}");
+        assert!(err.contains("user"), "and says who it does answer to: {err}");
+
+        // `"user"` still means the person, from anywhere.
+        assert!(matches!(
+            state.resolve_address(&tree, Some(&json!("user"))),
+            Ok(Address::User)
+        ));
     }
 
     /// **The two shape lines follow the transport.**

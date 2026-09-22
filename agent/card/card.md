@@ -61,14 +61,16 @@ declare const console: { log(...args: unknown[]): void };
 
 /** Say something to the person, from inside a block. The only way to put a computed value in front of them. */
 declare function tell(text: string): void;
-/** Say something to an agent you spawned or forked. */
-declare function tell(to: Agent, text: string): void;
+/** Say something to an agent you spawned or forked, or `"parent"` to whoever spawned you. */
+declare function tell(to: "parent" | Agent, text: string): void;
 
-/** Ask an open question and wait for the answer in the middle of this block. `"user"` is the person. The answer is text to read, not a value to compute with. */
-declare function ask(who: "user" | Agent, text: string): Promise<string>;
+/** Ask an open question and wait for the answer in the middle of this block. The answer is text to read, not a value to compute with.
+
+  `"user"` is the person driving the session. `"parent"` is whoever spawned you — a handle points downwards only, so this is the one way a child reaches the agent watching it, and the one that works when nobody is at a keyboard. The root has no parent and says so. */
+declare function ask(who: "user" | "parent" | Agent, text: string): Promise<string>;
 
 /** Ask which of a few named things they want. Resolves to one of `options`, exactly — compare it with `===`. An answer that is none of them fails the call with their words, and your next reply decides what they meant. */
-declare function choose(who: "user" | Agent, text: string, options: string[]): Promise<string>;
+declare function choose(who: "user" | "parent" | Agent, text: string, options: string[]): Promise<string>;
 
 /** Discharge an `ask()` or `choose()` another agent is blocked on, by its id; a `choose` takes one of the options it offered and nothing else. Answering is not resting: say `finish()` in the same block after the answer, or that agent spends a completion finding out it has nothing left to do. */
 declare function answer(question: number, value: unknown): void;
