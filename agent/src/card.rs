@@ -187,73 +187,6 @@ fn the_shipped_manifest_tells_the_truth_about_itself() {
     );
 }
 
-/// The opening listing: bounded, two deep, and quiet about build
-/// output.
-#[test]
-fn the_working_directory_listing_is_bounded_and_skips_noise() {
-    let dir = std::env::temp_dir().join(format!("agent2-listing-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(dir.join("sub/deeper")).unwrap();
-    std::fs::create_dir_all(dir.join("node_modules/pkg")).unwrap();
-    std::fs::write(dir.join("app.py"), "").unwrap();
-    std::fs::write(dir.join("sub/mod.py"), "").unwrap();
-    std::fs::write(dir.join("sub/deeper/buried.py"), "").unwrap();
-    std::fs::write(dir.join("node_modules/pkg/index.js"), "").unwrap();
-
-    let out = listing(&dir);
-    assert!(out.contains("app.py"), "{out}");
-    assert!(out.contains("sub/"), "directories are marked: {out}");
-    assert!(out.contains("sub/mod.py"), "two levels deep: {out}");
-    assert!(!out.contains("buried.py"), "and not three: {out}");
-    assert!(
-        !out.contains("node_modules"),
-        "build noise is skipped: {out}"
-    );
-
-    // A big tree costs a fixed number of bytes and says that it stopped.
-    let big = dir.join("many");
-    std::fs::create_dir_all(&big).unwrap();
-    for i in 0..(LISTING_MAX_ENTRIES + 20) {
-        std::fs::write(big.join(format!("f{i}.txt")), "").unwrap();
-    }
-    let out = listing(&dir);
-    assert!(out.contains("… and more"), "{out}");
-    assert!(
-        out.lines().count() < LISTING_MAX_ENTRIES + 12,
-        "bounded: {} lines",
-        out.lines().count()
-    );
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// **Bounded before the sort.** The 50-entry cap limits what is shown;
-/// without a read cap, a directory with a hundred thousand entries is
-/// still enumerated and sorted in full to print fifty of them, at the
-/// start of every session.
-#[test]
-fn a_huge_directory_costs_a_bounded_amount_of_work() {
-    let dir = std::env::temp_dir().join(format!("agent2-listing-big-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    for i in 0..(LISTING_MAX_SCAN + 200) {
-        std::fs::write(dir.join(format!("f{i:05}.txt")), "").unwrap();
-    }
-    let started = std::time::Instant::now();
-    let out = listing(&dir);
-    assert!(out.contains("… and more"), "says it stopped: {out}");
-    assert!(
-        out.lines().count() < LISTING_MAX_ENTRIES + 12,
-        "{} lines",
-        out.lines().count()
-    );
-    assert!(
-        started.elapsed() < std::time::Duration::from_secs(5),
-        "took {:?}",
-        started.elapsed()
-    );
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
 /// **The worked examples compile.**
 ///
 /// They are the most directly imitated thing the model is given — the
@@ -699,134 +632,11 @@ pub fn full_card(registry: &crate::host::ToolRegistry) -> String {
 /// must not silently rewrite what an existing conversation was told.
 fn working_directory() -> String {
     match std::env::current_dir() {
-        Ok(dir) => format!(
-            "\n\nCurrent working directory: {}{}",
-            dir.display(),
-            listing(&dir)
-        ),
+        Ok(dir) => format!("\n\nCurrent working directory: {}", dir.display()),
         // Not worth failing a session over, and a wrong answer would be
         // worse than none.
         Err(_) => String::new(),
     }
-}
-
-/// How many entries the opening listing shows before it stops.
-const LISTING_MAX_ENTRIES: usize = 50;
-
-/// How many directory entries are read before one is given up on.
-/// Ten times what can be shown, so ordinary directories sort whole and
-/// a pathological one costs a bounded amount of work rather than
-/// however much happens to be on disk.
-const LISTING_MAX_SCAN: usize = 500;
-
-/// Noise every listing of a working tree has and nobody wants: build
-/// output and dependency trees, which are large, uninteresting, and the
-/// reason a naive `find .` comes back with ten thousand lines.
-const LISTING_SKIP: [&str; 9] = [
-    ".git",
-    "node_modules",
-    "target",
-    "__pycache__",
-    ".venv",
-    "venv",
-    "dist",
-    ".mypy_cache",
-    ".pytest_cache",
-];
-
-/// **What is in the working directory, two levels deep.**
-///
-/// Telling the model *where* it is fixed half of this; the measurement
-/// says the other half was still being paid. Across 96 kept runs, 23 —
-/// **a quarter** — spend their entire first program on `ls`, `find` or
-/// `pwd` and nothing else, which is a whole completion spent learning
-/// what a listing would have said. Two of them ran `find` over a depth
-/// of three and piped it through `head -200`.
-///
-/// Two levels because one is usually a list of directories and three is
-/// usually a flood. Bounded at [`LISTING_MAX_ENTRIES`] and honest when
-/// it stops, so a large tree costs a fixed number of bytes rather than
-/// however many files happen to be there.
-///
-/// Snapshotted at the agent's root with everything else here: it says
-/// what was there when the conversation started, and a session that
-/// changes the tree later reads it as history, which is what the rest
-/// of the record is.
-fn listing(dir: &std::path::Path) -> String {
-    // **Breadth-first, so a truncation costs detail rather than a
-    // whole subtree.** Depth-first spends the budget on whatever sorts
-    // first: a repo whose `app/` holds sixty files would show `app/`
-    // and nothing else, and the reader would not learn that `tests/`
-    // and `Makefile` exist at all. Every top-level name first, then
-    // what is inside them, means the shallowest facts — which are the
-    // ones a first program acts on — are the ones that survive.
-    fn level(
-        dir: &std::path::Path,
-        prefix: &str,
-        out: &mut Vec<String>,
-        cut: &mut bool,
-    ) -> Vec<(String, String)> {
-        let mut dirs = Vec::new();
-        let Ok(rd) = std::fs::read_dir(dir) else {
-            return dirs;
-        };
-        // **Bounded before the sort, not after.** The cap below limits
-        // what is *shown*; this limits what is read, because a
-        // directory with a hundred thousand entries would otherwise be
-        // enumerated and sorted in full to print fifty of them, at the
-        // start of every session. The evals run in directories with
-        // four files; a real checkout is where this matters.
-        let mut entries: Vec<_> = rd.flatten().take(LISTING_MAX_SCAN).collect();
-        let overflowed = entries.len() == LISTING_MAX_SCAN;
-        entries.sort_by_key(|e| e.file_name());
-        if overflowed {
-            *cut = true;
-        }
-        for e in entries {
-            let name = e.file_name().to_string_lossy().into_owned();
-            if LISTING_SKIP.contains(&name.as_str()) {
-                continue;
-            }
-            if out.len() >= LISTING_MAX_ENTRIES {
-                *cut = true;
-                return dirs;
-            }
-            let is_dir = e.file_type().is_ok_and(|t| t.is_dir());
-            out.push(format!("{prefix}{name}{}", if is_dir { "/" } else { "" }));
-            if is_dir {
-                dirs.push((format!("{prefix}{name}/"), e.path().display().to_string()));
-            }
-        }
-        dirs
-    }
-    let mut out = Vec::new();
-    let mut truncated = false;
-    for (prefix, path) in level(dir, "", &mut out, &mut truncated) {
-        if truncated {
-            break;
-        }
-        level(
-            std::path::Path::new(&path),
-            &prefix,
-            &mut out,
-            &mut truncated,
-        );
-    }
-    // Back into path order once the budget has been spent breadth-first,
-    // so what is shown reads as a tree rather than as two passes.
-    out.sort();
-    if out.is_empty() {
-        return String::new();
-    }
-    let more = if truncated {
-        "\n… and more — `bash` for the rest."
-    } else {
-        ""
-    };
-    format!(
-        "\n\nWhat is in it, two levels deep:\n\n```text\n{}\n```{more}",
-        out.join("\n")
-    )
 }
 
 /// A worked exemplar: a real user/assistant pair opening `messages`,
@@ -1270,7 +1080,14 @@ mod tests {
         // `unreachable!("returned above")` is a panic message, not a
         // status, and scraping string literals out of that function put
         // it in the card as one.
-        for word in ["running", "thinking", "suspended", "idle", "dormant", "queued"] {
+        for word in [
+            "running",
+            "thinking",
+            "suspended",
+            "idle",
+            "dormant",
+            "queued",
+        ] {
             assert!(
                 card.contains(&format!("`\"{word}\"`")),
                 "the card does not name the status `{word}`"
