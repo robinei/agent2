@@ -31,17 +31,20 @@
 //! POC (`codemode/runner.rs`) after two live tasks were lost to a single
 //! unbalanced paren that the compiler already named exactly.
 
-mod deepseek;
 mod demo;
 mod llm;
+mod openai_completions;
+mod openai_responses;
 mod protocol;
+pub(crate) mod provider;
 mod registry;
 pub(crate) mod structural;
 pub(crate) mod tools;
 
-pub use deepseek::*;
 pub use demo::*;
 pub use llm::*;
+pub use openai_completions::*;
+pub use openai_responses::*;
 pub use protocol::*;
 pub use registry::*;
 pub use tools::*;

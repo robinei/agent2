@@ -1193,7 +1193,9 @@ mod tests {
                     .split(|c: char| !c.is_ascii_alphanumeric())
                     .map(|w| w.to_ascii_lowercase())
                     .collect();
-                let stale = words.iter().any(|w| matches!(w.as_str(), "block" | "blocks" | "cell" | "cells"))
+                let stale = words
+                    .iter()
+                    .any(|w| matches!(w.as_str(), "block" | "blocks" | "cell" | "cells"))
                     || l.contains("this reply")
                     || l.contains("next reply");
                 stale && !allowed.iter().any(|a| l.contains(a))

@@ -1137,8 +1137,7 @@ impl Runner {
                 Ok(v) => Some(v),
                 Err(_) => Some(NO_REHEARSAL_TAIL.to_owned()),
             },
-            no_rehearsal_last: std::env::var("AGENT2_NO_REHEARSAL_LAST")
-                .map_or(true, |v| v != "0"),
+            no_rehearsal_last: std::env::var("AGENT2_NO_REHEARSAL_LAST").map_or(true, |v| v != "0"),
             run_program: std::env::var("AGENT2_RUN_PROGRAM").is_ok_and(|v| v != "0"),
             finish_ignored: false,
             spine,
@@ -4171,11 +4170,21 @@ impl Runner {
                 if n == 1 { "" } else { "s" }
             ));
             lines.push(
-                if self.run_program { WORK_UNDER_WAY_CALL } else { WORK_UNDER_WAY }.to_owned(),
+                if self.run_program {
+                    WORK_UNDER_WAY_CALL
+                } else {
+                    WORK_UNDER_WAY
+                }
+                .to_owned(),
             );
         }
         lines.push(
-            if self.run_program { REPLY_IS_A_CALL } else { REPLY_IS_MARKDOWN }.to_owned(),
+            if self.run_program {
+                REPLY_IS_A_CALL
+            } else {
+                REPLY_IS_MARKDOWN
+            }
+            .to_owned(),
         );
         // Below the rule whose violation is silent, which is the whole
         // point of the arm: the two lines are competing for one slot.

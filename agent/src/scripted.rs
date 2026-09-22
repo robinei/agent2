@@ -280,7 +280,7 @@ use crate::host::tools::PROCESS_CWD as SANDBOX_CWD;
 /// directory, and fold the finished log into an [`Outcome`]. `llm` is
 /// the only thing that differs between this module's own scripted tests
 /// (a `ScriptedLlm`) and a live run (`harness::run_task`'s
-/// `DeepSeekClient`); `sandbox_dir` is a directory `task.setup` has
+/// `OpenAiCompletions`); `sandbox_dir` is a directory `task.setup` has
 /// already populated (see [`make_sandbox`]).
 ///
 /// **How it knows the task is finished.** `Session::run` returns once

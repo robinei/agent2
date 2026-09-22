@@ -35,46 +35,19 @@ use crate::machine::LlmTurn;
 /// The paid provider is opt-in now, by setting `DEEPSEEK_BASE_URL` and
 /// `DEEPSEEK_MODEL`, and `evals/drive.py` prints which endpoint it is
 /// about to use before the first run either way.
-const DEFAULT_MODEL: &str = "Qwen3.8-27B";
+pub(crate) const DEFAULT_MODEL: &str = "Qwen3.8-27B";
 
 /// Reasoning effort, sent as `reasoning_effort`. `high` because that is
 /// what one would realistically run — the harness is measured in the
 /// configuration it is used in, not a cheaper one chosen to make the
 /// numbers move.
-const DEFAULT_EFFORT: &str = "high";
-const DEFAULT_BASE_URL: &str = "http://192.168.1.216:8080/v1";
+pub(crate) const DEFAULT_EFFORT: &str = "high";
+pub(crate) const DEFAULT_BASE_URL: &str = "http://192.168.1.216:8080/v1";
 
 /// Whether a base URL is somewhere on this machine or this network —
 /// which is the same question as "does reaching it cost anything".
 ///
-/// Used for one thing only: an endpoint that cannot bill has no reason
-/// to demand a credential, and requiring one would make the free
-/// default unusable without a placeholder nobody reads.
-///
-/// **Parsed as an address, not matched as a prefix.** The first
-/// version tested `starts_with("192.168.")`, which is true of
-/// `192.168.1.216.example.com` — a name anybody can register, pointing
-/// anywhere, and treated as free. `Ipv4Addr` decides it instead, which
-/// also gets `172.16.0.0/12` right, and a hostname is remote unless it
-/// is literally `localhost`.
-fn is_local(base_url: &str) -> bool {
-    let after_scheme = base_url.split_once("://").map_or(base_url, |(_, r)| r);
-    let host = after_scheme.split('/').next().unwrap_or("");
-    let host = host
-        .strip_prefix('[')
-        .and_then(|h| h.split(']').next())
-        .unwrap_or_else(|| host.rsplit_once(':').map_or(host, |(h, _)| h));
-    if host == "localhost" {
-        return true;
-    }
-    match host.parse::<std::net::IpAddr>() {
-        Ok(std::net::IpAddr::V4(ip)) => ip.is_loopback() || ip.is_private(),
-        Ok(std::net::IpAddr::V6(ip)) => ip.is_loopback(),
-        Err(_) => false,
-    }
-}
-
-pub struct DeepSeekClient {
+pub struct OpenAiCompletions {
     api_key: String,
     model: String,
     base_url: String,
@@ -108,58 +81,20 @@ pub struct DeepSeekClient {
     session_id: String,
 }
 
-impl DeepSeekClient {
-    /// Key from `DEEPSEEK_API_KEY` (required), model from
-    /// `DEEPSEEK_MODEL`, base URL from `DEEPSEEK_BASE_URL`. Thinking is on
-    /// by default (the API's own default); set `DEEPSEEK_NO_THINKING` (to
-    /// any value) to send `"thinking": {"type": "disabled"}`.
-    ///
-    /// Reasoning effort defaults to [`DEFAULT_EFFORT`] and is overridden
-    /// by `DEEPSEEK_REASONING_EFFORT` —
-    /// `minimal`/`low`/`medium`/`high`/`xhigh`/`max`, sent as
-    /// `reasoning_effort`.
-    ///
-    /// It is pinned rather than left to the API's own default because
-    /// `DESIGN.md`'s M5 measures this harness against a third-party
-    /// agent on the same model, and an unpinned level makes "same model"
-    /// untrue in the one way that would silently explain away a
-    /// difference. The wire format is the one `pi` uses for this
-    /// provider — `reasoning_effort` to set a level, `thinking: {"type":
-    /// "disabled"}` to turn it off, the latter already byte-identical to
-    /// what `DEEPSEEK_NO_THINKING` sends — so both sides are set the
-    /// same way and can be checked against each other.
-    pub fn from_env() -> Result<Self, String> {
-        let model = std::env::var("DEEPSEEK_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.into());
-        let base_url =
-            std::env::var("DEEPSEEK_BASE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.into());
-        // A key is still required of anything that could charge for
-        // the answer, and the error still names the variable. A local
-        // server ignores whatever is sent, so asking for one there
-        // would only teach people to export a placeholder — and the
-        // habit of exporting a placeholder is exactly what made the
-        // old paid default silent.
-        let api_key = match std::env::var("DEEPSEEK_API_KEY") {
-            Ok(key) => key,
-            Err(_) if is_local(&base_url) => "local".to_owned(),
-            Err(_) => {
-                return Err(format!(
-                    "DEEPSEEK_API_KEY is not set, and {base_url} is not on this machine"
-                ));
-            }
-        };
-        let thinking = std::env::var("DEEPSEEK_NO_THINKING").is_err();
-        let max_tokens = std::env::var("DEEPSEEK_MAX_TOKENS")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .filter(|n| *n > 0);
-        let effort = std::env::var("DEEPSEEK_REASONING_EFFORT")
-            .ok()
-            .or_else(|| Some(DEFAULT_EFFORT.to_owned()));
-        let run_program = std::env::var("AGENT2_RUN_PROGRAM").is_ok_and(|v| v != "0");
-        Ok(Self::new(api_key, model, base_url, thinking)
-            .with_effort(effort)
-            .with_max_tokens(max_tokens)
-            .with_run_program(run_program))
+impl OpenAiCompletions {
+    /// Built from the one config `host::provider` reads, so every
+    /// provider is configured the same way and the env-var spellings
+    /// live in exactly one file.
+    pub fn from_config(config: &super::provider::Config) -> Self {
+        Self::new(
+            config.api_key.clone(),
+            config.model.clone(),
+            config.base_url.clone(),
+            config.thinking,
+        )
+        .with_effort(config.effort.clone())
+        .with_max_tokens(config.max_tokens)
+        .with_run_program(std::env::var("AGENT2_RUN_PROGRAM").is_ok_and(|v| v != "0"))
     }
 
     /// Pin the reasoning level (builder form, so `new`'s signature is
@@ -232,7 +167,7 @@ impl DeepSeekClient {
             .timeout_recv_response(Some(COMPLETION_CEILING))
             .timeout_recv_body(Some(SOCKET_IDLE))
             .build();
-        DeepSeekClient {
+        OpenAiCompletions {
             api_key,
             model,
             base_url,
@@ -247,7 +182,7 @@ impl DeepSeekClient {
     }
 }
 
-impl LlmClient for DeepSeekClient {
+impl LlmClient for OpenAiCompletions {
     fn complete(
         &self,
         request: &Document,
@@ -525,8 +460,11 @@ fn request_body(
         body["tools"] = serde_json::json!([run_program_tool()]);
     }
     if let Some(n) = max_tokens {
-        body[if openai_shape { "max_completion_tokens" } else { "max_tokens" }] =
-            serde_json::json!(n);
+        body[if openai_shape {
+            "max_completion_tokens"
+        } else {
+            "max_tokens"
+        }] = serde_json::json!(n);
     }
     if openai_shape {
         // No `thinking` object at all — OpenAI errors on the unknown
@@ -584,8 +522,7 @@ fn message_json(message: &ChatMessage) -> serde_json::Value {
         // reasoning to carry. Sending the model's own thinking fixed
         // two runs in five and left three failing on the worked
         // examples, which the error named and I did not read.
-        out["reasoning_content"] =
-            serde_json::json!(message.thinking.as_deref().unwrap_or(""));
+        out["reasoning_content"] = serde_json::json!(message.thinking.as_deref().unwrap_or(""));
         return out;
     }
     // And the report that answers one goes back in the `tool` role. The
@@ -750,9 +687,7 @@ fn parse_sse(
             chunk(LlmChunk::Text(t.to_owned()));
             acc.source.push_str(t);
         }
-        if run_program
-            && let Some(calls) = delta["tool_calls"].as_array()
-        {
+        if run_program && let Some(calls) = delta["tool_calls"].as_array() {
             for call in calls {
                 let Some(t) = call["function"]["arguments"].as_str() else {
                     continue;
@@ -903,17 +838,39 @@ mod tests {
         // exactly is what makes `DESIGN.md`'s M5 a comparison of two
         // harnesses rather than of two reasoning budgets.
         let request = Document {
-            messages: vec![ChatMessage { role: ChatRole::System, content: "c".into(), call: None, result_for: None, thinking: None }],
+            messages: vec![ChatMessage {
+                role: ChatRole::System,
+                content: "c".into(),
+                call: None,
+                result_for: None,
+                thinking: None,
+            }],
             preamble: 0,
         };
-        let body = request_body(&request, "deepseek-v4-flash", true, Some("medium"), None, false, false);
+        let body = request_body(
+            &request,
+            "deepseek-v4-flash",
+            true,
+            Some("medium"),
+            None,
+            false,
+            false,
+        );
         assert_eq!(body["reasoning_effort"], json!("medium"));
         // The level needs the enable flag beside it; alone it is a
         // request the API may answer at whatever default it likes.
         assert_eq!(body["thinking"], json!({ "type": "enabled" }));
 
         // Unpinned: no field at all, and the API picks.
-        let body = request_body(&request, "deepseek-v4-flash", true, None, None, false, false);
+        let body = request_body(
+            &request,
+            "deepseek-v4-flash",
+            true,
+            None,
+            None,
+            false,
+            false,
+        );
         assert!(body.get("reasoning_effort").is_none());
     }
 
@@ -933,7 +890,15 @@ mod tests {
     #[test]
     fn request_body_disables_thinking_on_request() {
         let request = doc(vec![]);
-        let body = request_body(&request, "deepseek-v4-flash", false, None, None, false, false);
+        let body = request_body(
+            &request,
+            "deepseek-v4-flash",
+            false,
+            None,
+            None,
+            false,
+            false,
+        );
         assert_eq!(body["thinking"], json!({ "type": "disabled" }));
     }
 
@@ -1116,7 +1081,7 @@ mod tests {
         ]);
         let (base, _h) = serve(vec![dies_in_reasoning, good]);
 
-        let client = DeepSeekClient::new("k".into(), "m".into(), base, true);
+        let client = OpenAiCompletions::new("k".into(), "m".into(), base, true);
         let mut text = String::new();
         let turn = client
             .complete(
@@ -1144,7 +1109,7 @@ mod tests {
         ]);
         let (base, _h) = serve(vec![dies_mid_reply, would_be_second]);
 
-        let client = DeepSeekClient::new("k".into(), "m".into(), base, true);
+        let client = OpenAiCompletions::new("k".into(), "m".into(), base, true);
         let mut text = String::new();
         let err = client
             .complete(
@@ -1191,13 +1156,19 @@ mod tests {
         let doc = doc(vec![
             msg(ChatRole::System, "card"),
             msg(ChatRole::User, "do it"),
-            msg(ChatRole::Assistant, "Reading it.\n\n```js\nreturn 1;\n```\n"),
+            msg(
+                ChatRole::Assistant,
+                "Reading it.\n\n```js\nreturn 1;\n```\n",
+            ),
             msg(ChatRole::User, "## program completed"),
         ])
         .into_tool_calls();
 
         let turn = &doc.messages[2];
-        assert_eq!(turn.content, "Reading it.", "the prose is kept, the fence is not");
+        assert_eq!(
+            turn.content, "Reading it.",
+            "the prose is kept, the fence is not"
+        );
         let (id, source) = turn.call.as_ref().expect("the turn became a call");
         // The cell keeps its trailing newline; the program is the
         // bytes between the fences, not a trimmed version of them.
@@ -1211,9 +1182,12 @@ mod tests {
         let body = message_json(turn);
         assert_eq!(body["role"], "assistant");
         assert_eq!(body["tool_calls"][0]["function"]["name"], "run_program");
-        let args: serde_json::Value =
-            serde_json::from_str(body["tool_calls"][0]["function"]["arguments"].as_str().unwrap())
-                .unwrap();
+        let args: serde_json::Value = serde_json::from_str(
+            body["tool_calls"][0]["function"]["arguments"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
         assert_eq!(args["source"], "return 1;\n");
         assert!(
             !body.to_string().contains("```js"),
@@ -1240,7 +1214,15 @@ mod tests {
         assert_eq!(ds["max_tokens"], 4096);
         assert!(ds.get("max_completion_tokens").is_none());
 
-        let oa = request_body(&request, "gpt-5", true, Some("high"), Some(4096), false, true);
+        let oa = request_body(
+            &request,
+            "gpt-5",
+            true,
+            Some("high"),
+            Some(4096),
+            false,
+            true,
+        );
         assert!(oa.get("thinking").is_none(), "OpenAI rejects it: {oa}");
         assert_eq!(oa["max_completion_tokens"], 4096);
         assert!(oa.get("max_tokens").is_none());
@@ -1255,14 +1237,14 @@ mod tests {
     /// And the flag is derived, not configured.
     #[test]
     fn the_endpoint_decides_its_own_shape() {
-        let oa = DeepSeekClient::new(
+        let oa = OpenAiCompletions::new(
             "k".into(),
             "gpt-5".into(),
             "https://api.openai.com/v1".into(),
             true,
         );
         assert!(oa.openai_shape);
-        let ds = DeepSeekClient::new(
+        let ds = OpenAiCompletions::new(
             "k".into(),
             "deepseek-v4-flash".into(),
             "https://opencode.ai/zen/go/v1".into(),
@@ -1301,7 +1283,10 @@ mod tests {
         assert_eq!(cells.len(), 2, "{:?}", turn.source);
         assert_eq!(cells[0].slice(&turn.source).trim(), "const a = 1;");
         assert_eq!(cells[1].slice(&turn.source).trim(), "const b = a + 1;");
-        assert_eq!(streamed, turn.source, "the session would see something else");
+        assert_eq!(
+            streamed, turn.source,
+            "the session would see something else"
+        );
     }
 
     /// **Reasoning goes back only when asked for, and the default is
@@ -1333,9 +1318,11 @@ mod tests {
         let mut plain = msg(ChatRole::Assistant, "prose");
         plain.thinking = Some("weighing it up".into());
         assert_eq!(message_json(&plain)["reasoning_content"], "weighing it up");
-        assert!(message_json(&msg(ChatRole::Assistant, "prose"))
-            .get("reasoning_content")
-            .is_none());
+        assert!(
+            message_json(&msg(ChatRole::Assistant, "prose"))
+                .get("reasoning_content")
+                .is_none()
+        );
     }
 
     /// **What is streamed must reconstruct what is returned.**
@@ -1489,12 +1476,17 @@ mod tests {
             r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
         ]);
         let mut chunks = Vec::new();
-        let turn = parse_sse(stream.as_bytes(), &Cancel::new(), &mut |c| {
-            chunks.push(match c {
-                LlmChunk::Text(t) => format!("T:{t}"),
-                LlmChunk::Thinking(t) => format!("R:{t}"),
-            });
-        }, false)
+        let turn = parse_sse(
+            stream.as_bytes(),
+            &Cancel::new(),
+            &mut |c| {
+                chunks.push(match c {
+                    LlmChunk::Text(t) => format!("T:{t}"),
+                    LlmChunk::Thinking(t) => format!("R:{t}"),
+                });
+            },
+            false,
+        )
         .unwrap();
 
         assert_eq!(turn.source, "const x = 42;");
@@ -1613,7 +1605,7 @@ mod tests {
             "http://[::1]:8080/v1",
             DEFAULT_BASE_URL,
         ] {
-            assert!(is_local(local), "{local}");
+            assert!(super::super::provider::is_local(local), "{local}");
         }
         for remote in [
             "https://opencode.ai/zen/go/v1",
@@ -1625,7 +1617,7 @@ mod tests {
             "https://localhost.example.com/v1",
             "https://172.32.0.1/v1",
         ] {
-            assert!(!is_local(remote), "{remote}");
+            assert!(!super::super::provider::is_local(remote), "{remote}");
         }
     }
 
@@ -1638,7 +1630,7 @@ mod tests {
         // through the same decision it makes, spelled out, so the test
         // does not race another test's `set_var`.
         let base = "https://opencode.ai/zen/go/v1";
-        assert!(!is_local(base));
+        assert!(!super::super::provider::is_local(base));
         let err = format!("DEEPSEEK_API_KEY is not set, and {base} is not on this machine");
         assert!(err.contains("DEEPSEEK_API_KEY"), "{err}");
         assert!(err.contains("opencode.ai"), "{err}");

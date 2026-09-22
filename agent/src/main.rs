@@ -45,10 +45,12 @@ const USAGE: &str = "usage: agent <command>
                                     is parked on ask(): its VM lives in
                                     this process, so a turn-per-process
                                     driver arrives after it is gone.
-    --real                          use DeepSeek (needs DEEPSEEK_API_KEY);
-                                    the TUI picks it automatically when the
-                                    key is set — --headless stays scripted
-                                    unless --real is given
+    --real                          use the real provider (needs
+                                    AGENT2_API_KEY, or the older
+                                    DEEPSEEK_API_KEY); the TUI picks it
+                                    automatically when the key is set —
+                                    --headless stays scripted unless
+                                    --real is given
     --turn <text>                   say this on the conversation branch
                                     before the TUI takes over, so a
                                     session can start — or carry on —
@@ -409,7 +411,10 @@ fn sample_document(args: &[String]) -> Result<(), String> {
     let jobs: usize = opt(args, "-j").unwrap_or("4").parse().map_err(|_| "-j")?;
     let jobs = jobs.max(1).min(n.max(1));
 
-    let client = host::DeepSeekClient::from_env()?;
+    // Whichever provider the environment names; this command has no
+    // business knowing which wire format it got.
+    let client = host::provider::from_env()?;
+    let client = ArcLlm(client);
     let bytes: usize = doc.messages.iter().map(|m| m.content.len()).sum();
     eprintln!(
         "{n} samples, {jobs} at a time — {} messages, {bytes} bytes each  [this bills]",
@@ -569,8 +574,8 @@ fn build_brain(
     real: bool,
 ) -> Result<(host::ToolRegistry, Box<dyn host::LlmClient>, &'static str), String> {
     if real {
-        let client = host::DeepSeekClient::from_env()?;
-        Ok((host::real_registry(), Box::new(client), REAL_PROMPT))
+        let client = host::provider::from_env()?;
+        Ok((host::real_registry(), Box::new(ArcLlm(client)), REAL_PROMPT))
     } else {
         Ok((
             host::demo_registry(),
@@ -988,5 +993,23 @@ fn describe_call(call: &Call) -> String {
             format!("fork {}", name.as_deref().unwrap_or("<unnamed>"))
         }
         Call::Invoke { name, args, .. } => format!("invoke {name}({args})"),
+    }
+}
+
+/// `Arc<dyn LlmClient>` where a `Box` is wanted.
+///
+/// `host::provider::from_env` hands back an `Arc` because the session
+/// loop shares one client across worker threads; the two callers that
+/// want a `Box` get this rather than a second constructor per provider.
+struct ArcLlm(std::sync::Arc<dyn host::LlmClient>);
+
+impl host::LlmClient for ArcLlm {
+    fn complete(
+        &self,
+        request: &document::Document,
+        cancel: &host::Cancel,
+        chunk: &mut dyn FnMut(host::LlmChunk),
+    ) -> Result<machine::LlmTurn, String> {
+        self.0.complete(request, cancel, chunk)
     }
 }

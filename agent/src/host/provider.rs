@@ -1,0 +1,185 @@
+//! **Which provider, and how it is configured.**
+//!
+//! There is more than one way to reach a model now, and they are not
+//! variations on a wire format — they are different ones. Chat
+//! completions takes `messages` and streams `choices[].delta`;
+//! Responses takes typed `input` items and streams named events. A
+//! single client with branches inside it would be two implementations
+//! wearing one name, which is the mistake `docs/23_ONE_AGENT.md`
+//! records from the last time this codebase kept two paths.
+//!
+//! So each is its own [`LlmClient`], and this module is the only place
+//! that chooses. Everything above it holds an `Arc<dyn LlmClient>` and
+//! cannot tell which it has.
+//!
+//! **The endpoint decides, not a flag.** `AGENT2_PROVIDER` exists to
+//! override, but the default is inferred from the base URL, because
+//! which API an endpoint speaks is a fact about that endpoint rather
+//! than a preference anyone holds. Getting it wrong is a 404 or a
+//! schema error on the first request, not a silent wrong answer.
+//!
+//! **The `DEEPSEEK_*` variables still work**, and are read as the
+//! second choice behind `AGENT2_*`. They are the spelling every eval
+//! script, `run.sh` and recorded arm on disk uses, and renaming them
+//! would invalidate the fingerprint on every result file already
+//! written. The prefix is a fossil — these keys have pointed at
+//! opencode, OpenRouter and a local llama-server far more often than
+//! at DeepSeek.
+
+use std::sync::Arc;
+
+use super::llm::LlmClient;
+
+/// The wire format an endpoint speaks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Api {
+    /// `POST /chat/completions` — `messages` in, `choices[].delta` out.
+    /// DeepSeek, opencode, OpenRouter, llama-server, and OpenAI's
+    /// non-reasoning models.
+    Completions,
+    /// `POST /responses` — typed `input` items in, named events out.
+    /// The only way to reach OpenAI's `*-codex` models.
+    Responses,
+}
+
+impl Api {
+    /// What this base URL almost certainly speaks.
+    ///
+    /// Only two things are ever true here: an endpoint whose path ends
+    /// in `/responses`, or one of the hosts that serve that API and
+    /// nothing else. Everything else in this project's history —
+    /// opencode, OpenRouter, llama-server, DeepSeek — is completions.
+    pub fn infer(base_url: &str) -> Api {
+        let u = base_url.trim_end_matches('/');
+        if u.ends_with("/responses") || u.contains("chatgpt.com/backend-api") {
+            Api::Responses
+        } else {
+            Api::Completions
+        }
+    }
+}
+
+/// Everything a provider needs, read once.
+#[derive(Clone, Debug)]
+pub struct Config {
+    pub api: Api,
+    pub api_key: String,
+    pub base_url: String,
+    pub model: String,
+    pub thinking: bool,
+    pub effort: Option<String>,
+    pub max_tokens: Option<u32>,
+}
+
+/// `AGENT2_<name>`, else `DEEPSEEK_<name>` — see the module note on why
+/// the old spelling is still honoured.
+pub fn var(name: &str) -> Option<String> {
+    std::env::var(format!("AGENT2_{name}"))
+        .or_else(|_| std::env::var(format!("DEEPSEEK_{name}")))
+        .ok()
+        .filter(|v| !v.is_empty())
+}
+
+/// **Is this endpoint on this machine?** Used for one thing only: an
+/// endpoint that cannot bill has no reason to demand a credential, and
+/// requiring one would make the free default unusable without a
+/// placeholder nobody reads.
+///
+/// **Parsed as an address, not matched as a prefix.** The first version
+/// tested `starts_with("192.168.")`, which is true of
+/// `192.168.1.216.example.com` — a name anybody can register, pointing
+/// anywhere, and treated as free. `Ipv4Addr` decides it instead, which
+/// also gets `172.16.0.0/12` right, and a hostname is remote unless it
+/// is literally `localhost`.
+pub fn is_local(base_url: &str) -> bool {
+    let after_scheme = base_url.split_once("://").map_or(base_url, |(_, r)| r);
+    let host = after_scheme.split('/').next().unwrap_or("");
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.split(']').next())
+        .unwrap_or_else(|| host.rsplit_once(':').map_or(host, |(h, _)| h));
+    if host == "localhost" {
+        return true;
+    }
+    match host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(ip)) => ip.is_loopback() || ip.is_private(),
+        Ok(std::net::IpAddr::V6(ip)) => ip.is_loopback(),
+        Err(_) => false,
+    }
+}
+
+impl Config {
+    pub fn from_env(
+        default_base_url: &str,
+        default_model: &str,
+        default_effort: &str,
+    ) -> Result<Config, String> {
+        let base_url = var("BASE_URL").unwrap_or_else(|| default_base_url.to_owned());
+        let model = var("MODEL").unwrap_or_else(|| default_model.to_owned());
+        let api_key = match var("API_KEY") {
+            Some(key) => key,
+            None if is_local(&base_url) => "local".to_owned(),
+            None => {
+                return Err(format!(
+                    "AGENT2_API_KEY is not set, and {base_url} is not on this machine"
+                ));
+            }
+        };
+        let api = match var("PROVIDER").as_deref() {
+            Some("completions") => Api::Completions,
+            Some("responses") => Api::Responses,
+            Some(other) => {
+                return Err(format!(
+                    "AGENT2_PROVIDER is `{other}` — expected `completions` or `responses`"
+                ));
+            }
+            None => Api::infer(&base_url),
+        };
+        Ok(Config {
+            api,
+            api_key,
+            base_url,
+            model,
+            thinking: var("NO_THINKING").is_none(),
+            effort: Some(var("REASONING_EFFORT").unwrap_or_else(|| default_effort.to_owned())),
+            max_tokens: var("MAX_TOKENS")
+                .and_then(|v| v.parse::<u32>().ok())
+                .filter(|n| *n > 0),
+        })
+    }
+}
+
+/// The client this environment asks for.
+pub fn from_env() -> Result<Arc<dyn LlmClient>, String> {
+    let config = Config::from_env(
+        super::openai_completions::DEFAULT_BASE_URL,
+        super::openai_completions::DEFAULT_MODEL,
+        super::openai_completions::DEFAULT_EFFORT,
+    )?;
+    Ok(match config.api {
+        Api::Completions => Arc::new(super::OpenAiCompletions::from_config(&config)),
+        Api::Responses => Arc::new(super::OpenAiResponses::from_config(&config)),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **The endpoint decides.** Every URL this project has actually
+    /// pointed at, and the one it is about to.
+    #[test]
+    fn the_api_is_inferred_from_where_the_request_goes() {
+        for (url, want) in [
+            ("https://opencode.ai/zen/go/v1", Api::Completions),
+            ("https://openrouter.ai/api/v1", Api::Completions),
+            ("http://192.168.1.216:8080/v1", Api::Completions),
+            ("https://api.deepseek.com/v1", Api::Completions),
+            ("https://api.openai.com/v1", Api::Completions),
+            ("https://api.openai.com/v1/responses", Api::Responses),
+            ("https://chatgpt.com/backend-api/codex", Api::Responses),
+        ] {
+            assert_eq!(Api::infer(url), want, "{url}");
+        }
+    }
+}
