@@ -116,9 +116,16 @@ impl Config {
     ) -> Result<Config, String> {
         let base_url = var("BASE_URL").unwrap_or_else(|| default_base_url.to_owned());
         let model = var("MODEL").unwrap_or_else(|| default_model.to_owned());
+        // **The ChatGPT backend takes a subscription token, not a
+        // key.** Asked for after the explicit key, so an env var still
+        // wins — which is what lets one of these endpoints be reached
+        // with a pasted token when debugging.
         let api_key = match var("API_KEY") {
             Some(key) => key,
             None if is_local(&base_url) => "local".to_owned(),
+            None if base_url.contains("chatgpt.com/backend-api") => {
+                super::openai_oauth::access_token()?
+            }
             None => {
                 return Err(format!(
                     "AGENT2_API_KEY is not set, and {base_url} is not on this machine"

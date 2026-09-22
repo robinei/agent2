@@ -86,6 +86,11 @@ const USAGE: &str = "usage: agent <command>
                                     inside completions split from the
                                     time everywhere else. JSON per log,
                                     so a before/after is diff or jq.
+  login                             sign in to OpenAI with a ChatGPT
+                                    subscription (PKCE in the browser).
+                                    The token it stores is what a
+                                    chatgpt.com/backend-api endpoint
+                                    authenticates with.
   capture <log.jsonl> [id] [-o f]   the same document, written so it
                                     reads back byte-identical. Edit any
                                     part of it — the card, one turn, the
@@ -221,6 +226,20 @@ fn main() {
             if let Err(e) = print_document(args.get(2).map(String::as_str), args.get(3)) {
                 eprintln!("{e}");
                 std::process::exit(1);
+            }
+        }
+        Some("login") => {
+            match host::openai_oauth::login() {
+                Ok(_) => {
+                    let path = host::openai_oauth::token_path()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default();
+                    eprintln!("Signed in. Token saved to {path} (mode 0600).");
+                }
+                Err(e) => {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
             }
         }
         Some("capture") => {

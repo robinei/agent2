@@ -34,6 +34,7 @@
 mod demo;
 mod llm;
 mod openai_completions;
+pub(crate) mod openai_oauth;
 mod openai_responses;
 mod protocol;
 pub(crate) mod provider;

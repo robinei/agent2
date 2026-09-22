@@ -14,6 +14,11 @@ textwrap = "0.16"
 unicode-width = "0.2"
 tempfile = "3"
 ureq = { version = "3.3", features = ["json"] }
+# PKCE needs SHA-256 and nothing else here does. A hash is not a
+# secret-dependent operation so a hand-rolled one would be safe, but
+# "we wrote our own hash for the auth code" is not a sentence worth
+# defending when the standard crate is this small.
+sha2 = "0.10"
 wait-timeout = "0.2"
 tree-sitter = "0.24"
 tree-sitter-rust = "0.23"
