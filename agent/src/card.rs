@@ -1069,7 +1069,7 @@ mod tests {
         // `card()` shows up as a diff review must look at, not a byte
         // count that silently drifts. Comparing full text (not just a
         // hash) so the diff itself is legible in a failure message.
-        const EXPECTED_LEN: usize = 15255;
+        const EXPECTED_LEN: usize = 15939;
         assert_eq!(
             card().len(),
             EXPECTED_LEN,
@@ -1211,6 +1211,65 @@ mod tests {
             card.contains("One call carries a whole program, not one step."),
             "the batching argument is missing from the call card"
         );
+    }
+
+    /// **The card cannot under-document `list_agents`.**
+    ///
+    /// It declared five fields and `serve_agents` returns eight. The
+    /// three it omitted were `parent`, `last_answer` and — the one that
+    /// matters — **`open`**, the count of questions a child is blocked
+    /// on. A supervisor polling `status` alone sees a stalled child as
+    /// merely quiet, which is a plausible reason the verb sat unused in
+    /// 520 logs: what makes it worth calling was not written down.
+    ///
+    /// Both directions, because a field named here and not returned is
+    /// a program reading `undefined` and believing it.
+    #[test]
+    fn the_card_declares_the_fields_list_agents_returns() {
+        // The shape `host::mod`'s `serve_agents` builds, in its order.
+        let returned = [
+            "agent",
+            "branch",
+            "name",
+            "charter",
+            "parent",
+            "status",
+            "open",
+            "last_answer",
+        ];
+        let card = card();
+        // The return type, not the whole declaration: `opts?: { under?:
+        // number; deep?: boolean }` holds semicolons of its own, and
+        // slicing to the first one truncates before any field appears.
+        let start = card
+            .find("declare function list_agents(")
+            .expect("the card declares list_agents");
+        let decl = &card[start..];
+        let body = decl
+            .split_once("Array<{")
+            .expect("a return type")
+            .1
+            .split_once("}>")
+            .expect("its end")
+            .0;
+        let declared: std::collections::BTreeSet<&str> = body
+            .split(';')
+            .filter_map(|f| f.split_once(':'))
+            .map(|(name, _)| name.trim())
+            .filter(|n| !n.is_empty())
+            .collect();
+        let expected: std::collections::BTreeSet<&str> = returned.into_iter().collect();
+        assert_eq!(
+            declared, expected,
+            "the card's `list_agents` row and what `serve_agents` builds disagree"
+        );
+        // And the status words a supervisor branches on.
+        for word in ["running", "thinking", "suspended", "idle", "dormant"] {
+            assert!(
+                card.contains(&format!("`\"{word}\"`")),
+                "the card does not name the status `{word}`"
+            );
+        }
     }
 
     #[test]

@@ -77,9 +77,14 @@ declare function answer(question: number, value: unknown): void;
 declare function spawn(charter: string): Agent;
 /** A new context inheriting your whole history. Also idle until messaged. */
 declare function fork(): Agent;
-/** Every agent in this subtree and what each is doing. */
+/** Every agent in this subtree and what each is doing — the verb a supervisor polls.
+
+  `status` is one of `"running"` (a program of its own is executing), `"thinking"` (waiting on a completion), `"suspended"`, `"idle"`, `"returned above"`, or `"dormant"` (no runner in this session; nothing is lost, it wakes when spoken to).
+
+  **`open` is the one to watch.** It counts the questions that agent is blocked on, and a child that stopped to ask cannot go on until somebody answers it — `answer(question, value)`, by the id the report gives. `last_answer` is what it was told most recently. A supervisor that polls `status` alone sees a stalled child as merely quiet. */
 declare function list_agents(opts?: { under?: number; deep?: boolean }):
-  Array<{ agent: number; branch: number; name: string; charter: string; status: string }>;
+  Array<{ agent: number; branch: number; name: string; charter: string;
+          parent: number | null; status: string; open: number; last_answer: unknown }>;
 
 /** The conversation itself, by the `[id]` shown against each entry. Answered from the log: costs nothing, adds nothing. */
 declare namespace history {
