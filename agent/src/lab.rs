@@ -124,6 +124,7 @@ pub fn parse(text: &str) -> Result<Document, String> {
                     content: body.join("\n"),
                     call: None,
                     result_for: None,
+                    thinking: None,
                 });
             }
             open = Some((role_of(name.trim())?, Vec::new()));
@@ -140,6 +141,7 @@ pub fn parse(text: &str) -> Result<Document, String> {
             content: body.join("\n"),
             call: None,
             result_for: None,
+            thinking: None,
         });
     }
     if messages.is_empty() {
@@ -187,6 +189,7 @@ mod tests {
             content: content.to_owned(),
             call: None,
             result_for: None,
+            thinking: None,
         }
     }
 

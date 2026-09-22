@@ -6059,6 +6059,7 @@ mod tests {
                         .to_owned(),
                 call: None,
                 result_for: None,
+                thinking: None,
             }),
             "{doc:?}"
         );

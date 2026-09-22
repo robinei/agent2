@@ -50,6 +50,19 @@ pub struct ChatMessage {
     /// The id of the call this message reports on, so the report goes
     /// back in the `tool` role rather than as a bare user turn.
     pub result_for: Option<String>,
+    /// This turn's reasoning, carried only when `AGENT2_SEND_REASONING`
+    /// asks for it.
+    ///
+    /// **Normally thinking is on the log and not in the document**, and
+    /// that is load-bearing: it is why a block drafted while reasoning
+    /// cannot reach the next turn's context, and therefore why drafting
+    /// can be measured per reply at all. The call transport is the
+    /// reason this exists — this provider rejects an assistant turn
+    /// carrying `tool_calls` unless its `reasoning_content` comes back
+    /// with it — so it is a knob, and turning it on gives thinking a
+    /// route into the context that every drafting measurement so far
+    /// has assumed was closed.
+    pub thinking: Option<String>,
 }
 
 impl ChatMessage {
@@ -59,6 +72,7 @@ impl ChatMessage {
             content: content.into(),
             call: None,
             result_for: None,
+            thinking: None,
         }
     }
 }
@@ -998,6 +1012,9 @@ pub(crate) fn render_with_lookup(
     // infer — a `Reply` opens it, `Part`s append to it, `ReplyEnd`
     // closes it (28).
     let mut reply: Option<(EventId, String)> = None;
+    // Off unless asked for: see `ChatMessage::thinking`.
+    let send_reasoning = std::env::var("AGENT2_SEND_REASONING").is_ok_and(|v| v != "0");
+    let mut reply_thinking = String::new();
     // Where each block of the open reply starts, and which row it is.
     // Collected while the parts concatenate, because that is the only
     // moment the offsets are known; spent in `annotate_history_calls`,
@@ -1073,8 +1090,14 @@ pub(crate) fn render_with_lookup(
                         // **Thinking is on the log and not in the
                         // document.** It arrived, so it is recorded; it
                         // is not what the model said, so it is not
-                        // replayed as what the model said.
-                        Part::Thinking(_) => {}
+                        // replayed as what the model said — unless the
+                        // transport requires it back, which is what the
+                        // knob is for.
+                        Part::Thinking(raw) => {
+                            if send_reasoning {
+                                reply_thinking.push_str(raw);
+                            }
+                        }
                         Part::Prose(raw) | Part::Cell(raw) => {
                             had_blocks = true;
                             // **Both strings, in step.** `sent_len`
@@ -1168,7 +1191,12 @@ pub(crate) fn render_with_lookup(
                 match content {
                     Some(content) => {
                         push_flush(&mut messages, &mut before);
-                        messages.push(assistant_turn(id, content));
+                        let mut turn = assistant_turn(id, content);
+                        if send_reasoning && !reply_thinking.is_empty() {
+                            turn.thinking = Some(std::mem::take(&mut reply_thinking));
+                        }
+                        reply_thinking.clear();
+                        messages.push(turn);
                     }
                     // Removed: no slot, and the blocks either side of it
                     // are one block.

@@ -545,7 +545,7 @@ fn message_json(message: &ChatMessage) -> serde_json::Value {
     // call it was, so the model's own history shows it acting the way
     // it is being told to act.
     if let Some((id, source)) = &message.call {
-        return serde_json::json!({
+        let mut out = serde_json::json!({
             "role": "assistant",
             "content": message.content,
             "tool_calls": [{
@@ -557,6 +557,14 @@ fn message_json(message: &ChatMessage) -> serde_json::Value {
                 }
             }]
         });
+        // This provider refuses an assistant turn carrying `tool_calls`
+        // unless its reasoning comes back with it — one run in five
+        // died on exactly that 400. Only sent when the document was
+        // rendered with it; see `ChatMessage::thinking`.
+        if let Some(t) = &message.thinking {
+            out["reasoning_content"] = serde_json::json!(t);
+        }
+        return out;
     }
     // And the report that answers one goes back in the `tool` role. The
     // API requires a tool message after a tool call; a bare user turn
@@ -574,7 +582,11 @@ fn message_json(message: &ChatMessage) -> serde_json::Value {
         ChatRole::User => "user",
         ChatRole::Assistant => "assistant",
     };
-    serde_json::json!({ "role": role, "content": message.content })
+    let mut out = serde_json::json!({ "role": role, "content": message.content });
+    if let Some(t) = &message.thinking {
+        out["reasoning_content"] = serde_json::json!(t);
+    }
+    out
 }
 
 /// What a completion cost, as the provider counted it.
@@ -805,6 +817,7 @@ mod tests {
             content: content.into(),
             call: None,
             result_for: None,
+            thinking: None,
         }
     }
 
@@ -843,7 +856,7 @@ mod tests {
         // exactly is what makes `DESIGN.md`'s M5 a comparison of two
         // harnesses rather than of two reasoning budgets.
         let request = Document {
-            messages: vec![ChatMessage { role: ChatRole::System, content: "c".into(), call: None, result_for: None }],
+            messages: vec![ChatMessage { role: ChatRole::System, content: "c".into(), call: None, result_for: None, thinking: None }],
             preamble: 0,
         };
         let body = request_body(&request, "deepseek-v4-flash", true, Some("medium"), None, false);
@@ -1163,6 +1176,37 @@ mod tests {
         let report = message_json(&doc.messages[3]);
         assert_eq!(report["role"], "tool", "{report}");
         assert_eq!(report["tool_call_id"], *id);
+    }
+
+    /// **Reasoning goes back only when asked for, and the default is
+    /// that it does not.**
+    ///
+    /// Thinking staying out of the document is why a block drafted
+    /// while reasoning cannot reach the next turn, and therefore why
+    /// drafting is measurable per reply at all. The knob exists because
+    /// this provider refuses an assistant turn carrying `tool_calls`
+    /// without it — one run in five died on that 400 — so turning it on
+    /// buys a working call transport and opens a route this week's
+    /// measurements all assumed was shut.
+    #[test]
+    fn reasoning_rides_back_only_when_the_document_carries_it() {
+        let mut m = msg(ChatRole::Assistant, "prose");
+        m.call = Some(("call_1".into(), "return 1;".into()));
+        let without = message_json(&m);
+        assert!(without.get("reasoning_content").is_none(), "{without}");
+
+        m.thinking = Some("weighing it up".into());
+        let with = message_json(&m);
+        assert_eq!(with["reasoning_content"], "weighing it up");
+        assert_eq!(with["tool_calls"][0]["function"]["name"], "run_program");
+
+        // And on a plain turn too, since the notebook arm may want it.
+        let mut plain = msg(ChatRole::Assistant, "prose");
+        plain.thinking = Some("weighing it up".into());
+        assert_eq!(message_json(&plain)["reasoning_content"], "weighing it up");
+        assert!(message_json(&msg(ChatRole::Assistant, "prose"))
+            .get("reasoning_content")
+            .is_none());
     }
 
     /// **What is streamed must reconstruct what is returned.**

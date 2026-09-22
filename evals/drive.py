@@ -717,6 +717,9 @@ def fingerprint(card: Path | None) -> dict:
             # only this says whether the program rode in a fence or in a
             # tool call, so without it the two arms stamp identically.
             "AGENT2_RUN_PROGRAM",
+            # Whether the model's own reasoning comes back to it. Changes
+            # nothing a card says and everything about what compounds.
+            "AGENT2_SEND_REASONING",
         )
         if k in os.environ
     }
