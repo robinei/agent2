@@ -68,3 +68,43 @@ hit in 6 → 98%), `drive.py` announcing the wrong model, and output
 items concatenated without a separator — which glued a fence mid-line,
 produced `…after the edit.```js`, ran no program, and failed a task
 while looking exactly like the model refusing to act.
+
+## Four models, and the task is not saturated after all
+
+Five runs each, same card, same task, effort `medium`.
+
+| model | pass | programs | calls/p | out tok | reas tok | wall | exec | provider | prov/prog |
+|---|---|---|---|---|---|---|---|---|---|
+| `deepseek-v4-flash` | **5/5** | 3.0 | 4.3 | 3,460 | 527 | 36 s | 6.6 | 29.6 | 9.9 |
+| `gpt-5.6-sol` | **5/5** | 2.0 | 4.0 | 913 | 246 | 41 s | 21.4 | 19.3 | 9.7 |
+| `gpt-5.6-luna` | 3/5 | 2.0 | 2.5 | 1,005 | 425 | 32 s | 17.6 | 14.7 | 7.3 |
+| `gpt-5.6-terra` | 4/5 | 3.0 | 3.0 | 1,236 | 361 | **27 s** | 16.1 | 10.8 | **3.6** |
+
+I predicted saturation and was wrong: three of twenty runs fail, and
+they separate the models.
+
+**Both luna failures are the same thing, and it is not a capability
+gap.** It reads the files, gathers the evidence, and then writes prose
+and stops — *"I've collected the helper definitions and repository-wide
+reference search. I'm stopping here until…"*. One program, zero tool
+calls on the second reply, branch rested, task untouched. That is
+exactly the failure the card names: **a reply with no code blocks rests
+the branch**, and it is the one whose violation is silent.
+
+terra's single failure is different and ordinary — it did the work and
+got the answer wrong.
+
+**So the cheapest model in the table beats two frontier variants**, not
+by being smarter but by always acting. On a task where the work is
+unambiguous, the discriminator is willingness to finish rather than
+ability to reason.
+
+Per-round-trip latency is where the frontier models are plainly ahead:
+9.9 s for flash against 3.6 s for terra. The notebook shape converts
+that into wall clock only when the model actually uses its turn.
+
+## The output-item fix, confirmed
+
+Across all twenty runs, **zero prose parts contain a fence** — the seam
+that produced `…after the edit.```js` and cost a task is gone, and the
+two-sentence prose in luna's failure shows the separator doing its job.
