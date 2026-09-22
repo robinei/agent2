@@ -80,6 +80,33 @@ pub fn load() -> Option<Tokens> {
     serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
 }
 
+/// **Can the token be stored?** Checked before a person is sent to a
+/// browser, not after.
+///
+/// The first live sign-in got all the way through — state matched, code
+/// exchanged — and then lost the token to `EROFS` on `$HOME`, reporting
+/// a bare errno. The browser round trip had to be repeated for a
+/// filesystem fact knowable in advance, and the message did not say
+/// which knob fixes it.
+pub fn check_writable() -> Result<(), String> {
+    let path = token_path()?;
+    let dir = path.parent().unwrap_or(&path).to_owned();
+    std::fs::create_dir_all(&dir)
+        .and_then(|()| {
+            let probe = dir.join(".agent2-write-probe");
+            std::fs::write(&probe, b"")?;
+            std::fs::remove_file(&probe)
+        })
+        .map_err(|e| {
+            format!(
+                "cannot write the token to {}: {e}\n\
+                 Set AGENT2_STATE_DIR to somewhere writable, or run `agent login` \
+                 from a shell where $HOME is not read-only.",
+                dir.display()
+            )
+        })
+}
+
 pub fn save(tokens: &Tokens) -> Result<(), String> {
     let path = token_path()?;
     if let Some(parent) = path.parent() {
@@ -238,6 +265,7 @@ fn urldecode(s: &str) -> String {
 /// Run the whole flow: print a URL, wait for the redirect, exchange the
 /// code. Blocks until a browser comes back or the listener is killed.
 pub fn login() -> Result<Tokens, String> {
+    check_writable()?;
     let (url, verifier, state) = authorize_url();
     // Bound before the URL is printed: if the port is taken there is no
     // point sending anybody to a redirect nothing is listening for.
