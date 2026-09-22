@@ -75,9 +75,18 @@ declare function choose(who: "user" | "parent" | Agent, text: string, options: s
 /** Discharge an `ask()` or `choose()` another agent is blocked on, by its id; a `choose` takes one of the options it offered and nothing else. Answering is not resting: say `finish()` in the same block after the answer, or that agent spends a completion finding out it has nothing left to do. */
 declare function answer(question: number, value: unknown): void;
 
-/** A new agent with a clean context. Creating is not messaging: it is idle until you `tell` or `ask` the handle. */
+/** A new agent with a clean context. Creating is not messaging: it is idle until you `tell` or `ask` the handle.
+
+  **For work whose mess you do not want.** The charter is all it gets, so anything it reads stays in its context and never in yours — which is the point when the reading is long and the answer is short. */
 declare function spawn(charter: string): Agent;
-/** A new context inheriting your whole history. Also idle until messaged. */
+
+/** A branch of your own context: it has read everything you have read and knows everything you know, and is idle until messaged.
+
+  **For work that needs what you already understand.** You cannot brief a helper on a thing you have not realised is load-bearing, and a charter is written before you find out. A fork skips that: instead of deciding in advance what matters, you hand over the lot.
+
+  **Row ids carry across.** The history is the same history, so `history.fetch(9)` in the fork means the row *you* appended as 9 — you can point at what you found rather than repeat it, and the bytes are not copied or re-sent.
+
+  So: **`spawn` to keep a mess out of your context; `fork` to share the understanding already in it.** A fork is not free — it carries everything you carry, and pays for it on every turn of its own — so fork when the context is the valuable part, and spawn when it is the expensive part. */
 declare function fork(): Agent;
 /** Every agent in this subtree and what each is doing — the verb a supervisor polls.
 
