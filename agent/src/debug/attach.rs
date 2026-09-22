@@ -510,7 +510,13 @@ impl AttachedApp {
                         // (17_BRANCHES Part D). Scoped to prose rather
                         // than the tool-call rows, which already have
                         // their own click behaviour (inspect the call).
-                        RowDetail::None => {
+                        // `Prose` is here too: it is the same plain
+                        // prose row, carrying its completion only so
+                        // the pane can tell one response from the next.
+                        // Left out of this arm, clicking "agent 3" in a
+                        // sentence stopped working the moment prose
+                        // learned which program wrote it.
+                        RowDetail::None | RowDetail::Prose(_) => {
                             // **Only if it names a branch that exists.**
                             // `agent_reference_in` matches the word
                             // "agent" followed by digits, and prose is
@@ -2117,35 +2123,44 @@ fn render_chat(
     // coordinate) find its way back to a logical row.
     let mut row_at_line: Vec<usize> = Vec::with_capacity(rows.len());
     let mut prev_speaker: Option<u8> = None;
-    let mut prev_block: Option<EventId> = None;
+    let mut prev_turn: Option<EventId> = None;
     for (row_idx, (kind, text, detail, id)) in rows.iter().enumerate() {
         if *kind == ChatKind::Thinking && !app.show_thinking {
             continue;
         }
-        // **A blank line where the voice changes.** Turns used to run
-        // into each other, with row parity the only thing separating
-        // them; whitespace says it plainly and costs one row per change
-        // rather than a shade per row.
+        // **A blank line where one turn ends and the next begins**, and
+        // nowhere else — a turn being one person's message, then one
+        // model response to it.
+        //
+        // This used to break on any change of *block*, which is not the
+        // same thing. One completion's rows alternate between its block
+        // (header, source, `⚙` lines) and its prose, so a reply that
+        // spoke, ran a cell, then spoke again was drawn as three pieces
+        // with air between them — indistinguishable from three separate
+        // responses, which is exactly what the blank line is supposed
+        // to be telling you apart.
+        //
+        // Keyed on the completion now. Every row of one model response
+        // carries that response's program id (prose included), so they
+        // are one unbroken run; the blank falls between completions and
+        // between the person's turn and the answer to it. A row that
+        // belongs to no completion — a user post, the system header, a
+        // marker — is its own turn, keyed by its own event id.
         let speaker = speaker_of(*kind);
-        // A block is a panel, so it gets air after it too — otherwise
-        // the prose that follows butts against the slab and reads as
-        // part of it. Keyed on which program a row belongs to, not on
-        // the background, because a block's lid and its source are
-        // different backgrounds and the same panel.
         let block = match detail {
-            RowDetail::Program(pid) | RowDetail::Invoke(pid, _) | RowDetail::Note(pid, _) => {
-                Some(*pid)
-            }
+            RowDetail::Program(pid)
+            | RowDetail::Invoke(pid, _)
+            | RowDetail::Note(pid, _)
+            | RowDetail::Prose(pid) => Some(*pid),
             RowDetail::None => None,
         };
-        if prev_speaker.is_some_and(|p| p != speaker)
-            || (prev_block.is_some() && block != prev_block)
-        {
+        let turn = block.unwrap_or(*id);
+        if prev_turn.is_some_and(|p| p != turn) || prev_speaker.is_some_and(|p| p != speaker) {
             lines.push(Line::from(""));
             row_at_line.resize(lines.len(), row_idx);
         }
+        prev_turn = Some(turn);
         prev_speaker = Some(speaker);
-        prev_block = block;
         let mut style = chat_style(*kind);
         if matches!(detail, RowDetail::Program(_))
             && let Some(color) = program_header_severity(text)
@@ -2979,21 +2994,94 @@ mod tests {
         );
     }
 
-    /// **Turns are separated by air, and a block is a panel with air
-    /// around it.** Row parity used to be the only grouping signal
-    /// there was; it is gone, so this is the one that has to hold.
+    /// **Two responses, two runs, one blank line between them.** The
+    /// fixture above has a single completion, which cannot tell a rule
+    /// that separates completions from one that separates nothing.
     #[test]
-    fn a_blank_line_separates_the_voices_and_the_block() {
+    fn consecutive_completions_are_separated_from_each_other() {
+        let (tx, rx) = channel();
+        let session = Session::new(
+            Tree::new(None),
+            "a test agent",
+            ToolRegistry::new(),
+            Box::new(ScriptedLlm::new([
+                scripted_markdown("First answer.\n\n```js\ntell(\"one\");\n```\n"),
+                scripted_markdown("Second answer.\n\n```js\ntell(\"two\");\n```\n"),
+            ])),
+            tx,
+        )
+        .unwrap();
+        let branch = session.conversation_branch();
+        session.handle().send(SessionCommand::UserTurn {
+            branch,
+            text: "first question".into(),
+            expects_reply: true,
+        });
+        session.handle().send(SessionCommand::UserTurn {
+            branch,
+            text: "second question".into(),
+            expects_reply: true,
+        });
+        let session = session.run();
+        let mut app = AttachedApp::new(session.conversation_branch());
+        for event in rx.try_iter() {
+            app.apply(&event);
+        }
+
+        let screen = Screen::chat(&app, 64, 30);
+        let two = screen.find("Second answer").expect("the second response");
+        let first_lid = screen.find("program:").expect("the first block");
+        assert!(first_lid < two, "the responses are in order");
+        // Somewhere between the end of the first response and the start
+        // of the second there is exactly one blank row, and none inside
+        // either run.
+        let blanks: Vec<u16> = (first_lid..two)
+            .filter(|r| screen.inner(*r).trim().is_empty())
+            .collect();
+        assert_eq!(
+            blanks.len(),
+            1,
+            "one blank between two completions, got {blanks:?}:\n{}",
+            screen.dump()
+        );
+    }
+
+    /// **Air falls between turns, and never inside one.** A turn is the
+    /// person's message and the one model response to it; that response
+    /// is a block, the prose it spoke, and the calls it made.
+    ///
+    /// The rule used to break on any change of *block*, which put a
+    /// blank line between a completion's own parts — so a reply that
+    /// spoke, ran a cell, then spoke again was drawn as three pieces
+    /// with air between them, indistinguishable from three separate
+    /// responses. The slab background is what keeps the block legible
+    /// against the prose around it; whitespace is reserved for saying
+    /// where one completion ends.
+    #[test]
+    fn a_blank_line_separates_turns_and_never_splits_a_completion() {
         let app = a_session_with_one_of_everything();
         let screen = Screen::chat(&app, 64, 26);
         let user = screen.find("how long is a.txt").expect("the question");
-        assert_eq!(screen.inner(user - 1), "", "air above the user's turn");
-        let call = screen.find("⚙ read_file").expect("the block's last row");
-        assert_eq!(screen.inner(call + 1), "", "air below the block");
-        assert!(
-            screen.inner(call + 2).contains("Reading it first"),
-            "and the prose after it is outside the slab"
-        );
+        assert_eq!(screen.inner(user - 1), "", "air above the person's turn");
+        assert_eq!(screen.inner(user + 1), "", "and below it, before the answer");
+
+        // One response, one unbroken run: lid, source, prose, call,
+        // closing prose, with the call in the middle of it rather than
+        // fenced off from the words either side.
+        let lid = screen.find("program:").expect("the block's lid");
+        let call = screen.find("⚙ read_file").expect("the block's call");
+        let last = screen
+            .find("a.txt is 5 characters")
+            .expect("the response's closing prose");
+        assert!(lid < call && call < last, "the run is in reading order");
+        for row in lid..=last {
+            assert_ne!(
+                screen.inner(row).trim(),
+                "",
+                "row {row} splits one completion:\n{}",
+                screen.dump()
+            );
+        }
     }
 
     /// **A `tell` is speech, not a call.** It reaches the pane as its

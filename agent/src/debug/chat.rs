@@ -124,6 +124,14 @@ pub enum RowDetail {
     Program(EventId),
     /// An invoke row — clicking selects the program + that invoke.
     Invoke(EventId, usize),
+    /// A row in the model's own voice — prose or reasoning — and the
+    /// completion that produced it.
+    ///
+    /// Carries the program so the pane can tell one model response from
+    /// the next — the blank line between turns is counted off this —
+    /// without claiming to be an invoke, which would shift every
+    /// following call's index and show the wrong detail on click.
+    Prose(EventId),
     /// An `history.append` row — the program it belongs to, then the
     /// note's own event id.
     ///
@@ -477,12 +485,21 @@ impl ChatState {
                     ..
                 } = call
                 {
+                    // **Prose belongs to the completion that wrote it.**
+                    // It used to be filed with `program: None`, which
+                    // left it outside the block grouping — so one
+                    // reply's parts were scattered and the pane drew a
+                    // blank line between them, in the middle of a turn.
                     self.push_entry(Entry::Line {
                         branch,
                         id,
                         kind: ChatKind::Assistant,
                         text: text.clone(),
-                        program: None,
+                        program: self
+                            .program_stack
+                            .get(&branch)
+                            .and_then(|stack| stack.last())
+                            .copied(),
                     });
                 } else {
                     let is_wait_until =
@@ -705,12 +722,15 @@ impl ChatState {
                     .copied();
                 match part {
                     crate::types::Part::Thinking(t) if !t.is_empty() => {
+                        // Reasoning belongs to the completion that did
+                        // it, for the same reason its prose does: one
+                        // model response is one run of rows.
                         self.push_entry(Entry::Line {
                             branch,
                             id,
                             kind: ChatKind::Thinking,
                             text: t.clone(),
-                            program: None,
+                            program,
                         });
                     }
                     crate::types::Part::Thinking(_) => {}
@@ -912,18 +932,37 @@ impl ChatState {
         // block is the unit a reader is following, so this pulls them
         // back to it: one forward pass, because a `Reply` is always
         // logged before the calls its cells make.
+        //
+        // **And so does its prose**, for the same reason and one more:
+        // a completion is the unit the person is trying to separate,
+        // and a reply that speaks, runs a cell, then speaks again was
+        // drawn as three pieces with blank lines between them — which
+        // reads as three turns. Prose and calls are collected together
+        // here, in entry order, so one model response is one run of
+        // rows with nothing of anyone else's in the middle.
         let mut calls_of: HashMap<EventId, Vec<usize>> = HashMap::new();
+        // Reasoning is kept apart from the rest because it goes *above*
+        // the block: it is what the model did before writing the
+        // program, and a reader following the response wants it in that
+        // order. Everything else follows the header.
+        let mut thinking_of: HashMap<EventId, Vec<usize>> = HashMap::new();
         for (i, entry) in self.entries.iter().enumerate() {
             if let Entry::Line {
                 branch,
                 id,
-                kind: ChatKind::Program,
+                kind,
                 program: Some(pid),
                 ..
             } = entry
                 && visible(*branch, *id)
             {
-                calls_of.entry(*pid).or_default().push(i);
+                match kind {
+                    ChatKind::Thinking => thinking_of.entry(*pid).or_default().push(i),
+                    ChatKind::Program | ChatKind::Assistant => {
+                        calls_of.entry(*pid).or_default().push(i)
+                    }
+                    _ => {}
+                }
             }
         }
         // Which programs put a header out — the ones whose calls have
@@ -968,6 +1007,16 @@ impl ChatState {
                         Some(tag) => format!(" · {tag}"),
                         None => String::new(),
                     };
+                    for i in thinking_of.get(program).into_iter().flatten().copied() {
+                        let Entry::Line { id, text, .. } = &self.entries[i] else {
+                            continue;
+                        };
+                        for (k, line) in
+                            self.entry_lines(i, ChatKind::Thinking, text, render_markdown, width)
+                        {
+                            out.push((k, line, RowDetail::Prose(*program), *id));
+                        }
+                    }
                     out.push((
                         ChatKind::Program,
                         format!("{indent}{who}{label}: {status}{dialect}"),
@@ -977,10 +1026,14 @@ impl ChatState {
                     out.extend(self.cell_rows(*program, source, &indent, selected));
                     grouped.insert(*program);
                     for i in calls_of.get(program).into_iter().flatten().copied() {
-                        let Entry::Line { id, text, .. } = &self.entries[i] else {
+                        let Entry::Line { id, text, kind, .. } = &self.entries[i] else {
                             continue;
                         };
-                        let detail = if self.appends.contains(id) {
+                        // Prose keeps its own voice and its own
+                        // click target; only a `⚙` row is an invoke.
+                        let detail = if *kind == ChatKind::Assistant {
+                            RowDetail::Prose(*program)
+                        } else if self.appends.contains(id) {
                             RowDetail::Note(*program, *id)
                         } else {
                             let idx = invoke_index.entry(*program).or_insert(0);
@@ -989,7 +1042,7 @@ impl ChatState {
                             detail
                         };
                         for (k, line) in
-                            self.entry_lines(i, ChatKind::Program, text, render_markdown, width)
+                            self.entry_lines(i, *kind, text, render_markdown, width)
                         {
                             out.push((k, line, detail.clone(), *id));
                         }
@@ -1002,9 +1055,12 @@ impl ChatState {
                     text,
                     program,
                 } if visible(*branch, *id) => {
-                    // Already drawn under its block, above.
-                    if *kind == ChatKind::Program
-                        && program.is_some_and(|pid| grouped.contains(&pid))
+                    // Already drawn under its block, above — prose
+                    // as well as `⚙` rows now that both are grouped.
+                    if matches!(
+                        kind,
+                        ChatKind::Program | ChatKind::Assistant | ChatKind::Thinking
+                    ) && program.is_some_and(|pid| grouped.contains(&pid))
                     {
                         continue;
                     }
