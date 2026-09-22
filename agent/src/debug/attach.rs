@@ -2262,7 +2262,17 @@ fn render_chat(
         // and a bar down its edge is what says so. Narrowed to a single
         // row once a sub-item is picked out, which is then the finer
         // thing being pointed at.
-        let in_block = block.is_some() && block == app.selected_program;
+        //
+        // **Prose is beside the program, not in it.** It belongs to the
+        // same completion — which is why it sits in the same unbroken
+        // run and shares the turn key above — but selecting a *program*
+        // points at the program: its lid, its source, the calls it
+        // made. Marking the answer it spoke as well drew the bar down
+        // an entire response, which says "this is the thing you picked"
+        // about four different things at once.
+        let in_block = block.is_some()
+            && block == app.selected_program
+            && !matches!(detail, RowDetail::Prose(_));
         let selected = match app.selected_effect {
             Some(Effect::Invoke(sel)) => matches!(detail, RowDetail::Invoke(pid, idx)
                 if app.selected_program == Some(*pid) && *idx == sel),
@@ -3130,6 +3140,30 @@ mod tests {
             "one blank between two completions, got {blanks:?}:\n{}",
             screen.dump()
         );
+    }
+
+    /// **Selecting a program marks the program, not the whole
+    /// response.** Prose shares the completion — same unbroken run,
+    /// same turn key — but the gutter bar points at what was picked,
+    /// and what was picked is a program: its lid, its source, its
+    /// calls.
+    #[test]
+    fn selecting_a_program_does_not_mark_the_prose_beside_it() {
+        let mut app = a_session_with_one_of_everything();
+        app.selected_program = Some(EventId::new(3));
+        let screen = Screen::chat(&app, 64, 26);
+
+        let lid = screen.find("program:").expect("the lid");
+        let call = screen.find("⚙ read_file").expect("the call");
+        let prose = screen.find("Reading it first").expect("the prose");
+        for (row, marked) in [(lid, true), (call, true), (prose, false)] {
+            assert_eq!(
+                screen.inner(row).starts_with('▌'),
+                marked,
+                "row {row} mark should be {marked}:\n{}",
+                screen.dump()
+            );
+        }
     }
 
     /// **Something is happening, and the pane says so.**

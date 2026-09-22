@@ -55,17 +55,41 @@ pub const CELL_COLLAPSED_LINES: usize = 3;
 /// — so it comes back separately and goes in the header, where there
 /// is already a line about what this block is.
 fn unfenced(source: &str) -> (Vec<&str>, Option<&str>) {
-    let mut lines: Vec<&str> = source.trim_end().lines().collect();
+    // **Every fence, not just the outermost pair.** A block's `source`
+    // is all of the reply's cells concatenated, and each one carries
+    // its own ` ```js ` and ` ``` ` because that is what makes the
+    // parts rebuild the reply byte for byte (28). Stripping only the
+    // first and last left every interior pair on the screen: a reply
+    // with ten cells drew eighteen fence lines through the middle of
+    // its own listing, seen in `try24.jsonl`.
+    //
+    // A blank line stands in for each boundary, so the cells still read
+    // as the separate steps they are without the punctuation saying so
+    // twice.
+    let mut lines: Vec<&str> = Vec::new();
     let mut dialect = None;
-    if let Some(first) = lines.first()
-        && let Some(tag) = first.trim_start().strip_prefix("```")
-    {
-        let tag = tag.trim();
-        dialect = (!tag.is_empty()).then_some(tag);
-        lines.remove(0);
-        if lines.last().is_some_and(|l| l.trim() == "```") {
-            lines.pop();
+    let mut first_fence = true;
+    let mut just_closed = false;
+    for line in source.trim_end().lines() {
+        let trimmed = line.trim_start();
+        if let Some(tag) = trimmed.strip_prefix("```") {
+            if first_fence {
+                let tag = tag.trim();
+                dialect = (!tag.is_empty()).then_some(tag);
+                first_fence = false;
+            } else if !lines.is_empty() {
+                just_closed = true;
+            }
+            continue;
         }
+        if just_closed {
+            lines.push("");
+            just_closed = false;
+        }
+        lines.push(line);
+    }
+    while lines.last().is_some_and(|l| l.trim().is_empty()) {
+        lines.pop();
     }
     (lines, dialect)
 }
@@ -1980,6 +2004,31 @@ mod tests {
                 },
             },
         )
+    }
+
+    /// **A ten-cell reply is one listing, not a fenced sandwich.**
+    ///
+    /// From `try24.jsonl`: the block's `source` is every cell of the
+    /// reply concatenated, each carrying its own fences so the parts
+    /// rebuild the reply byte for byte — and `unfenced` stripped only
+    /// the outermost pair, so eighteen fence lines ran down the middle
+    /// of the listing.
+    #[test]
+    fn every_cell_fence_is_punctuation_and_none_of_it_reaches_the_pane() {
+        let source = "```js\nconst a = 1;\n```\n```js\nconst b = 2;\n```\n```js\nconst c = 3;\n```\n";
+        let (lines, dialect) = unfenced(source);
+        assert_eq!(dialect, Some("js"), "the lid still names the dialect");
+        assert!(
+            !lines.iter().any(|l| l.trim_start().starts_with("```")),
+            "no fence survived: {lines:?}"
+        );
+        // A blank line stands in for each boundary, so three cells still
+        // read as three steps.
+        assert_eq!(
+            lines,
+            ["const a = 1;", "", "const b = 2;", "", "const c = 3;"],
+            "{lines:?}"
+        );
     }
 
     /// **One failure, one row.** The host emits a live
