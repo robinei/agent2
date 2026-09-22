@@ -3928,7 +3928,9 @@ impl Runner {
         let (measured, limit, unit) = match (crate::host::context_tokens(), self.next_prompt_floor)
         {
             (Some(context), Counted::Floor(tokens)) => {
-                let usable = context.saturating_sub(crate::host::completion_reserve());
+                let usable = context
+                    .saturating_sub(crate::host::completion_reserve())
+                    .min(crate::host::max_document_tokens());
                 (tokens as usize, usable, Measure::Tokens)
             }
             // A window is configured and the count it is tested against

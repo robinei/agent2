@@ -59,6 +59,44 @@ impl Api {
     }
 }
 
+/// **What the model can actually hold, in tokens.**
+///
+/// The compaction trigger wants a window and the harness had none, so
+/// it fell back to a flat 64 KB of *bytes* — about 14k tokens once the
+/// headroom is taken. Against `deepseek-v4-flash` that is 1.3% of a
+/// 1,048,576-token window, and a session was spending a completion on
+/// compaction every few turns with the document ninety-eight percent
+/// empty. Five of them in one exploratory run on 2026-09-22, each
+/// removing rows and none getting under the line, because the line had
+/// nothing to do with the model.
+///
+/// Matched on a prefix, so a dated or suffixed name (`deepseek-v4-flash-0423`,
+/// `gpt-5.6-luna-preview`) resolves to the same window as its family.
+/// Longest match wins, so a more specific entry can override a family.
+///
+/// `AGENT2_CONTEXT_TOKENS` still overrides everything; an unknown model
+/// gets `None` and the byte budget, which is the old behaviour and the
+/// right default for something nobody has measured.
+const CONTEXT_WINDOWS: &[(&str, usize)] = &[
+    // 1,048,576 — deepseek.com and the V4 paper.
+    ("deepseek-v4", 1_048_576),
+    ("deepseek-flash", 131_072),
+    // 1.05M, with a pricing step at 272k that is not a limit.
+    ("gpt-5.6", 1_050_000),
+    ("gpt-5", 400_000),
+    // The LAN box's llama-server preset (`evals/local.sh`).
+    ("Qwen3.8-27B", 65_536),
+];
+
+/// The window for `model`, by longest matching prefix.
+pub fn context_window(model: &str) -> Option<usize> {
+    CONTEXT_WINDOWS
+        .iter()
+        .filter(|(name, _)| model.starts_with(name))
+        .max_by_key(|(name, _)| name.len())
+        .map(|(_, window)| *window)
+}
+
 /// Everything a provider needs, read once.
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -172,6 +210,36 @@ pub fn from_env() -> Result<Arc<dyn LlmClient>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **Every model this project actually points at has a window.**
+    ///
+    /// `AGENT2_CONTEXT_TOKENS` was set in one place in the repository —
+    /// a unit test — so every run took the byte path: a flat 64 KB,
+    /// about 14k tokens after headroom, whatever the model. Against a
+    /// 1,048,576-token window that is 1.3%, and an exploratory run on
+    /// 2026-09-22 spent five completions compacting a document the
+    /// model could have held seventy-five times over.
+    #[test]
+    fn the_models_we_point_at_have_a_window_and_the_rest_do_not() {
+        for (model, want) in [
+            ("deepseek-v4-flash", 1_048_576),
+            // A dated build is the same model.
+            ("deepseek-v4-flash-0423", 1_048_576),
+            ("deepseek-v4-pro", 1_048_576),
+            ("gpt-5.6-luna", 1_050_000),
+            ("Qwen3.8-27B", 65_536),
+        ] {
+            assert_eq!(context_window(model), Some(want), "{model}");
+        }
+        // **Longest prefix wins**, so `deepseek-flash` (an older, much
+        // smaller model) is not swallowed by `deepseek-v4`'s entry, and
+        // `gpt-5.6` is not swallowed by `gpt-5`.
+        assert_eq!(context_window("deepseek-flash"), Some(131_072));
+        assert_eq!(context_window("gpt-5-codex"), Some(400_000));
+        // Unknown is `None`, which keeps the byte budget — the old
+        // behaviour, and the right default for an unmeasured model.
+        assert_eq!(context_window("some-model-nobody-has-measured"), None);
+    }
 
     /// **The endpoint decides.** Every URL this project has actually
     /// pointed at, and the one it is about to.
