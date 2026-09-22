@@ -108,7 +108,25 @@ pub(crate) fn request_body(
         "store": false,
     });
     if thinking && let Some(effort) = effort {
-        body["reasoning"] = serde_json::json!({ "effort": effort });
+        // **A summary must be asked for, or no reasoning comes back at
+        // all.** Raw chain-of-thought is not returned by these models —
+        // normal for a frontier reasoning model — but with `summary`
+        // the stream carries `response.reasoning_summary_text.delta`
+        // and `Part::Thinking` is populated. Without it the log records
+        // no reasoning, which costs this project the one thing it has
+        // been measuring all week and quietly empties the corpus the
+        // logs are meant to become.
+        //
+        // A summary is a paraphrase, not the stream: counting drafted
+        // blocks in it is a weaker measurement than counting them in
+        // raw reasoning, and anything derived from it should say so.
+        let summary = super::provider::var("REASONING_SUMMARY")
+            .unwrap_or_else(|| "auto".to_owned());
+        body["reasoning"] = if summary == "off" {
+            serde_json::json!({ "effort": effort })
+        } else {
+            serde_json::json!({ "effort": effort, "summary": summary })
+        };
     }
     if let Some(n) = max_tokens {
         body["max_output_tokens"] = serde_json::json!(n);
@@ -330,6 +348,26 @@ mod tests {
         assert_eq!(body["store"], false, "the log is the only state");
         assert!(body.get("messages").is_none(), "that is the other API");
         assert!(body.get("tools").is_none(), "a notebook offers none");
+    }
+
+    /// **The summary is requested by default**, because without it
+    /// these models return no reasoning at all and `Part::Thinking` is
+    /// empty — which silently ends the measurement this project runs
+    /// on. `AGENT2_REASONING_SUMMARY=off` opts out.
+    #[test]
+    fn a_reasoning_summary_is_asked_for_by_default() {
+        let body = request_body(
+            &doc(vec![msg(ChatRole::System, "card")]),
+            "gpt-5.6-sol",
+            true,
+            Some("high"),
+            None,
+        );
+        assert_eq!(body["reasoning"]["effort"], "high");
+        assert_eq!(
+            body["reasoning"]["summary"], "auto",
+            "no summary means no reasoning text comes back: {body}"
+        );
     }
 
     /// Thinking off means no `reasoning` block at all, not one set to
