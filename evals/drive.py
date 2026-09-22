@@ -413,6 +413,22 @@ def score_log(log: Path) -> dict:
     return json.loads(out.stdout)
 
 
+def task_timeout(task, default: int) -> int:
+    """How long this task may take, in seconds.
+
+    **A task that waits is not a task that hung.** The driver's
+    `--timeout` is one number for the whole suite, so a task built
+    around a program that polls — a build to finish, a fan-out of
+    workers to report — forces every other task's ceiling up with it,
+    or gets cut off and scored as "no completion ever arrived".
+
+    A task declares `TIMEOUT` when it needs more. The flag still wins
+    when it is raised above the task's own figure, so one slow run can
+    be given room from the command line without editing anything.
+    """
+    return max(getattr(task, "TIMEOUT", 0), default)
+
+
 def run_once(
     task, card: Path | None, timeout: int, keep: Path | None = None, agent: str = "code"
 ) -> dict:
@@ -1126,7 +1142,7 @@ def main():
 
     def one(item):
         task, i = item
-        r = run_once(task, args.card, args.timeout, args.keep, args.agent)
+        r = run_once(task, args.card, task_timeout(task, args.timeout), args.keep, args.agent)
         verdict = (
             "pass"
             if r["pass"]
