@@ -5552,7 +5552,18 @@ impl Runner {
                     // to the person reading them.
                     let cleaned = crate::document::strip_imitated_markers(&verbatim);
                     let trimmed = cleaned.trim();
-                    if trimmed.is_empty() {
+                    // **Nothing but punctuation is nothing to say.** A
+                    // stray ` ``` ` — a fence the model opened and shut
+                    // with no cell in it, or one closed twice — parses
+                    // as prose and is not blank, so it reached the
+                    // person as a message whose whole content was
+                    // backticks. Seen live on 2026-09-22 (`new-2` of
+                    // the card A/B): a reply whose second message to
+                    // the person was "```\n```".
+                    if trimmed
+                        .lines()
+                        .all(|l| l.trim().is_empty() || l.trim().starts_with("```"))
+                    {
                         continue;
                     }
                     let text = trimmed.to_owned();
@@ -8674,6 +8685,42 @@ mod tests {
             !state.needs_prompt(&tree),
             "the model answered; the next thing to happen is whatever the person says"
         );
+    }
+
+    /// **A stray fence is not a message.**
+    ///
+    /// A ` ``` ` the model opened and shut with no cell in it parses as
+    /// prose, and prose that is not blank becomes a `Send` — so the
+    /// person got a message whose entire content was backticks. Seen
+    /// live on 2026-09-22 in the card A/B, where a reply's second
+    /// message to the person was "```\n```".
+    #[test]
+    fn prose_that_is_only_fence_punctuation_is_not_sent() {
+        let (mut tree, mut state) = setup_under();
+        user_post(&mut state, &mut tree, "go");
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::LlmResponse(crate::host::scripted_markdown(
+                    "Looking now.\n\n```js\nconsole.log(1);\n```\n\n```\n```\n",
+                )),
+            )
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+
+        let said: Vec<String> = tree
+            .path_events(state.spine.leaf_id)
+            .iter()
+            .filter_map(|e| match &e.payload {
+                EventPayload::Call(Call::Send {
+                    to: Address::User,
+                    text,
+                    ..
+                }) => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(said, ["Looking now."], "only the sentence reached them");
     }
 
     /// **A reply that said nothing at all is asked again — once.**
