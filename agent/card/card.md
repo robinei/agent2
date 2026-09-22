@@ -92,6 +92,8 @@ declare function spawn(charter: string, name?: string): Agent;
 
 /** A branch of your own context: it has read everything you have read and knows everything you know, and is idle until messaged.
 
+  **Its first message is its charter.** There is no charter slot: a fork arrives holding everything you hold, and is told only that it is a fork and that the branch it came from is handling what went before. What it is *now* — whether it does this itself or hands it on, and how far it may reach — is whatever you say first. Say it in the same breath as the work, because it has your context and will otherwise carry on being you.
+
   **For work that needs what you already understand.** You cannot brief a helper on a thing you have not realised is load-bearing, and a charter is written before you find out. A fork skips that: instead of deciding in advance what matters, you hand over the lot.
 
   **Row ids carry across.** The history is the same history, so `history.fetch(9)` in the fork means the row *you* appended as 9 — you can point at what you found rather than repeat it, and the bytes are not copied or re-sent.
