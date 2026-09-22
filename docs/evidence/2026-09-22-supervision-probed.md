@@ -71,3 +71,36 @@ long time. Long work alone is answered by `Promise.all`
 supervisor is one where a child cannot finish without a decision only
 the parent can make — and then the loop, `open`, and
 `answer(question, value)` are all doing work that nothing else can do.
+
+## Measured: what a child blocked on its parent actually reports
+
+A child was spawned, told to `ask("parent", …)`, and deliberately left
+unanswered while the parent polled ten times.
+
+    +11.6s  child: idle,    open 0
+    +17.2s  child SENDS  → {"Branch": 1}  expects_reply: true   (post #31)
+    +30.7s  child: running, open 0
+    …
+    +45.7s  child: running, open 0
+
+**`ask("parent", …)` works.** The question lands on the parent's
+branch as an ordinary post that expects a reply. The child even
+escalated on its own: *"Please answer open question #30 with the units
+for widget_count; I will not guess."*
+
+**But the roster shows nothing.** A child waiting on its parent reads
+`running`, not `suspended` — an unanswered `ask` is a promise its
+program has not settled, not a parked frame — and `open` stays `0`.
+
+`open` counts what that agent **owes**: questions put *to it* that it
+has not answered. A child waiting on you is your debt, not its own.
+The card said the opposite until this probe, which is the third thing
+that sentence got wrong after inventing a status and omitting three
+fields.
+
+**And nothing is missing.** The signal a supervisor needs is not in
+the roster and does not need to be: the child's question arrives on
+the parent's own branch with an `[id]`, in its `# NEW EVENTS` and its
+tail, and `answer(id, value)` discharges it — the same path a question
+from the user takes. `list_agents` is for *who exists and what they
+are doing*; the parent's own open list is for *who is waiting on me*.

@@ -83,7 +83,9 @@ declare function fork(): Agent;
 
   `status` is one of: `"running"` — a program of its own is executing; `"suspended"` — a program of its own stopped part-way and is waiting for an answer; `"thinking"` — waiting on a completion; `"idle"` — awake with nothing to do; `"dormant"` — not loaded in this session, which is not a problem and not a loss: it wakes when spoken to.
 
-  **`open` is the one to watch.** It counts the questions that agent is blocked on, and a child that stopped to ask cannot go on until somebody answers it — `answer(question, value)`, by the id the report gives. `last_answer` is what it was told most recently. A supervisor that polls `status` alone sees a stalled child as merely quiet. */
+  **`open` is what that agent owes**, not what it is waiting for: the count of questions *put to it* that it has not answered. A child waiting on an answer from you is not in it — that debt is yours, and it reaches you the ordinary way, as a post on your own branch with an `[id]`, which `answer(id, value)` discharges. `last_answer` is what that agent was told most recently.
+
+  **A child waiting on you reads as `"running"`**, because an unanswered `ask` is a promise its program has not settled, not a parked frame. So the roster will not tell you a child is stuck — your own open questions will. */
 declare function list_agents(opts?: { under?: number; deep?: boolean }):
   Array<{ agent: number; branch: number; name: string; charter: string;
           parent: number | null; status: string; open: number; last_answer: unknown }>;
