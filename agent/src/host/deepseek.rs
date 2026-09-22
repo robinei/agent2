@@ -557,13 +557,15 @@ fn message_json(message: &ChatMessage) -> serde_json::Value {
                 }
             }]
         });
-        // This provider refuses an assistant turn carrying `tool_calls`
-        // unless its reasoning comes back with it — one run in five
-        // died on exactly that 400. Only sent when the document was
-        // rendered with it; see `ChatMessage::thinking`.
-        if let Some(t) = &message.thinking {
-            out["reasoning_content"] = serde_json::json!(t);
-        }
+        // **Always present on a call, even when empty.** This provider
+        // refuses an assistant turn carrying `tool_calls` unless its
+        // reasoning comes back with it, and the turns that have none
+        // are the *exemplars* — static files, written once, with no
+        // reasoning to carry. Sending the model's own thinking fixed
+        // two runs in five and left three failing on the worked
+        // examples, which the error named and I did not read.
+        out["reasoning_content"] =
+            serde_json::json!(message.thinking.as_deref().unwrap_or(""));
         return out;
     }
     // And the report that answers one goes back in the `tool` role. The
@@ -1192,8 +1194,11 @@ mod tests {
     fn reasoning_rides_back_only_when_the_document_carries_it() {
         let mut m = msg(ChatRole::Assistant, "prose");
         m.call = Some(("call_1".into(), "return 1;".into()));
+        // A call always carries the field, empty when there is nothing
+        // — the exemplars are exactly that case and the provider 400s
+        // without it.
         let without = message_json(&m);
-        assert!(without.get("reasoning_content").is_none(), "{without}");
+        assert_eq!(without["reasoning_content"], "", "{without}");
 
         m.thinking = Some("weighing it up".into());
         let with = message_json(&m);
