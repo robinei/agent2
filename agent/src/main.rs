@@ -29,7 +29,7 @@ mod debug;
 pub use machine::*;
 pub use types::*;
 
-use host::SessionEvent;
+use host::{BranchId, SessionEvent};
 
 const USAGE: &str = "usage: agent <command>
   debug <file.js>                   standalone debugger TUI: compile and
@@ -649,8 +649,32 @@ fn queue_nav(session: &host::Session, nav: &SessionNav) {
         h.send(host::SessionCommand::Rename { branch, name });
     }
     if let Some(text) = nav.turn.clone() {
-        submit(session, text);
+        submit(
+            session,
+            turn_target(session.tree(), nav.resume, session.conversation_branch()),
+            text,
+        );
     }
+}
+
+/// Where a `--turn` lands.
+///
+/// The conversation branch, unless `--resume <id>` named a leaf — then
+/// that leaf's branch, because naming one is the whole point of the
+/// flag.
+///
+/// **This is the fix for a silent wrong-branch turn.** `open_at`
+/// anchors the *runner* at the named leaf, but `submit` addressed
+/// `conversation_branch()`, which is `branches().first()` and so is
+/// always the root agent's first branch. A fork of the conversation
+/// branch is a second branch of the *same* agent, so
+/// `--resume <fork> --turn ...` put the message on the original and
+/// reported it there, with nothing to say it had gone somewhere else.
+/// There was no way to speak to a fork from the CLI at all.
+fn turn_target(tree: &types::Tree, resume: Option<u64>, conversation: BranchId) -> BranchId {
+    resume
+        .and_then(|id| tree.branch_of(EventId::new(id)))
+        .unwrap_or(conversation)
 }
 
 /// **One gesture: the person typed something.**
@@ -666,11 +690,10 @@ fn queue_nav(session: &host::Session, nav: &SessionNav) {
 ///
 /// A kickoff line is a task instruction, not a question, and the
 /// agent's reply reaches the client either way (18_TARGETING).
-fn submit(session: &host::Session, text: String) {
-    session.handle().send(host::SessionCommand::Submit {
-        branch: session.conversation_branch(),
-        text,
-    });
+fn submit(session: &host::Session, branch: BranchId, text: String) {
+    session
+        .handle()
+        .send(host::SessionCommand::Submit { branch, text });
 }
 
 /// The attached TUI (9_TUI Step 4) — the harness's primary frontend.
@@ -1030,5 +1053,65 @@ impl host::LlmClient for ArcLlm {
         chunk: &mut dyn FnMut(host::LlmChunk),
     ) -> Result<machine::LlmTurn, String> {
         self.0.complete(request, cancel, chunk)
+    }
+}
+
+#[cfg(test)]
+mod turn_target_tests {
+    use super::*;
+
+    fn post(text: &str) -> EventPayload {
+        EventPayload::Post {
+            from: Author::User,
+            origin: Origin::Direct {
+                text: text.into(),
+                input: serde_json::json!(null),
+                options: Vec::new(),
+                expects_reply: true,
+            },
+        }
+    }
+
+    /// **`--resume` names a branch; `--turn` must honour it.**
+    ///
+    /// A fork of the conversation branch belongs to the *same* agent, so
+    /// `conversation_branch()` — `branches().first()` — returns the
+    /// original for both. Addressing a turn that way put the message on
+    /// the branch the person had just navigated away from, and said
+    /// nothing about it. There was no way to speak to a fork from the
+    /// CLI at all.
+    #[test]
+    fn a_turn_beside_resume_lands_on_the_resumed_branch() {
+        let mut tree = types::Tree::new(None);
+        let mut spine = tree
+            .start_agent(None, None, "root", None, "", Vec::new())
+            .unwrap();
+        let at = tree.append(&mut spine, post("q")).unwrap();
+        let conversation = tree.branch_of(at).expect("the root branch");
+
+        // A branch root is an `Agent` or a `Fork` event, so the fork
+        // event itself is what makes the new spine a branch — exactly
+        // what `SessionCommand::Fork` appends.
+        let mut other = tree.fork(at).unwrap();
+        tree.append(
+            &mut other,
+            EventPayload::Fork {
+                name: Some("untold".into()),
+            },
+        )
+        .unwrap();
+        let forked = tree.append(&mut other, post("f")).unwrap();
+        let fork_branch = tree.branch_of(forked).expect("the fork's branch");
+        assert_ne!(fork_branch, conversation, "the fork is its own branch");
+
+        assert_eq!(
+            turn_target(&tree, Some(forked.as_u64()), conversation),
+            fork_branch,
+            "--resume <fork> --turn must address the fork"
+        );
+        // No --resume: the conversation branch, as it always was.
+        assert_eq!(turn_target(&tree, None, conversation), conversation);
+        // An id that is not in the log falls back rather than panicking.
+        assert_eq!(turn_target(&tree, Some(9999), conversation), conversation);
     }
 }
