@@ -2386,6 +2386,13 @@ impl Runner {
                     };
                     match (text, self.resolve_address(tree, to.as_ref())) {
                         (Some(text), Ok(to)) => {
+                            // **The same bound as prose.** `tell` and a
+                            // prose segment are the two ways a reply
+                            // speaks, and they are built at different
+                            // sites — so capping one left the other
+                            // able to deliver a megabyte of repeated
+                            // text to the person.
+                            let text = crate::report::cap_prose(&text);
                             let send = self.issue_call(
                                 tree,
                                 Call::Send {
@@ -5568,7 +5575,7 @@ impl Runner {
                     {
                         continue;
                     }
-                    let text = trimmed.to_owned();
+                    let text = crate::report::cap_prose(trimmed);
                     let send = tree.append(
                         &mut self.spine,
                         EventPayload::Call(Call::Send {
@@ -8687,6 +8694,54 @@ mod tests {
             !state.needs_prompt(&tree),
             "the model answered; the next thing to happen is whatever the person says"
         );
+    }
+
+    /// **The cap is wired, not just written.** `cap_prose` has a unit
+    /// test of its own; this is the half that was missing when the bug
+    /// existed — a degenerate reply actually reaching the person in
+    /// full. Both doors: a prose segment and a `tell`, which are built
+    /// at different sites and so can be fixed one at a time by
+    /// accident.
+    #[test]
+    fn neither_door_delivers_a_degenerate_reply_whole() {
+        let huge = "x".repeat(crate::report::PROSE_MAX_BYTES * 2);
+        for source in [
+            // Prose: the harness makes the Send itself.
+            format!("{huge}\n\n```js\nconsole.log(1);\n```\n"),
+            // `tell`: the program makes it.
+            format!("```js\ntell({});\n```\n", serde_json::json!(huge)),
+        ] {
+            let (mut tree, mut state) = setup_under();
+            user_post(&mut state, &mut tree, "go");
+            let out = state
+                .step(
+                    &mut tree,
+                    StepInput::LlmResponse(crate::host::scripted_markdown(&source)),
+                )
+                .unwrap();
+            drain(&mut state, &mut tree, out);
+
+            let said: Vec<usize> = tree
+                .path_events(state.spine.leaf_id)
+                .iter()
+                .filter_map(|e| match &e.payload {
+                    EventPayload::Call(Call::Send {
+                        to: Address::User,
+                        text,
+                        ..
+                    }) => Some(text.len()),
+                    _ => None,
+                })
+                .collect();
+            assert!(!said.is_empty(), "something was said");
+            for len in said {
+                assert!(
+                    len <= crate::report::PROSE_MAX_BYTES + 64,
+                    "delivered {len} bytes of a {} byte reply",
+                    huge.len()
+                );
+            }
+        }
     }
 
     /// **A stray fence is not a message.**

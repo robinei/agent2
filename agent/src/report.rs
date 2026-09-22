@@ -132,6 +132,13 @@ pub const PREVIEW_MAX_BYTES: usize = 256;
 /// and a model choosing between them should not be choosing a budget.
 pub const NOTE_ROW_MAX_BYTES: usize = CONSOLE_SECTION_MAX_BYTES;
 
+/// Max bytes of a prose segment a reply sends to the person. The reply
+/// itself keeps every byte on the log (28 — the parts concatenate back
+/// to it); this bounds only what is **delivered**, like
+/// `strip_imitated_markers`. A degenerate reply of repeated text must
+/// not land on the person in full.
+pub const PROSE_MAX_BYTES: usize = 16 * 1024;
+
 /// One artifact-menu entry: a `Call` (settled or still pending) or a
 /// `ProgramResult`, named by its event id and fetchable via
 /// `fetch_history(id)`.
@@ -1032,6 +1039,14 @@ pub fn cap_console(lines: &[String], event_hint: &str) -> Vec<String> {
         );
     }
     kept
+}
+
+/// Cap prose a reply sends to the person: a message, not data. Keeps
+/// the **head** (a message's opening is what a person reads first) and
+/// marks where it was cut — the truncation is never silent, the same
+/// rule [`cap_console`] applies to a program's prints.
+pub fn cap_prose(text: &str) -> String {
+    clip(text, PROSE_MAX_BYTES)
 }
 
 /// One handback's slice of a branch's path: the reply that drove it,
@@ -2478,6 +2493,39 @@ mod tests {
         let uni = "é".repeat(60);
         let c = clip(&uni, 99);
         assert!(c.contains("[truncated;"));
+    }
+
+    /// Prose a reply sends to the person is bounded like console
+    /// output: a degenerate reply of repeated text must not deliver
+    /// megabytes to the person. The log keeps every byte (28); this
+    /// caps only what is delivered, like `strip_imitated_markers`.
+    #[test]
+    fn prose_sent_to_the_person_is_capped() {
+        // An ordinary message passes through whole.
+        let short = "a short message";
+        assert_eq!(cap_prose(short), short);
+
+        // A degenerate one keeps its head, stays near the budget, and
+        // says it was cut — the never-silent rule `cap_console`
+        // documents.
+        let long = "x".repeat(PROSE_MAX_BYTES * 2);
+        let capped = cap_prose(&long);
+        assert!(capped.starts_with("xxx"), "the head survives");
+        assert!(
+            capped.len() <= PROSE_MAX_BYTES + 64,
+            "stays near the budget: {}",
+            capped.len()
+        );
+        assert!(
+            capped.contains("[truncated;"),
+            "the clip is never silent: {capped}"
+        );
+
+        // Multi-byte safety: clipping mid-codepoint backs up.
+        let uni = "é".repeat(PROSE_MAX_BYTES + 1);
+        let capped = cap_prose(&uni);
+        assert!(capped.contains("[truncated;"));
+        assert!(capped.ends_with("bytes total]"));
     }
 
     /// The tail is bounded in **total** bytes, not by a flat per-line
