@@ -540,8 +540,26 @@ impl ChatState {
                 }
             }
             EventPayload::Result { call, outcome } => {
+                // **Only a call row is completed in place.** A `Send` to
+                // the user files its text as an `Assistant` prose row
+                // under the same call id, and that row has no pending
+                // `→ …` marker to fill in — so the split below found
+                // whatever arrow the *model* had written and threw away
+                // everything after it. One reply that said
+                // "`oxc_parser` → stack-VM instructions" lost five
+                // bullets and ended `oxc_parser → {"post":null}`, which
+                // reads as the model stopping mid-sentence.
+                //
+                // `rsplit_once` is right for a real call row precisely
+                // because the marker is appended last; it is wrong for
+                // anything else, and `ChatKind::Program` is exactly the
+                // set of rows that carry one.
                 if let Some(&row) = self.entry_index.get(call)
-                    && let Some(Entry::Line { text, .. }) = self.entries.get_mut(row)
+                    && let Some(Entry::Line {
+                        text,
+                        kind: ChatKind::Program,
+                        ..
+                    }) = self.entries.get_mut(row)
                 {
                     let head = text.rsplit_once(" → ").map(|(h, _)| h.to_owned());
                     if let Some(head) = head {
@@ -1923,6 +1941,67 @@ mod tests {
                 },
             },
         )
+    }
+
+    /// **A result completes a call row, and must not touch prose.**
+    ///
+    /// From `try23.jsonl`: a reply whose text contained "`oxc_parser` →
+    /// stack-VM instructions" was rendered as
+    ///
+    /// ```text
+    /// - interp/ — the JS engine: oxc_parser → {"post":null}
+    /// ```
+    ///
+    /// and five bullets after it were gone. A `Send` to the user files
+    /// its text as prose under the call's own id, and the `Result`
+    /// handler split that row on its last " → " to replace the pending
+    /// marker — a marker prose never had. The arrow it found was the
+    /// model's own.
+    #[test]
+    fn a_result_never_truncates_prose_that_contains_an_arrow() {
+        let mut chat = ChatState::new();
+        chat.apply(&agent_event());
+        chat.apply(&post(2, "what is this project?"));
+        for e in run_program(3) {
+            chat.apply(&e);
+        }
+        let said = "the JS engine: `oxc_parser` → stack-VM instructions,                     then bindings → frame locals. And a closing line.";
+        chat.apply(&ev(
+            7,
+            EventPayload::Call(Call::Send {
+                prose: true,
+                to: Address::User,
+                text: said.into(),
+                input: serde_json::Value::Null,
+                options: Vec::new(),
+                expects_reply: false,
+                site: 0,
+                site_end: 0,
+            }),
+        ));
+        chat.apply(&ev(
+            8,
+            EventPayload::Result {
+                call: EventId::new(7),
+                outcome: Outcome::Delivered(serde_json::json!({ "post": null })),
+            },
+        ));
+
+        let rows = chat.rows(None, 80, None);
+        let prose: String = rows
+            .iter()
+            .filter(|(k, ..)| *k == ChatKind::Assistant)
+            .map(|(_, t, ..)| t.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            prose.contains("And a closing line."),
+            "the tail of the message survived: {prose:?}"
+        );
+        assert!(
+            !prose.contains("post"),
+            "the delivery receipt did not land in the prose: {prose:?}"
+        );
     }
 
     /// **Compaction is about the next request, not about the
