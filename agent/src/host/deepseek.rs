@@ -748,12 +748,27 @@ fn parse_sse(
         let program = args["source"]
             .as_str()
             .ok_or_else(|| format!("run_program call has no `source` string: {}", acc.tool_args))?;
-        let prose = acc.source.trim();
-        if prose.is_empty() {
+        // **And the cell has to go through `chunk` too**, because the
+        // session never reads the value this function returns: it feeds
+        // the notebook from the deltas as they arrive
+        // (`host/mod.rs`'s `on_chunk`) and finalises a reply that is
+        // already on the log. The `content` deltas under this transport
+        // are prose alone, so a reply assembled from them has no cell
+        // in it — the program runs nowhere, the branch rests, and the
+        // run ends having read four files and stopped. That was 0 of 5
+        // on `sweep-8`, and `agent sample`, which *does* read the
+        // return value, scored the same document 12 of 12.
+        //
+        // Emitted whole and last rather than streamed: the arguments
+        // arrive as fragments of an escaped JSON string, so there is no
+        // prefix of them that is a program.
+        let suffix = if acc.source.trim().is_empty() {
             format!("```js\n{program}\n```\n")
         } else {
-            format!("{prose}\n\n```js\n{program}\n```\n")
-        }
+            format!("\n\n```js\n{program}\n```\n")
+        };
+        chunk(LlmChunk::Text(suffix.clone()));
+        format!("{}{suffix}", acc.source)
     } else {
         acc.source
     };
@@ -1148,6 +1163,60 @@ mod tests {
         let report = message_json(&doc.messages[3]);
         assert_eq!(report["role"], "tool", "{report}");
         assert_eq!(report["tool_call_id"], *id);
+    }
+
+    /// **What is streamed must reconstruct what is returned.**
+    ///
+    /// The session never reads `LlmTurn.source`: it feeds the notebook
+    /// from `chunk` as the deltas arrive and finalises a reply that is
+    /// already on the log. So a transport that assembles its program
+    /// only in the return value delivers a prose-only reply, the
+    /// program runs nowhere, and the branch rests — which cost three
+    /// A/B runs and looked each time like the model refusing to call.
+    ///
+    /// Asserted for both transports, because the rule is about the
+    /// contract and not about the arm: whatever `source` says, the
+    /// chunks said first.
+    #[test]
+    fn the_chunks_add_up_to_the_turn() {
+        for (run_program, stream) in [
+            (
+                true,
+                sse(&[
+                    r#"{"choices":[{"delta":{"content":"Reading them."}}]}"#,
+                    r#"{"choices":[{"delta":{"tool_calls":[{"function":{"arguments":"{\"source\":\"return 1;\"}"}}]}}]}"#,
+                    r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+                ]),
+            ),
+            (
+                false,
+                sse(&[
+                    r#"{"choices":[{"delta":{"content":"```js\nreturn 1;\n```"}}]}"#,
+                    r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+                ]),
+            ),
+        ] {
+            let mut streamed = String::new();
+            let turn = parse_sse(
+                stream.as_bytes(),
+                &Cancel::new(),
+                &mut |c| {
+                    if let LlmChunk::Text(t) = c {
+                        streamed.push_str(&t);
+                    }
+                },
+                run_program,
+            )
+            .unwrap();
+            assert_eq!(
+                streamed, turn.source,
+                "run_program={run_program}: the session would see something else"
+            );
+            assert!(
+                !crate::notebook::split_cells(&streamed).is_empty(),
+                "run_program={run_program}: nothing to run in the streamed reply"
+            );
+        }
     }
 
     /// A turn with no cell is left alone — a resting reply is prose and
