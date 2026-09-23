@@ -4349,7 +4349,21 @@ impl Runner {
         //
         // A readout, not an argument: the two numbers and the verb, the
         // same shape as the open-questions line above.
-        if let Some((measured, limit, unit)) = self.last_fullness
+        // Falling back to a fresh measurement when there has been no
+        // live step to cache one — a reopened log, and in particular
+        // `agent document`, which is how anyone checks what the model
+        // was actually sent. A line that appears in the request and not
+        // in the rendering of that request is a line nobody can audit,
+        // and this file has been caught by that shape before.
+        let fullness = self.last_fullness.or_else(|| {
+            let doc = crate::document::render(tree, &self.spine, self.document_budget());
+            Some((
+                crate::compaction::rendered_size(&doc),
+                self.document_budget(),
+                Measure::Bytes,
+            ))
+        });
+        if let Some((measured, limit, unit)) = fullness
             && limit > 0
             && !self.compaction_requested
         {
