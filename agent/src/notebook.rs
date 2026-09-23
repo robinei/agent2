@@ -90,7 +90,7 @@ impl Notebook {
         // one frame, so returning from that frame is the least
         // surprising reading of the primitive and is what `stop(reason)`
         // used to spell. The rejection that stood here sent a model
-        // writing `return` to `history.append` and `finish(text)`,
+        // writing `return` to `history.note` and `finish(text)`,
         // neither of which ends anything.
         let mut core = interp::ReplCore::new();
         core.prime_prelude(vm)

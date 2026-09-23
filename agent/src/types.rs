@@ -91,7 +91,7 @@ pub enum EventPayload {
     /// every one of them, and a throwing projection would break reading
     /// the record.
     ///
-    /// **Provenance is the point.** `history.append(f.content)` wrote a
+    /// **Provenance is the point.** `history.note(f.content)` wrote a
     /// row that had lost its origin: a value, with the call that
     /// produced it sitting elsewhere, unlinked. 988 of those in the
     /// corpus, and a staleness check that had to guess by matching
@@ -215,7 +215,7 @@ pub enum EventPayload {
     /// spine. Renders to chat: yes — as a marker in the branch's own
     /// history, nothing more.
     ///
-    /// `append_history` is what **I** should remember; a `tell`/`Post`
+    /// `note_history` is what **I** should remember; a `tell`/`Post`
     /// is what **someone else** needs to know. A `Note` has no
     /// recipient and wakes no branch — where every `tell` is heard by
     /// someone, a note is heard by no one but the branch's own future
@@ -227,7 +227,7 @@ pub enum EventPayload {
     /// you are already holding it.
     Note {
         /// **What was appended, not a rendering of it.** This was a
-        /// `String` holding `value.to_string()`, so `history.append(obj)`
+        /// `String` holding `value.to_string()`, so `history.note(obj)`
         /// came back from `history.fetch` as the JSON *text* of `obj` —
         /// against a card that promises "read any entry back, **whole**".
         /// A program had to know to `JSON.parse` a value it had just
@@ -240,7 +240,7 @@ pub enum EventPayload {
         /// truth rather than two fields that can disagree.
         #[serde(alias = "text")]
         value: serde_json::Value,
-        /// Source byte range of the `history.append(...)` that wrote it,
+        /// Source byte range of the `history.note(...)` that wrote it,
         /// so the document can point the call at the row it produced.
         /// Zero for notes written before this existed, and for any the
         /// harness itself appends.

@@ -698,7 +698,7 @@ mod tests {
     fn a_compaction_says_why_the_next_reply_is_not_about_the_task() {
         let mut c = Conversation::new();
         c.user("go");
-        c.reply("```js\nhistory.append(\"something\");\n```\n");
+        c.reply("```js\nhistory.note(\"something\");\n```\n");
         c.log(EventPayload::Compaction {
             measured: 40_000,
             limit: 32_000,
@@ -720,7 +720,7 @@ mod tests {
     fn a_long_value_is_one_line_with_its_size() {
         let mut c = Conversation::new();
         c.user("go");
-        c.reply("```js\nhistory.append(\"x\".repeat(5000));\n```\n");
+        c.reply("```js\nhistory.note(\"x\".repeat(5000));\n```\n");
 
         let out = render(c.tree(), c.runner().spine.leaf_id);
         let row = out

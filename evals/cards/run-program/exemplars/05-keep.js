@@ -5,8 +5,8 @@ const [readme, design] = await Promise.all([
   tools.read_file("README.md"),
   tools.read_file("DESIGN.md"),
 ]);
-history.append({ documented_check: readme.content.match(/^\s*\$ (.+)$/m)?.[1] });
-history.append({ rules: design.content.match(/^- .*/gm) ?? [] });
+history.note({ documented_check: readme.content.match(/^\s*\$ (.+)$/m)?.[1] });
+history.note({ rules: design.content.match(/^- .*/gm) ?? [] });
 ```
 
 Now the failure itself — printed, not kept: what earns a row is what I conclude from it.

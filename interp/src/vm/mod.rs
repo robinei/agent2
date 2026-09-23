@@ -803,7 +803,7 @@ pub struct SettleCall {
     /// Arguments in call order (`args[0]` is the first argument).
     pub args: Vec<Value>,
     /// Source byte range of the `Settle` instruction that issued this
-    /// call, like `InvokeCall::site`/`site_end`. `append_history` is why
+    /// call, like `InvokeCall::site`/`site_end`. `note_history` is why
     /// the end travels: its `Note` gets a row of its own, and the
     /// document annotates the call that wrote it with that row's id.
     pub site: u32,

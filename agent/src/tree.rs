@@ -1236,7 +1236,7 @@ mod tests {
             let mut tree = open()?;
             let mut spine = tree.start_agent(None, None, "root", None, "", Vec::new())?;
             agent = spine.leaf_id; // the Agent id is the agent id
-            let [reply, cell] = assistant_msg("console.log('hi'); history.append(42);");
+            let [reply, cell] = assistant_msg("console.log('hi'); history.note(42);");
             let rid = tree.append(&mut spine, reply)?;
             tree.append(&mut spine, cell)?;
             let bash = tree.append(
@@ -1278,7 +1278,7 @@ mod tests {
         assert_eq!(progs.len(), 1);
         let p = &progs[0];
         assert_eq!(p.id, EventId::new(agent.as_u64() + 1)); // the run_program assistant event
-        assert!(p.source.contains("history.append(42)"), "{}", p.source);
+        assert!(p.source.contains("history.note(42)"), "{}", p.source);
         assert_eq!(p.invokes.len(), 1);
         assert_eq!(p.invokes[0].name, "bash");
         // A reply has no `return` (D5): what it produced is the row it
@@ -1323,7 +1323,7 @@ mod tests {
             "a reopened log says how the run ended"
         );
 
-        let [reply, cell] = assistant_msg("history.append(resume(null));");
+        let [reply, cell] = assistant_msg("history.note(resume(null));");
         let handler = tree.append(&mut spine, reply)?;
         tree.append(&mut spine, cell)?;
         // The handler's own ending, then the raiser's once it has been
@@ -1774,7 +1774,7 @@ mod tests {
             let mut tree = open()?;
             let mut spine = tree.start_agent(None, None, "root", None, "", Vec::new())?;
             tree.append(&mut spine, user_msg("go"))?;
-            let [reply, cell] = assistant_msg("history.append(1);");
+            let [reply, cell] = assistant_msg("history.note(1);");
             let rid = tree.append(&mut spine, reply)?;
             tree.append(&mut spine, cell)?;
             tree.sync()?;

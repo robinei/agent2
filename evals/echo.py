@@ -23,7 +23,7 @@ read a file and needs to reason about it on the *next* turn has two
 choices, print it or fetch it again, and printing is the one that costs
 nothing to write. It is worth knowing the size of, and worth measuring
 again after any change to what the card says about `console.log`,
-`history.append` or the history bound — which is what this is for.
+`history.note` or the history bound — which is what this is for.
 
 The probe is a 300-character slice from the middle of a value the run
 received, looked for in a console section that came after it. Middles

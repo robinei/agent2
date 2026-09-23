@@ -135,7 +135,7 @@ fn the_builtin_namespaces_survive_their_own_declaration() {
     assert!(
         interp::compile(
             r#"declare namespace history { function append(v: unknown): void }
-               history.append({ a: 1 });"#
+               history.note({ a: 1 });"#
         )
         .is_ok()
     );

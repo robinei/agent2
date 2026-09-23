@@ -382,7 +382,7 @@ struct Cut {
 /// produced — and with a literal argument replaced by that reference
 /// when doing so is shorter than keeping it.
 ///
-/// **Every `tell`, `ask` and `history.append` is annotated**, whether
+/// **Every `tell`, `ask` and `history.note` is annotated**, whether
 /// or not its text is duplicated. The row says `[40] you told user: …`
 /// and the call says `/* history[40] */`, and neither on its own says
 /// that *this* call produced *that* row. With several computed calls
@@ -521,7 +521,7 @@ fn annotate_history_calls(
             // **Replace an imitated one, never sit beside it.** The
             // model reads these in its own turns and writes them back:
             // on a live run of 2026-09-19 it emitted
-            // `history.append(…); /* history[13] */` with four
+            // `history.note(…); /* history[13] */` with four
             // invented ids, and the pass below added the four real ones
             // beside them — so every line came back doubly annotated,
             // with a *wrong* id next to the true one that `fetch` would
@@ -1595,7 +1595,7 @@ mod tests {
             .start_agent(None, None, "root", None, "CARD", Vec::new())
             .unwrap();
         tree.append(&mut spine, user_post("hello")).unwrap();
-        append_turn(&mut tree, &mut spine, "tell('hi'); history.append(1);");
+        append_turn(&mut tree, &mut spine, "tell('hi'); history.note(1);");
         tree.append(
             &mut spine,
             EventPayload::Handback {
@@ -1620,7 +1620,7 @@ mod tests {
         assert_eq!(conv[1].role, ChatRole::Assistant);
         assert_eq!(
             conv[1].content,
-            "↓ history[4]\n```js\ntell('hi'); history.append(1);\n```\n"
+            "↓ history[4]\n```js\ntell('hi'); history.note(1);\n```\n"
         );
         assert_eq!(conv[2].role, ChatRole::User);
     }
@@ -1687,7 +1687,7 @@ mod tests {
         )
         .unwrap();
         // The handler: its own Turn and Return, both at depth 1.
-        append_turn(&mut tree, &mut spine, "history.append(resume(1));");
+        append_turn(&mut tree, &mut spine, "history.note(resume(1));");
         tree.append(
             &mut spine,
             EventPayload::Handback {
@@ -1725,7 +1725,7 @@ mod tests {
         assert_eq!(conv[1].content, "↓ history[4]\n```js\nraise('x');\n```\n");
         assert_eq!(
             conv[3].content,
-            "↓ history[8]\n```js\nhistory.append(resume(1));\n```\n"
+            "↓ history[8]\n```js\nhistory.note(resume(1));\n```\n"
         );
         assert!(
             !conv[2].content.is_empty(),
@@ -1883,7 +1883,7 @@ mod tests {
     /// **An annotation the model wrote itself is replaced, not joined.**
     ///
     /// It reads these in its own turns and writes them back. On a live
-    /// run of 2026-09-19 it emitted `history.append(…); /* history[13] */`
+    /// run of 2026-09-19 it emitted `history.note(…); /* history[13] */`
     /// with four invented ids, and the pass added the four real ones
     /// beside them: every line came back doubly annotated, with a wrong
     /// id next to the true one that `fetch` would follow somewhere
@@ -1892,20 +1892,20 @@ mod tests {
     fn an_imitated_annotation_is_replaced_by_the_real_one() {
         let cuts = vec![Cut {
             start: 0,
-            end: 19,
+            end: 17,
             row: 30,
             literal: false,
         }];
         // The model's own guess, in our shape and with the wrong id.
-        let source = "history.append(arg); /* history[13] */\n";
+        let source = "history.note(arg); /* history[13] */\n";
         let out = annotate_history_calls(source, Some(&cuts), &[]);
-        assert_eq!(out, "history.append(arg) /* ← history[30] */;\n");
+        assert_eq!(out, "history.note(arg) /* ← history[30] */;\n");
         assert!(!out.contains("13"), "the invented id is gone: {out}");
 
         // And the same once it has imitated the arrow too.
-        let source = "history.append(arg); /* ← history[13] */\n";
+        let source = "history.note(arg); /* ← history[13] */\n";
         let out = annotate_history_calls(source, Some(&cuts), &[]);
-        assert_eq!(out, "history.append(arg) /* ← history[30] */;\n");
+        assert_eq!(out, "history.note(arg) /* ← history[30] */;\n");
     }
 
     /// **A part that is nothing but a copied marker renders as
@@ -2013,7 +2013,7 @@ mod tests {
             row: 30,
             literal: false,
         }];
-        let source = "history.append(arg); /* see history[9] for the listing */\n";
+        let source = "history.note(arg); /* see history[9] for the listing */\n";
         let out = annotate_history_calls(source, Some(&cuts), &[]);
         assert!(out.contains("see history[9] for the listing"), "{out}");
         assert!(out.contains("/* ← history[30] */"), "{out}");
@@ -2331,7 +2331,7 @@ mod tests {
             .start_agent(None, None, "root", None, "CARD", Vec::new())
             .unwrap();
         tree.append(&mut spine, user_post("hello")).unwrap();
-        append_turn(&mut tree, &mut spine, "tell('hi'); history.append(1);");
+        append_turn(&mut tree, &mut spine, "tell('hi'); history.note(1);");
         tree.append(
             &mut spine,
             EventPayload::Handback {
@@ -2361,7 +2361,7 @@ mod tests {
         assert_eq!(conv[1].role, ChatRole::Assistant);
         assert_eq!(
             conv[1].content,
-            "↓ history[4]\n```js\ntell('hi'); history.append(1);\n```\n"
+            "↓ history[4]\n```js\ntell('hi'); history.note(1);\n```\n"
         );
         assert_eq!(conv[2].role, ChatRole::User, "{conv:?}");
     }

@@ -83,11 +83,11 @@ pub const TOOL_FORK: &str = "fork";
 /// there is no longer a distinguished "turn that only answers", so
 /// this is an ordinary dispatched call like any other bare verb.
 pub const TOOL_ANSWER: &str = "answer";
-/// `append_history(value)` — logs an `EventPayload::Note` (22's "one
+/// `note_history(value)` — logs an `EventPayload::Note` (22's "one
 /// vocabulary decision" list; DESIGN.md "No exception"): what a mind
 /// chose to remember for its own later turns, never re-derived and
 /// never entering anyone else's context.
-pub const TOOL_APPEND_HISTORY: &str = "append_history";
+pub const TOOL_NOTE_HISTORY: &str = "note_history";
 /// `fetch_history(id)` — id-addressable fetch from the log, resolved
 /// synchronously without a host round trip. The **only** survivor of
 /// the old budgeted-answer machinery (DESIGN.md "No exception": the
@@ -97,7 +97,7 @@ pub const TOOL_APPEND_HISTORY: &str = "append_history";
 /// Named `artifact` until 27.4, which is what it was while the thing
 /// it read was a separate compartment — a menu of call results beside
 /// the conversation. There is one history: the menu is those rows
-/// rendered, `append_history` writes one, `remove_history` and
+/// rendered, `note_history` writes one, `remove_history` and
 /// `rewrite_history` shorten one, and this reads one back. A verb
 /// called `artifact` in that set names a compartment that no longer
 /// exists, and it is the only one of the four that did not say what it
@@ -432,7 +432,7 @@ const INTERRUPT_NOTICE: &str = "The user interrupted your program. It is paused 
 
 /// Iteration cap for one `Tick`: each extra round requires a
 /// settle-at-dispatch verb the harness could answer on the spot (a
-/// `fetch_history` off the log, an `append_history`, a compaction edit)
+/// `fetch_history` off the log, an `note_history`, a compaction edit)
 /// to have unblocked the program, but a pathological program could chain
 /// those forever. Hitting the cap is a slice boundary, not a failure —
 /// the branch re-enqueues and carries on next tick.
@@ -885,8 +885,8 @@ pub struct Runner {
     /// anything but `Finished`. Set by whoever cut it off; read once by
     /// `finish_notebook_generation`.
     reply_ended: Option<ReplyEnd>,
-    /// A `resume(...)`/`abandon()` handed to `history.append`, waiting
-    /// for this reply's run to end. See the `TOOL_APPEND_HISTORY` arm.
+    /// A `resume(...)`/`abandon()` handed to `history.note`, waiting
+    /// for this reply's run to end. See the `TOOL_NOTE_HISTORY` arm.
     pending_decision: Option<serde_json::Value>,
     /// Whether a client is attached to the session right now.
     ///
@@ -1869,7 +1869,7 @@ impl Runner {
         // run — so resuming a stop produced no rows, no terminal
         // handback and no error, just a branch that went quiet with a
         // program still open. Found 2026-09-20 by resuming one: reply
-        // #8 ran `history.append(resume(null))` and logged nothing at
+        // #8 ran `history.note(resume(null))` and logged nothing at
         // all.
         run.returned = None;
         match &suspension {
@@ -2359,7 +2359,7 @@ impl Runner {
     /// settled later by exactly one `Result`.
     ///
     /// The settle-at-dispatch verbs — `spawn`, `fork`, `list_agents`,
-    /// `finish`, `answer`, `append_history`, `fetch_history`,
+    /// `finish`, `answer`, `note_history`, `fetch_history`,
     /// `remove_history`, `rewrite_history` — can no longer reach this
     /// function at all: the compiler lowers them to `Instr::Settle`, so
     /// they arrive as `StepResult::Settle` and are handled one at a time
@@ -2496,7 +2496,7 @@ impl Runner {
     /// value is known, never whether the frame survives:
     ///
     /// - **Answered here.** `fetch_history` reads a row off the log,
-    ///   `answer` and `append_history` append one, `remove_history` /
+    ///   `answer` and `note_history` append one, `remove_history` /
     ///   `rewrite_history` add an edit to the batch the running
     ///   compaction handler is building, `finish` sets the flag that
     ///   stops the loop. The value is pushed before this function
@@ -2763,7 +2763,7 @@ impl Runner {
                     _ => unreachable!("normalised to two arguments above"),
                 }
             }
-            TOOL_APPEND_HISTORY => {
+            TOOL_NOTE_HISTORY => {
                 let args = self.call_args_json(&call.args);
                 match args.first() {
                     // **A decision is not a row.** `resume(v)`/`abandon()`
@@ -2818,7 +2818,7 @@ impl Runner {
                         // call should be handing over.
                         self.settle(Ok(serde_json::json!(row.as_u64())));
                     }
-                    None => self.settle_err("append_history(value) needs one argument"),
+                    None => self.settle_err("note_history(value) needs one argument"),
                 }
                 Ok(true)
             }
@@ -3408,7 +3408,7 @@ impl Runner {
         // program a value nobody actually chose).
         // The reply's own value if it had one (the program transport's
         // shape, still what a hand-typed `take_turn` produces), else a
-        // decision handed to `history.append` during the run.
+        // decision handed to `history.note` during the run.
         let appended = self.pending_decision.take();
         let value_json = match (&appended, decision_tag(&value_json)) {
             (Some(d), None) => d.clone(),
@@ -4101,7 +4101,7 @@ impl Runner {
     /// it.
     ///
     /// Anything the program *said* survives: a `tell` and a
-    /// `history.append` are rows of their own, and the summary a good
+    /// `history.note` are rows of their own, and the summary a good
     /// compaction leaves behind is exactly such a row.
     fn compact_the_compaction_program(&mut self, tree: &mut Tree) -> io::Result<()> {
         let reply = self.reply_id;
@@ -4628,7 +4628,7 @@ pub(crate) fn off_menu(who: &str, reply: &str, options: &[String]) -> String {
     format!("choose: {who} answered outside the offered set [{offered}], saying: {reply}")
 }
 
-/// `append_history(value)` takes any JSON value, but `EventPayload::Note`
+/// `note_history(value)` takes any JSON value, but `EventPayload::Note`
 /// stores rendered text: a JSON string is used verbatim, anything else is
 /// serialized. The card's own guidance is to append a short projection
 /// (a summary), not a raw result, so the common case is already a string.
@@ -4647,8 +4647,8 @@ pub(crate) fn note_text(value: &serde_json::Value) -> String {
 /// return — and [`note_text`] renders a string bare, which makes
 /// `append("{\"a\": 1}")` and `append({ a: 1 })` identical on the page
 /// and different in the hand. Quoting costs a couple of characters and
-/// removes the guess: `appended: "a conclusion"` is a string,
-/// `appended: {"a":1}` is an object.
+/// removes the guess: `noted: "a conclusion"` is a string,
+/// `noted: {"a":1}` is an object.
 ///
 /// `note_text` stays as it is — `Outcome::appended` is contracted as
 /// "the note's own literal text" and the benchmark checkers read it.
@@ -4700,10 +4700,10 @@ fn note_row(id: u64, value: &serde_json::Value) -> String {
     }
     let shown = crate::document::escape_untrusted(&full[..b]);
     if b == full.len() {
-        return format!("appended: {shown}");
+        return format!("noted: {shown}");
     }
     format!(
-        "appended: {shown}\n  … {b} of {} bytes — `history.fetch({id})` has all of it, and \
+        "noted: {shown}\n  … {b} of {} bytes — `history.fetch({id})` has all of it, and \
          `history.replace({id}, …)` moves this window onto the next stretch",
         full.len(),
     )
@@ -4985,19 +4985,21 @@ pub(crate) fn menu_rows(
                         crate::document::escape_untrusted(&value.to_string())
                     )),
                 }),
-                // A `history.append` — the one channel that crosses
+                // A `history.note` — the one channel that crosses
                 // between replies by design, so it belongs in the list
                 // of what this run put on the record, beside the calls
                 // that produced the values.
                 //
-                // **`appended:`, because that is the verb it wrote.**
-                // The model calls `history.append` and used to read the
-                // row back as `note:`, leaving it to infer from
-                // position and content that the two were the same
-                // thing. One thing, one name, wherever it is spoken —
-                // and the model-facing direction is the one that
-                // matters. `EventPayload::Note` keeps its name; nobody
-                // outside this file sees it.
+                // **`noted:`, because that is the verb it wrote.** One
+                // thing, one name, wherever it is spoken, and the
+                // model-facing direction is the one that matters: the
+                // row and the call that wrote it have said the same
+                // word since the verb stopped being `append`.
+                //
+                // Why it stopped: the distinction the card now has to
+                // teach is `note` against `keep` — bytes you wrote
+                // against a result you were given — and `append`
+                // against `keep` says nothing about which is which.
                 EventPayload::Note { value, .. } => Some(Artifact {
                     id,
                     label: String::new(),
@@ -6069,7 +6071,7 @@ mod tests {
         let reply = format!("```js\n{source}\n```\n");
         assert_eq!(&reply[site..site_end], r#"tell("hello")"#);
     }
-    /// `history.append` is a settle-at-dispatch verb, so its span comes
+    /// `history.note` is a settle-at-dispatch verb, so its span comes
     /// through `SettleCall` rather than `InvokeCall` — a path that
     /// carried no end offset until the note needed one. End to end
     /// because that plumbing is the part with nothing else watching it.
@@ -6077,12 +6079,12 @@ mod tests {
     fn an_append_is_cross_referenced_to_the_note_it_wrote() {
         let mut c = Conversation::new();
         c.user("go");
-        let reply = "```js\nhistory.append({ found: 3 });\n```\n";
+        let reply = "```js\nhistory.note({ found: 3 });\n```\n";
         let r = c.reply(reply);
 
         assert_eq!(
             r.row().source_in(reply),
-            "history.append({ found: 3 })",
+            "history.note({ found: 3 })",
             "the span is the whole call"
         );
         assert!(
@@ -6151,7 +6153,7 @@ mod tests {
             .step(
                 &mut tree,
                 StepInput::LlmResponse(llm_program(
-                    "console.log(\"hi there\"); history.append(6 * 7);",
+                    "console.log(\"hi there\"); history.note(6 * 7);",
                 )),
             )
             .unwrap();
@@ -6372,7 +6374,7 @@ mod tests {
     fn raise_suspends_with_pushed_disposition_and_host_driven_resume_continues() {
         let mut c = Conversation::new();
         let r = c.reply(
-            "```js\nconst x = raise(\"need_help\", { got: 41 });\nhistory.append(x + 1);\n```\n",
+            "```js\nconst x = raise(\"need_help\", { got: 41 });\nhistory.note(x + 1);\n```\n",
         );
         // A raise *pauses*: the run is still there to come back to,
         // which is what `suspended` means and a terminal handback does
@@ -6392,7 +6394,7 @@ mod tests {
         let out = state
             .step(
                 &mut tree,
-                StepInput::LlmResponse(llm_program("raise(\"need\", null); history.append(1);")),
+                StepInput::LlmResponse(llm_program("raise(\"need\", null); history.note(1);")),
             )
             .unwrap();
         drain(&mut state, &mut tree, out);
@@ -6482,7 +6484,7 @@ mod tests {
     fn a_tagged_completion_is_routed_to_resume_or_abandon() {
         let mut c = Conversation::new();
         let r = c.reply(
-            "```js\nconst x = raise(\"need_help\", { got: 41 });\nhistory.append(x + 1);\n```\n",
+            "```js\nconst x = raise(\"need_help\", { got: 41 });\nhistory.note(x + 1);\n```\n",
         );
         assert_eq!(
             r.ended,
@@ -6496,7 +6498,7 @@ mod tests {
         // The handler answers with a program, not a direct host call —
         // `finish_program` is the one reading the tag off its
         // completion.
-        let handled = c.reply("```js\nhistory.append(resume(41));\n```\n");
+        let handled = c.reply("```js\nhistory.note(resume(41));\n```\n");
         assert_eq!(
             handled.values(),
             [&json!(42)],
@@ -6506,9 +6508,9 @@ mod tests {
 
         // A second raise, this time abandoned the same way — through a
         // handler's own completion, not a direct host call.
-        c.reply("```js\nraise(\"need\", null);\nhistory.append(1);\n```\n");
+        c.reply("```js\nraise(\"need\", null);\nhistory.note(1);\n```\n");
         assert_eq!(c.status(), "suspended");
-        let gave_up = c.reply("```js\nhistory.append(abandon());\n```\n");
+        let gave_up = c.reply("```js\nhistory.note(abandon());\n```\n");
         assert_eq!(c.status(), "idle");
         assert_eq!(
             gave_up.ended,
@@ -6582,7 +6584,7 @@ mod tests {
             .step(
                 &mut tree,
                 StepInput::LlmResponse(llm_program(&format!(
-                    "history.append(await ask({}, \"which file?\"));",
+                    "history.note(await ask({}, \"which file?\"));",
                     root.agent_id().as_u64()
                 ))),
             )
@@ -6617,7 +6619,7 @@ mod tests {
         let out = state
             .step(
                 &mut tree,
-                StepInput::LlmResponse(llm_program("history.append(await spawn(\"researcher\"));")),
+                StepInput::LlmResponse(llm_program("history.note(await spawn(\"researcher\"));")),
             )
             .unwrap();
         let settled = drain(&mut state, &mut tree, out);
@@ -6642,7 +6644,7 @@ mod tests {
         let out = state
             .step(
                 &mut tree,
-                StepInput::LlmResponse(llm_program("history.append(fork());")),
+                StepInput::LlmResponse(llm_program("history.note(fork());")),
             )
             .unwrap();
         let settled = drain(&mut state, &mut tree, out);
@@ -6659,11 +6661,11 @@ mod tests {
     }
 
     #[test]
-    fn append_history_logs_a_note_and_is_never_re_sent_to_context() {
+    fn note_history_logs_a_note_and_is_never_re_sent_to_context() {
         let mut c = Conversation::new();
         let r = c.reply(
-            "```js\nawait append_history(\"figured out the bug is in parsing\");\n\
-             history.append(1);\n```\n",
+            "```js\nawait note_history(\"figured out the bug is in parsing\");\n\
+             history.note(1);\n```\n",
         );
         assert_eq!(
             r.values(),
@@ -6695,7 +6697,7 @@ mod tests {
 
         let out = state.abandon(&mut tree).unwrap();
         drain(&mut state, &mut tree, out);
-        let rewrite = format!("history.append(await fetch_history({}));", id.as_u64());
+        let rewrite = format!("history.note(await fetch_history({}));", id.as_u64());
         let out = state
             .step(&mut tree, StepInput::LlmResponse(llm_program(&rewrite)))
             .unwrap();
@@ -6732,7 +6734,7 @@ mod tests {
         );
 
         let r = c.reply(&format!(
-            "```js\nhistory.append(await fetch_history({}));\n```\n",
+            "```js\nhistory.note(await fetch_history({}));\n```\n",
             post.as_u64()
         ));
         assert_eq!(
@@ -6760,12 +6762,12 @@ mod tests {
     #[test]
     fn what_was_appended_comes_back_as_what_was_appended() {
         let mut c = Conversation::new();
-        let first = c.reply("```js\nhistory.append({ dead: [\"a\", \"b\"], kept: 3 });\n```\n");
+        let first = c.reply("```js\nhistory.note({ dead: [\"a\", \"b\"], kept: 3 });\n```\n");
         let row = first.row().id.as_u64();
 
         let back = c.reply(&format!(
             "```js\nconst row = history.fetch({row});\n\
-             history.append([typeof row, row.kept, row.dead[1]]);\n```\n"
+             history.note([typeof row, row.kept, row.dead[1]]);\n```\n"
         ));
         // An object, indexable — not a string anyone has to parse.
         assert_eq!(back.row().value, json!(["object", 3, "b"]));
@@ -6773,7 +6775,7 @@ mod tests {
 
     /// **The row is the view; `fetch` is the value.**
     ///
-    /// `history.append` was the one visible thing in the system with no
+    /// `history.note` was the one visible thing in the system with no
     /// bound on it, and by bytes it is how models read — 72% of
     /// everything appended across 352 kept runs was a verbatim copy of
     /// a result, rendered whole on every turn until something compacted
@@ -6783,7 +6785,7 @@ mod tests {
     fn a_long_appended_row_is_clipped_and_fetch_still_hands_back_all_of_it() {
         let mut c = Conversation::new();
         let n = crate::report::NOTE_ROW_MAX_BYTES * 3;
-        let r = c.reply(&format!("```js\nhistory.append(\"x\".repeat({n}));\n```\n"));
+        let r = c.reply(&format!("```js\nhistory.note(\"x\".repeat({n}));\n```\n"));
         let id = r.row().id;
 
         // What the model is shown: bounded, and it says how much is left.
@@ -6804,13 +6806,13 @@ mod tests {
         // The JSON head survives, so the row still says what kind of
         // thing `fetch` will return.
         assert!(
-            shown.contains("appended: \"x"),
+            shown.contains("noted: \"x"),
             "a string still looks like a string: {shown}"
         );
 
         // And the value itself is untouched — the clip is a rendering.
         let back = c.reply(&format!(
-            "```js\nhistory.append((await fetch_history({})).length);\n```\n",
+            "```js\nhistory.note((await fetch_history({})).length);\n```\n",
             id.as_u64()
         ));
         assert_eq!(
@@ -7308,7 +7310,7 @@ mod tests {
     fn returning_skips_every_block_after_it() {
         let mut c = Conversation::new();
         let r = c.reply(
-            "Checking first.\n\n```js\nhistory.append(\"before\");\nreturn \"the check disagrees\";\n```\n\nAnd now the part that must not happen.\n\n```js\nhistory.append(\"after\");\n```\n",
+            "Checking first.\n\n```js\nhistory.note(\"before\");\nreturn \"the check disagrees\";\n```\n\nAnd now the part that must not happen.\n\n```js\nhistory.note(\"after\");\n```\n",
         );
 
         assert_eq!(
@@ -7343,7 +7345,7 @@ mod tests {
         let mut c = Conversation::new();
         let n = crate::report::NOTE_ROW_MAX_BYTES * 2;
         let r = c.reply(&format!(
-            "```js\nhistory.append(\"a\".repeat({n}) + \"TAIL\");\n```\n"
+            "```js\nhistory.note(\"a\".repeat({n}) + \"TAIL\");\n```\n"
         ));
         let id = r.row().id;
 
@@ -7361,7 +7363,7 @@ mod tests {
 
         // And the value behind it is still all of it.
         let back = c.reply(&format!(
-            "```js\nhistory.append((await fetch_history({})).length);\n```\n",
+            "```js\nhistory.note((await fetch_history({})).length);\n```\n",
             id.as_u64()
         ));
         assert_eq!(
@@ -7376,11 +7378,11 @@ mod tests {
     #[test]
     fn a_short_appended_row_is_untouched_by_the_bound() {
         let mut c = Conversation::new();
-        let r = c.reply("```js\nhistory.append({ dead: 3 });\n```\n");
+        let r = c.reply("```js\nhistory.note({ dead: 3 });\n```\n");
         // What the model reads, verbatim: the row's id and its value.
         assert_eq!(
             c.row_shown(r.row().id),
-            format!("- `[{}]` appended: {{\"dead\":3}}", r.row().id.as_u64())
+            format!("- `[{}]` noted: {{\"dead\":3}}", r.row().id.as_u64())
         );
     }
 
@@ -7393,20 +7395,20 @@ mod tests {
     fn an_appended_row_renders_as_the_json_it_will_hand_back() {
         for (program, row) in [
             (
-                "history.append({ kept: 3, dead: [\"a\"] });",
-                r#"appended: {"kept":3,"dead":["a"]}"#,
+                "history.note({ kept: 3, dead: [\"a\"] });",
+                r#"noted: {"kept":3,"dead":["a"]}"#,
             ),
             (
-                "history.append(\"a conclusion\");",
-                r#"appended: "a conclusion""#,
+                "history.note(\"a conclusion\");",
+                r#"noted: "a conclusion""#,
             ),
             // **The guess this exists to remove.** An object and a
             // string that happens to contain JSON rendered identically
             // while a string was shown bare — same row, different
             // things in the hand, and nothing to tell them apart.
             (
-                "history.append(JSON.stringify({ a: 1 }));",
-                r#"appended: "{\"a\":1}""#,
+                "history.note(JSON.stringify({ a: 1 }));",
+                r#"noted: "{\"a\":1}""#,
             ),
         ] {
             let (mut tree, mut state) = setup();
@@ -7435,14 +7437,14 @@ mod tests {
             drain(&mut state, &mut tree, out);
             let doc = crate::document::render(&tree, &state.spine, 64 * 1024);
             let text: String = doc.messages.iter().map(|m| m.content.as_str()).collect();
-            let at = text.find("appended: ").expect("a note row");
+            let at = text.find("noted: ").expect("a note row");
             text[at..].lines().next().unwrap().to_owned()
         };
-        let object = row("history.append({ a: 1 });");
-        let string = row("history.append(JSON.stringify({ a: 1 }));");
+        let object = row("history.note({ a: 1 });");
+        let string = row("history.note(JSON.stringify({ a: 1 }));");
         assert_ne!(object, string, "the guess is back");
-        assert_eq!(object, r#"appended: {"a":1}"#);
-        assert_eq!(string, r#"appended: "{\"a\":1}""#);
+        assert_eq!(object, r#"noted: {"a":1}"#);
+        assert_eq!(string, r#"noted: "{\"a\":1}""#);
     }
 
     /// **A resumed run does not replay what it already printed.**
@@ -7586,12 +7588,12 @@ mod tests {
     #[test]
     fn fetch_history_reads_a_note_and_a_program_back() {
         let mut c = Conversation::new();
-        let src = "```js\nawait append_history(\"the parser drops the last field\");\n\
-                   history.append(1);\n```\n";
+        let src = "```js\nawait note_history(\"the parser drops the last field\");\n\
+                   history.note(1);\n```\n";
         let first = c.reply(src);
 
         let back = c.reply(&format!(
-            "```js\nhistory.append([await fetch_history({}), await fetch_history({})]);\n```\n",
+            "```js\nhistory.note([await fetch_history({}), await fetch_history({})]);\n```\n",
             first.rows[0].id.as_u64(),
             first.reply.as_u64()
         ));
@@ -7640,8 +7642,8 @@ mod tests {
             "await replace_history(0, \"x\");",
             "await replace_history(1);",
             "await replace_history(undefined, undefined);",
-            "history.append(undefined);",
-            "history.append();",
+            "history.note(undefined);",
+            "history.note();",
             "await tell();",
             "await tell(undefined);",
             "await tell(null);",
@@ -7695,8 +7697,8 @@ mod tests {
     fn fetching_row_zero_is_an_error_not_a_crash() {
         let mut c = Conversation::new();
         let r = c.reply(
-            "```js\ntry { await fetch_history(0); history.append(\"no throw\"); }\n\
-             catch (e) { history.append(String(e.message || e)); }\n```\n",
+            "```js\ntry { await fetch_history(0); history.note(\"no throw\"); }\n\
+             catch (e) { history.note(String(e.message || e)); }\n```\n",
         );
         let said = r.row().value.as_str().unwrap_or_default();
         assert!(
@@ -7745,7 +7747,7 @@ mod tests {
         let question = c.open()[0];
 
         let r = c.reply(&format!(
-            "```js\nawait answer({}, \"q\", \"the second\");\nhistory.append(1);\n```\n",
+            "```js\nawait answer({}, \"q\", \"the second\");\nhistory.note(1);\n```\n",
             question.as_u64()
         ));
         assert_eq!(r.answered, [(question, json!("the second"))]);
@@ -7773,7 +7775,7 @@ mod tests {
         fork.kickoff(&mut tree).unwrap();
 
         let src = format!(
-            "try {{ await answer({}, \"q\", 1); history.append(\"unreachable\"); }} catch (e) {{ history.append(\
+            "try {{ await answer({}, \"q\", 1); history.note(\"unreachable\"); }} catch (e) {{ history.note(\
              \"caught: \" + e); }}",
             question.as_u64()
         );
@@ -7794,7 +7796,7 @@ mod tests {
         let src = r#"
             const a = tools.fetch("x");
             const b = tools.fetch("y");
-            history.append([await a, await b]);
+            history.note([await a, await b]);
         "#;
         let out = state
             .step(&mut tree, StepInput::LlmResponse(llm_program(src)))
@@ -7833,8 +7835,8 @@ mod tests {
         let mut c = Conversation::new();
         c.rejects("fetch", "host is down");
         let r = c.reply(
-            "```js\ntry { history.append(await tools.fetch(\"a\")); }\n\
-             catch (e) { history.append(\"caught: \" + e); }\n```\n",
+            "```js\ntry { history.note(await tools.fetch(\"a\")); }\n\
+             catch (e) { history.note(\"caught: \" + e); }\n```\n",
         );
 
         assert!(
@@ -7893,7 +7895,7 @@ mod tests {
         let out = child
             .step(
                 &mut tree,
-                StepInput::LlmResponse(llm_program("history.append(input.body.length);")),
+                StepInput::LlmResponse(llm_program("history.note(input.body.length);")),
             )
             .unwrap();
         drain(&mut child, &mut tree, out);
@@ -9785,7 +9787,7 @@ mod tests {
             .collect()
     }
 
-    /// **`history.append` hands back the row's id.** A program that
+    /// **`history.note` hands back the row's id.** A program that
     /// wants to name what it just wrote should not have to wait a turn
     /// to read the annotation off its own source — two live programs
     /// invented an identifier rather than do without, and died on it.
@@ -9794,7 +9796,7 @@ mod tests {
         let mut c = Conversation::new();
         c.user("go");
         let r = c.reply(
-            "```js\nconst id = history.append({ a: 1 });\nconsole.log(typeof id, id);\n```\n",
+            "```js\nconst id = history.note({ a: 1 });\nconsole.log(typeof id, id);\n```\n",
         );
         assert_eq!(
             r.printed,

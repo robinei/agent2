@@ -212,7 +212,7 @@ pub struct Row {
     /// The `Note`'s own id — what a later `history.fetch(id)` names.
     pub id: EventId,
     pub value: serde_json::Value,
-    /// Where in the reply the `history.append(...)` call was written.
+    /// Where in the reply the `history.note(...)` call was written.
     /// Half-open, reply-absolute (not cell-local), which is what lets
     /// the debugger put a cursor on it.
     pub site: (u32, u32),
@@ -274,7 +274,7 @@ pub struct Said {
     pub told: Vec<EventId>,
     /// `ask` / `choose` — the sends still waiting on someone.
     pub asks: Vec<Ask>,
-    /// `history.append(value)`, in order.
+    /// `history.note(value)`, in order.
     pub rows: Vec<Row>,
     /// `tools.*` calls, in dispatch order, as `(name, args)`.
     pub calls: Vec<(String, serde_json::Value)>,
@@ -1408,7 +1408,7 @@ mod tests {
         c.user("which files mention it?");
 
         let r = c.reply(
-            "```js\nconst hits = (await tools.bash(\"grep -rl OLD .\")).stdout.split(\"\\n\").filter(Boolean);\nhistory.append({ hits });\n```\n",
+            "```js\nconst hits = (await tools.bash(\"grep -rl OLD .\")).stdout.split(\"\\n\").filter(Boolean);\nhistory.note({ hits });\n```\n",
         );
 
         assert_eq!(r.row().value, json!({ "hits": ["a.rs", "b.rs"] }));
@@ -1553,7 +1553,7 @@ mod tests {
     fn the_row_a_reply_appends_is_in_the_next_request() {
         let mut c = Conversation::new();
         c.user("what is here?");
-        c.reply("```js\nhistory.append({ found: \"two config files\" });\n```\n");
+        c.reply("```js\nhistory.note({ found: \"two config files\" });\n```\n");
 
         assert!(
             c.document().contains("two config files"),

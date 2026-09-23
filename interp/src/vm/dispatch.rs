@@ -2809,7 +2809,7 @@ impl VM {
                     }
                     let args = self.stack.split_off(self.stack.len() - n);
                     // Only the start travels into `SettleCall::site` (see its
-                    // own doc). The end travels too now: `append_history`
+                    // own doc). The end travels too now: `note_history`
                     // logs a `Note`, whose row the document cross-
                     // references back to the call that wrote it.
                     let span = self

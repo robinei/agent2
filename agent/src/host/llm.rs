@@ -138,7 +138,7 @@ pub fn scripted_markdown(markdown: &str) -> LlmTurn {
 /// restart").
 #[allow(dead_code)]
 pub fn scripted_resume(value: serde_json::Value) -> LlmTurn {
-    scripted_program(&format!("history.append(resume({value}));"))
+    scripted_program(&format!("history.note(resume({value}));"))
 }
 
 /// A scripted handler turn that discharges an open `ask()` by the

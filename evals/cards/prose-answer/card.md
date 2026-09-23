@@ -28,11 +28,11 @@ A ```ts or ```typescript block runs too, with the types erased before anything e
 
 **`return` ends the reply, and `value` is what it came back with.** Every block shares one scope and one frame, so returning from that frame ends the program — not just the block it is written in. Nothing after it runs: not the rest of that block, not the blocks below, not the prose between them, because a program that has just found out it is wrong should not go on to write the file it was about to write.
 
-**What you return reaches you**, at the top of the next reply, with every row this program added and everything it printed still in hand. So return what your next reply could act on: the count that disagreed, the command that failed and its output. It is not a report to a person — for that, `tell`. Use it the moment a check comes back wrong, rather than describing the wrong answer and carrying on. For anything worth keeping that is *not* a reason to stop, `history.append` is finer-grained: a block can append twice, and two rows compact independently where one fat value does not.
+**What you return reaches you**, at the top of the next reply, with every row this program added and everything it printed still in hand. So return what your next reply could act on: the count that disagreed, the command that failed and its output. It is not a report to a person — for that, `tell`. Use it the moment a check comes back wrong, rather than describing the wrong answer and carrying on. For anything worth keeping that is *not* a reason to stop, `history.note` is finer-grained: a block can append twice, and two rows compact independently where one fat value does not.
 
 ## What crosses from this reply to the next
 
-**`history.append(v)`** — the next reply is written with this in front of it, any number of times, from anywhere, and each one a row of its own. It lands the moment you call it, so it survives even a block that traps afterwards, **and it hands back that row's id**, so a later call can name what you just wrote without waiting to read the annotation.
+**`history.note(v)`** — the next reply is written with this in front of it, any number of times, from anywhere, and each one a row of its own. It lands the moment you call it, so it survives even a block that traps afterwards, **and it hands back that row's id**, so a later call can name what you just wrote without waiting to read the annotation.
 
 **`console.log(x)`** — the output lands in front of the *next* reply, and nowhere before it. **You never see what your own blocks print while you are writing them.** A value you mean to act on in this reply is a variable, not a printout: write `if (t.status !== 0)`, not `console.log(t.stdout)` followed by a sentence about what it said. Printing it and carrying on as though you had read it is how a reply comes to tell somebody the tests passed while the traceback sits in the console. What it shows next turn is the output — its recent tail, if it was large enough to need clipping, and the id to `history.fetch` the rest. A loop over two hundred items belongs here, not in the one above.
 
@@ -42,7 +42,7 @@ A ```ts or ```typescript block runs too, with the types erased before anything e
 
 **a call's result** — is *not* in front of the next reply, but it is not gone: you see that the call happened, what shape its answer has and how big it was — `[12]` `bash("grep …") → ok, {status, stdout, stderr}, 343 bytes` — and `history.fetch(id)` hands back the bytes themselves, whole and for nothing. So there is never a reason to copy a result anywhere; keep the id, or keep what you concluded.
 
-**Your own blocks come back annotated, and the arrow is how you know.** An arrow names a row of the history and points at what it names. `↓ history[12]` on a line of its own names the block *below* it — the paragraph or the fenced cell that follows — so every block of every reply you have written can be read back with `history.fetch(12)`. A `tell`, `ask` or `history.append` comes back carrying `/* ← history[40] */`, naming the row that call wrote; a long literal is replaced by `/* ← snipped - history[40] */`, because the row already holds those bytes. **Every `↓` and `←` was added by the harness, never by you.** Do not write them yourself: you cannot know the id — the row does not exist until the reply is logged — so one you write is a guess, and a wrong `history.fetch` follows it. Leave them out and they appear.
+**Your own blocks come back annotated, and the arrow is how you know.** An arrow names a row of the history and points at what it names. `↓ history[12]` on a line of its own names the block *below* it — the paragraph or the fenced cell that follows — so every block of every reply you have written can be read back with `history.fetch(12)`. A `tell`, `ask` or `history.note` comes back carrying `/* ← history[40] */`, naming the row that call wrote; a long literal is replaced by `/* ← snipped - history[40] */`, because the row already holds those bytes. **Every `↓` and `←` was added by the harness, never by you.** Do not write them yourself: you cannot know the id — the row does not exist until the reply is logged — so one you write is a guess, and a wrong `history.fetch` follows it. Leave them out and they appear.
 
 **Nothing else crosses between replies — least of all your variables.** Within one reply every block shares the same scope; across replies nothing does, so a later `ls.stdout` or `content` is a `ReferenceError`, not a value. A reply that finds something and neither acts on it nor hands it on has thrown the finding away, and the next reply will go and find the same thing again.
 
@@ -55,7 +55,7 @@ A ```ts or ```typescript block runs too, with the types erased before anything e
 ```ts
 /** A handle to another agent. Opaque: only the verbs below take one. */
 declare type Agent = unknown;
-/** A raise-handler's verdict. Build with `resume()`/`abandon()`, then `history.append` it. */
+/** A raise-handler's verdict. Build with `resume()`/`abandon()`, then `history.note` it. */
 declare type Decision = unknown;
 
 /** Print, for your own benefit. */
@@ -93,7 +93,7 @@ declare namespace history {
 
   Worth a row: **a conclusion you reached**. You write the next reply out of what is in front of you, so a row holds what you want to still be looking at then — the four paths that matter out of the two hundred you listed, never the two hundred. Every row is paid for again on every turn, until something compacts it.
 
-  **And this is how you read something.** A call's result is on the record but not in front of you — the row names the call and its shape, and nothing more. Appending the bytes is what puts them where you can read them: `history.append(f.content)` after a `read_file`, and the next reply has the file in front of it. **Append what you will read; fetch what you will compute with.** A program that only needs to search or edit those bytes calls `history.fetch(id)` and never pays to look at them.
+  **And this is how you read something.** A call's result is on the record but not in front of you — the row names the call and its shape, and nothing more. Appending the bytes is what puts them where you can read them: `history.note(f.content)` after a `read_file`, and the next reply has the file in front of it. **Append what you will read; fetch what you will compute with.** A program that only needs to search or edit those bytes calls `history.fetch(id)` and never pays to look at them.
 
   **A row shows its first 4 KB.** More than that and it says how many bytes there are and which id holds them all — and `history.slice(id, 4096)` moves that window onto the next stretch, as often as you like, writing nothing each time. The bytes are already on the record; a window is two numbers.
 

@@ -160,7 +160,7 @@ pub enum KeyAction {
 pub enum ExplicitMode {
     /// `r` — `Rename { branch, name }`.
     Rename,
-    /// `v` — `Restart { branch, source: "history.append(resume(<value>));" }`; the
+    /// `v` — `Restart { branch, source: "history.note(resume(<value>));" }`; the
     /// text is parsed as JSON, falling back to a bare string, and
     /// spliced into the synthesized program — what's shown in the pane
     /// is exactly what runs (22_ONE_VOCABULARY's `UserCall` collapse).
@@ -1244,7 +1244,7 @@ fn resolve_submit_mode(mode: ExplicitMode, branch: BranchId, text: String) -> Se
                 serde_json::from_str(&text).unwrap_or_else(|_| serde_json::Value::String(text));
             SessionCommand::Restart {
                 branch,
-                source: format!("history.append(resume({value}));"),
+                source: format!("history.note(resume({value}));"),
             }
         }
         // `e` is unchanged in spirit: the pasted text *is* the program.
@@ -3663,14 +3663,14 @@ mod tests {
             resolve_submit_mode(ExplicitMode::ResumeWithValue, branch, "5".into()),
             SessionCommand::Restart {
                 branch,
-                source: "history.append(resume(5));".into(),
+                source: "history.note(resume(5));".into(),
             }
         );
         assert_eq!(
             resolve_submit_mode(ExplicitMode::ResumeWithValue, branch, "not json".into()),
             SessionCommand::Restart {
                 branch,
-                source: "history.append(resume(\"not json\"));".into(),
+                source: "history.note(resume(\"not json\"));".into(),
             },
             "a non-JSON value falls back to a bare string"
         );
@@ -5335,10 +5335,10 @@ mod tests {
         let script = vec![
             scripted_program(
                 r#"const w = await spawn("child worker");
-                   history.append(await ask(w.agent, "child task"));"#,
+                   history.note(await ask(w.agent, "child task"));"#,
             ),
-            scripted_program("history.append(await tools.slow());"),
-            scripted_program(r#"history.append(answer(8, "child", "done"));"#),
+            scripted_program("history.note(await tools.slow());"),
+            scripted_program(r#"history.note(answer(8, "child", "done"));"#),
         ];
         let (tx, _rx) = channel();
         let mut session = Session::new(

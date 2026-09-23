@@ -20,7 +20,7 @@ const DEMO_SOURCE: &str = r#"
 const a = tools.echo("alpha");
 const b = tools.echo("beta");
 console.log("fanned out: two echo calls in flight");
-history.append([await a, await b]);
+history.note([await a, await b]);
 "#;
 
 pub fn demo_registry() -> ToolRegistry {

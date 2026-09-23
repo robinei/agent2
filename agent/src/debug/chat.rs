@@ -156,7 +156,7 @@ pub enum RowDetail {
     /// without claiming to be an invoke, which would shift every
     /// following call's index and show the wrong detail on click.
     Prose(EventId),
-    /// An `history.append` row — the program it belongs to, then the
+    /// An `history.note` row — the program it belongs to, then the
     /// note's own event id.
     ///
     /// Addressed by id, not by an index: the index in
@@ -247,7 +247,7 @@ pub struct ChatState {
     /// `disposition` is `Handover`. Its top is where the branch's next
     /// `Call` attaches, handler nesting included.
     program_stack: HashMap<BranchId, Vec<EventId>>,
-    /// Rows that are an `history.append` rather than a call, so the
+    /// Rows that are an `history.note` rather than a call, so the
     /// grouped-effect pass can give them their own `RowDetail` without
     /// consuming an invoke index. A side set for the same reason
     /// `compacted` is one: it marks a handful of rows without a field
@@ -641,11 +641,11 @@ impl ChatState {
                 );
             }
             // A note is heard by no one but the branch's own future self
-            // — a marker in its own history, same as `append_history`'s
+            // — a marker in its own history, same as `note_history`'s
             // own doc in `types.rs` describes.
             EventPayload::Note { value, .. } => {
                 // **An effect of the program that wrote it, one line
-                // long.** `history.append` is how a program carries
+                // long.** `history.note` is how a program carries
                 // something to its next reply, so it belongs under that
                 // program's block beside the `⚙` calls — not loose in
                 // the transcript, and not at its full length. A run

@@ -887,7 +887,7 @@ mod tests {
         // `card()` shows up as a diff review must look at, not a byte
         // count that silently drifts. Comparing full text (not just a
         // hash) so the diff itself is legible in a failure message.
-        const EXPECTED_LEN: usize = 21396;
+        const EXPECTED_LEN: usize = 21290;
         assert_eq!(
             card().len(),
             EXPECTED_LEN,
@@ -1144,7 +1144,7 @@ mod tests {
         // usually the program that made it rather than a compaction
         // program later with less to go on.
         for member in [
-            "function append(",
+            "function note(",
             "function fetch(",
             "function remove(",
             "function replace(",
@@ -1275,7 +1275,7 @@ mod tests {
     struct Ending {
         /// `finish(text)` was called: the task is over.
         finished: bool,
-        /// `history.append` was called: something was handed to the
+        /// `history.note` was called: something was handed to the
         /// reply after this one. A reply has no `return` (D5), so this
         /// is the other way one can end on purpose.
         appended: bool,
@@ -1318,7 +1318,7 @@ mod tests {
                 // called them, so the stub pushes the value rather than
                 // settling a promise.
                 StepResult::Settle { call } => {
-                    if call.name == crate::machine::TOOL_APPEND_HISTORY {
+                    if call.name == crate::machine::TOOL_NOTE_HISTORY {
                         appended = true;
                     }
                     let result = stub_result(&call.name, &call.args);
@@ -1348,7 +1348,7 @@ mod tests {
     /// falling off the end is no longer an ending at all, and an
     /// exemplar that did it would be teaching the accident the whole
     /// change exists to prevent. Each one either calls `finish(text)`, because
-    /// its task is finished, or `history.append`s the thing the next
+    /// its task is finished, or `history.note`s the thing the next
     /// reply continues from.
     #[test]
     fn every_exemplar_ends_on_purpose() {
@@ -1371,7 +1371,7 @@ mod tests {
             let ending = run_against_stubs(&source)
                 .unwrap_or_else(|e| panic!("exemplar for {:?} trapped: {e}", ex.user));
             // **The two endings a reply has.** `finish(text)` says the task is
-            // finished; `history.append` hands a finding to the reply
+            // finished; `history.note` hands a finding to the reply
             // after this one and rests the branch (D4). There is no
             // `return` to be the second of those any more, and an
             // exemplar that does neither demonstrates a reply that found
@@ -1478,14 +1478,14 @@ mod tests {
                 }
                 // And what counts as an *ending* depends on it too. A
                 // notebook cell cannot `return` at all (D5), so the verb
-                // that hands work to the next reply is `history.append`.
+                // that hands work to the next reply is `history.note`.
                 // A variant's exemplar with no cells is a rest, same
                 // as the shipped card's — see
                 // `every_exemplar_ends_on_purpose`.
                 let ends = cells.is_empty()
                     || ex.assistant.contains("finish(")
                     || ex.assistant.contains("stop(")
-                    || ex.assistant.contains("history.append")
+                    || ex.assistant.contains("history.note")
                     || ex
                         .assistant
                         .lines()
@@ -1509,7 +1509,7 @@ mod tests {
 
     /// **Five positional exemplar tests lived here** — the second
     /// demonstrates `ask` inline, the fourth calls `raise`, the fifth
-    /// uses `append_history` as a short projection, and every one opens
+    /// uses `note_history` as a short projection, and every one opens
     /// with a `tell`. They pinned a ten-exemplar card whose job was to
     /// teach the API by demonstration.
     ///
@@ -1578,11 +1578,11 @@ mod tests {
             "the first ends a finished task, and says the answer on its way out: {}",
             ex[0].assistant
         );
-        // **`history.append`, not `finish()`.** What the second
+        // **`history.note`, not `finish()`.** What the second
         // exemplar demonstrates is handing a finding on to the next
         // reply and *not* ending the task.
         assert!(
-            ex[1].assistant.contains("history.append") && !ex[1].assistant.contains("finish("),
+            ex[1].assistant.contains("history.note") && !ex[1].assistant.contains("finish("),
             "the second hands on and does not stop: {}",
             ex[1].assistant
         );
@@ -1613,7 +1613,7 @@ mod tests {
         // the next program" (every past return still renders). What is
         // left is granularity, and landing before the program ends. A
         // `return`
-        // is a promise the program has to live to keep; `history.append`
+        // is a promise the program has to live to keep; `history.note`
         // is already on the log the moment it is called, and survives
         // the program's own trap — verified on a real run, where note
         // #551 outlived the exception that killed the program holding
@@ -1622,7 +1622,7 @@ mod tests {
         // correctly which attributes were pointless, trapped on
         // `fmt is not defined`, and lost the whole analysis.
         assert!(
-            ex[4].assistant.matches("history.append").count() == 2,
+            ex[4].assistant.matches("history.note").count() == 2,
             "the fifth appends separately, a row each: {}",
             ex[4].assistant
         );
@@ -1655,7 +1655,7 @@ mod tests {
             ex[6].assistant
         );
         assert!(
-            ex[3].assistant.contains("console.log") && !ex[3].assistant.contains("history.append"),
+            ex[3].assistant.contains("console.log") && !ex[3].assistant.contains("history.note"),
             "the loop prints per item rather than appending: {}",
             ex[3].assistant
         );
@@ -1824,7 +1824,7 @@ mod tests {
 
     /// **Every notebook exemplar ends on purpose too**, and under this
     /// transport there are only two ways to: `finish(text)`, because the task is
-    /// finished, or `history.append`, because something is being handed to
+    /// finished, or `history.note`, because something is being handed to
     /// the next reply. `return` is not one — a cell cannot (D5) — so the
     /// third option the shipped exemplars have is simply gone.
     #[test]
@@ -1839,7 +1839,7 @@ mod tests {
         let card = load_from(&dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
         for ex in &card.exemplars {
             let finishes = ex.assistant.contains("finish(");
-            let hands_on = ex.assistant.contains("history.append");
+            let hands_on = ex.assistant.contains("history.note");
             assert!(
                 finishes || hands_on,
                 "notebook exemplar for {:?} neither finishes nor hands on",
@@ -1881,7 +1881,7 @@ mod tests {
         // The second hands on without stopping — which is now `append`,
         // there being no `return`.
         assert!(
-            ex[1].assistant.contains("history.append") && !ex[1].assistant.contains("finish("),
+            ex[1].assistant.contains("history.note") && !ex[1].assistant.contains("finish("),
             "the second hands on and does not stop: {}",
             ex[1].assistant
         );
@@ -1905,7 +1905,7 @@ mod tests {
             ex[3].assistant.contains("Promise.all")
                 && ex[3].assistant.contains("for (")
                 && ex[3].assistant.contains("console.log")
-                && !ex[3].assistant.contains("history.append"),
+                && !ex[3].assistant.contains("history.note"),
             "the fourth does many at once and prints per item: {}",
             ex[3].assistant
         );
@@ -1922,7 +1922,7 @@ mod tests {
         // The fifth keeps two rows rather than one fat value, so a later
         // compaction can drop one and leave the other exact.
         assert!(
-            ex[4].assistant.matches("history.append").count() >= 2,
+            ex[4].assistant.matches("history.note").count() >= 2,
             "the fifth appends separately, a row each: {}",
             ex[4].assistant
         );

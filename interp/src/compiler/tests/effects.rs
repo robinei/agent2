@@ -287,8 +287,8 @@ fn settle_at_dispatch_verbs_yield_settle_with_or_without_await() {
         ("list_agents()", "list_agents", vec![]),
         ("fetch_history(7)", "fetch_history", vec![Value::PosInt(7)]),
         (
-            "append_history(1)",
-            "append_history",
+            "note_history(1)",
+            "note_history",
             vec![Value::PosInt(1)],
         ),
         (

@@ -126,7 +126,7 @@ impl super::Compiler {
                             // because they are what the host dispatches
                             // on.
                             let verb = match method {
-                                "append" => "append_history",
+                                "note" => "note_history",
                                 "fetch" => "fetch_history",
                                 "remove" => "remove_history",
                                 "replace" => "replace_history",
@@ -151,7 +151,7 @@ impl super::Compiler {
                                 }
                                 _ => {
                                     let known =
-                                        "append, fetch, keep, peek, remove and replace";
+                                        "note, fetch, keep, peek, remove and replace";
                                     return self.error(
                                         span,
                                         format!("`history.{method}` is not a thing — history has {known}"),
@@ -689,13 +689,13 @@ impl super::Compiler {
                 self.compile_args(argv);
                 self.emit(Instr::Notify(name.into(), argv.len() as u32), span);
             }
-            "spawn" | "fork" | "list_agents" | "fetch_history" | "answer" | "append_history"
+            "spawn" | "fork" | "list_agents" | "fetch_history" | "answer" | "note_history"
             | "keep_history" | "peek_history"
             | "remove_history" | "replace_history" => {
                 // **The settle-at-dispatch verbs.** None of these leaves
                 // the frame that called it: the host answers each from
                 // the log or the tree it already has — `fetch_history`
-                // reads a row, `answer`/`append_history` append one,
+                // reads a row, `answer`/`note_history` append one,
                 // `remove_history`/`rewrite_history` add an edit to the
                 // batch the running compaction handler is building,
                 // `finish` sets the flag that stops the loop, and

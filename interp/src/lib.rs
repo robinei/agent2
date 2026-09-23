@@ -49,7 +49,7 @@ pub const HARNESS_VERBS: &[&str] = &[
     "finish",
     "fetch_history",
     "answer",
-    "append_history",
+    "note_history",
     "keep_history",
     "peek_history",
     "remove_history",

@@ -518,7 +518,7 @@ mod tests {
         c.user("is PATH right, and does the check pass?");
         c.reply(
             "Reading it first.\n\n```js\nconst f = await tools.read_file(\"PATH\");\n\
-             history.append({ says: f.content });\n```\n",
+             history.note({ says: f.content });\n```\n",
         );
         c.reply(
             "Now the check.\n\n```js\nconst r = await tools.bash(\"make check\");\n\

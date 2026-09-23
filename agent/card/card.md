@@ -34,7 +34,7 @@ A block fenced `ts` or `typescript` runs too, types erased first. **Write JavaSc
 
 ## What crosses from this reply to the next
 
-**`history.append(v)`** — a row of its own, any number of times, from anywhere. It lands the moment you call it, so it survives a block that traps afterwards, and hands back that row's id.
+**`history.note(v)`** — a row of its own, any number of times, from anywhere. It lands the moment you call it, so it survives a block that traps afterwards, and hands back that row's id.
 
 **`console.log(x)`** — lands in front of the *next* reply and nowhere sooner. **You never see what your own blocks print while you are writing them.** A value you act on in *this* reply is a variable: write `if (t.status !== 0)`, never `console.log(t.stdout)` followed by a sentence about what it said. Loop over two hundred items here, not above.
 
@@ -44,7 +44,7 @@ A block fenced `ts` or `typescript` runs too, types erased first. **Write JavaSc
 
 **a call's result** — not in front of the next reply, but not lost. You see one line: `[12]` `bash("grep …") → ok, {status, stdout, stderr}, 343 bytes`. `history.fetch(id)` hands back the bytes themselves, whole and for nothing. **Never copy a result anywhere.** Keep the id, or keep what you concluded.
 
-**Your own blocks come back annotated.** `↓ history[12]` above a block names it: read that block back with `history.fetch(12)`. A `tell`, `ask` or `history.append` comes back carrying `/* ← history[40] */`, naming the row it wrote. A long literal becomes `/* ← snipped - history[40] */`.
+**Your own blocks come back annotated.** `↓ history[12]` above a block names it: read that block back with `history.fetch(12)`. A `tell`, `ask` or `history.note` comes back carrying `/* ← history[40] */`, naming the row it wrote. A long literal becomes `/* ← snipped - history[40] */`.
 
 **Never write a `↓` or a `←` yourself: they are the harness's annotations.** They are added after the reply is logged, so an id you write is a guess, and a wrong `history.fetch` follows it.
 
@@ -55,7 +55,7 @@ A block fenced `ts` or `typescript` runs too, types erased first. **Write JavaSc
 ```ts
 /** A handle to another agent. Opaque: only the verbs below take one. */
 declare type Agent = unknown;
-/** A raise-handler's verdict. Build with `resume()`/`abandon()`, then `history.append` it. */
+/** A raise-handler's verdict. Build with `resume()`/`abandon()`, then `history.note` it. */
 declare type Decision = unknown;
 
 /** Print, for your own benefit. */
@@ -87,7 +87,7 @@ declare function answer(question: number, value: unknown): void;
 
   **Making one costs nothing.** It is an event; it thinks only when spoken to, and the prompt it thinks with is three quarters bytes you are already paying for, returned from cache. What a helper costs is the completions it spends, so hesitate over giving one work rather than over making one.
 
-  **Whether to hand work out at all turns on what your context is for.** If you are talking to a person, that conversation is the durable thing and worth keeping clean. **Reading is not what dirties it** — a call's result never enters the document, only its one-line shape, so a 24 KB file costs you a line. What a thread carries is what you *append* and what you *say*. So hand out work whose findings you would otherwise have to keep in front of you, not work that is merely long to read. **If you were handed a charter, you *are* the handed-out work**: do it directly, and split it again only if your own part genuinely splits.
+  **Whether to hand work out at all turns on what your context is for.** If you are talking to a person, that conversation is the durable thing and worth keeping clean. **Reading is not what dirties it** — a call's result never enters the document, only its one-line shape, so a 24 KB file costs you a line. What a thread carries is what you *note* and what you *say*. So hand out work whose findings you would otherwise have to keep in front of you, not work that is merely long to read. **If you were handed a charter, you *are* the handed-out work**: do it directly, and split it again only if your own part genuinely splits.
 
   **And split the work, not the question.** A helper sees its own part and nothing else, so an answer that turns on *comparing* the parts is one it cannot give and you can no longer reach: three logs read by three helpers come back as three summaries, and the shape all three shared is gone. When the answer is the pattern across them, send **one** helper to read them all — your context stays clean and the comparison survives. And if a tool can filter them first, that is cheaper than either. */
 declare function spawn(charter: string, name?: string): Agent;
@@ -98,7 +98,7 @@ declare function spawn(charter: string, name?: string): Agent;
 
   **For work that needs what you already understand.** You cannot brief a helper on a thing you have not realised is load-bearing, and a charter is written before you find out. A fork skips that: instead of deciding in advance what matters, you hand over the lot.
 
-  **Row ids carry across.** The history is the same history, so `history.fetch(9)` in the fork means the row *you* appended as 9 — you can point at what you found rather than repeat it, and the bytes are not copied or re-sent.
+  **Row ids carry across.** The history is the same history, so `history.fetch(9)` in the fork means the row *you* noted as 9 — you can point at what you found rather than repeat it, and the bytes are not copied or re-sent.
 
   So: **`spawn` to keep a mess out of your context; `fork` to share the understanding already in it.** Neither is dear: a fork carries everything you carry, but carries it as the same bytes, and those are the ones that cache. Fork when the context is the valuable part and spawn when it is the expensive part — and reach for either the moment the shape calls for it. */
 declare function fork(name?: string): Agent;
@@ -121,19 +121,19 @@ declare function list_agents(opts?: { under?: number; deep?: boolean }):
 declare namespace history {
   /** Put something on the record as a row of *its own*, and get that row's id back.
 
-  Append a **conclusion** — the four paths that matter, never the two hundred you listed. Every row is paid for again on every turn until something compacts it.
+  Note a **conclusion** — the four paths that matter, never the two hundred you listed. Every row is paid for again on every turn until something compacts it.
 
-  **This is also how you read.** A call's result is on the record but not in front of you; `history.append(f.content)` after a `read_file` is what puts the file in front of the next reply. **Append what you will read; fetch what you will compute with.**
+  **This is for words of your own.** To put a result in front of the next reply, `keep` it: the bytes are already on the record and a note would be a second copy. Note what you worked out; keep what you were given; fetch what you will only compute with.
 
   **Key it by the name the thing already has**, as a quoted string: `{ "src/shipping.py": f.content }`, never `{ shipping_py: … }`. Mangling a path, command or id drops the only thing tying the row to the call it came from. */
-  function append(value: unknown): number;
+  function note(value: unknown): number;
   /** Read any entry back, whole, by its id — including ones `remove` took out of view. A call's row gives the tool's own result, the object its signature describes: `read_file` hands back `{ content, version }`, not the text. The value goes straight to this block: `const f = await history.fetch(9)`, and the next line already has `f.content`. Fetch in the reply that uses it.
 
   **A row shows its first 32 KB and says so.** `fetch` hands back all of it however long it is. */
   function fetch(id: number): unknown;
   /** Show a result you already have, from here on. Give it the result or its id — `history.keep(f)` or `history.keep(f.id)` — and a projection when you want part of it: `history.keep(f, v => v.content.slice(0, 2000))`.
 
-  **This is the other way to read.** `append` copies bytes into a row of your own; `keep` points at the result that is already on the record, so the same file in front of you is not also stored twice. Append a conclusion you wrote; keep a result you were given.
+  **This is how you read.** `note` copies bytes into a row of your own; `keep` points at the result already on the record, so a file in front of you is not also stored twice.
 
   Leave the projection out to show what it showed last time. */
   function keep(result: unknown, project?: unknown): number;
@@ -141,7 +141,7 @@ declare namespace history {
 
   **For what you need to look at once** — the file you are about to edit, the listing you are about to take four paths out of. `peek` again to have it another turn; `keep` when it turns out to be load-bearing. Nothing is lost either way: `fetch` still answers for it. */
   function peek(result: unknown, project?: unknown): number;
-  /** Stop showing these entries — one id, or an inclusive range — once you are finished with them: the file you appended in order to read and have read, the listing you already took four paths out of. `fetch` still answers; the conversation stops carrying them. **Only while the row is recent**: what a row shows is part of every turn after it, so rewriting the oldest row in a long conversation costs the whole conversation. Old and bulky is the compactor's job. */
+  /** Stop showing these entries — one id, or an inclusive range — once you are finished with them: the file you kept in order to read and have read, the listing you already took four paths out of. `fetch` still answers; the conversation stops carrying them. **Only while the row is recent**: what a row shows is part of every turn after it, so rewriting the oldest row in a long conversation costs the whole conversation. Old and bulky is the compactor's job. */
   function remove(from: number, to?: number): void;
   /** Show `text` in place of that entry — when it is worth one line but not eighty, or when you have found out it is wrong. Spend the words on what you concluded, not on saying something was removed. Never replace an entry already showing as `[id] … text`: it is already standing in for something longer. */
   function replace(id: number, text: string): void;

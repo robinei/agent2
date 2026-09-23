@@ -13,7 +13,7 @@ What crosses from this program to the next, and what does not:
 
   return value       the next program is written with this in front
                      of it. Once, at the end.
-  history.append(v)  the same, any number of times, from anywhere,
+  history.note(v)  the same, any number of times, from anywhere,
                      and each one a row of its own — which is what a
                      return is not, however much you pack into it.
                      Not alongside the return, though: appending what
@@ -40,7 +40,7 @@ What crosses from this program to the next, and what does not:
                      anywhere; keep the id, or keep what you
                      concluded.
 
-Your own programs come back to you annotated: a `tell`, `ask` or `history.append` carries `/* history[40] */`, naming the row it wrote, and a long literal is replaced by `/* snipped - history[40] */` because the row already holds those bytes. You did not write those comments and do not need to; they are there so you can see which call made which row.
+Your own programs come back to you annotated: a `tell`, `ask` or `history.note` carries `/* history[40] */`, naming the row it wrote, and a long literal is replaced by `/* snipped - history[40] */` because the row already holds those bytes. You did not write those comments and do not need to; they are there so you can see which call made which row.
 
 Nothing else crosses — least of all your variables. Every name you bind here goes when this program ends, so a later `ls.stdout` or `content` is a `ReferenceError`, not a value. A program that finds something and neither acts on it nor hands it on has thrown the finding away, and the next program will go and find the same thing again. You are writing this one now; what it fetches arrives when you are no longer here, and only the program after it can read any of it.
 

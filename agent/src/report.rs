@@ -53,7 +53,7 @@ pub const STACK_MAX_FRAMES: usize = 8;
 /// Live on 2026-09-20, and it cost the run its task. The model said
 /// "I need the full files first — the earlier run only showed the
 /// tail", printed them again, got the tail again, and then wrote
-/// `history.append({ code, tests })` over both files — because
+/// `history.note({ code, tests })` over both files — because
 /// appending was the only way left to put a file in front of itself.
 /// That is the copy the card forbids, produced by the harness leaving
 /// no other door.
@@ -83,7 +83,7 @@ pub const CONSOLE_MAX_BYTES: usize = 256 * 1024;
 ///
 /// 4 KB, and it used to be written as half of a `RETURN_MAX_BYTES`
 /// that no longer described anything: a reply has no `return` (D5),
-/// and what a program hands on it hands on through `history.append`.
+/// and what a program hands on it hands on through `history.note`.
 /// A number standing on a deleted idea reads as though it were derived
 /// from something.
 /// **Sized against the document budget, and it moved.** 4096 was
@@ -111,7 +111,7 @@ pub const PREVIEW_MAX_BYTES: usize = 256;
 
 /// Bytes of an appended row shown before it says how much is left.
 ///
-/// **The row is the view; `fetch` is the value.** `history.append` was
+/// **The row is the view; `fetch` is the value.** `history.note` was
 /// the one visible thing in the system with no bound on it, and by
 /// bytes it is how models actually read: 72% of everything appended
 /// across 352 kept runs was a verbatim copy of a result, against a card
@@ -125,7 +125,7 @@ pub const PREVIEW_MAX_BYTES: usize = 256;
 /// file-shaped ones, halving the bytes appended across the corpus.
 ///
 /// Clipped at render and never on the log, like every other bound here,
-/// so one `history.append(f.content)` is a bounded view *and* a whole
+/// so one `history.note(f.content)` is a bounded view *and* a whole
 /// value that `history.fetch` still hands back.
 /// Kept equal to [`CONSOLE_SECTION_MAX_BYTES`]: printing a thing and
 /// appending it are the two ways to put it in front of the next reply,
@@ -361,7 +361,7 @@ mod bare_stack_tests {
 /// The document now has exactly one generous channel and it is that
 /// one — the menu is an index (27.2), a call's arguments are clipped,
 /// a result is a size, and what a program hands on it hands on through
-/// `history.append` — which is a row of its own and compacts like one.
+/// `history.note` — which is a row of its own and compacts like one.
 pub struct CompletionReport {
     /// What a top-level `return` handed back, if anything.
     ///
@@ -391,7 +391,7 @@ pub struct CompletionReport {
     /// there** — 79 KB carried twice, in 19 runs. The card says it in
     /// bold ("Not the bytes of something you read") and the worked
     /// example that broke the rule has been fixed, and a run on
-    /// 2026-09-20 still opened with `history.append({cargoToml:
+    /// 2026-09-20 still opened with `history.note({cargoToml:
     /// cargoToml.content, lib: lib.content, fmt: fmt.content, …})` over
     /// three files it had read in the same program. Prose in the card
     /// is 16 KB from the decision; this is next to it.
@@ -1562,9 +1562,9 @@ fn what_happened(h: &Handback<'_>, cause: &HandbackHow, site: u32) -> String {
                 .unwrap_or_else(|| "(none)".into());
             what.push_str(&clip(&rendered, PAYLOAD_MAX_BYTES));
             what.push_str(
-                "\n\nWrite a reply that decides it. `history.append(resume(value))` \
+                "\n\nWrite a reply that decides it. `history.note(resume(value))` \
                  continues past the raise with `value` becoming the result of the \
-                 `raise(...)` expression; `history.append(abandon())` gives up on it. \
+                 `raise(...)` expression; `history.note(abandon())` gives up on it. \
                  Or do neither and handle this some other way — a reply has no \
                  `return`, so appending the decision is how you make it.",
             );
@@ -2226,7 +2226,7 @@ mod tests {
         let text = derive_report(&tree, leaf, o, 64 * 1024);
         assert!(text.contains("condition `need` raised"), "{text}");
         assert!(text.contains(r#"payload: {"got":1}"#), "{text}");
-        assert!(text.contains("history.append(resume(value))"), "{text}");
+        assert!(text.contains("history.note(resume(value))"), "{text}");
 
         // Condition: a trapped error, not resumable — the report says so
         // in prose now, inline with the diagnostic.
@@ -2250,7 +2250,7 @@ mod tests {
         // **A copy of a result is a second charge for bytes already
         // kept.** 72% of everything appended across 96 kept runs was
         // already on the log; a run on 2026-09-20 opened with
-        // `history.append({lib: lib.content, …})` over files it had read
+        // `history.note({lib: lib.content, …})` over files it had read
         // in the same program.
         let big = "x".repeat(600);
         let mut tree = Tree::new(None);
@@ -2700,7 +2700,7 @@ mod tests {
     /// **What crosses to the next reply is a row, and it crosses
     /// whole.** This was three tests about a `return` value — the
     /// channel a reply no longer has (D5). What replaced it is
-    /// `history.append`, and the thing worth guarding is the same: the
+    /// `history.note`, and the thing worth guarding is the same: the
     /// value the author chose reaches the next reader unclipped, where
     /// everything else in the report is an index entry.
     #[test]

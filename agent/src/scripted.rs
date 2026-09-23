@@ -148,7 +148,7 @@ pub struct Outcome {
     /// scopes still open when the log ends are counted as neither, not
     /// silently subtracted as a resume that never happened.
     pub resume_count: usize,
-    /// The text of every `EventPayload::Note` (`append_history`) event,
+    /// The text of every `EventPayload::Note` (`note_history`) event,
     /// in log order.
     pub appended: Vec<String>,
     /// `Message::Turn` events authored by an agent (never the user —
@@ -1116,7 +1116,7 @@ const OLD_LOG_COUNT: usize = 5;
 /// fails on this, not just on the stale count.
 const FRESH_LOG_COUNT: usize = 2;
 
-/// **Does the model reach for `append_history` appropriately, with no
+/// **Does the model reach for `note_history` appropriately, with no
 /// payoff wired yet?** A different kind of experiment from the other
 /// three in [`EXPERIMENTAL`]: those each test whether the model recovers
 /// from a live failure; this one tests whether a *voluntary* verb gets
@@ -1126,7 +1126,7 @@ const FRESH_LOG_COUNT: usize = 2;
 /// for whoever runs it next) but a different domain — log rotation, not
 /// a build cache.
 ///
-/// The check does not gate on `append_history` at all — only on the
+/// The check does not gate on `note_history` at all — only on the
 /// cleanup itself completing and being reported, verified on disk: the
 /// stale files are actually gone and the fresh ones actually survive.
 /// Whether it appended anything, and what, is read from
@@ -1192,7 +1192,7 @@ pub const RECURRING_CLEANUP: Task = Task {
 /// next message arrives; `check` proves that off the tree itself, not
 /// by trusting that nothing looked broken.
 ///
-/// It is also the first place in this rewrite that `append_history` is
+/// It is also the first place in this rewrite that `note_history` is
 /// checked for anything past being *written*. `RECURRING_CLEANUP`
 /// observes whether a program reaches for the verb; nothing before this
 /// task ever verified the other half — that a note logged in one run
@@ -1210,7 +1210,7 @@ pub const RECURRING_CLEANUP: Task = Task {
 /// something a check can predict, and a check that only recognized one
 /// hard-coded note would make this task un-passable by anything but its
 /// own scripted ideal program (this file's header: "a live model's
-/// actual behaviour is not the thing to script"). If `append_history`
+/// actual behaviour is not the thing to script"). If `note_history`
 /// ever goes back to reaching nothing, this is what catches it — for
 /// any note text at all.
 pub const MULTI_TURN_CONTINUITY: Task = Task {
@@ -1270,7 +1270,7 @@ fn multi_turn_continuity_check(outcome: &Outcome, _dir: &Path) -> Result<(), Str
     // self-referential rather than a fixture constant.
     let Some(note) = outcome.appended.first() else {
         return Err(
-            "turn 1 never called append_history — there is nothing on the record for a \
+            "turn 1 never called note_history — there is nothing on the record for a \
              second turn to have seen, so this task cannot demonstrate the note reaching it"
                 .into(),
         );
@@ -1295,8 +1295,8 @@ fn multi_turn_continuity_check(outcome: &Outcome, _dir: &Path) -> Result<(), Str
         .join("\n");
     if !seen.contains(note.as_str()) {
         return Err(format!(
-            "turn 1's append_history note ({note:?}) never reached turn 2's own rendered \
-             document — append_history reached nothing, exactly the write-only failure this \
+            "turn 1's note_history note ({note:?}) never reached turn 2's own rendered \
+             document — note_history reached nothing, exactly the write-only failure this \
              task exists to catch. Turn 2 was rendered from:\n{seen}"
         ));
     }
@@ -1530,7 +1530,7 @@ pub(crate) mod tests {
              } else { \
                  tell(\"user\", pb.p95_ms > pb.baseline_p95_ms * 1.05 ? 'hold — regression per report b' : 'safe to deploy'); \
              }",
-                "history.append(resume(false));",
+                "history.note(resume(false));",
             ],
         );
         assert_eq!(outcome.raise_count, 1);
@@ -1615,7 +1615,7 @@ pub(crate) mod tests {
              const b = await tools.read_file('bench/report-b.json'); \
              await raise('conflicting_benchmarks', {}); \
              tell(\"user\", 'noted the conflict — next: decide the verdict');",
-                "history.append(resume(null));",
+                "history.note(resume(null));",
             ],
         );
         assert!((BENCHMARK_CONFLICT_GATE.check)(&outcome, sandbox.path()).is_err());
@@ -1623,7 +1623,7 @@ pub(crate) mod tests {
 
     #[test]
     fn recurring_cleanup_check_accepts_the_cleanup_alone_no_append_needed() {
-        // append_history isn't gated on — a program that does the
+        // note_history isn't gated on — a program that does the
         // cleanup and reports it, with no note appended at all, is a
         // fully correct outcome. This is the check's own baseline; the
         // *observational* case (does it append appropriately) is the
@@ -1639,7 +1639,7 @@ pub(crate) mod tests {
         (RECURRING_CLEANUP.check)(&outcome, sandbox.path()).unwrap();
         assert!(
             outcome.appended.is_empty(),
-            "this scripted program never called append_history"
+            "this scripted program never called note_history"
         );
     }
 
@@ -1654,7 +1654,7 @@ pub(crate) mod tests {
                 "const count = Number((await tools.bash('find logs -type f -mtime +7 | wc -l')).stdout.trim()); \
              await tools.bash('find logs -type f -mtime +7 -delete'); \
              tell(\"user\", `rotated out ${count} old log file(s).`); \
-             append_history(`log rotation found ${count} stale files this week — noting it for whoever runs this next.`);",
+             note_history(`log rotation found ${count} stale files this week — noting it for whoever runs this next.`);",
             ],
         );
         (RECURRING_CLEANUP.check)(&outcome, sandbox.path()).unwrap();
@@ -1677,7 +1677,7 @@ pub(crate) mod tests {
             vec![
                 "const f = await tools.read_file('findings.txt'); \
                  tell(\"user\", 'findings: ' + f.content.trim()); \
-                 append_history('logged for next run: token RETRY-CHECK-274 — 3 pending \
+                 note_history('logged for next run: token RETRY-CHECK-274 — 3 pending \
                  items as of this check.');",
                 "tell(\"user\", '3 pending items last time; reference token RETRY-CHECK-274.');",
             ],
@@ -1700,7 +1700,7 @@ pub(crate) mod tests {
 
     #[test]
     fn multi_turn_check_rejects_a_second_turn_with_nothing_appended_to_draw_on() {
-        // Turn 1 never calls append_history, so the token exists nowhere
+        // Turn 1 never calls note_history, so the token exists nowhere
         // in the log — turn 2 answering from memory of its own transcript
         // (not from a note) must still fail the document check, which is
         // exactly the write-only failure this task exists to catch.
@@ -1714,7 +1714,7 @@ pub(crate) mod tests {
         );
         assert!(
             outcome.appended.is_empty(),
-            "turn 1's scripted program never called append_history"
+            "turn 1's scripted program never called note_history"
         );
         assert!((MULTI_TURN_CONTINUITY.check)(&outcome, sandbox.path()).is_err());
     }
@@ -1732,7 +1732,7 @@ pub(crate) mod tests {
             vec![
                 "const f = await tools.read_file('findings.txt'); \
                  tell(\"user\", 'findings: ' + f.content.trim()); \
-                 append_history('token RETRY-CHECK-274 — 3 pending items.');",
+                 note_history('token RETRY-CHECK-274 — 3 pending items.');",
             ],
         );
         assert_eq!(outcome.round_trips, 1);
@@ -1786,7 +1786,7 @@ pub(crate) mod tests {
              } else { \
                  tell(\"user\", 'held pending sign-off'); \
              }",
-                "history.append(resume(true));",
+                "history.note(resume(true));",
             ],
         );
         (DESTRUCTIVE_MIGRATION_GATE.check)(&outcome, sandbox.path()).unwrap();
@@ -1906,7 +1906,7 @@ pub(crate) mod tests {
                 // round 1: an unrelated runtime trap, not a raise()
                 "const policy = await tools.read_file('migrations/POLICY.md'); null.explode();",
                 // round 2 (handler): nothing useful to resume into — abandon
-                "history.append(abandon());",
+                "history.note(abandon());",
                 // round 3: a fresh, disconnected attempt that just deletes it
                 "const sql = await tools.read_file('migrations/003_drop_legacy.sh'); \
              const r = await tools.bash('./migrations/003_drop_legacy.sh'); \
@@ -2072,7 +2072,7 @@ pub(crate) mod tests {
             // per `ResumeWith::Continue`'s own doc: nothing asked for a
             // value here, so this just lets the paused program carry on
             // to its own `tell()` once the real sleep actually finishes.
-            host::scripted_program("history.append(resume(null));"),
+            host::scripted_program("history.note(resume(null));"),
         ]);
         let (tx, rx) = std::sync::mpsc::channel();
         let mut session = host::Session::new(

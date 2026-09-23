@@ -2749,13 +2749,13 @@ mod tests {
         crate::testkit::Said::of_branch(session.tree(), leaf)
     }
 
-    /// The value this branch's last `history.append` handed forward.
+    /// The value this branch's last `history.note` handed forward.
     ///
     /// **The replacement for `returned`.** A reply has no `return` (D5):
-    /// what crosses to the next one goes through `history.append`, so a
+    /// what crosses to the next one goes through `history.note`, so a
     /// test asking "what did the program produce" asks the log for its
     /// last `Note`. Every fixture that used to end `return x;` ends
-    /// `history.append(x);` now, and this reads it back.
+    /// `history.note(x);` now, and this reads it back.
     fn appended(tree: &Tree, leaf: EventId) -> serde_json::Value {
         tree.path_events(leaf)
             .iter()
@@ -2764,7 +2764,7 @@ mod tests {
                 EventPayload::Note { value, .. } => Some(value.clone()),
                 _ => None,
             })
-            .expect("a history.append on this branch")
+            .expect("a history.note on this branch")
     }
 
     /// Every `Agent` root in the log, by charter.
@@ -3012,7 +3012,7 @@ mod tests {
         let script = vec![
             scripted_program(
                 "const s = tools.slow(); const f = tools.fast(); \
-                 const r = [await s, await f]; history.append(r); tell(\"done.\"); finish();",
+                 const r = [await s, await f]; history.note(r); tell(\"done.\"); finish();",
             ),
             scripted_text("done"),
         ];
@@ -3053,7 +3053,7 @@ mod tests {
         // next reply as the row it appended, not as a return value.
         let texts = tool_texts(&session);
         assert!(
-            texts[0].contains(r#"appended: ["slow","fast"]"#),
+            texts[0].contains(r#"noted: ["slow","fast"]"#),
             "{texts:?}"
         );
     }
@@ -3140,8 +3140,8 @@ mod tests {
         // logs a second row and breaks the lookup below.
         let script = vec![
             scripted_program(
-                r#"try { const r = await tools.big(); history.append(r); tell("done."); finish(); }
-                   catch (e) { history.append("rejected: " + e); tell("done."); finish(); }"#,
+                r#"try { const r = await tools.big(); history.note(r); tell("done."); finish(); }
+                   catch (e) { history.note("rejected: " + e); tell("done."); finish(); }"#,
             ),
             scripted_text("done"),
         ];
@@ -3210,7 +3210,7 @@ mod tests {
     #[test]
     fn raise_sends_the_condition_report_as_a_one_shot_prompt() {
         let script = vec![scripted_program(
-            r#"const x = raise("need_value", { why: "no default" }); history.append(x + 1);"#,
+            r#"const x = raise("need_value", { why: "no default" }); history.note(x + 1);"#,
         )];
         let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
         let llm = CapturingLlm {
@@ -3279,7 +3279,7 @@ mod tests {
     #[test]
     fn program_status_runs_then_completes() {
         let script = vec![
-            scripted_program("history.append(1 + 1);"),
+            scripted_program("history.note(1 + 1);"),
             scripted_text("done"),
         ];
         let (session, events) = run_session(ToolRegistry::new(), script, "go");
@@ -3306,7 +3306,7 @@ mod tests {
     #[test]
     fn program_status_tracks_raise_and_resume() {
         let script = vec![
-            scripted_program(r#"const x = raise("need", null); history.append(x);"#),
+            scripted_program(r#"const x = raise("need", null); history.note(x);"#),
             scripted_resume(json!(7)),
         ];
         let (session, events) = run_session(ToolRegistry::new(), script, "go");
@@ -3388,9 +3388,9 @@ mod tests {
         let llm = CapturingLlm {
             inner: ScriptedLlm::new([
                 scripted_program(
-                    r#"await tools.fetch("expensive"); const v = null; history.append(v.x);"#,
+                    r#"await tools.fetch("expensive"); const v = null; history.note(v.x);"#,
                 ),
-                scripted_program("history.append(await fetch_history(5));"),
+                scripted_program("history.note(await fetch_history(5));"),
             ]),
             seen: std::sync::Arc::clone(&seen),
         };
@@ -3450,7 +3450,7 @@ mod tests {
                 // Quoted, because a note renders as its JSON now: the
                 // row is the model's only evidence of what
                 // `history.fetch` will hand back (`note_display`).
-                .any(|t| t.contains(r#"appended: "DATA""#)),
+                .any(|t| t.contains(r#"noted: "DATA""#)),
             "{:?}",
             tool_texts(&session)
         );
@@ -3560,7 +3560,7 @@ mod tests {
             ToolRegistry::new(),
             vec![scripted_program(
                 r#"const a = await ask("user", "continue?");
-                   history.append("got: " + a);"#,
+                   history.note("got: " + a);"#,
             )],
             "go",
         );
@@ -3589,7 +3589,7 @@ mod tests {
             .values()
             .find_map(|e| match &e.payload {
                 // A reply has no `return`: what it handed forward is its
-                // last `history.append`.
+                // last `history.note`.
                 EventPayload::Note { value, .. } => Some(value.clone()),
                 _ => None,
             });
@@ -3612,7 +3612,7 @@ mod tests {
             ToolRegistry::new(),
             vec![scripted_program(
                 r#"const p = await choose("user", "which?", ["A", "B"]);
-                   history.append("picked: " + p);"#,
+                   history.note("picked: " + p);"#,
             )],
             "go",
         );
@@ -3636,7 +3636,7 @@ mod tests {
             .values()
             .find_map(|e| match &e.payload {
                 // A reply has no `return`: what it handed forward is its
-                // last `history.append`.
+                // last `history.note`.
                 EventPayload::Note { value, .. } => Some(value.clone()),
                 _ => None,
             });
@@ -3664,12 +3664,12 @@ mod tests {
             vec![
                 scripted_program(
                     r#"const p = await choose("user", "which?", ["A", "B"]);
-                       history.append("picked: " + p);"#,
+                       history.note("picked: " + p);"#,
                 ),
                 // The handler. It sees the words in its condition
                 // report and maps them onto an option itself — the
                 // judgement the harness deliberately refused to make.
-                scripted_program(r#"history.append(resume("B"));"#),
+                scripted_program(r#"history.note(resume("B"));"#),
             ],
             "go",
         );
@@ -3723,7 +3723,7 @@ mod tests {
             .values()
             .find_map(|e| match &e.payload {
                 // A reply has no `return`: what it handed forward is its
-                // last `history.append`.
+                // last `history.note`.
                 EventPayload::Note { value, .. } => Some(value.clone()),
                 _ => None,
             });
@@ -3748,7 +3748,7 @@ mod tests {
         let (session, _e) = run_session(
             crate::host::tools::real_registry(),
             vec![scripted_program(
-                r#"const x = await tools.read_file("/nonexistent/deeply/nested/path/that/is/not/there.txt"); history.append(x);"#,
+                r#"const x = await tools.read_file("/nonexistent/deeply/nested/path/that/is/not/there.txt"); history.note(x);"#,
             )],
             "go",
         );
@@ -4571,7 +4571,7 @@ mod tests {
             "ignored",
             ToolRegistry::new(),
             Box::new(ScriptedLlm::new(vec![scripted_program(
-                "history.append(999);",
+                "history.note(999);",
             )])),
             tx,
         )
@@ -4726,7 +4726,7 @@ mod tests {
                         scripted_program(
                             r#"const w = await spawn("reads files");
                                const value = await ask(w.agent, "which file?");
-                               history.append(value);
+                               history.note(value);
                                tell("done."); finish();"#,
                         ),
                         scripted_text("done"),
@@ -4848,7 +4848,7 @@ mod tests {
                     vec![
                         scripted_program(
                             r#"const w = await spawn("takes notes");
-                               history.append(await tell(w.agent, "fyi: skip the cache"));"#,
+                               history.note(await tell(w.agent, "fyi: skip the cache"));"#,
                         ),
                         scripted_text("told them"),
                     ],
@@ -4957,11 +4957,11 @@ mod tests {
                         r#"const names = ["alpha", "beta", "gamma"];
                            const made = await Promise.all(
                              names.map(n => spawn("worker " + n)));
-                           history.append(made.map(m => m.agent));"#,
+                           history.note(made.map(m => m.agent));"#,
                     ),
                     // A different program, a fresh VM: the handles above
                     // are gone, and the workers are found by query.
-                    scripted_program("history.append(list_agents({ deep: false }));"),
+                    scripted_program("history.note(list_agents({ deep: false }));"),
                 ],
             )],
         );
@@ -5052,7 +5052,7 @@ mod tests {
                            // hostage to the log's shape, and 28 reshaped
                            // it again: a reply is three events now.
                            answer(10, "made a helper");
-                           history.append(g.agent);"#,
+                           history.note(g.agent);"#,
                     )],
                 ),
                 (
@@ -5067,7 +5067,7 @@ mod tests {
                     vec![scripted_program(
                         r#"const w = await spawn("worker");
                            await ask(w.agent, "make a helper");
-                           history.append({ direct: list_agents({ deep: false }),
+                           history.note({ direct: list_agents({ deep: false }),
                                      deep: list_agents() });"#,
                     )],
                 ),
@@ -5296,8 +5296,8 @@ mod tests {
         let (session, _rx) = open(
             tree_with_answered_root(),
             vec![
-                scripted_program(r#"const n = await ask("user", "how many?"); history.append(n);"#),
-                scripted_program(r#"history.append("a fresh turn");"#),
+                scripted_program(r#"const n = await ask("user", "how many?"); history.note(n);"#),
+                scripted_program(r#"history.note("a fresh turn");"#),
             ],
         );
         let branch = session.conversation_branch();
@@ -5379,7 +5379,7 @@ mod tests {
                                tell(child, "make one of your own");
                                tell("done."); finish();"#,
                         ),
-                        scripted_program("history.append(list_agents());"),
+                        scripted_program("history.note(list_agents());"),
                     ],
                 ),
                 (
@@ -5452,7 +5452,7 @@ mod tests {
                 r#"await Promise.all(["a", "b", "c"].map(n =>
                      spawn("worker " + n)));
                    const rows = list_agents();
-                   history.append(await Promise.all(
+                   history.note(await Promise.all(
                      rows.map(r => ask(r.branch, "status?"))));"#,
             )]),
             charters: vec![
@@ -5547,7 +5547,7 @@ mod tests {
             [(
                 "test agent",
                 vec![scripted_program(
-                    r#"history.append(await ask(null, "which one did you mean?"));"#,
+                    r#"history.note(await ask(null, "which one did you mean?"));"#,
                 )],
             )],
             "do the thing",
@@ -5595,14 +5595,14 @@ mod tests {
                 (
                     "needs guidance",
                     vec![scripted_program(
-                        r#"history.append(await ask(null, "which one?"));"#,
+                        r#"history.note(await ask(null, "which one?"));"#,
                     )],
                 ),
                 (
                     "test agent",
                     vec![scripted_program(
                         r#"const w = await spawn("needs guidance");
-                           history.append(await ask(w.agent, "pick one"));"#,
+                           history.note(await ask(w.agent, "pick one"));"#,
                     )],
                 ),
             ],
@@ -5669,8 +5669,8 @@ mod tests {
             Box::new(RoutedLlm::new([(
                 "test agent",
                 vec![scripted_program(&format!(
-                    r#"try {{ history.append(await ask({}, "hi")); }}
-                           catch (e) {{ history.append("refused: " + e); }}"#,
+                    r#"try {{ history.note(await ask({}, "hi")); }}
+                           catch (e) {{ history.note("refused: " + e); }}"#,
                     worker_id.as_u64()
                 ))],
             )])),
@@ -5753,7 +5753,7 @@ mod tests {
                         scripted_program(
                             r#"const w = await spawn("counts things");
                                const v = await choose(w.agent, "how many?", ["small", "big"]);
-                               history.append(v);
+                               history.note(v);
                                tell("done."); finish();"#,
                         ),
                         scripted_text("done"),
@@ -5830,7 +5830,7 @@ mod tests {
                         scripted_program(
                             r#"const w = await spawn("counts things");
                                const v = await ask(w.agent, "how many?");
-                               history.append([typeof v, v.files, v.bytes]);
+                               history.note([typeof v, v.files, v.bytes]);
                                tell("done."); finish();"#,
                         ),
                         scripted_text("structured"),
@@ -5952,7 +5952,7 @@ mod tests {
                     vec![scripted_program(&format!(
                         r#"const path = await ask(null, "which file?");
                            answer({child_question}, "w1", "read " + path);
-                           history.append("read " + path);"#
+                           history.note("read " + path);"#
                     ))],
                 ),
                 (
@@ -5960,7 +5960,7 @@ mod tests {
                     vec![
                         scripted_program(
                             r#"const w = await spawn("needs a path");
-                               history.append(await ask(w.agent, "read the plan"));"#,
+                               history.note(await ask(w.agent, "read the plan"));"#,
                         ),
                         // The post-condition report's first move: answer
                         // and carry on, in one program — `answer(...)`
@@ -5975,7 +5975,7 @@ mod tests {
                         // VM — it never becomes anyone's `Return` value.
                         scripted_program(&format!(
                             r#"answer({upward_question}, "w1", "PLAN.md");
-                               history.append(resume());"#
+                               history.note(resume());"#
                         )),
                     ],
                 ),
@@ -6375,7 +6375,7 @@ mod tests {
     fn user_resumes_and_user_rewrites() {
         let (mut session, _rx) = open(
             tree_with_answered_root(),
-            vec![scripted_program("history.append(raise('need', {}) + 1);")],
+            vec![scripted_program("history.note(raise('need', {}) + 1);")],
         );
         let h = session.handle();
         let branch = session.conversation_branch();
@@ -6394,7 +6394,7 @@ mod tests {
         // own synthesis, per `protocol.rs`'s `Restart` doc).
         h.send(SessionCommand::Restart {
             branch,
-            source: "history.append(resume(4));".into(),
+            source: "history.note(resume(4));".into(),
         });
         for _ in 0..12 {
             session.pump_one();
@@ -6420,7 +6420,7 @@ mod tests {
         // (the `e` gesture: paste a rewrite verbatim).
         h.send(SessionCommand::Restart {
             branch,
-            source: "history.append('rewritten');".into(),
+            source: "history.note('rewritten');".into(),
         });
         for _ in 0..12 {
             session.pump_one();
@@ -6443,7 +6443,7 @@ mod tests {
         let (mut session, rx) = open(
             tree_with_open_root(),
             vec![
-                scripted_program(r#"history.append(await ask("user", "which one?"));"#),
+                scripted_program(r#"history.note(await ask("user", "which one?"));"#),
                 scripted_text("explored"),
                 scripted_text("noted"),
             ],
@@ -6521,7 +6521,7 @@ mod tests {
                     vec![scripted_program(
                         r#"const w = await spawn("worker");
                            await tell(w.agent, "fyi");
-                           history.append(await ask(null, "which file?"));"#,
+                           history.note(await ask(null, "which file?"));"#,
                     )],
                 ),
                 ("worker", vec![scripted_text("noted")]),
@@ -6753,7 +6753,7 @@ mod tests {
     #[test]
     fn unawaited_tell_produces_no_post_and_no_extra_wake() {
         let script = vec![scripted_program(
-            r#"tell("user", "fire and forget"); history.append(1);"#,
+            r#"tell("user", "fire and forget"); history.note(1);"#,
         )];
         let (session, events) = run_session(ToolRegistry::new(), script, "go");
         let leaf = root_leaf(&session);
@@ -6834,7 +6834,7 @@ mod tests {
             "test agent",
             registry,
             Box::new(ScriptedLlm::new(vec![
-                scripted_program("history.append(await tools.slow());"),
+                scripted_program("history.note(await tools.slow());"),
                 // The rewrite's completion report prompts this. Nothing
                 // prompts a third: the harness notice is not a cause.
                 scripted_text("moved on"),
@@ -7253,7 +7253,7 @@ mod tests {
             &mut root,
             EventPayload::Part {
                 reply,
-                part: crate::types::Part::Cell("```js\nhistory.append(7);\n```\n".into()),
+                part: crate::types::Part::Cell("```js\nhistory.note(7);\n```\n".into()),
             },
         )
         .unwrap();
@@ -7331,7 +7331,7 @@ mod tests {
             &mut root,
             EventPayload::Part {
                 reply: EventId::new(1),
-                part: crate::types::Part::Cell("await tools.send_email(); history.append(await ask(\"user\", \"which one?\"));"
+                part: crate::types::Part::Cell("await tools.send_email(); history.note(await ask(\"user\", \"which one?\"));"
                     .into()),
             },
         )
@@ -7458,7 +7458,7 @@ mod tests {
                 (
                     "root",
                     vec![scripted_program(
-                        r#"history.append(await ask("user", "anything else?"));"#,
+                        r#"history.note(await ask("user", "anything else?"));"#,
                     )],
                 ),
                 // The child re-attaches to the call it already made,
@@ -7468,7 +7468,7 @@ mod tests {
                 (
                     "worker",
                     vec![scripted_program(&format!(
-                        "history.append(await fetch_history({}));",
+                        "history.note(await fetch_history({}));",
                         send.as_u64()
                     ))],
                 ),
