@@ -929,6 +929,9 @@ fn print_session_event(event: &SessionEvent) {
                 EventPayload::RequestFailed { message } => {
                     println!("{head} request failed: {message}");
                 }
+                EventPayload::Render { of, mode, .. } => {
+                    println!("{head} {mode:?} #{}", of.as_u64());
+                }
                 EventPayload::Fork { name } => {
                     let name = name
                         .as_deref()

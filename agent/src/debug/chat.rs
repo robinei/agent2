@@ -745,6 +745,10 @@ impl ChatState {
                 self.thinking_streaming.retain(|(b, _)| *b != branch);
             }
             EventPayload::Compaction { .. } => {}
+            // The pane shows the reply's own blocks; what the model
+            // asked to see of a result is a document fact, not a
+            // transcript one.
+            EventPayload::Render { .. } => {}
             // **A failed request is on the transcript, not just in the
             // status line.** The pane is the person's record of what
             // happened; a branch that went quiet because the provider

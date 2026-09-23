@@ -121,6 +121,8 @@ pub const TOOL_FETCH_HISTORY: &str = "fetch_history";
 /// the floor that makes a bound necessary at all.
 const COMPACTION_ATTEMPTS: u32 = 2;
 
+pub const TOOL_KEEP_HISTORY: &str = "keep_history";
+pub const TOOL_PEEK_HISTORY: &str = "peek_history";
 pub const TOOL_REMOVE_HISTORY: &str = "remove_history";
 pub const TOOL_REPLACE_HISTORY: &str = "replace_history";
 /// `history.slice(id, from, to?)` — show a window of an entry's own
@@ -2805,6 +2807,53 @@ impl Runner {
                 }
                 Ok(true)
             }
+            TOOL_KEEP_HISTORY | TOOL_PEEK_HISTORY => {
+                let args = self.call_args_json(&call.args);
+                // **Either the result or its id.** A tool hands back an
+                // object carrying `id`, so `keep(f)` is what a program
+                // naturally writes and `keep(f.id)` is what it writes
+                // when it has only kept the number. Refusing one of
+                // them would be a rule with nothing behind it.
+                let (id, from_object) = match args.first() {
+                    Some(v) if v.is_u64() => (v.as_u64(), None),
+                    Some(v) => (
+                        v.get("id").and_then(|i| i.as_u64()),
+                        Some(v.clone()),
+                    ),
+                    None => (None, None),
+                };
+                let Some(id) = id.filter(|n| *n > 0).map(EventId::new) else {
+                    let verb = call.name.as_str();
+                    self.settle_err(&format!(
+                        "{verb}(result) needs a tool result, or the id of one — \
+                         `{verb}(f)` or `{verb}(f.id)`"
+                    ));
+                    return Ok(true);
+                };
+                let mode = if call.name.as_str() == TOOL_KEEP_HISTORY {
+                    crate::types::RenderMode::Kept
+                } else {
+                    crate::types::RenderMode::Peeked
+                };
+                // **No projection means the one already in force.** A
+                // row shown once and wanted again should not have to
+                // restate how it was cut; and because a result never
+                // changes, re-applying the same projection to the same
+                // value is the value already stored.
+                let value = match args.get(1).filter(|v| !v.is_null()) {
+                    Some(v) => v.clone(),
+                    None => self
+                        .last_rendered_value(tree, id)
+                        .or(from_object)
+                        .unwrap_or(serde_json::Value::Null),
+                };
+                tree.append(
+                    &mut self.spine,
+                    EventPayload::Render { of: id, mode, value },
+                )?;
+                self.settle(Ok(serde_json::json!(id.as_u64())));
+                Ok(true)
+            }
             TOOL_REMOVE_HISTORY | TOOL_REPLACE_HISTORY | TOOL_SLICE_HISTORY => {
                 // Nothing leaves the process and nothing settles later.
                 // The op joins the batch this handler is building and
@@ -3987,6 +4036,22 @@ impl Runner {
         Ok(Some(self.render_request(tree)))
     }
 
+    /// What the last `keep`/`peek` of this row chose to show.
+    ///
+    /// A result never changes, so re-applying the projection that was
+    /// used before would produce exactly this — which is why asking for
+    /// a row again without saying how to cut it can simply reuse it,
+    /// and why that is not an approximation.
+    fn last_rendered_value(&self, tree: &Tree, of: EventId) -> Option<serde_json::Value> {
+        tree.path_events(self.spine.leaf_id)
+            .iter()
+            .rev()
+            .find_map(|e| match &e.payload {
+                EventPayload::Render { of: o, value, .. } if *o == of => Some(value.clone()),
+                _ => None,
+            })
+    }
+
     /// Commit a finished compaction handler's batch, or say why not.
     ///
     /// `compaction::compact` validates the whole batch against the log
@@ -4856,6 +4921,37 @@ pub(crate) fn menu_rows(
                 // measured that day were computed, so the source shows
                 // `tell("--- " + f.content)` and not one byte of what
                 // was actually said.
+                // **A result the program asked to see**, under the id
+                // of the call it came from. `Kept` shows from here on;
+                // `Peeked` shows only while no reply has been logged
+                // after it, which is one request exactly — no timer,
+                // and a reopened log renders the same as a live one.
+                EventPayload::Render { of, mode, value } => {
+                    if *mode == crate::types::RenderMode::Peeked
+                        && settlements.iter().any(|e| {
+                            e.id > event.id && matches!(e.payload, EventPayload::Reply)
+                        })
+                    {
+                        return None;
+                    }
+                    let body = crate::report::clip(
+                        &note_text(value),
+                        crate::report::NOTE_ROW_MAX_BYTES,
+                    );
+                    let gone = if *mode == crate::types::RenderMode::Peeked {
+                        " — shown once; it is not here next time"
+                    } else {
+                        ""
+                    };
+                    Some(Artifact {
+                        id,
+                        label: String::new(),
+                        state: ArtifactState::Whole(format!(
+                            "from [{}]{gone}:\n{body}",
+                            of.as_u64()
+                        )),
+                    })
+                }
                 EventPayload::Call(Call::Send {
                     to,
                     text,
@@ -5907,6 +6003,7 @@ mod tests {
                 EventPayload::Post { .. } => "Post",
                 EventPayload::Reply => "Reply",
                 EventPayload::RequestFailed { .. } => "RequestFailed",
+                EventPayload::Render { .. } => "Render",
                 EventPayload::Compaction { .. } => "Compaction",
                 EventPayload::Part { .. } => "Part",
                 EventPayload::ReplyEnd { .. } => "ReplyEnd",
@@ -8742,6 +8839,51 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// **`keep` and `peek` take a value or a lambda, a result or an id.**
+    ///
+    /// The lambda is why: it lets the result stay anonymous. The value
+    /// form has to name it twice — once to keep, once to project — and
+    /// a name costs a `const` the next cell cannot reuse.
+    #[test]
+    fn keep_and_peek_project_with_a_lambda_or_a_value() {
+        let (mut tree, mut state) = setup_under();
+        user_post(&mut state, &mut tree, "go");
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::LlmResponse(crate::host::scripted_markdown(
+                    "```js\n\
+                     history.keep(2, \"beta\");\n\
+                     history.peek({ id: 2 }, (r) => \"from \" + r.id);\n\
+                     ```\n",
+                )),
+            )
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+
+        let shown: Vec<(crate::types::RenderMode, String)> = tree
+            .path_events(state.spine.leaf_id)
+            .iter()
+            .filter_map(|e| match &e.payload {
+                EventPayload::Render { mode, value, .. } => {
+                    Some((*mode, note_text(value)))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(shown.len(), 2, "both landed: {shown:?}");
+        assert_eq!(
+            shown[0],
+            (crate::types::RenderMode::Kept, "beta".to_owned()),
+            "a plain value projection lands, and a bare id names the row"
+        );
+        assert_eq!(
+            shown[1],
+            (crate::types::RenderMode::Peeked, "from 2".to_owned()),
+            "the lambda ran, was given the whole object, and its result was stored"
+        );
     }
 
     /// **A stray fence is not a message.**

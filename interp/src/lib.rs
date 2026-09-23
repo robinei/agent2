@@ -50,6 +50,8 @@ pub const HARNESS_VERBS: &[&str] = &[
     "fetch_history",
     "answer",
     "append_history",
+    "keep_history",
+    "peek_history",
     "remove_history",
     "replace_history",
     "slice_history",

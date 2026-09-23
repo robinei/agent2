@@ -2391,6 +2391,7 @@ fn leaf_summary(tree: &Tree, leaf: EventId) -> String {
             format!("Answer to #{}: {value}", question.as_u64())
         }
         EventPayload::RequestFailed { message } => format!("request failed: {message}"),
+        EventPayload::Render { of, mode, .. } => format!("{mode:?} #{}", of.as_u64()),
         EventPayload::Post { from, origin } => {
             format!(
                 "Post: {}",
@@ -2788,6 +2789,7 @@ mod tests {
                 EventPayload::Post { .. } => "Post",
                 EventPayload::Reply => "Reply",
                 EventPayload::RequestFailed { .. } => "RequestFailed",
+                EventPayload::Render { .. } => "Render",
                 EventPayload::Restart => "Restart",
                 EventPayload::Part { .. } => "Part",
                 EventPayload::Call(_) => "Call",

@@ -87,6 +87,36 @@ pub enum EventPayload {
         usage: crate::host::Usage,
     },
 
+    /// **A result put in front of the next reply**, with the call it
+    /// came from. Parent: the owning agent's spine.
+    ///
+    /// A call's result is not rendered: the document shows one line
+    /// saying the call happened and how big its answer was, and the
+    /// bytes stay in the log for `fetch`. This is how a program asks
+    /// for the bytes themselves to be shown, and for how long.
+    ///
+    /// **Why it carries the value rather than naming a projection.**
+    /// The projection is applied once, where the value is already in
+    /// scope, and the result is stored. Rendering runs in five places
+    /// — the document, `transcript`, `capture`, replay and the TUI —
+    /// and a projection re-applied at render would put a VM behind
+    /// every one of them, and a throwing projection would break reading
+    /// the record.
+    ///
+    /// **Provenance is the point.** `history.append(f.content)` wrote a
+    /// row that had lost its origin: a value, with the call that
+    /// produced it sitting elsewhere, unlinked. 988 of those in the
+    /// corpus, and a staleness check that had to guess by matching
+    /// bytes. This row names its call, so what it holds, where it came
+    /// from and at which version are all facts rather than inferences.
+    Render {
+        /// The `Call` whose result this shows.
+        of: EventId,
+        mode: RenderMode,
+        /// The projected value, computed once at the call site.
+        value: serde_json::Value,
+    },
+
     /// **A request went out and came back an error.** Parent: the
     /// owning agent's spine. Renders to chat: no — the model is not
     /// told that the provider failed, because it never saw the request
@@ -430,6 +460,27 @@ impl Post {
 }
 
 /// One piece of a reply, exactly as it arrived (28.A).
+/// How long a shown result stays shown.
+///
+/// The state machine is small and every edge is reachable: a row is
+/// hidden until `keep` or `peek` names it, `keep` on a peeked row
+/// promotes it, `peek` on a kept row spends it — one more turn, then
+/// gone — and `peek` on a peeked row renews it for one more.
+/// `history.remove` hides it from any state.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RenderMode {
+    /// Shown from here on.
+    Kept,
+    /// Shown in the next request and no further.
+    ///
+    /// **Derived, never counted down.** A peek renders exactly while no
+    /// `Reply` has been logged after it: when the request carrying it is
+    /// built the reply it is for does not exist yet, and the moment that
+    /// reply lands the peek stops rendering. No timer, no state on the
+    /// runner, and a reopened log gets the same answer as a live one.
+    Peeked,
+}
+
 /// What a size was measured in — see [`EventPayload::Compaction`].
 ///
 /// Both are real limits and neither converts to the other: bytes are

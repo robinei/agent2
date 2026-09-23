@@ -131,8 +131,28 @@ impl super::Compiler {
                                 "remove" => "remove_history",
                                 "replace" => "replace_history",
                                 "slice" => "slice_history",
+                                // Through the helper, so the projection
+                                // may be a lambda: a settle verb takes
+                                // values, and a function pushed onto
+                                // that stack is not one.
+                                "keep" | "peek" => {
+                                    let Some(label) = self.find_root_callee_label("__historyShow")
+                                    else {
+                                        return self.error(
+                                            span,
+                                            "`history.keep`/`history.peek` need their prelude \
+                                             helper, which was not compiled".to_owned(),
+                                        );
+                                    };
+                                    let k = self.intern_string(method);
+                                    self.emit(Instr::PushStr(k), span);
+                                    self.compile_args(&argv);
+                                    self.emit(Instr::Call(label, 1 + argv.len() as u32), span);
+                                    return;
+                                }
                                 _ => {
-                                    let known = "append, fetch, remove, replace and slice";
+                                    let known =
+                                        "append, fetch, keep, peek, remove, replace and slice";
                                     return self.error(
                                         span,
                                         format!("`history.{method}` is not a thing — history has {known}"),
@@ -671,6 +691,7 @@ impl super::Compiler {
                 self.emit(Instr::Notify(name.into(), argv.len() as u32), span);
             }
             "spawn" | "fork" | "list_agents" | "fetch_history" | "answer" | "append_history"
+            | "keep_history" | "peek_history"
             | "remove_history" | "replace_history" | "slice_history" => {
                 // **The settle-at-dispatch verbs.** None of these leaves
                 // the frame that called it: the host answers each from

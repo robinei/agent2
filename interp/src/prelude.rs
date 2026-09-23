@@ -278,6 +278,29 @@ const REPLACE_ALL: &str = r#"function __replaceAll(s, pat, rep) {
   return out + s.slice(last);
 }"#;
 
+/// `history.keep(x, p)` / `history.peek(x, p)` — lowered to a helper so
+/// the projection may be a **lambda** as well as a value.
+///
+/// A settle verb takes values off the stack; a function pushed there
+/// would serialize to nothing. Calling it has to happen in JS, and the
+/// higher-order methods already show how: a helper, compiled ahead of
+/// the program, that does the call itself.
+///
+/// Why a lambda at all, when `keep(f, f.content.slice(0, 400))` says the
+/// same thing: the value form has to name the result twice, so it has to
+/// name it at all — and a name costs a `const` that the next cell cannot
+/// reuse. `keep(await tools.read_file(p), r => r.content.slice(0, 400))`
+/// keeps the result anonymous.
+///
+/// Takes the whole result or just its id, because a tool hands back an
+/// object carrying `id` and either is a reasonable thing to have kept.
+const HISTORY_SHOW: &str = r#"function __historyShow(kind, x, p) {
+  const id = (typeof x === "number") ? x : (x && x.id);
+  if (p === undefined) { return kind === "keep" ? keep_history(id) : peek_history(id); }
+  const v = (typeof p === "function") ? p(x) : p;
+  return kind === "keep" ? keep_history(id, v) : peek_history(id, v);
+}"#;
+
 /// Every helper `user_source` needs, in a fixed order, each keyed by the
 /// method that pulls it in. The key names the helper, not the call site, so
 /// it is a stable identity for "this helper is already compiled" — which is
@@ -293,6 +316,9 @@ fn needed_parts(user_source: &str) -> Vec<(&'static str, &'static str)> {
     // a receiver, so they get their own (equally token-exact) detection.
     // `.allSettled` does not match the `all` token (boundary check), so each
     // pulls in exactly its own helper.
+    if user_source.contains("history.keep") || user_source.contains("history.peek") {
+        out.push(("history.show", HISTORY_SHOW));
+    }
     if uses_method(user_source, "all") && user_source.contains("Promise.all") {
         out.push(("Promise.all", PROMISE_ALL));
     }
