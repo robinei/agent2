@@ -36,7 +36,7 @@ A block fenced `ts` or `typescript` runs too, types erased first. **Write JavaSc
 
 **`history.note(v)`** — a row of its own, any number of times, from anywhere. It lands the moment you call it, so it survives a block that traps afterwards, and hands back that row's id.
 
-**`history.keep(r)`** — a result you already have, written out on the row it is already on, from here on. **`history.peek(r)`** the same for one reply only. Either takes a projection for the part you actually read: `history.keep(f, (v) => v.content)`. This is how you put something in front of yourself; the console is not.
+**`history.keep(r)`** — a result you already have, written out on the row it is already on, from your next reply onwards. **`history.peek(r)`** the same for your next reply only, then gone. Either takes a projection for the part you actually read: `history.keep(f, (v) => v.content)`. This is how you put bytes in front of yourself; the console is not. **Neither shows you anything in *this* reply** — nothing does; what this reply has is its variables.
 
 **`console.log(x)`** — lands in front of the *next* reply and nowhere sooner. **You never see what your own blocks print while you are writing them.** A value you act on in *this* reply is a variable: write `if (t.status !== 0)`, never `console.log(t.stdout)` followed by a sentence about what it said. Loop over two hundred items here, not above.
 
@@ -133,15 +133,15 @@ declare namespace history {
 
   **A row shows its first 32 KB and says so.** `fetch` hands back all of it however long it is. */
   function fetch(id: number): unknown;
-  /** **The row writes its value out**, from here on. Give it the result or its id — `history.keep(f)` or `history.keep(4)` — and a projection when you want part of it, either a value or a function of the result: `history.keep(f, v => v.content.slice(0, 2000))`. The function form lets the result stay anonymous, so no `const` is needed to hold it.
+  /** **The row writes its value out**, from your next reply onwards. Give it the result or its id — `history.keep(f)` or `history.keep(4)` — and a projection when you want part of it, either a value or a function of the result: `history.keep(f, v => v.content.slice(0, 2000))`. The function form lets the result stay anonymous, so no `const` is needed to hold it.
 
   **This is how you read.** `note` copies bytes into a row of your own; `keep` makes the row that already exists show what it got, so a file in front of you is not also stored twice. Nothing moves: the value appears under that row's own line, under the id you already have.
 
   Leave the projection out for the whole result, or for the way it was cut last time. */
   function keep(result: unknown, project?: unknown | ((r: unknown) => unknown)): number;
-  /** **The same for exactly one reply**, and it arrives at the end rather than in place: in front of you now, gone from the next turn, and the row itself never changes.
+  /** **The same for your next reply and no further**, and it arrives at the end of that reply's page rather than on the row: there for one reading, gone from the one after, and the row itself never changes.
 
-  **For what you need to look at once** — the file you are about to edit, the listing you are about to take four paths out of. Costs nothing to give up, because nothing above it is rewritten. `peek` again to have it another turn; `keep` when it turns out to be load-bearing, and `peek` something you kept to stop paying for it after one more look. `fetch` still answers either way. */
+  **For what you need to look at once** — the file you are about to edit, the listing you are about to take four paths out of. Costs nothing to give up, because nothing above it is rewritten. `peek` again to have it another reply; `keep` when it turns out to be load-bearing, and `peek` something you kept to stop paying for it after one more look. `fetch` still answers either way. */
   function peek(result: unknown, project?: unknown | ((r: unknown) => unknown)): number;
   /** Stop showing these entries — one id, or an inclusive range — once you are finished with them: the file you kept in order to read and have read, the listing you already took four paths out of. `fetch` still answers; the conversation stops carrying them. **Only while the row is recent**: what a row shows is part of every turn after it, so rewriting the oldest row in a long conversation costs the whole conversation. Old and bulky is the compactor's job. */
   function remove(from: number, to?: number): void;
