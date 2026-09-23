@@ -322,6 +322,30 @@ impl Tree {
         // Log first: an event's own id is part of what it contributes to
         // a context (an open post is tracked *by id*).
         let id = self.log_event(Some(spine.leaf_id), payload)?;
+        // **An edit to what an older row shows invalidates the memo.**
+        // A report is cached on the promise that it is a pure function
+        // of the log up to its own outcome, and these two are the
+        // events that break the promise: a `Compacted` or a `Render`
+        // names a row that may sit in a report rendered turns ago, and
+        // that report's text is what the model reads.
+        //
+        // Without this `history.remove(id)` did not remove a *menu
+        // row* at all. The `Compacted` event landed, `menu_rows`
+        // honoured it, and nobody called `menu_rows`: the report had
+        // been rendered into the next request and frozen there. What
+        // did work was removing a reply's blocks or a whole report,
+        // which `document.rs` drops by shadow at render time and never
+        // memoises — which is most of what compaction does, and why
+        // this survived.
+        //
+        // Wholesale, because both events are rare and the alternative
+        // is reasoning about which reports hold which ids.
+        if matches!(
+            self.events[&id].payload,
+            EventPayload::Compacted { .. } | EventPayload::Render { .. }
+        ) {
+            self.clear_report_memo();
+        }
         Self::replay_event(&mut spine.contexts, &self.events, &self.events[&id]);
         spine.leaf_id = id;
         Ok(id)

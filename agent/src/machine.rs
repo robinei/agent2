@@ -9052,6 +9052,41 @@ mod tests {
         );
     }
 
+    /// **`remove` removes a menu row, which it did not.**
+    ///
+    /// A report is memoised on its outcome's id, on the promise that it
+    /// is a pure function of the log up to that outcome. A `Compacted`
+    /// naming one of its rows breaks that promise — and nothing
+    /// invalidated the memo, so the row went on rendering out of a
+    /// frozen string. The `Compacted` event landed, `menu_rows`
+    /// honoured it, and nobody called `menu_rows`.
+    ///
+    /// It survived because it is not what compaction mostly does: a
+    /// reply's blocks and a whole report are dropped by
+    /// `document.rs` at render time from the shadow, and that path is
+    /// not memoised. The rows were the part that silently did nothing.
+    #[test]
+    fn removing_a_row_removes_it_from_a_report_already_rendered() {
+        let mut c = Conversation::new();
+        c.reply("```js\nhistory.note(\"FINDME\");\n```\n");
+        let row = c.document();
+        assert_eq!(
+            row.matches("FINDME").count(),
+            2,
+            "the source and the menu row: {row}"
+        );
+
+        // A later reply removes it. The report holding that row was
+        // rendered into the request this reply answered.
+        c.reply("```js\nhistory.remove(4);\n```\n");
+        let gone = c.document();
+        assert_eq!(
+            gone.matches("FINDME").count(),
+            1,
+            "only the source that wrote it is left: {gone}"
+        );
+    }
+
     /// **A stray fence is not a message.**
     ///
     /// A ` ``` ` the model opened and shut with no cell in it parses as
