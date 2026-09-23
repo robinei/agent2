@@ -948,6 +948,12 @@ pub struct Runner {
     /// One turn stale at worst, which a readout can afford and a
     /// trigger could not.
     last_fullness: Option<(usize, usize, Measure)>,
+    /// What the document rendered to when the trigger last looked, and
+    /// this conversation's measured bytes-per-token from pairing that
+    /// with the count the provider returned for it. See
+    /// [`Runner::fullness`] for why a counted trigger needs them.
+    last_rendered_bytes: Option<usize>,
+    bytes_per_token: Option<f64>,
     /// History edits this program has queued, applied when it finishes.
     ///
     /// Any program may queue them, not only a compaction program. The
@@ -1142,6 +1148,8 @@ impl Runner {
         Runner {
             compaction_requested: false,
             last_fullness: None,
+            last_rendered_bytes: None,
+            bytes_per_token: None,
             pending_edits: Vec::new(),
             finished: false,
             // Off unless asked for: of the thirteen times this fired
@@ -3980,6 +3988,7 @@ impl Runner {
         }
         let doc = crate::document::render(tree, &self.spine, budget);
         let rendered = crate::compaction::rendered_size(&doc);
+        self.last_rendered_bytes = Some(rendered);
         // **One trigger, and it is the counted one where it exists.**
         // [`Runner::next_prompt_floor`] is two counted numbers added
         // together — the prompt the provider charged for, and the part
@@ -4101,7 +4110,27 @@ impl Runner {
                 let usable = context
                     .saturating_sub(crate::host::completion_reserve())
                     .min(crate::host::max_document_tokens());
-                Some((tokens as usize, usable, Measure::Tokens))
+                // **A count describes the request that returned it, and
+                // the program that ran since then has been appending.**
+                // Usage arrives at the end of a stream, so the trigger
+                // holds a number from one request ago while `keep`,
+                // `note` and a reply's own blocks grow the next one —
+                // and a `keep` is large: three kept files put 96 KB in
+                // a document on 2026-09-23, roughly 24k tokens, against
+                // a window of 24k, and the trigger let it through
+                // holding a count of 8,554 from the turn before.
+                //
+                // So: the count, or what this conversation's own
+                // measured density says the document is worth now,
+                // whichever is larger. Not a bytes-to-tokens constant —
+                // the ratio comes from the last request's own bytes and
+                // its own charged tokens, and is recomputed every
+                // reply.
+                let implied = self
+                    .bytes_per_token
+                    .filter(|d| *d > 0.0)
+                    .map_or(0, |d| (rendered as f64 / d) as usize);
+                Some(((tokens as usize).max(implied), usable, Measure::Tokens))
             }
             // A window, and nothing counted against it. Silence: the
             // other unit is a different question with a different
@@ -5738,6 +5767,15 @@ impl Runner {
             // rather than replacing it with zero.
             let survives = usage.completion.saturating_sub(usage.reasoning);
             self.next_prompt_floor = Counted::Floor(usage.prompt + survives);
+            // **This conversation's own density**, measured rather than
+            // assumed: the bytes the last request rendered to, over the
+            // tokens the provider charged for them. It is not a
+            // bytes-to-tokens constant — it is this document's ratio,
+            // recomputed every reply, and it exists so the trigger can
+            // see growth that happened *after* the count it is holding.
+            if let Some(bytes) = self.last_rendered_bytes {
+                self.bytes_per_token = Some(bytes as f64 / usage.prompt as f64);
+            }
         }
         tree.append(
             &mut self.spine,
@@ -7798,6 +7836,17 @@ mod tests {
     fn compaction_fires_on_the_counted_prompt_not_the_estimate() {
         let (mut tree, mut state) = setup();
         state.kickoff(&mut tree).unwrap();
+        // **Held for the whole test, because the process is shared.**
+        // `cargo test` runs these on threads of one process, so a
+        // window set here is set for every test running alongside. It
+        // used to be harmless — an unexpected window fell through to
+        // the byte path, which is what those tests wanted anyway — and
+        // stopped being harmless the day `fullness` started answering
+        // `None` to "a window, and nothing counted against it". Then
+        // `compaction_does_not_fire_while_already_compacting` began
+        // failing about one run in three, on a variable it never
+        // mentions.
+        let _env = env_lock();
         unsafe {
             std::env::set_var("AGENT2_CONTEXT_TOKENS", "10000");
             std::env::set_var("AGENT2_COMPLETION_RESERVE", "2000");
@@ -8341,6 +8390,15 @@ mod tests {
     /// So it is measured rather than guessed: fill until the whole is
     /// three times the preamble, which leaves half the document
     /// reachable with room to spare.
+    /// Serialises the tests that set process-wide environment
+    /// variables against the tests that read them. Poisoning is not
+    /// interesting here — a panicking test has already failed — so the
+    /// guard is taken through the poison.
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn crowded() -> (Tree, Runner, usize) {
         let (mut tree, mut state) = setup();
         let rendered = |tree: &Tree, state: &Runner| {
@@ -8580,6 +8638,9 @@ mod tests {
     /// a handler that frees nothing from asking for itself forever.
     #[test]
     fn compaction_does_not_fire_while_already_compacting() {
+        // Reads the environment through `context_tokens`, so it waits
+        // for whoever is setting it — see `env_lock`.
+        let _env = env_lock();
         let (mut tree, mut state, budget) = crowded();
         state.compaction_if_needed(&mut tree, budget, 0.25).unwrap();
         let again = state.compaction_if_needed(&mut tree, budget, 0.25).unwrap();
@@ -9382,6 +9443,52 @@ mod tests {
         let (m, limit, unit) = state.fullness(&tree, None, 40_000, 65_536).expect("tokens");
         assert_eq!((m, unit), (12_000, Measure::Tokens));
         assert!(limit > 100_000, "the window came off the log too: {limit}");
+    }
+
+    /// **A count describes the request that returned it, and the
+    /// program that ran since then has been appending.**
+    ///
+    /// Usage arrives at the end of a stream, so the trigger holds a
+    /// number from one request ago while the next one grows. That gap
+    /// was small when only `note` could widen it. It is not small now:
+    /// a live run on 2026-09-23 with a 24,000-token window kept three
+    /// files in one program — 96 KB, about 24k tokens — and the trigger
+    /// let the request through holding a count of 8,554 from the turn
+    /// before.
+    ///
+    /// So the trigger takes the larger of the count and what this
+    /// conversation's own measured density says the document is worth
+    /// now. The density is this document's bytes over this document's
+    /// charged tokens, recomputed every reply — not a constant, and not
+    /// a guess about content the crate cannot see.
+    #[test]
+    fn the_trigger_sees_what_the_program_added_since_the_last_count() {
+        let (tree, mut state) = setup_under();
+        state.next_prompt_floor = Counted::Floor(8_554);
+
+        // No density measured yet: the count is all there is, and it is
+        // comfortably under a 24k window.
+        let (measured, _, unit) = state
+            .fullness(&tree, Some(24_000), 140_000, 64 * 1024)
+            .expect("counted");
+        assert_eq!((measured, unit), (8_554, Measure::Tokens));
+
+        // One reply's worth of calibration: the request that counted
+        // 8,554 tokens rendered to 34,000 bytes, so this conversation
+        // runs about 4 bytes to the token.
+        state.bytes_per_token = Some(34_000.0 / 8_554.0);
+        let (measured, usable, _) = state
+            .fullness(&tree, Some(24_000), 140_000, 64 * 1024)
+            .expect("counted");
+        assert!(
+            measured > usable,
+            "140 KB at this document's own density is over a 24k window: \
+             {measured} against {usable}"
+        );
+        assert!(
+            crate::compaction::should_fire(measured, usable, 0.2),
+            "and that is what the trigger asks"
+        );
     }
 
     /// **A stray fence is not a message.**
