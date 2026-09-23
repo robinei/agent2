@@ -1177,12 +1177,47 @@ pub fn derive_report(tree: &Tree, leaf: EventId, outcome: EventId, budget: usize
     if let Some(hit) = tree.memoised_report(outcome) {
         return hit;
     }
-    let text = match handback(tree, leaf, outcome) {
-        Some(h) => render_handback(&h, budget),
+    let handback = handback(tree, leaf, outcome);
+    let text = match &handback {
+        Some(h) => render_handback(h, budget),
         None => "(no outcome recorded for this call)".to_owned(),
     };
-    tree.memoise_report(outcome, text.clone());
+    // **A report holding a live `peek` is not final yet.** Everything
+    // else here is a pure function of the log up to `outcome`, which is
+    // what makes the memo safe and the prefix immutable. A peeked row
+    // is the one thing that is not: it shows for exactly one request
+    // and then stops, so the report it sits in renders one way now and
+    // another way after the next reply, and memoising the first would
+    // freeze it there forever.
+    //
+    // It costs one uncached suffix, once, and only for the request that
+    // spends the peek — a peek expires on the very next reply, so what
+    // changes is always near the end of the document. That is the trade
+    // the verb *is*: a row you do not go on paying for.
+    if !handback.is_some_and(|h| holds_a_live_peek(&h)) {
+        tree.memoise_report(outcome, text.clone());
+    }
     text
+}
+
+/// Whether this report shows a `peek` that has not been spent yet — see
+/// [`derive_report`], which declines to memoise when it has.
+fn holds_a_live_peek(h: &Handback<'_>) -> bool {
+    h.path[..=h.outcome_at]
+        .iter()
+        .filter(|e| e.id.as_u64() > h.previous_outcome)
+        .any(|e| {
+            matches!(
+                &e.payload,
+                EventPayload::Render {
+                    mode: crate::types::RenderMode::Peeked,
+                    ..
+                }
+            ) && !h
+                .path
+                .iter()
+                .any(|l| l.id > e.id && matches!(l.payload, EventPayload::Reply))
+        })
 }
 
 /// The "you copied a row" advisory, shared by both report shapes.

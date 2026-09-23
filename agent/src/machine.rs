@@ -8822,6 +8822,76 @@ mod tests {
         );
     }
 
+    /// **The whole claim, end to end: `keep` stays and `peek` goes.**
+    ///
+    /// Everything else about these two verbs is bookkeeping. This is
+    /// the promise the card makes — "in front of you now, gone from the
+    /// next turn" — and it is checked against the rendered document,
+    /// because that is the only place the model can tell the difference.
+    ///
+    /// **One request exactly, with no timer in it.** A `Peeked` row
+    /// expires on the first `Reply` logged after it, which is a fact
+    /// about the log, so a reopened log renders exactly as the live one
+    /// did and a run that is read back a week later shows what the
+    /// model was actually looking at.
+    #[test]
+    fn a_kept_row_stays_and_a_peeked_one_is_gone_next_turn() {
+        let (mut tree, mut state) = setup_under();
+        user_post(&mut state, &mut tree, "go");
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::LlmResponse(crate::host::scripted_markdown(
+                    "```js\n\
+                     history.keep(2, \"KEPT-VALUE\");\n\
+                     history.peek(2, \"PEEKED-VALUE\");\n\
+                     ```\n",
+                )),
+            )
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+
+        let rendered = |tree: &Tree, state: &Runner| {
+            crate::document::render(tree, &state.spine, 64 * 1024)
+                .conversation()
+                .iter()
+                .map(|m| m.content.clone())
+                .collect::<String>()
+        };
+
+        // Counted, not searched for: the program's own source is in the
+        // document too and holds both strings whatever the rows do, so
+        // `contains` would pass on the source alone.
+        let times = |hay: &str, needle: &str| hay.matches(needle).count();
+        let now = rendered(&tree, &state);
+        assert_eq!(times(&now, "KEPT-VALUE"), 2, "the source and the row: {now}");
+        assert_eq!(times(&now, "PEEKED-VALUE"), 2, "likewise: {now}");
+        // And the peeked row says it is going, where the model reads it
+        // — otherwise "gone next turn" is a rule only the harness knows.
+        assert!(
+            now.contains("shown once"),
+            "the row says it will not be here next time: {now}"
+        );
+
+        // One more reply, which is what spends a peek.
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::LlmResponse(crate::host::scripted_markdown("Done.\n")),
+            )
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+
+        let after = rendered(&tree, &state);
+        assert_eq!(times(&after, "KEPT-VALUE"), 2, "kept means kept: {after}");
+        assert_eq!(
+            times(&after, "PEEKED-VALUE"),
+            1,
+            "the row went and only the source that wrote it is left: {after}"
+        );
+        assert!(!after.contains("shown once"), "and its notice went too");
+    }
+
     /// **A stray fence is not a message.**
     ///
     /// A ` ``` ` the model opened and shut with no cell in it parses as
