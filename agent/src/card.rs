@@ -887,7 +887,7 @@ mod tests {
         // `card()` shows up as a diff review must look at, not a byte
         // count that silently drifts. Comparing full text (not just a
         // hash) so the diff itself is legible in a failure message.
-        const EXPECTED_LEN: usize = 21798;
+        const EXPECTED_LEN: usize = 21988;
         assert_eq!(
             card().len(),
             EXPECTED_LEN,
@@ -1640,11 +1640,18 @@ mod tests {
         // told helper answers `queued` at best and, before that status
         // existed, `idle`: it decided the work was done before it had
         // begun. `ask` is the wait, and it cannot race.
+        // **And the rows it points at are the reads themselves.** It
+        // used to copy all three files into a note and point the forks
+        // at that, which is the same bytes twice — a result carries the
+        // id of the row it landed on, so `f.id` is the row, and a live
+        // `deepseek-v4-flash` run on 2026-09-23 reproduced the copy
+        // exactly, keys and all, for two 26 KB files.
         assert!(
             ex[5].assistant.contains("fork()")
-                && ex[5].assistant.contains("history.fetch(${row})")
-                && ex[5].assistant.contains("\"svc-a.yaml\""),
-            "the sixth forks, points at a row, and keys it by name: {}",
+                && ex[5].assistant.contains("f.id")
+                && ex[5].assistant.contains("history.fetch")
+                && !ex[5].assistant.contains("history.note"),
+            "the sixth forks and points at the rows the reads already are: {}",
             ex[5].assistant
         );
         assert!(

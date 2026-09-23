@@ -125,7 +125,7 @@ declare namespace history {
 
   **This is for words of your own.** To put a result in front of the next reply, `keep` it: the bytes are already on the record and a note would be a second copy. Note what you worked out; keep what you were given; fetch what you will only compute with.
 
-  **Key it by the name the thing already has**, as a quoted string: `{ "src/shipping.py": f.content }`, never `{ shipping_py: … }`. Mangling a path, command or id drops the only thing tying the row to the call it came from. */
+  **Key it by the name the thing already has**, as a quoted string: `{ "src/shipping.py": "rate table is hard-coded at line 40" }`, never `{ shipping_py: … }`. Mangling a path, command or id drops the only thing tying the row to the call it came from. And the value is what you found, never the file: `{ "src/shipping.py": f.content }` is a second copy of bytes the record already has — `keep` that row instead. */
   function note(value: unknown): number;
   /** Read any entry back, whole, by its id — including ones `remove` took out of view. A call's row gives the tool's own result, the object its signature describes: `read_file` hands back `{ content, version }`, not the text. The value goes straight to this block: `const f = await history.fetch(9)`, and the next line already has `f.content`. Fetch in the reply that uses it.
 
