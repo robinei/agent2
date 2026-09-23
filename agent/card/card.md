@@ -38,7 +38,11 @@ A block fenced `ts` or `typescript` runs too, types erased first. **Write JavaSc
 
 **`history.keep(r)`** — a result you already have, written out on the row it is already on, from your next reply onwards. **`history.peek(r)`** the same for your next reply only, then gone. Either takes a projection for the part you actually read: `history.keep(f, (v) => v.content)`. This is how you put bytes in front of yourself; the console is not. **Neither shows you anything in *this* reply** — nothing does; what this reply has is its variables.
 
-**`console.log(x)`** — lands in front of the *next* reply and nowhere sooner. **You never see what your own blocks print while you are writing them.** A value you act on in *this* reply is a variable: write `if (t.status !== 0)`, never `console.log(t.stdout)` followed by a sentence about what it said. Loop over two hundred items here, not above.
+**`console.log(x)`** — a trace of what your program *did* while it ran: which way a branch went, which of two hundred items failed. Loop over two hundred items here, not above.
+
+  **It is not how you read anything.** It is not a row: it has no `[id]`, nothing can `keep` or `peek` it, you are shown the last N lines rather than all of them, and it goes only when the whole report around it goes. Print a file and you have a clipped tail of a file you must read again. Bytes you want in front of the next reply are a row — `keep` the result, or `note` what you concluded from it.
+
+  **You never see what your own blocks print while you are writing them.** A value you act on in *this* reply is a variable: write `if (t.status !== 0)`, never `console.log(t.stdout)` followed by a sentence about what it said.
 
 **`tell(text)`** — reaches the person and lands on the record whole, as its own row. For what you just found out: a computed value, a check's verdict, a word to an agent you spawned. Not for talking to yourself; `console.log` costs them nothing. **The reply that finishes owes them the answer**, so `tell` carries it — `finish()` says nothing.
 
@@ -129,7 +133,7 @@ declare namespace history {
 
   **Key it by the name the thing already has**, as a quoted string: `{ "src/shipping.py": "rate table is hard-coded at line 40" }`, never `{ shipping_py: … }`. Mangling a path, command or id drops the only thing tying the row to the call it came from. And the value is what you found, never the file: `{ "src/shipping.py": f.content }` is a second copy of bytes the record already has — `keep` that row instead. */
   function note(value: unknown): number;
-  /** Read any entry back, whole, by its id — including ones `remove` took out of view. A call's row gives the tool's own result, the object its signature describes: `read_file` hands back `{ content, version }`, not the text. The value goes straight to this block: `const f = await history.fetch(9)`, and the next line already has `f.content`. Fetch in the reply that uses it.
+  /** Read any entry back, whole, by its id — including ones no longer shown. A call's row gives the tool's own result, the object its signature describes: `read_file` hands back `{ content, version }`, not the text. The value goes straight to this block: `const f = await history.fetch(9)`, and the next line already has `f.content`. Fetch in the reply that uses it.
 
   **A row shows its first 32 KB and says so.** `fetch` hands back all of it however long it is. */
   function fetch(id: number): unknown;
@@ -143,9 +147,9 @@ declare namespace history {
 
   **For what you need to look at once** — the file you are about to edit, the listing you are about to take four paths out of. Costs nothing to give up, because nothing above it is rewritten. `peek` again to have it another reply; `keep` when it turns out to be load-bearing, and `peek` something you kept to stop paying for it after one more look. `fetch` still answers either way. */
   function peek(result: unknown, project?: unknown | ((r: unknown) => unknown)): number;
-  /** Stop showing these entries — one id, or an inclusive range — once you are finished with them: the file you kept in order to read and have read, the listing you already took four paths out of. `fetch` still answers; the conversation stops carrying them. **Only while the row is recent**: what a row shows is part of every turn after it, so rewriting the oldest row in a long conversation costs the whole conversation. Old and bulky is the compactor's job. */
-  function remove(from: number, to?: number): void;
-  /** Show `text` in place of that entry — when it is worth one line but not eighty, or when you have found out it is wrong. Spend the words on what you concluded, not on saying something was removed. Never replace an entry already showing as `[id] … text`: it is already standing in for something longer. */
+  /** Show `text` in place of that entry — **when you have found out it is wrong**, or when it is worth one line and not eighty. A later reader cannot discover that a row is wrong; only you, now, know that. Spend the words on what is true, not on saying something changed. Never replace an entry already showing as `[id] … text`: it is already standing in for something longer.
+
+  There is no verb here for *dropping* a row. Not keeping it costs nothing and undoing costs a rewrite of everything after it, so the choice is `peek` rather than `keep`, made before the fact. */
   function replace(id: number, text: string): void;
 }
 

@@ -4389,10 +4389,15 @@ impl Runner {
         {
             let pct = measured * 100 / limit;
             if pct >= SOFT_FULL_PERCENT {
+                // **Prospective, because that is the only verb it has.**
+                // It named `history.remove(id)` while the card still
+                // declared it. The card does not: undoing costs a
+                // rewrite of the history and the model cannot know
+                // which rows are dear to rewrite, while not keeping a
+                // thing in the first place costs nothing at all.
                 lines.push(format!(
-                    "- {pct}% full: {measured} {}s of {limit}. history.remove(id) for what you \
-                     are finished with — a recent row is nearly free to drop and the oldest \
-                     one costs the whole conversation.",
+                    "- {pct}% full: {measured} {}s of {limit}. Everything you keep is paid for \
+                     again every turn; peek what you only need once.",
                     unit.noun()
                 ));
             }
@@ -7401,10 +7406,16 @@ mod tests {
         }
         let full = c.runner().request_tail(c.tree()).unwrap_or_default();
         assert!(full.contains("% full"), "{full}");
+        // **The advice is prospective, because that is the only verb
+        // the card gives it.** It named `history.remove(id)` while the
+        // card still declared that; the card does not, since not
+        // keeping a thing costs nothing and undoing it costs a rewrite
+        // of every turn after the row.
         assert!(
-            full.contains("history.remove(id)"),
-            "it names the verb, as the open-questions line does: {full}"
+            full.contains("peek what you only need once"),
+            "it names the verb the card actually teaches: {full}"
         );
+        assert!(!full.contains("remove"), "{full}");
     }
 
     #[test]

@@ -887,7 +887,7 @@ mod tests {
         // `card()` shows up as a diff review must look at, not a byte
         // count that silently drifts. Comparing full text (not just a
         // hash) so the diff itself is legible in a failure message.
-        const EXPECTED_LEN: usize = 22632;
+        const EXPECTED_LEN: usize = 22829;
         assert_eq!(
             card().len(),
             EXPECTED_LEN,
@@ -1105,6 +1105,73 @@ mod tests {
         );
     }
 
+    /// **Every history verb the card declares is demonstrated by a
+    /// worked example, and no example uses one the card does not
+    /// declare.**
+    ///
+    /// The two halves fail differently and both have. `05-keep` was
+    /// named for a verb it never called: it read two files and wrote
+    /// their contents with `history.note` while the card, three
+    /// paragraphs up, said `keep` was how you read. A live
+    /// `deepseek-v4-flash` copied 11.7 KB into a row rather than keep
+    /// it, and the advisory that fires on exactly that was in the
+    /// prompt and ignored. The example beat the rule, which is what it
+    /// has done every time it has been measured here.
+    ///
+    /// The other half is the cheaper failure: an example calling a verb
+    /// that has been renamed or withdrawn teaches a name that does not
+    /// resolve. `append` was renamed to `note`, and `remove` left the
+    /// card when `peek` took its job.
+    #[test]
+    fn every_history_verb_is_demonstrated_and_every_demonstration_is_declared() {
+        let card = card();
+        let declared: std::collections::BTreeSet<String> = card
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("function "))
+            .filter_map(|l| l.split('(').next())
+            .filter(|n| !n.is_empty())
+            .map(str::to_owned)
+            .collect();
+        // The `history` namespace's own verbs: the ones an exemplar
+        // reaches through `history.`.
+        let used: std::collections::BTreeSet<String> = exemplars()
+            .iter()
+            .flat_map(|ex| {
+                ex.assistant
+                    .match_indices("history.")
+                    .map(|(i, _)| {
+                        ex.assistant[i + "history.".len()..]
+                            .chars()
+                            .take_while(char::is_ascii_alphanumeric)
+                            .collect::<String>()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .filter(|v| !v.is_empty())
+            .collect();
+
+        let history_verbs: std::collections::BTreeSet<String> = ["note", "fetch", "keep", "peek"]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+        for verb in &history_verbs {
+            assert!(
+                declared.contains(verb),
+                "the card stopped declaring history.{verb};                  if that is deliberate, take it out of this list too"
+            );
+            assert!(
+                used.contains(verb),
+                "the card declares history.{verb} and no worked example uses it —                  the example is what the model copies"
+            );
+        }
+        for verb in &used {
+            assert!(
+                declared.contains(verb),
+                "an exemplar calls history.{verb}, which the card does not declare"
+            );
+        }
+    }
+
     #[test]
     fn the_card_names_every_bare_verb() {
         for verb in [
@@ -1121,13 +1188,21 @@ mod tests {
         ] {
             assert!(card().contains(verb), "card is missing {verb}");
         }
-        // `history.remove`/`history.replace` are named here too now.
-        // They stay named, against the argument that they belong only
-        // to the compactor: three of the four runs that rewrote outside
-        // compaction were *correcting* a row they had found to be wrong
-        // ("superseded — that row's computation was broken"), which a
-        // compaction handler later cannot know; and `remove` is how a
-        // reply stops paying for a file it appended in order to read.
+        // **`replace` is named; `remove` is not, and the line between
+        // them is who can know.** Three of the four runs that rewrote
+        // outside compaction were *correcting* a row they had found to
+        // be wrong ("superseded — that row's computation was broken").
+        // Nothing later can discover that: a compaction handler reads
+        // the row, not the world it described. So `replace` stays.
+        //
+        // `remove`'s case outside compaction was "how a reply stops
+        // paying for a file it appended in order to read" — and since
+        // `peek`, that decision is made *before* the fact and costs
+        // nothing, where removing costs a rewrite of every turn after
+        // the row. A verb whose whole job another verb now does
+        // earlier and cheaper is one the card can stop advertising;
+        // the compaction directive introduces it in full where it is
+        // actually the job.
         //
         // What they carry instead is where they are cheap. Changing
         // what a row shows makes every turn after it new text: measured
@@ -1146,7 +1221,6 @@ mod tests {
         for member in [
             "function note(",
             "function fetch(",
-            "function remove(",
             "function replace(",
             "function keep(",
             "function peek(",
