@@ -142,6 +142,14 @@ const OPEN_NOTE_MAX_IDS: usize = 8;
 /// choosing by size alone, which is the choice the directive spends
 /// three paragraphs arguing against.
 const HEAVIEST_NAMED: usize = 5;
+/// How full the conversation has to be before the tail says so.
+///
+/// Half. Below that the line is noise — the room is not the binding
+/// constraint and saying so every request only spends bytes making that
+/// point. Above it, every row dropped is dropped while it is still
+/// cheap to drop, which is the whole reason for saying anything before
+/// the hard trigger fires.
+const SOFT_FULL_PERCENT: usize = 50;
 
 /// The trailing presence line, the two ways round. It is deliberately
 /// about the *client*, not the person: attached means a client is
@@ -931,6 +939,15 @@ pub struct Runner {
     /// does not ask twice and `request_tail` knows to carry the
     /// directive.
     compaction_requested: bool,
+    /// How full the conversation was when `compaction_if_needed` last
+    /// looked: `(measured, limit, unit)`, the same three numbers the
+    /// directive quotes. Kept so [`Runner::request_tail`] can say so
+    /// without rendering the document a second time — it is *called*
+    /// from the render, so it cannot start one.
+    ///
+    /// One turn stale at worst, which a readout can afford and a
+    /// trigger could not.
+    last_fullness: Option<(usize, usize, Measure)>,
     /// History edits this program has queued, applied when it finishes.
     ///
     /// Any program may queue them, not only a compaction program. The
@@ -1124,6 +1141,7 @@ impl Runner {
         let leaf = spine.leaf_id;
         Runner {
             compaction_requested: false,
+            last_fullness: None,
             pending_edits: Vec::new(),
             finished: false,
             // Off unless asked for: of the thirteen times this fired
@@ -3998,6 +4016,7 @@ impl Runner {
             (Some(_), Counted::Stale) => return Ok(None),
             _ => (rendered, budget, Measure::Bytes),
         };
+        self.last_fullness = Some((measured, limit, unit));
         if !crate::compaction::should_fire(measured, limit, headroom) {
             return Ok(None);
         }
@@ -4305,6 +4324,30 @@ impl Runner {
                 "- {count} rows, #{first}–#{last}. history.fetch(id) for any of them; \
                  a report lists only what is new."
             ));
+        }
+        // **How full it is, once that is a number worth knowing.** The
+        // card says a row is cheap to drop while it is recent and costs
+        // the whole conversation once it is old, and then leaves the
+        // model with no way to tell where it stands — so it drops
+        // nothing until the harness stops it and demands a compaction
+        // program, by which time every cheap removal has become a dear
+        // one. This is the missing half of that advice.
+        //
+        // A readout, not an argument: the two numbers and the verb, the
+        // same shape as the open-questions line above.
+        if let Some((measured, limit, unit)) = self.last_fullness
+            && limit > 0
+            && !self.compaction_requested
+        {
+            let pct = measured * 100 / limit;
+            if pct >= SOFT_FULL_PERCENT {
+                lines.push(format!(
+                    "- {pct}% full: {measured} {}s of {limit}. history.remove(id) for what you \
+                     are finished with — a recent row is nearly free to drop and the oldest \
+                     one costs the whole conversation.",
+                    unit.noun()
+                ));
+            }
         }
         if self.finish_ignored {
             lines.push(SILENT_FINISH.to_owned());
@@ -7187,6 +7230,41 @@ mod tests {
             mid.lines().count(),
             end.lines().count(),
             "a reorder, not an addition or a loss"
+        );
+    }
+
+    /// **The tail says how full the conversation is, once that is a
+    /// number worth knowing.**
+    ///
+    /// The card says a row is cheap to drop while it is recent and
+    /// costs the whole conversation once it is old, and then leaves the
+    /// model with no way to tell where it stands — so it drops nothing
+    /// until the harness stops it and demands a compaction program, by
+    /// which time every cheap removal has become a dear one.
+    #[test]
+    fn the_tail_says_how_full_it_is_only_once_it_is_half_full() {
+        let mut c = Conversation::new();
+        c.user("go");
+        c.reply("Starting.\n");
+        let early = c.runner().request_tail(c.tree()).unwrap_or_default();
+        assert!(
+            !early.contains("% full"),
+            "an empty conversation is not news: {early}"
+        );
+
+        // Enough rows to pass the mark. Each is under the row bound, so
+        // all of them render and the document really is that big.
+        for i in 0..24 {
+            c.reply(&format!(
+                "```js\nhistory.note(\"{}\");\n```\n",
+                format_args!("{i}{}", "z".repeat(1200))
+            ));
+        }
+        let full = c.runner().request_tail(c.tree()).unwrap_or_default();
+        assert!(full.contains("% full"), "{full}");
+        assert!(
+            full.contains("history.remove(id)"),
+            "it names the verb, as the open-questions line does: {full}"
         );
     }
 
