@@ -4453,7 +4453,7 @@ impl Runner {
             {
                 continue;
             }
-            let body = crate::report::clip(&note_text(value), crate::report::NOTE_ROW_MAX_BYTES);
+            let body = shown_body("peek", *of, value);
             // The row as the menu would draw it, so the value arrives
             // under the line saying where it came from. A row that
             // renders nothing any more — removed, or never a row at all
@@ -5154,14 +5154,48 @@ pub(crate) fn menu_rows(
         })
         .map(|mut a| {
             if let Some((crate::types::RenderMode::Kept, value)) = inline.get(&EventId::new(a.id)) {
-                a.shown = Some(crate::report::clip(
-                    &note_text(value),
-                    crate::report::NOTE_ROW_MAX_BYTES,
-                ));
+                a.shown = Some(shown_body("keep", EventId::new(a.id), value));
             }
             a
         })
         .collect()
+}
+
+/// How big a whole-result body has to be before the row suggests
+/// narrowing it. Under this the JSON braces are noise, not a cost.
+const SHOWN_HINT_MIN_BYTES: usize = 1024;
+
+/// The body a `keep`/`peek` writes under its row: the value as the
+/// model reads it, bounded — and, when it is a whole object a
+/// projection would narrow, one line saying so.
+///
+/// **The advice belongs where the wall of text is.** A bare
+/// `keep(f)` on a `read_file` result stores `{content, version, id}`,
+/// which renders as a single JSON line with every newline escaped:
+/// barely legible, and 31 KB of it on a live run of 2026-09-23. The
+/// card asks for a projection in the abstract; this is the moment that
+/// request means something, and it can name the field.
+fn shown_body(verb: &str, id: EventId, value: &serde_json::Value) -> String {
+    let body = crate::report::clip(&note_text(value), crate::report::NOTE_ROW_MAX_BYTES);
+    if !value.is_object() || body.len() <= SHOWN_HINT_MIN_BYTES {
+        return body;
+    }
+    // The longest string field is the one worth reading on its own —
+    // `content` on a read, `stdout` on a command. A result with no
+    // string in it is one a projection would not help.
+    let Some(field) = value.as_object().and_then(|map| {
+        map.iter()
+            .filter(|(_, v)| v.is_string())
+            .max_by_key(|(_, v)| v.as_str().map_or(0, str::len))
+            .map(|(k, _)| k.clone())
+    }) else {
+        return body;
+    };
+    format!(
+        "{body}\n… that is the whole result, as JSON. \
+         `history.{verb}({}, (v) => v.{field})` shows just that field.",
+        id.as_u64()
+    )
 }
 
 /// The last `keep`/`peek` naming each row, by the row it names.
@@ -9149,6 +9183,42 @@ mod tests {
                 .nth(row + 1)
                 .is_some_and(|l| l.trim() == "ECHOED"),
             "the lambda saw the result, not the number 4: {doc}"
+        );
+    }
+
+    /// **A whole result kept without a projection says how to narrow
+    /// it, and names the field.**
+    ///
+    /// `keep(f)` on a `read_file` result stores `{content, version,
+    /// id}`, which renders as one JSON line with every newline escaped
+    /// — 31 KB of it on a live run of 2026-09-23, barely legible and
+    /// paid for on every turn after. The card asks for a projection in
+    /// the abstract; the row can ask for it where the wall of text is.
+    #[test]
+    fn a_whole_result_kept_says_which_field_to_keep_instead() {
+        let mut c = Conversation::new();
+        c.answers(
+            "read_file",
+            serde_json::json!({ "content": "x".repeat(4000), "version": "v1" }),
+        );
+        c.reply("```js\nhistory.keep(await tools.read_file(\"a.rs\"));\n```\n");
+
+        let doc = c.document();
+        assert!(
+            doc.contains("`history.keep(4, (v) => v.content)` shows just that field"),
+            "it names the verb, the row and the field: {doc}"
+        );
+
+        // A projection was given, so there is nothing to suggest.
+        let mut c = Conversation::new();
+        c.answers(
+            "read_file",
+            serde_json::json!({ "content": "x".repeat(4000), "version": "v1" }),
+        );
+        c.reply("```js\nhistory.keep(await tools.read_file(\"a.rs\"), (v) => v.content);\n```\n");
+        assert!(
+            !c.document().contains("shows just that field"),
+            "no advice where none is owed"
         );
     }
 
