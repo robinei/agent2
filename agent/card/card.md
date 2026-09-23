@@ -131,16 +131,16 @@ declare namespace history {
 
   **A row shows its first 32 KB and says so.** `fetch` hands back all of it however long it is. */
   function fetch(id: number): unknown;
-  /** Show a result you already have, from here on. Give it the result or its id — `history.keep(f)` or `history.keep(f.id)` — and a projection when you want part of it: `history.keep(f, v => v.content.slice(0, 2000))`.
+  /** Show a result you already have, from here on. Give it the result or its id — `history.keep(f)` or `history.keep(f.id)` — and a projection when you want part of it — a value, or a function of the result: `history.keep(f, v => v.content.slice(0, 2000))`. The function form is what lets the result stay anonymous, so a `const` the next cell cannot reach is not needed to hold it.
 
   **This is how you read.** `note` copies bytes into a row of your own; `keep` points at the result already on the record, so a file in front of you is not also stored twice.
 
   Leave the projection out to show what it showed last time. */
-  function keep(result: unknown, project?: unknown): number;
+  function keep(result: unknown, project?: unknown | ((r: unknown) => unknown)): number;
   /** The same, for exactly one reply: in front of you now, gone from the next turn.
 
   **For what you need to look at once** — the file you are about to edit, the listing you are about to take four paths out of. `peek` again to have it another turn; `keep` when it turns out to be load-bearing. Nothing is lost either way: `fetch` still answers for it. */
-  function peek(result: unknown, project?: unknown): number;
+  function peek(result: unknown, project?: unknown | ((r: unknown) => unknown)): number;
   /** Stop showing these entries — one id, or an inclusive range — once you are finished with them: the file you kept in order to read and have read, the listing you already took four paths out of. `fetch` still answers; the conversation stops carrying them. **Only while the row is recent**: what a row shows is part of every turn after it, so rewriting the oldest row in a long conversation costs the whole conversation. Old and bulky is the compactor's job. */
   function remove(from: number, to?: number): void;
   /** Show `text` in place of that entry — when it is worth one line but not eighty, or when you have found out it is wrong. Spend the words on what you concluded, not on saying something was removed. Never replace an entry already showing as `[id] … text`: it is already standing in for something longer. */
