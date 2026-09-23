@@ -1,16 +1,20 @@
-Each gets a row of its own, so a later compaction can drop the one I am done with and leave the other exact. A row holds what I took from a file, never the file — those bytes are on the record already, and `history.fetch` returns them for nothing.
+Reading the failure once — after this reply I know what it said, and the bytes stay on the record either way.
 
 ```js
-const [readme, design] = await Promise.all([
-  tools.read_file("README.md"),
-  tools.read_file("DESIGN.md"),
-]);
-history.note({ documented_check: readme.content.match(/^\s*\$ (.+)$/m)?.[1] });
-history.note({ rules: design.content.match(/^- .*/gm) ?? [] });
+const check = await tools.bash("CHECK 2>&1");
+history.peek(check, (r) => r.stdout);
 ```
 
-Now the failure itself — printed, not kept: what earns a row is what I conclude from it.
+The file it names I am working against from here, so that one stays. `content` alone: the row already carries the version.
 
 ```js
-console.log((await tools.bash("CHECK 2>&1")).stdout);
+const conf = await tools.read_file("CONF.json");
+history.keep(conf, (f) => f.content);
+```
+
+What I worked out gets rows of its own — nothing else holds it, and one each lets a later compaction drop the one I am done with.
+
+```js
+history.note({ why_check_fails: "retries is 3, CHECK wants 5" });
+history.note({ who_writes_conf: "the deploy job" });
 ```

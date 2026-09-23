@@ -9109,6 +9109,35 @@ mod tests {
         assert!(!spent.contains("ECHOED"), "then not at all: {spent}");
     }
 
+    /// **A projection is applied to the row's value, however the row
+    /// was named.**
+    ///
+    /// `keep(f, v => v.content)` hands the lambda the result, and
+    /// `keep(6, v => v.content)` has to hand it the same thing — the
+    /// row is the only thing either call names. It did not: the lambda
+    /// got the *id*, so a live `deepseek-v4-flash` run on 2026-09-23
+    /// wrote `history.keep(15, (x) => x.map((f) => f.content))` off the
+    /// menu and trapped on `cannot read .length of a number (15)`,
+    /// losing eight file reads with it.
+    #[test]
+    fn a_projection_is_given_the_rows_value_even_when_the_row_is_named_by_id() {
+        let mut c = Conversation::new();
+        c.answers("echo", serde_json::json!({ "out": "ECHOED" }));
+        c.reply("```js\nawait tools.echo(1);\nhistory.keep(4, (v) => v.out);\n```\n");
+
+        let doc = c.document();
+        let row = doc
+            .lines()
+            .position(|l| l.starts_with("- `[") && l.contains("echo(1)"))
+            .expect("the call's row");
+        assert!(
+            doc.lines()
+                .nth(row + 1)
+                .is_some_and(|l| l.trim() == "ECHOED"),
+            "the lambda saw the result, not the number 4: {doc}"
+        );
+    }
+
     /// **A stray fence is not a message.**
     ///
     /// A ` ``` ` the model opened and shut with no cell in it parses as

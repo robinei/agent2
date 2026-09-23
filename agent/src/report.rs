@@ -1252,11 +1252,12 @@ fn copied_note(rows: &[(u64, u64)]) -> Option<String> {
         .collect::<Vec<_>>()
         .join("; ");
     Some(format!(
-        "### worth knowing\n\n{pairs}. A call's result is already kept — \
-         `history.fetch(id)` hands it back whole, from the log, for nothing — so a \
-         copy of it is a second charge on every turn from here for something you \
-         already had. Keep the id. What is worth a row of its own is what you \
-         concluded from those bytes."
+        "### worth knowing\n\n{pairs}. A call's result is on the record already, so a \
+         copy of it is a second charge on every turn from here for bytes you \
+         had. To put a result in front of you, name the call: `history.keep(id)` \
+         from here on, `history.peek(id)` for one reply, and a projection on either \
+         for the part of it you actually read. What is worth a row of its own is what \
+         you concluded from those bytes."
     ))
 }
 
@@ -2507,7 +2508,12 @@ mod tests {
             )),
             "names both rows: {text}"
         );
-        assert!(text.contains("Keep the id"), "{text}");
+        // And it names the verb that does the job instead of the copy.
+        // It used to say "Keep the id", which meant *remember* it — a
+        // phrase that stopped being readable the day `history.keep(id)`
+        // became a thing you can call.
+        assert!(text.contains("history.keep(id)"), "{text}");
+        assert!(text.contains("history.peek(id)"), "{text}");
 
         // Compaction: the handler has to be told what it is being asked
         // for and how much, or it reads the report as an ordinary

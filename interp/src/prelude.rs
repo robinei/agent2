@@ -299,7 +299,8 @@ const HISTORY_SHOW: &str = r#"function __historyShow(kind, x, p) {
   const id = bare ? x : (x && x.id);
   let v;
   if (p === undefined) { v = bare ? null : x; }
-  else { v = (typeof p === "function") ? p(x) : p; }
+  else if (typeof p === "function") { v = p(bare ? fetch_history(id) : x); }
+  else { v = p; }
   return kind === "keep" ? keep_history(id, v) : peek_history(id, v);
 }"#;
 
