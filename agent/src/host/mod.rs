@@ -2549,6 +2549,7 @@ mod tests {
                     cached: 0,
                     completion: 20,
                     reasoning: 700,
+                    window: None,
                 }),
                 ..scripted_program(reply)
             }])),

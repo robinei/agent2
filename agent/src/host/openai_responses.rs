@@ -244,6 +244,9 @@ pub(crate) fn parse_events(
                 reasoning: u["output_tokens_details"]["reasoning_tokens"]
                     .as_u64()
                     .unwrap_or(0),
+                // The window this request went against, so the
+                // log carries both halves of the measurement.
+                window: crate::host::context_tokens().map(|n| n as u64),
             };
         }
     }

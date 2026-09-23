@@ -4006,7 +4006,7 @@ impl Runner {
         // The byte path stays for the two cases where there is nothing
         // to count against: no window configured, and no reply has
         // reported a `prompt_tokens` yet.
-        let Some((measured, limit, unit)) = self.fullness(rendered, budget) else {
+        let Some((measured, limit, unit)) = self.fullness(tree, crate::host::context_tokens(), rendered, budget) else {
             return Ok(None);
         };
         self.last_fullness = Some((measured, limit, unit));
@@ -4066,19 +4066,67 @@ impl Runner {
     /// reopened log. Substituting the other unit there is what went
     /// wrong — see [`Counted::Stale`] for the live run that first made
     /// the point.
-    fn fullness(&self, rendered: usize, budget: usize) -> Option<(usize, usize, Measure)> {
-        match (crate::host::context_tokens(), self.next_prompt_floor) {
-            (Some(context), Counted::Floor(tokens)) => {
+    ///
+    /// `configured` is the host's window, passed rather than read, so
+    /// the rule is a pure function of its inputs and a test of it does
+    /// not have to set a process-wide environment variable. It did, and
+    /// the variable leaked into whichever other test happened to be
+    /// running: `compaction_does_not_fire_while_already_compacting`
+    /// failed about one run in three.
+    fn fullness(
+        &self,
+        tree: &Tree,
+        configured: Option<usize>,
+        rendered: usize,
+        budget: usize,
+    ) -> Option<(usize, usize, Measure)> {
+        // **Live state first, then the log.** A reopened log has no
+        // `next_prompt_floor` and no environment, but it does have the
+        // count and the window the last request actually carried —
+        // which is why `Usage` records both. Without the second half,
+        // rendering a past request had to guess, and guessed in bytes.
+        let (context, counted) = match (configured, self.next_prompt_floor) {
+            (Some(context), Counted::Floor(tokens)) => (Some(context), Some(tokens)),
+            (window, Counted::Never) => match self.logged_usage(tree) {
+                Some(usage) => (
+                    usage.window.map(|n| n as usize).or(window),
+                    Some(usage.prompt),
+                ),
+                None => (window, None),
+            },
+            (window, _) => (window, None),
+        };
+        match (context, counted) {
+            (Some(context), Some(tokens)) => {
                 let usable = context
                     .saturating_sub(crate::host::completion_reserve())
                     .min(crate::host::max_document_tokens());
                 Some((tokens as usize, usable, Measure::Tokens))
             }
-            (Some(_), _) => None,
-            // No window configured at all: bytes are the only budget
-            // there is, and the one the trigger uses.
-            _ => Some((rendered, budget, Measure::Bytes)),
+            // A window, and nothing counted against it. Silence: the
+            // other unit is a different question with a different
+            // answer, and answering it here is what went wrong.
+            (Some(_), None) => None,
+            // No window anywhere: bytes are the only budget there is,
+            // and the one the trigger uses.
+            (None, _) => Some((rendered, budget, Measure::Bytes)),
         }
+    }
+
+    /// The usage of the newest reply on this path — the count, and the
+    /// window it was counted against. What lets a reopened log measure
+    /// itself the way the live session did.
+    fn logged_usage(&self, tree: &Tree) -> Option<crate::host::Usage> {
+        tree.path_events(self.spine.leaf_id)
+            .iter()
+            .rev()
+            // A reply that reported nothing counted is not an answer:
+            // `prompt` of zero is the absence of a measurement, not a
+            // measurement of zero.
+            .find_map(|e| match &e.payload {
+                EventPayload::ReplyEnd { usage, .. } if usage.prompt > 0 => Some(*usage),
+                _ => None,
+            })
     }
 
     /// What the last `keep`/`peek` of this row chose to show.
@@ -4379,6 +4427,8 @@ impl Runner {
         let fullness = self.last_fullness.or_else(|| {
             let doc = crate::document::render(tree, &self.spine, self.document_budget());
             self.fullness(
+                tree,
+                crate::host::context_tokens(),
                 crate::compaction::rendered_size(&doc),
                 self.document_budget(),
             )
@@ -9267,28 +9317,71 @@ mod tests {
     ///
     /// Now one function answers both, and its silence is the case that
     /// went wrong: a window configured, nothing counted against it yet,
-    /// which is every reopened log.
+    /// which is every reopened log until this commit gave `Usage` the
+    /// window to carry.
     #[test]
     fn the_fullness_readout_is_silent_rather_than_answering_in_the_wrong_unit() {
-        let mut c = Conversation::new();
-        c.user("go");
-        c.reply("```js\nhistory.note(\"x\".repeat(40000));\n```\n");
+        let (mut tree, mut state) = setup_under();
+        user_post(&mut state, &mut tree, "go");
+        state.next_prompt_floor = Counted::Never;
 
-        // No window configured: bytes are the only budget there is, and
+        // No window anywhere: bytes are the only budget there is, and
         // the trigger uses them, so the readout speaks in them.
-        let tail = c.runner().request_tail(c.tree()).unwrap_or_default();
-        assert!(tail.contains("% full"), "{tail}");
-        assert!(c.runner().fullness(40_000, 65_536).is_some());
+        assert!(state.fullness(&tree, None, 40_000, 65_536).is_some());
 
-        // A window *is* configured and no reply has counted against it.
-        // The trigger declines to fire; the readout declines to speak.
-        unsafe { std::env::set_var("AGENT2_CONTEXT_TOKENS", "1000000") };
-        let quiet = c.runner().fullness(40_000, 65_536);
-        unsafe { std::env::remove_var("AGENT2_CONTEXT_TOKENS") };
+        // A window *is* configured and nothing has counted against it,
+        // on the log or live. The trigger declines to fire; the readout
+        // declines to speak, rather than answering the other question.
+        let quiet = state.fullness(&tree, Some(1_000_000), 40_000, 65_536);
         assert!(
             quiet.is_none(),
             "it answered in bytes about a token window: {quiet:?}"
         );
+    }
+
+    /// **A reopened log measures itself the way the live session did.**
+    ///
+    /// `prompt` was on the log and the window was in a shell variable,
+    /// so rendering a past request could not reproduce it — `agent
+    /// document` on a 1M-token run measured in bytes and announced
+    /// "133% full" about a request the live trigger passed at 2%.
+    /// `Usage` carries both halves now, and `fullness` reads them when
+    /// there is no live state, so the instrument and the request agree
+    /// whatever shell it is run from.
+    #[test]
+    fn a_reopened_log_measures_itself_from_its_own_usage() {
+        let (mut tree, mut state) = setup_under();
+        user_post(&mut state, &mut tree, "go");
+        // What a replay has: no live count, no environment.
+        state.next_prompt_floor = Counted::Never;
+
+        // Nothing counted on the log either, so bytes are all there is.
+        let (m, _, unit) = state.fullness(&tree, None, 40_000, 65_536).expect("bytes");
+        assert_eq!((m, unit), (40_000, Measure::Bytes));
+
+        // A reply that reported a count against a window. The replay
+        // reads both off the log and answers in tokens — the unit the
+        // live trigger used.
+        let reply = tree.append(&mut state.spine, EventPayload::Reply).unwrap();
+        tree.append(
+            &mut state.spine,
+            EventPayload::ReplyEnd {
+                reply,
+                how: crate::types::ReplyEnd::Finished,
+                usage: crate::host::Usage {
+                    prompt: 12_000,
+                    cached: 0,
+                    completion: 10,
+                    reasoning: 0,
+                    window: Some(1_000_000),
+                },
+            },
+        )
+        .unwrap();
+
+        let (m, limit, unit) = state.fullness(&tree, None, 40_000, 65_536).expect("tokens");
+        assert_eq!((m, unit), (12_000, Measure::Tokens));
+        assert!(limit > 100_000, "the window came off the log too: {limit}");
     }
 
     /// **A stray fence is not a message.**
@@ -10145,6 +10238,7 @@ mod tests {
                         completion: 900,
                         reasoning: 700,
                         cached: 0,
+                        window: None,
                     }),
                     ..llm_program("tell(\"hi\");")
                 }),
@@ -10523,6 +10617,7 @@ mod tests {
                 cached: 40,
                 completion: 200,
                 reasoning,
+                window: None,
             }),
             reply: None,
         }

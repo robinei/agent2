@@ -563,6 +563,19 @@ pub struct Usage {
     pub cached: u64,
     pub completion: u64,
     pub reasoning: u64,
+    /// The context window this request was sent against, when one was
+    /// configured — the *other* half of the only measurement that
+    /// decides whether a conversation is full.
+    ///
+    /// **Logged because the environment is not.** `prompt` was on the
+    /// log and the window was in a shell variable, so rendering a past
+    /// request could not reproduce it: `agent document` on a run
+    /// against a 1M-token model measured it in bytes against the
+    /// document budget and announced "133% full" about a request the
+    /// live trigger had passed at 2%. A log that cannot reproduce its
+    /// own request is one every instrument reads differently.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window: Option<u64>,
 }
 
 #[derive(Default)]
@@ -668,6 +681,9 @@ fn parse_sse(
                 reasoning: u["completion_tokens_details"]["reasoning_tokens"]
                     .as_u64()
                     .unwrap_or(0),
+                // The window this request went against, so the
+                // log carries both halves of the measurement.
+                window: crate::host::context_tokens().map(|n| n as u64),
             };
         }
         let choice = &event["choices"][0];

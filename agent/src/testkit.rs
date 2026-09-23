@@ -615,6 +615,7 @@ impl Conversation {
             cached: 0,
             completion,
             reasoning: 0,
+            window: None,
         });
         self.close_reply(false)
     }
