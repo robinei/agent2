@@ -295,9 +295,11 @@ const REPLACE_ALL: &str = r#"function __replaceAll(s, pat, rep) {
 /// Takes the whole result or just its id, because a tool hands back an
 /// object carrying `id` and either is a reasonable thing to have kept.
 const HISTORY_SHOW: &str = r#"function __historyShow(kind, x, p) {
-  const id = (typeof x === "number") ? x : (x && x.id);
-  if (p === undefined) { return kind === "keep" ? keep_history(id) : peek_history(id); }
-  const v = (typeof p === "function") ? p(x) : p;
+  const bare = (typeof x === "number");
+  const id = bare ? x : (x && x.id);
+  let v;
+  if (p === undefined) { v = bare ? null : x; }
+  else { v = (typeof p === "function") ? p(x) : p; }
   return kind === "keep" ? keep_history(id, v) : peek_history(id, v);
 }"#;
 

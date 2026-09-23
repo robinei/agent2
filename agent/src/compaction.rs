@@ -750,6 +750,38 @@ mod tests {
         }
     }
 
+    /// **A `peek` does not put a removed row back.** `keep` and
+    /// `remove` are the same edit written two ways — does this row
+    /// render — so the later one wins. A `peek` is not that edit at
+    /// all: it shows a value in the ephemeral tail for one request and
+    /// never touches the history, so a row you removed and then peeked
+    /// is one you have looked at once, not one you have restored.
+    #[test]
+    fn a_peek_does_not_un_remove_the_row_it_names() {
+        let (mut tree, mut spine, _reply, ret) = branch_with_a_report();
+        tree.append(
+            &mut spine,
+            EventPayload::Compacted {
+                of: ret,
+                text: None,
+            },
+        )
+        .unwrap();
+        tree.append(
+            &mut spine,
+            EventPayload::Render {
+                of: ret,
+                mode: crate::types::RenderMode::Peeked,
+                value: serde_json::Value::Null,
+            },
+        )
+        .unwrap();
+        assert!(
+            tree.compacted_lookup(spine.leaf_id).contains_key(&ret),
+            "the row is still removed"
+        );
+    }
+
     /// One op per row still holds — the second op on an id is dropped
     /// rather than overwriting the first, so "no row gets two
     /// operations" survives the move to best effort.

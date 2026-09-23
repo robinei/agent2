@@ -131,15 +131,15 @@ declare namespace history {
 
   **A row shows its first 32 KB and says so.** `fetch` hands back all of it however long it is. */
   function fetch(id: number): unknown;
-  /** Show a result you already have, from here on. Give it the result or its id — `history.keep(f)` or `history.keep(f.id)` — and a projection when you want part of it — a value, or a function of the result: `history.keep(f, v => v.content.slice(0, 2000))`. The function form is what lets the result stay anonymous, so a `const` the next cell cannot reach is not needed to hold it.
+  /** **The row writes its value out**, from here on. Give it the result or its id — `history.keep(f)` or `history.keep(4)` — and a projection when you want part of it, either a value or a function of the result: `history.keep(f, v => v.content.slice(0, 2000))`. The function form lets the result stay anonymous, so no `const` is needed to hold it.
 
-  **This is how you read.** `note` copies bytes into a row of your own; `keep` points at the result already on the record, so a file in front of you is not also stored twice.
+  **This is how you read.** `note` copies bytes into a row of your own; `keep` makes the row that already exists show what it got, so a file in front of you is not also stored twice. Nothing moves: the value appears under that row's own line, under the id you already have.
 
-  Leave the projection out to show what it showed last time. */
+  Leave the projection out for the whole result, or for the way it was cut last time. */
   function keep(result: unknown, project?: unknown | ((r: unknown) => unknown)): number;
-  /** The same, for exactly one reply: in front of you now, gone from the next turn.
+  /** **The same for exactly one reply**, and it arrives at the end rather than in place: in front of you now, gone from the next turn, and the row itself never changes.
 
-  **For what you need to look at once** — the file you are about to edit, the listing you are about to take four paths out of. `peek` again to have it another turn; `keep` when it turns out to be load-bearing. Nothing is lost either way: `fetch` still answers for it. */
+  **For what you need to look at once** — the file you are about to edit, the listing you are about to take four paths out of. Costs nothing to give up, because nothing above it is rewritten. `peek` again to have it another turn; `keep` when it turns out to be load-bearing, and `peek` something you kept to stop paying for it after one more look. `fetch` still answers either way. */
   function peek(result: unknown, project?: unknown | ((r: unknown) => unknown)): number;
   /** Stop showing these entries — one id, or an inclusive range — once you are finished with them: the file you kept in order to read and have read, the listing you already took four paths out of. `fetch` still answers; the conversation stops carrying them. **Only while the row is recent**: what a row shows is part of every turn after it, so rewriting the oldest row in a long conversation costs the whole conversation. Old and bulky is the compactor's job. */
   function remove(from: number, to?: number): void;

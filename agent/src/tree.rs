@@ -870,12 +870,22 @@ impl Tree {
                 EventPayload::Compacted { of, text } => {
                     lookup.insert(*of, CompactedView { text: text.clone() });
                 }
-                // **`keep`/`peek` and `remove` are edits to one thing:
-                // does this row render.** So they resolve the same way —
-                // last write on the path wins, and root-first iteration
-                // makes that fall out. A row swept away and later kept
-                // comes back; a row kept and later swept goes.
-                EventPayload::Render { of, .. } => {
+                // **`keep` and `remove` are edits to one thing: does
+                // this row render.** So they resolve the same way — last
+                // write on the path wins, and root-first iteration makes
+                // that fall out. A row swept away and later kept comes
+                // back; a row kept and later swept goes.
+                //
+                // **A `peek` is not that edit.** It shows a value in the
+                // ephemeral tail for one request and never touches the
+                // history, so it cannot un-remove anything: a row you
+                // removed and then peeked is one you have looked at
+                // once, not one you have put back.
+                EventPayload::Render {
+                    of,
+                    mode: crate::types::RenderMode::Kept,
+                    ..
+                } => {
                     lookup.remove(of);
                 }
                 _ => {}

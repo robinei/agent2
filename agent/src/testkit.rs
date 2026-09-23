@@ -826,11 +826,19 @@ impl Conversation {
     }
 
     /// The document the next request would carry — what the model is
-    /// about to be looking at. Renders without advancing anything, so a
-    /// test may read it as often as it likes.
+    /// about to be looking at, **ephemeral tail included**. Renders
+    /// without advancing anything, so a test may read it as often as it
+    /// likes.
+    ///
+    /// The tail used to be left off, which made this quietly not the
+    /// thing it says it is: `history.peek` shows a value there and
+    /// nowhere else, and a test reading this would have concluded the
+    /// value never arrived.
     pub fn document(&self) -> String {
+        let tail = self.runner.request_tail(&self.tree).unwrap_or_default();
         self.runner
             .document(&self.tree, TEST_BUDGET)
+            .with_tail(&tail)
             .messages
             .iter()
             .map(|m| m.content.as_str())

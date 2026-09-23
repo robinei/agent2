@@ -2875,16 +2875,21 @@ impl Runner {
                 } else {
                     crate::types::RenderMode::Peeked
                 };
-                // **No projection means the one already in force.** A
-                // row shown once and wanted again should not have to
-                // restate how it was cut; and because a result never
-                // changes, re-applying the same projection to the same
-                // value is the value already stored.
+                // **No projection means the whole thing, cut the way it
+                // was cut last time if it was.** A row shown once and
+                // wanted again should not have to restate how it was
+                // cut, and because a result never changes, re-applying
+                // the same projection to the same value is the value
+                // already stored. Failing that it is the result the
+                // caller is holding, and failing *that* — `keep(4)`,
+                // read off the menu with nothing in hand — the row's
+                // own value, read back the way `history.fetch` reads it.
                 let value = match args.get(1).filter(|v| !v.is_null()) {
                     Some(v) => v.clone(),
                     None => self
                         .last_rendered_value(tree, id)
                         .or(from_object)
+                        .or_else(|| self.fetch_history(tree, &[Value::PosInt(id.as_u64())]).ok())
                         .unwrap_or(serde_json::Value::Null),
                 };
                 tree.append(
@@ -4294,6 +4299,15 @@ impl Runner {
         // request. Two lines written here today read as card prose and
         // both overclaimed; terse facts are harder to overclaim in.
         let mut lines: Vec<String> = Vec::new();
+        // **A `peek` rides here and nowhere else.** This block is the
+        // one part of the request re-emitted at the new end each time
+        // rather than written into the history, so a value meant to be
+        // in front of you for one reply and then gone costs no rewrite
+        // of anything above it and no cache. It is also why the row it
+        // names goes on rendering its value-less self up in the
+        // conversation: the copy down here is not a second row, it is
+        // this request's own end matter.
+        lines.extend(self.peeked_block(tree));
         let open = self.open();
         if !open.is_empty() {
             let shown = open.len().min(OPEN_NOTE_MAX_IDS);
@@ -4391,6 +4405,64 @@ impl Runner {
             lines.push(line.clone());
         }
         Some(lines.join("\n"))
+    }
+
+    /// The `peek`ed rows, rendered for this request only — the block
+    /// [`Runner::request_tail`] opens with.
+    ///
+    /// **Live means "no reply has been logged since".** That is one
+    /// request exactly, with no timer in it, so a log reopened a week
+    /// later renders what the model was actually looking at. A row
+    /// whose newest `Render` is a `keep` is not here: it writes its
+    /// value out in place, up where its id is.
+    fn peeked_block(&self, tree: &Tree) -> Vec<String> {
+        let path = tree.path_events(self.spine.leaf_id);
+        let last_reply = path
+            .iter()
+            .rev()
+            .find(|e| matches!(e.payload, EventPayload::Reply | EventPayload::Restart))
+            .map(|e| e.id);
+        let newest = last_renders(&path);
+        let compacted = tree.compacted_lookup(self.spine.leaf_id);
+        let mut rows: Vec<String> = Vec::new();
+        for event in &path {
+            let EventPayload::Render { of, mode, value } = &event.payload else {
+                continue;
+            };
+            // Only the newest word on this row, and only while it is a
+            // peek this reply has not already spent.
+            if *mode != crate::types::RenderMode::Peeked
+                || newest
+                    .get(of)
+                    .is_none_or(|(m, _)| *m != crate::types::RenderMode::Peeked)
+                || last_reply.is_some_and(|r| r > event.id)
+            {
+                continue;
+            }
+            let body = crate::report::clip(&note_text(value), crate::report::NOTE_ROW_MAX_BYTES);
+            // The row as the menu would draw it, so the value arrives
+            // under the line saying where it came from. A row that
+            // renders nothing any more — removed, or never a row at all
+            // — still shows its value under a bare id: `peek` is a
+            // request to see something, and refusing it silently over
+            // an unrelated `remove` would be the narrow channel again.
+            let target: Vec<&Event> = path.iter().copied().filter(|e| e.id == *of).collect();
+            let mut drawn = menu_rows(&target, 0, &compacted, &path);
+            rows.push(match drawn.pop() {
+                Some(mut a) => {
+                    a.shown = Some(body);
+                    crate::report::render_row(&a)
+                }
+                None => format!("- `[{}]` {body}", of.as_u64()),
+            });
+        }
+        if rows.is_empty() {
+            return Vec::new();
+        }
+        let mut out = vec!["### peeked — here for this reply only\n".to_owned()];
+        out.extend(rows);
+        out.push(String::new());
+        out
     }
 
     /// How many replies have run a program since anyone last spoke to
@@ -4879,6 +4951,16 @@ pub(crate) fn menu_rows(
     compacted: &std::collections::HashMap<EventId, crate::tree::CompactedView>,
     settlements: &[&Event],
 ) -> Vec<Artifact> {
+    // **What `history.keep` asked to be shown, on the row that shows
+    // it.** A `Render` is not a row; it is one bit about a row that
+    // already exists — does it write its value out — so it renders
+    // where that row already is, under the id the model already has.
+    //
+    // It was a row of its own at first, and that double-charged
+    // anything whose row already showed its own value: a note and a
+    // `keep` of that note put the same bytes on the page twice, under
+    // two ids.
+    let inline = last_renders(settlements);
     segment
         .iter()
         .filter(|e| e.id.as_u64() > since)
@@ -4911,6 +4993,7 @@ pub(crate) fn menu_rows(
                     id,
                     label: String::new(),
                     state: ArtifactState::Whole(format!("… {text}")),
+                    shown: None,
                 });
             }
             match &event.payload {
@@ -4959,50 +5042,6 @@ pub(crate) fn menu_rows(
                 // measured that day were computed, so the source shows
                 // `tell("--- " + f.content)` and not one byte of what
                 // was actually said.
-                // **A result the program asked to see**, under the id
-                // of the call it came from. `Kept` shows from here on;
-                // `Peeked` shows only while no reply has been logged
-                // after it, which is one request exactly — no timer,
-                // and a reopened log renders the same as a live one.
-                EventPayload::Render { of, mode, value } => {
-                    // **Last write wins, here as everywhere else.** One
-                    // result, one row: `keep` after `peek` promotes the
-                    // row it is already looking at rather than adding a
-                    // second copy of the same value, and `peek` after
-                    // `keep` retires the keep — "have it one more turn,
-                    // then stop paying for it", which is the only way
-                    // to undo a `keep` short of compaction.
-                    if settlements.iter().any(|e| {
-                        e.id > event.id
-                            && matches!(&e.payload, EventPayload::Render { of: o, .. } if o == of)
-                    }) {
-                        return None;
-                    }
-                    if *mode == crate::types::RenderMode::Peeked
-                        && settlements.iter().any(|e| {
-                            e.id > event.id && matches!(e.payload, EventPayload::Reply)
-                        })
-                    {
-                        return None;
-                    }
-                    let body = crate::report::clip(
-                        &note_text(value),
-                        crate::report::NOTE_ROW_MAX_BYTES,
-                    );
-                    let gone = if *mode == crate::types::RenderMode::Peeked {
-                        " — shown once; it is not here next time"
-                    } else {
-                        ""
-                    };
-                    Some(Artifact {
-                        id,
-                        label: String::new(),
-                        state: ArtifactState::Whole(format!(
-                            "from [{}]{gone}:\n{body}",
-                            of.as_u64()
-                        )),
-                    })
-                }
                 EventPayload::Call(Call::Send {
                     to,
                     text,
@@ -5037,6 +5076,7 @@ pub(crate) fn menu_rows(
                             )
                         }
                     )),
+                    shown: None,
                 }),
                 // A row's label comes from the call *variant*; its value
                 // (or its absence) from the `Result`.
@@ -5057,6 +5097,7 @@ pub(crate) fn menu_rows(
                             }
                         },
                     },
+                    shown: None,
                 }),
                 // **An `answer` is a row again.** It stopped being an
                 // outcome in 28 — a reply can answer and keep going, and
@@ -5071,6 +5112,7 @@ pub(crate) fn menu_rows(
                         question.as_u64(),
                         crate::document::escape_untrusted(&value.to_string())
                     )),
+                    shown: None,
                 }),
                 // A `history.note` — the one channel that crosses
                 // between replies by design, so it belongs in the list
@@ -5091,11 +5133,40 @@ pub(crate) fn menu_rows(
                     id,
                     label: String::new(),
                     state: ArtifactState::Whole(note_row(id, value)),
+                    shown: None,
                 }),
                 _ => None,
             }
         })
+        .map(|mut a| {
+            if let Some((crate::types::RenderMode::Kept, value)) = inline.get(&EventId::new(a.id)) {
+                a.shown = Some(crate::report::clip(
+                    &note_text(value),
+                    crate::report::NOTE_ROW_MAX_BYTES,
+                ));
+            }
+            a
+        })
         .collect()
+}
+
+/// The last `keep`/`peek` naming each row, by the row it names.
+///
+/// One result, one answer: a row writes its value out in place, or
+/// shows it once in the tail, or shows nothing — whichever the newest
+/// `Render` on the path says. The same resolution `compacted_lookup`
+/// gives `remove` against `replace`, for the same reason: they answer
+/// one question about one row.
+pub(crate) fn last_renders(
+    path: &[&Event],
+) -> std::collections::HashMap<EventId, (crate::types::RenderMode, serde_json::Value)> {
+    let mut out = std::collections::HashMap::new();
+    for event in path {
+        if let EventPayload::Render { of, mode, value } = &event.payload {
+            out.insert(*of, (*mode, value.clone()));
+        }
+    }
+    out
 }
 
 /// A menu row's label, read from the call variant — never by re-parsing a
@@ -8917,174 +8988,125 @@ mod tests {
     ///
     /// Everything else about these two verbs is bookkeeping. This is
     /// the promise the card makes — "in front of you now, gone from the
-    /// next turn" — and it is checked against the rendered document,
-    /// because that is the only place the model can tell the difference.
+    /// next turn" — checked against the rendered document, because that
+    /// is the only place the model can tell the difference.
     ///
-    /// **One request exactly, with no timer in it.** A `Peeked` row
-    /// expires on the first `Reply` logged after it, which is a fact
-    /// about the log, so a reopened log renders exactly as the live one
-    /// did and a run that is read back a week later shows what the
-    /// model was actually looking at.
+    /// **And they live in different halves of the request.** A `keep`
+    /// writes its value into the row's own line, up in the
+    /// conversation, under the id that is already there; a `peek` rides
+    /// the ephemeral tail, which is re-emitted at the new end each
+    /// request and never written into the history — so a value meant
+    /// for one reply costs no rewrite of anything above it.
+    ///
+    /// **One request exactly, with no timer in it.** A peek is spent by
+    /// the next `Reply` on the log, so a log reopened a week later
+    /// renders what the model was actually looking at.
     #[test]
     fn a_kept_row_stays_and_a_peeked_one_is_gone_next_turn() {
-        let (mut tree, mut state) = setup_under();
-        user_post(&mut state, &mut tree, "go");
-        let out = state
-            .step(
-                &mut tree,
-                StepInput::LlmResponse(crate::host::scripted_markdown(
-                    "```js\n\
-                     history.keep(2, \"KEPT-VALUE\");\n\
-                     history.peek(4, \"PEEKED-VALUE\");\n\
-                     ```\n",
-                )),
-            )
-            .unwrap();
-        drain(&mut state, &mut tree, out);
+        // Two tools, so neither value is also a literal in the program
+        // source the document carries: `contains` on a projection
+        // written into the reply passes on the reply alone.
+        let mut c = Conversation::new();
+        c.answers("kept", serde_json::json!({ "out": "KEPT-VALUE" }));
+        c.answers("peeked", serde_json::json!({ "out": "PEEKED-VALUE" }));
+        c.reply(
+            "```js\n\
+             history.keep(await tools.kept());\n\
+             history.peek(await tools.peeked());\n\
+             ```\n",
+        );
 
-        let rendered = |tree: &Tree, state: &Runner| {
-            crate::document::render(tree, &state.spine, 64 * 1024)
-                .conversation()
-                .iter()
-                .map(|m| m.content.clone())
-                .collect::<String>()
-        };
-
-        // Counted, not searched for: the program's own source is in the
-        // document too and holds both strings whatever the rows do, so
-        // `contains` would pass on the source alone.
-        let times = |hay: &str, needle: &str| hay.matches(needle).count();
-        let now = rendered(&tree, &state);
-        assert_eq!(times(&now, "KEPT-VALUE"), 2, "the source and the row: {now}");
-        assert_eq!(times(&now, "PEEKED-VALUE"), 2, "likewise: {now}");
-        // And the peeked row says it is going, where the model reads it
-        // — otherwise "gone next turn" is a rule only the harness knows.
+        let now = c.document();
+        assert!(now.contains("KEPT-VALUE"), "the keep is inline: {now}");
+        assert!(now.contains("PEEKED-VALUE"), "the peek is in the tail");
         assert!(
-            now.contains("shown once"),
-            "the row says it will not be here next time: {now}"
+            now.contains("### peeked — here for this reply only"),
+            "and the block says what it is: {now}"
         );
 
         // One more reply, which is what spends a peek.
-        let out = state
-            .step(
-                &mut tree,
-                StepInput::LlmResponse(crate::host::scripted_markdown("Done.\n")),
-            )
-            .unwrap();
-        drain(&mut state, &mut tree, out);
-
-        let after = rendered(&tree, &state);
-        assert_eq!(times(&after, "KEPT-VALUE"), 2, "kept means kept: {after}");
-        assert_eq!(
-            times(&after, "PEEKED-VALUE"),
-            1,
-            "the row went and only the source that wrote it is left: {after}"
+        c.reply("Done.\n");
+        let after = c.document();
+        assert!(after.contains("KEPT-VALUE"), "kept means kept: {after}");
+        assert!(
+            !after.contains("PEEKED-VALUE"),
+            "the peek was spent by the reply after it: {after}"
         );
-        assert!(!after.contains("shown once"), "and its notice went too");
+        assert!(!after.contains("### peeked"), "and its block went too");
     }
 
-    /// **One result, one row: the last `keep`/`peek` on it wins.**
+    /// **A kept value renders on the row's own line, not beside it.**
     ///
-    /// `keep` after `peek` promotes the row already in front of you
-    /// rather than putting a second copy of the same value beside it,
-    /// and `peek` after `keep` retires the keep — "have it one more
-    /// turn, then stop paying for it", which is the only way to undo a
-    /// `keep` short of compaction. Same rule as `remove` against
-    /// `keep`, and for the same reason: both answer one question, does
-    /// this render, so the newest answer is the answer.
+    /// The first shape of this made the `Render` a row of its own,
+    /// which double-charged anything whose row already showed its own
+    /// value: `note("x")` and a `keep` of that note put `x` on the page
+    /// twice, under two ids. A `keep` is one bit about a row that
+    /// already exists, so there is one row and one id.
+    #[test]
+    fn a_kept_value_is_shown_by_the_row_it_came_from() {
+        let mut c = Conversation::new();
+        c.answers("echo", serde_json::json!({ "out": "ECHOED" }));
+        c.reply("```js\nhistory.keep(await tools.echo(1));\n```\n");
+
+        let doc = c.document();
+        assert_eq!(
+            doc.matches("ECHOED").count(),
+            1,
+            "one row, one copy of the value: {doc}"
+        );
+        // And it is under the call's *menu row*, indented as part of
+        // it — not somewhere else that happens to hold those bytes.
+        let row = doc
+            .lines()
+            .position(|l| l.starts_with("- `[") && l.contains("echo(1)"))
+            .expect("the call's row");
+        assert!(
+            doc.lines()
+                .nth(row + 1)
+                .is_some_and(|l| l.starts_with("  ") && l.contains("ECHOED")),
+            "the value is the indented line under the row: {doc}"
+        );
+    }
+
+    /// **One result, one answer: the last `keep`/`peek` on it wins.**
+    ///
+    /// `keep` after `peek` promotes the row in place instead of leaving
+    /// the value in the tail, and `peek` after `keep` retires the keep
+    /// — have it one more turn, then stop paying for it, which is the
+    /// only way to undo a `keep` short of compaction. Same rule as
+    /// `remove` against `replace`, and for the same reason: they answer
+    /// one question about one row, so the newest answer is the answer.
+    ///
+    /// It crosses turns, which is where a memo used to lie about it:
+    /// the report carrying the kept row was frozen on the strength of
+    /// being a pure function of the log up to its own outcome. See
+    /// `Tree::append`, which drops the memo when a `Render` lands.
     #[test]
     fn the_last_keep_or_peek_on_one_result_is_the_one_that_renders() {
-        let (mut tree, mut state) = setup_under();
-        user_post(&mut state, &mut tree, "go");
-        let out = state
-            .step(
-                &mut tree,
-                StepInput::LlmResponse(crate::host::scripted_markdown(
-                    "```js\n\
-                     history.peek(2, \"FIRST\");\n\
-                     history.keep(2, \"SECOND\");\n\
-                     ```\n",
-                )),
-            )
-            .unwrap();
-        drain(&mut state, &mut tree, out);
-
-        let doc = crate::document::render(&tree, &state.spine, 64 * 1024)
-            .conversation()
-            .iter()
-            .map(|m| m.content.clone())
-            .collect::<String>();
-        // Twice each in the source; only the second gets a row.
-        assert_eq!(doc.matches("SECOND").count(), 2, "{doc}");
-        assert_eq!(doc.matches("FIRST").count(), 1, "{doc}");
-        // And the surviving row is a keep, so it carries no notice.
-        assert!(!doc.contains("shown once"), "{doc}");
-    }
-
-    /// **And across turns, which is where the memo used to lie.** A
-    /// `keep` written three replies ago is retired by a `peek` written
-    /// now, so the row it put in an older report has to go — and that
-    /// report was memoised on the strength of being a pure function of
-    /// the log up to its own outcome. See `derive_report`: a report
-    /// showing a result is not memoised at all.
-    #[test]
-    fn a_keep_from_an_earlier_turn_is_retired_by_a_later_peek() {
         let mut c = Conversation::new();
-        c.reply("```js\nhistory.keep(2, \"THE-VALUE\");\n```\n");
-        let held = c.document();
-        assert_eq!(held.matches("THE-VALUE").count(), 2, "{held}");
+        c.answers("echo", serde_json::json!({ "out": "ECHOED" }));
+        c.reply("```js\nhistory.keep(await tools.echo(1));\n```\n");
+        assert!(
+            !c.document().contains("### peeked"),
+            "a keep is inline, not in the tail"
+        );
 
         // A later reply peeks the same result: one more turn, then out.
-        c.reply("```js\nhistory.peek(2, \"THE-VALUE\");\n```\n");
+        c.reply("```js\nhistory.peek(4);\n```\n");
         let once_more = c.document();
+        assert!(
+            once_more.contains("### peeked"),
+            "the keep was retired into a peek: {once_more}"
+        );
         assert_eq!(
-            once_more.matches("THE-VALUE").count(),
-            3,
-            "two sources and the one surviving row: {once_more}"
+            once_more.matches("ECHOED").count(),
+            1,
+            "and it is shown once, in the tail: {once_more}"
         );
 
         c.reply("Done.\n");
         let spent = c.document();
-        assert_eq!(
-            spent.matches("THE-VALUE").count(),
-            2,
-            "both sources, no row: {spent}"
-        );
-    }
-
-    /// **`remove` removes a menu row, which it did not.**
-    ///
-    /// A report is memoised on its outcome's id, on the promise that it
-    /// is a pure function of the log up to that outcome. A `Compacted`
-    /// naming one of its rows breaks that promise — and nothing
-    /// invalidated the memo, so the row went on rendering out of a
-    /// frozen string. The `Compacted` event landed, `menu_rows`
-    /// honoured it, and nobody called `menu_rows`.
-    ///
-    /// It survived because it is not what compaction mostly does: a
-    /// reply's blocks and a whole report are dropped by
-    /// `document.rs` at render time from the shadow, and that path is
-    /// not memoised. The rows were the part that silently did nothing.
-    #[test]
-    fn removing_a_row_removes_it_from_a_report_already_rendered() {
-        let mut c = Conversation::new();
-        c.reply("```js\nhistory.note(\"FINDME\");\n```\n");
-        let row = c.document();
-        assert_eq!(
-            row.matches("FINDME").count(),
-            2,
-            "the source and the menu row: {row}"
-        );
-
-        // A later reply removes it. The report holding that row was
-        // rendered into the request this reply answered.
-        c.reply("```js\nhistory.remove(4);\n```\n");
-        let gone = c.document();
-        assert_eq!(
-            gone.matches("FINDME").count(),
-            1,
-            "only the source that wrote it is left: {gone}"
-        );
+        assert!(!spent.contains("ECHOED"), "then not at all: {spent}");
     }
 
     /// **A stray fence is not a message.**

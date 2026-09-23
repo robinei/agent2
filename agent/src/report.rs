@@ -148,6 +148,17 @@ pub struct Artifact {
     /// `spawn(name)`, `name(args-preview)`, or `program result`.
     pub label: String,
     pub state: ArtifactState,
+    /// The row's value, written out under its line because
+    /// `history.keep` asked for it — or, in the tail, because
+    /// `history.peek` did.
+    ///
+    /// **It is the row that shows its value, not a row of its own.** A
+    /// result is on the record and not in front of you; these two verbs
+    /// change that one bit about the row it came from, in place, where
+    /// the id already is. Rendering the value as a *second* row instead
+    /// was the first shape this took, and it put the same bytes on the
+    /// page twice for anything whose row already showed its own value.
+    pub shown: Option<String>,
 }
 
 /// What the menu says about a row, and whether it can be fetched.
@@ -682,6 +693,24 @@ fn render_row_list(heading: &str, artifacts: &[&Artifact]) -> Option<String> {
         ));
     }
     for a in &artifacts[start..] {
+        out.push_str(&row_line(a));
+        // Under the line, indented as a continuation of its bullet, so
+        // a value of several lines still reads as belonging to the row
+        // whose id is above it.
+        if let Some(shown) = &a.shown {
+            for line in shown.lines() {
+                out.push_str("\n  ");
+                out.push_str(line);
+            }
+        }
+    }
+    Some(out)
+}
+
+/// One row's own line — everything but the value `keep`/`peek` may have
+/// asked to see under it.
+fn row_line(a: &Artifact) -> String {
+    {
         let tail = match &a.state {
             // **A delivered value is never shown here.** This menu is an
             // index of history rows, not a replay of them: the row's
@@ -715,13 +744,11 @@ fn render_row_list(heading: &str, artifacts: &[&Artifact]) -> Option<String> {
             // to draw: the label already says who said what, and an
             // arrow after it would point at nothing.
             ArtifactState::Whole(text) => {
-                out.push_str(&format!("\n- `[{}]` {}", a.id, text));
-                continue;
+                return format!("\n- `[{}]` {}", a.id, text);
             }
         };
-        out.push_str(&format!("\n- `[{}]` `{}` → {}", a.id, a.label, tail));
+        format!("\n- `[{}]` `{}` → {}", a.id, a.label, tail)
     }
-    Some(out)
 }
 
 /// What a delivered row says about itself: that it arrived, and how
@@ -1177,40 +1204,18 @@ pub fn derive_report(tree: &Tree, leaf: EventId, outcome: EventId, budget: usize
     if let Some(hit) = tree.memoised_report(outcome) {
         return hit;
     }
-    let handback = handback(tree, leaf, outcome);
-    let text = match &handback {
-        Some(h) => render_handback(h, budget),
+    let text = match handback(tree, leaf, outcome) {
+        Some(h) => render_handback(&h, budget),
         None => "(no outcome recorded for this call)".to_owned(),
     };
-    // **A report holding a `keep` or a `peek` is never final.**
-    // Everything else here is a pure function of the log up to
-    // `outcome`, which is what makes the memo safe. A shown result is
-    // the one thing that is not: a peek stops rendering at the next
-    // reply, and either one is retired by a later `keep`/`peek` on the
-    // same result, so the report it sits in renders one way now and
-    // another way three turns from now. Memoising the first would
-    // freeze it there forever — which is exactly what happened, and it
-    // made `peek` inert: the expiry check in `menu_rows` was correct
-    // and unreachable.
-    //
-    // These reports are the rare ones, so the memo still covers nearly
-    // every report on a branch. What it costs where it does apply is a
-    // rewritten suffix and the cache behind it — the same bill
-    // compaction pays, for the same reason, and the whole point of the
-    // verb is that the alternative is paying for the bytes forever.
-    if !handback.is_some_and(|h| shows_a_result(&h)) {
-        tree.memoise_report(outcome, text.clone());
-    }
+    // Memoised unconditionally: a report *is* a pure function of the
+    // log, and the two events that can change one after the fact —
+    // `Compacted` and `Render` — drop the whole memo as they land
+    // (`Tree::append`). Deciding here which reports are safe to cache
+    // was the wrong half of the problem: it cannot see the edit that
+    // has not happened yet.
+    tree.memoise_report(outcome, text.clone());
     text
-}
-
-/// Whether this report shows a result through `keep` or `peek` — see
-/// [`derive_report`], which declines to memoise when it does.
-fn shows_a_result(h: &Handback<'_>) -> bool {
-    h.path[..=h.outcome_at]
-        .iter()
-        .filter(|e| e.id.as_u64() > h.previous_outcome)
-        .any(|e| matches!(&e.payload, EventPayload::Render { .. }))
 }
 
 /// The "you copied a row" advisory, shared by both report shapes.
@@ -2072,6 +2077,7 @@ mod tests {
             id,
             label: label.into(),
             state: ArtifactState::Delivered(result),
+            shown: None,
         }
     }
 
@@ -2080,6 +2086,7 @@ mod tests {
             id,
             label: label.into(),
             state,
+            shown: None,
         }
     }
 
@@ -2895,7 +2902,8 @@ mod tests {
             new_artifacts: vec![Artifact {
                 id: 9,
                 label: String::new(),
-                state: ArtifactState::Whole(format!("appended: {long}")),
+                state: ArtifactState::Whole(format!("noted: {long}")),
+                shown: None,
             }],
             failed_calls: 0,
             long_bash: 0,
@@ -2903,7 +2911,7 @@ mod tests {
         }
         .render();
         assert!(rendered.contains(&long), "the row is not clipped");
-        assert!(rendered.contains("- `[9]` appended:"), "{rendered}");
+        assert!(rendered.contains("- `[9]` noted:"), "{rendered}");
     }
 
     /// **A structured row names its shape.** Keys, never contents: a
