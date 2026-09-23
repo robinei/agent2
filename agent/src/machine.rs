@@ -1970,6 +1970,29 @@ impl Runner {
             }
             // Resolution order is arrival order: the `Result` lands now,
             // naming the `Call` logged at dispatch.
+            // **The row's id travels with its value.** `keep(f)` and
+            // `peek(f)` want the row a result came from, and a program
+            // holding only the value had no way back to it — the id
+            // appears in the document a turn later, on the menu row,
+            // which is too late to name in the reply that made the
+            // call. Injected before the value is logged, so a `fetch`
+            // of the row and the call that produced it agree.
+            //
+            // Objects only: there is nowhere to hang a field on a
+            // string or a number, and every tool that returns something
+            // worth showing returns an object.
+            let with_id = |v: &serde_json::Value| match v {
+                serde_json::Value::Object(map) if !map.contains_key("id") => {
+                    let mut map = map.clone();
+                    map.insert("id".into(), serde_json::json!(tr.call.as_u64()));
+                    serde_json::Value::Object(map)
+                }
+                other => other.clone(),
+            };
+            let tr = ToolResult {
+                call: tr.call,
+                result: tr.result.as_ref().map(&with_id).map_err(|e| e.clone()),
+            };
             let outcome = match &tr.result {
                 Ok(v) => Outcome::Delivered(v.clone()),
                 Err(msg) => Outcome::Failed(msg.clone()),

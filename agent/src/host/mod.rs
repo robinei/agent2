@@ -4922,7 +4922,10 @@ mod tests {
                 _ => None,
             })
             .expect("the send's own Result carries the receipt");
-        assert_eq!(receipt, json!({ "post": post.as_u64() }));
+        // The receipt carries its own row id too, like every object
+        // result: `keep`/`peek` name a row by the value they were handed.
+        assert_eq!(receipt["post"], json!(post.as_u64()));
+        assert!(receipt["id"].is_u64(), "the row it landed on: {receipt}");
     }
 
     /// **Agents outlive programs, but a program's handles to them do
