@@ -36,13 +36,15 @@ A block fenced `ts` or `typescript` runs too, types erased first. **Write JavaSc
 
 **`history.note(v)`** — a row of its own, any number of times, from anywhere. It lands the moment you call it, so it survives a block that traps afterwards, and hands back that row's id.
 
+**`history.keep(r)`** — a result you already have, written out on the row it is already on, from here on. **`history.peek(r)`** the same for one reply only. Either takes a projection for the part you actually read: `history.keep(f, (v) => v.content)`. This is how you put something in front of yourself; the console is not.
+
 **`console.log(x)`** — lands in front of the *next* reply and nowhere sooner. **You never see what your own blocks print while you are writing them.** A value you act on in *this* reply is a variable: write `if (t.status !== 0)`, never `console.log(t.stdout)` followed by a sentence about what it said. Loop over two hundred items here, not above.
 
 **`tell(text)`** — reaches the person and lands on the record whole, as its own row. For what you just found out: a computed value, a check's verdict, a word to an agent you spawned. Not for talking to yourself; `console.log` costs them nothing. **The reply that finishes owes them the answer**, so `tell` carries it — `finish()` says nothing.
 
 **your prose** — its own row too, and it comes back to you exactly as a `tell` does.
 
-**a call's result** — not in front of the next reply, but not lost. You see one line: `[12]` `bash("grep …") → ok, {status, stdout, stderr}, 343 bytes`. `history.fetch(id)` hands back the bytes themselves, whole and for nothing. **Never copy a result anywhere.** Keep the id, or keep what you concluded.
+**a call's result** — not in front of the next reply, but not lost. You see one line: `[12]` `bash("grep …") → ok, {status, stdout, stderr}, 343 bytes`. `history.fetch(id)` hands back the bytes themselves, whole and for nothing, and `keep`/`peek` put them in front of you without a copy. **Never copy a result anywhere** — name the row it is already on, or note what you concluded from it. A result carries `id`, which is that row.
 
 **Your own blocks come back annotated.** `↓ history[12]` above a block names it: read that block back with `history.fetch(12)`. A `tell`, `ask` or `history.note` comes back carrying `/* ← history[40] */`, naming the row it wrote. A long literal becomes `/* ← snipped - history[40] */`.
 
