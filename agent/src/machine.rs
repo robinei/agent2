@@ -4006,20 +4006,8 @@ impl Runner {
         // The byte path stays for the two cases where there is nothing
         // to count against: no window configured, and no reply has
         // reported a `prompt_tokens` yet.
-        let (measured, limit, unit) = match (crate::host::context_tokens(), self.next_prompt_floor)
-        {
-            (Some(context), Counted::Floor(tokens)) => {
-                let usable = context
-                    .saturating_sub(crate::host::completion_reserve())
-                    .min(crate::host::max_document_tokens());
-                (tokens as usize, usable, Measure::Tokens)
-            }
-            // A window is configured and the count it is tested against
-            // is momentarily gone. Waiting for the next reply to bring
-            // one is the whole of the right answer here — see
-            // [`Counted::Stale`] for the run that proved it.
-            (Some(_), Counted::Stale) => return Ok(None),
-            _ => (rendered, budget, Measure::Bytes),
+        let Some((measured, limit, unit)) = self.fullness(rendered, budget) else {
+            return Ok(None);
         };
         self.last_fullness = Some((measured, limit, unit));
         if !crate::compaction::should_fire(measured, limit, headroom) {
@@ -4060,6 +4048,37 @@ impl Runner {
         self.compaction_requested = true;
         self.await_llm();
         Ok(Some(self.render_request(tree)))
+    }
+
+    /// **How full this conversation is, in the one unit that decides.**
+    /// `None` when that cannot be answered yet.
+    ///
+    /// Shared by the compaction trigger and the tail's readout, because
+    /// the day they were two functions they disagreed: the readout fell
+    /// back to bytes-against-the-document-budget whenever nothing had
+    /// cached a measurement, so `agent document` on a run whose model
+    /// has a 1M-token window announced "133% full" about a request the
+    /// model saw as 2%. An instrument that contradicts the request is
+    /// worse than one that is silent.
+    ///
+    /// `None` is the silence: a window is configured and no reply has
+    /// reported a `prompt_tokens` against it yet, which is every
+    /// reopened log. Substituting the other unit there is what went
+    /// wrong — see [`Counted::Stale`] for the live run that first made
+    /// the point.
+    fn fullness(&self, rendered: usize, budget: usize) -> Option<(usize, usize, Measure)> {
+        match (crate::host::context_tokens(), self.next_prompt_floor) {
+            (Some(context), Counted::Floor(tokens)) => {
+                let usable = context
+                    .saturating_sub(crate::host::completion_reserve())
+                    .min(crate::host::max_document_tokens());
+                Some((tokens as usize, usable, Measure::Tokens))
+            }
+            (Some(_), _) => None,
+            // No window configured at all: bytes are the only budget
+            // there is, and the one the trigger uses.
+            _ => Some((rendered, budget, Measure::Bytes)),
+        }
     }
 
     /// What the last `keep`/`peek` of this row chose to show.
@@ -4354,14 +4373,15 @@ impl Runner {
         // `agent document`, which is how anyone checks what the model
         // was actually sent. A line that appears in the request and not
         // in the rendering of that request is a line nobody can audit,
-        // and this file has been caught by that shape before.
+        // and this file has been caught by that shape before. Through
+        // `fullness`, so the rendering cannot answer in a different
+        // unit from the trigger.
         let fullness = self.last_fullness.or_else(|| {
             let doc = crate::document::render(tree, &self.spine, self.document_budget());
-            Some((
+            self.fullness(
                 crate::compaction::rendered_size(&doc),
                 self.document_budget(),
-                Measure::Bytes,
-            ))
+            )
         });
         if let Some((measured, limit, unit)) = fullness
             && limit > 0
@@ -9219,6 +9239,44 @@ mod tests {
         assert!(
             !c.document().contains("shows just that field"),
             "no advice where none is owed"
+        );
+    }
+
+    /// **The readout and the trigger answer in one unit, or not at
+    /// all.**
+    ///
+    /// They were two functions for a day and disagreed inside it: the
+    /// tail fell back to bytes-against-the-document-budget whenever
+    /// nothing had cached a measurement, so `agent document` on a
+    /// 1M-token model announced "133% full" about a request the live
+    /// trigger had measured at 2% and correctly let pass. The rendering
+    /// of a request is how anyone checks what the model was sent, so a
+    /// number there that the request never carried is worse than no
+    /// number.
+    ///
+    /// Now one function answers both, and its silence is the case that
+    /// went wrong: a window configured, nothing counted against it yet,
+    /// which is every reopened log.
+    #[test]
+    fn the_fullness_readout_is_silent_rather_than_answering_in_the_wrong_unit() {
+        let mut c = Conversation::new();
+        c.user("go");
+        c.reply("```js\nhistory.note(\"x\".repeat(40000));\n```\n");
+
+        // No window configured: bytes are the only budget there is, and
+        // the trigger uses them, so the readout speaks in them.
+        let tail = c.runner().request_tail(c.tree()).unwrap_or_default();
+        assert!(tail.contains("% full"), "{tail}");
+        assert!(c.runner().fullness(40_000, 65_536).is_some());
+
+        // A window *is* configured and no reply has counted against it.
+        // The trigger declines to fire; the readout declines to speak.
+        unsafe { std::env::set_var("AGENT2_CONTEXT_TOKENS", "1000000") };
+        let quiet = c.runner().fullness(40_000, 65_536);
+        unsafe { std::env::remove_var("AGENT2_CONTEXT_TOKENS") };
+        assert!(
+            quiet.is_none(),
+            "it answered in bytes about a token window: {quiet:?}"
         );
     }
 
