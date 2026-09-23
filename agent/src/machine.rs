@@ -4301,6 +4301,29 @@ impl Runner {
         })
     }
 
+    /// Whether a compaction has been asked for and not yet answered —
+    /// **read off the log, not off `self`.**
+    ///
+    /// `compaction_requested` is the live flag: set beside the
+    /// `Compaction` event, cleared when the handler's batch is applied
+    /// at its handback. Both moments are on the log, so the same
+    /// question has a logged answer — and it needs one, because the
+    /// flag is false in every process that merely *reads* a log.
+    /// `agent document` could not render the compaction directive at
+    /// all, which is the one prompt in this system whose wording is
+    /// argued over most and the only one nobody could look at.
+    fn compaction_outstanding(&self, tree: &Tree) -> bool {
+        tree.path_events(self.spine.leaf_id)
+            .iter()
+            .rev()
+            .find_map(|e| match &e.payload {
+                EventPayload::Compaction { .. } => Some(true),
+                EventPayload::Handback { .. } => Some(false),
+                _ => None,
+            })
+            .unwrap_or(false)
+    }
+
     /// The directive for the compaction currently outstanding, read
     /// back off the log rather than stashed on `self`: the `Condition`
     /// carrying the sizes was appended by `compaction_if_needed` one
@@ -4383,7 +4406,7 @@ impl Runner {
         // not being done in this program. It lives here rather than in
         // the document because it instructs rather than reports: see
         // `document::render_with_lookup`, which skips the row.
-        if self.compaction_requested
+        if self.compaction_outstanding(tree)
             && let Some(directive) = self.compaction_directive(tree)
         {
             return Some(directive);
@@ -4464,7 +4487,7 @@ impl Runner {
         });
         if let Some((measured, limit, unit)) = fullness
             && limit > 0
-            && !self.compaction_requested
+            && !self.compaction_outstanding(tree)
         {
             let pct = measured * 100 / limit;
             if pct >= SOFT_FULL_PERCENT {
@@ -5773,7 +5796,13 @@ impl Runner {
             // bytes-to-tokens constant — it is this document's ratio,
             // recomputed every reply, and it exists so the trigger can
             // see growth that happened *after* the count it is holding.
-            if let Some(bytes) = self.last_rendered_bytes {
+            // **Taken, not read.** The pairing is only sound when the
+            // size recorded is the size of *this* request, and
+            // `compaction_if_needed` returns before rendering while a
+            // compaction is already outstanding — so that request's
+            // bytes are never recorded, and reading a stale number here
+            // would calibrate the density against the wrong document.
+            if let Some(bytes) = self.last_rendered_bytes.take() {
                 self.bytes_per_token = Some(bytes as f64 / usage.prompt as f64);
             }
         }
@@ -9489,6 +9518,40 @@ mod tests {
             crate::compaction::should_fire(measured, usable, 0.2),
             "and that is what the trigger asks"
         );
+    }
+
+    /// **The compaction directive renders from the log.**
+    ///
+    /// It was gated on `compaction_requested`, a live flag that is
+    /// false in every process that merely reads a log — so `agent
+    /// document` could not show the directive at all. That is the one
+    /// prompt in this system whose wording gets argued over most, and
+    /// it was the only one nobody could look at. Both moments that move
+    /// the flag are already on the log: the `Compaction` event, and the
+    /// handback of the program that answers it.
+    #[test]
+    fn a_reopened_log_can_render_the_compaction_directive() {
+        let (mut tree, mut state) = setup_under();
+        user_post(&mut state, &mut tree, "go");
+        tree.append(
+            &mut state.spine,
+            EventPayload::Compaction {
+                measured: 34_734,
+                limit: 20_000,
+                unit: Measure::Tokens,
+            },
+        )
+        .unwrap();
+
+        // The flag a live run would be holding is not set here, which
+        // is exactly the state a reopened log is in.
+        assert!(!state.compaction_requested);
+        let tail = state.request_tail(&tree).unwrap_or_default();
+        assert!(
+            tail.contains("STOP — THIS CONVERSATION IS FULL"),
+            "the directive is what the tail carries: {tail}"
+        );
+        assert!(tail.contains("34734"), "with the numbers it fired on");
     }
 
     /// **A stray fence is not a message.**
