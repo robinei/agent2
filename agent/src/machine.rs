@@ -4922,6 +4922,19 @@ pub(crate) fn menu_rows(
                 // after it, which is one request exactly — no timer,
                 // and a reopened log renders the same as a live one.
                 EventPayload::Render { of, mode, value } => {
+                    // **Last write wins, here as everywhere else.** One
+                    // result, one row: `keep` after `peek` promotes the
+                    // row it is already looking at rather than adding a
+                    // second copy of the same value, and `peek` after
+                    // `keep` retires the keep — "have it one more turn,
+                    // then stop paying for it", which is the only way
+                    // to undo a `keep` short of compaction.
+                    if settlements.iter().any(|e| {
+                        e.id > event.id
+                            && matches!(&e.payload, EventPayload::Render { of: o, .. } if o == of)
+                    }) {
+                        return None;
+                    }
                     if *mode == crate::types::RenderMode::Peeked
                         && settlements.iter().any(|e| {
                             e.id > event.id && matches!(e.payload, EventPayload::Reply)
@@ -8844,7 +8857,7 @@ mod tests {
                 StepInput::LlmResponse(crate::host::scripted_markdown(
                     "```js\n\
                      history.keep(2, \"KEPT-VALUE\");\n\
-                     history.peek(2, \"PEEKED-VALUE\");\n\
+                     history.peek(4, \"PEEKED-VALUE\");\n\
                      ```\n",
                 )),
             )
@@ -8890,6 +8903,75 @@ mod tests {
             "the row went and only the source that wrote it is left: {after}"
         );
         assert!(!after.contains("shown once"), "and its notice went too");
+    }
+
+    /// **One result, one row: the last `keep`/`peek` on it wins.**
+    ///
+    /// `keep` after `peek` promotes the row already in front of you
+    /// rather than putting a second copy of the same value beside it,
+    /// and `peek` after `keep` retires the keep — "have it one more
+    /// turn, then stop paying for it", which is the only way to undo a
+    /// `keep` short of compaction. Same rule as `remove` against
+    /// `keep`, and for the same reason: both answer one question, does
+    /// this render, so the newest answer is the answer.
+    #[test]
+    fn the_last_keep_or_peek_on_one_result_is_the_one_that_renders() {
+        let (mut tree, mut state) = setup_under();
+        user_post(&mut state, &mut tree, "go");
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::LlmResponse(crate::host::scripted_markdown(
+                    "```js\n\
+                     history.peek(2, \"FIRST\");\n\
+                     history.keep(2, \"SECOND\");\n\
+                     ```\n",
+                )),
+            )
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+
+        let doc = crate::document::render(&tree, &state.spine, 64 * 1024)
+            .conversation()
+            .iter()
+            .map(|m| m.content.clone())
+            .collect::<String>();
+        // Twice each in the source; only the second gets a row.
+        assert_eq!(doc.matches("SECOND").count(), 2, "{doc}");
+        assert_eq!(doc.matches("FIRST").count(), 1, "{doc}");
+        // And the surviving row is a keep, so it carries no notice.
+        assert!(!doc.contains("shown once"), "{doc}");
+    }
+
+    /// **And across turns, which is where the memo used to lie.** A
+    /// `keep` written three replies ago is retired by a `peek` written
+    /// now, so the row it put in an older report has to go — and that
+    /// report was memoised on the strength of being a pure function of
+    /// the log up to its own outcome. See `derive_report`: a report
+    /// showing a result is not memoised at all.
+    #[test]
+    fn a_keep_from_an_earlier_turn_is_retired_by_a_later_peek() {
+        let mut c = Conversation::new();
+        c.reply("```js\nhistory.keep(2, \"THE-VALUE\");\n```\n");
+        let held = c.document();
+        assert_eq!(held.matches("THE-VALUE").count(), 2, "{held}");
+
+        // A later reply peeks the same result: one more turn, then out.
+        c.reply("```js\nhistory.peek(2, \"THE-VALUE\");\n```\n");
+        let once_more = c.document();
+        assert_eq!(
+            once_more.matches("THE-VALUE").count(),
+            3,
+            "two sources and the one surviving row: {once_more}"
+        );
+
+        c.reply("Done.\n");
+        let spent = c.document();
+        assert_eq!(
+            spent.matches("THE-VALUE").count(),
+            2,
+            "both sources, no row: {spent}"
+        );
     }
 
     /// **A stray fence is not a message.**

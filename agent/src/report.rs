@@ -1182,42 +1182,35 @@ pub fn derive_report(tree: &Tree, leaf: EventId, outcome: EventId, budget: usize
         Some(h) => render_handback(h, budget),
         None => "(no outcome recorded for this call)".to_owned(),
     };
-    // **A report holding a live `peek` is not final yet.** Everything
-    // else here is a pure function of the log up to `outcome`, which is
-    // what makes the memo safe and the prefix immutable. A peeked row
-    // is the one thing that is not: it shows for exactly one request
-    // and then stops, so the report it sits in renders one way now and
-    // another way after the next reply, and memoising the first would
-    // freeze it there forever.
+    // **A report holding a `keep` or a `peek` is never final.**
+    // Everything else here is a pure function of the log up to
+    // `outcome`, which is what makes the memo safe. A shown result is
+    // the one thing that is not: a peek stops rendering at the next
+    // reply, and either one is retired by a later `keep`/`peek` on the
+    // same result, so the report it sits in renders one way now and
+    // another way three turns from now. Memoising the first would
+    // freeze it there forever — which is exactly what happened, and it
+    // made `peek` inert: the expiry check in `menu_rows` was correct
+    // and unreachable.
     //
-    // It costs one uncached suffix, once, and only for the request that
-    // spends the peek — a peek expires on the very next reply, so what
-    // changes is always near the end of the document. That is the trade
-    // the verb *is*: a row you do not go on paying for.
-    if !handback.is_some_and(|h| holds_a_live_peek(&h)) {
+    // These reports are the rare ones, so the memo still covers nearly
+    // every report on a branch. What it costs where it does apply is a
+    // rewritten suffix and the cache behind it — the same bill
+    // compaction pays, for the same reason, and the whole point of the
+    // verb is that the alternative is paying for the bytes forever.
+    if !handback.is_some_and(|h| shows_a_result(&h)) {
         tree.memoise_report(outcome, text.clone());
     }
     text
 }
 
-/// Whether this report shows a `peek` that has not been spent yet — see
-/// [`derive_report`], which declines to memoise when it has.
-fn holds_a_live_peek(h: &Handback<'_>) -> bool {
+/// Whether this report shows a result through `keep` or `peek` — see
+/// [`derive_report`], which declines to memoise when it does.
+fn shows_a_result(h: &Handback<'_>) -> bool {
     h.path[..=h.outcome_at]
         .iter()
         .filter(|e| e.id.as_u64() > h.previous_outcome)
-        .any(|e| {
-            matches!(
-                &e.payload,
-                EventPayload::Render {
-                    mode: crate::types::RenderMode::Peeked,
-                    ..
-                }
-            ) && !h
-                .path
-                .iter()
-                .any(|l| l.id > e.id && matches!(l.payload, EventPayload::Reply))
-        })
+        .any(|e| matches!(&e.payload, EventPayload::Render { .. }))
 }
 
 /// The "you copied a row" advisory, shared by both report shapes.
