@@ -847,14 +847,25 @@ impl Tree {
     pub fn compacted_lookup(&self, leaf: EventId) -> HashMap<EventId, CompactedView> {
         let mut lookup = HashMap::new();
         for event in self.path_events(leaf) {
-            if let EventPayload::Compacted { of, text, window } = &event.payload {
-                lookup.insert(
-                    *of,
-                    CompactedView {
-                        text: text.clone(),
-                        window: *window,
-                    },
-                );
+            match &event.payload {
+                EventPayload::Compacted { of, text, window } => {
+                    lookup.insert(
+                        *of,
+                        CompactedView {
+                            text: text.clone(),
+                            window: *window,
+                        },
+                    );
+                }
+                // **`keep`/`peek` and `remove` are edits to one thing:
+                // does this row render.** So they resolve the same way —
+                // last write on the path wins, and root-first iteration
+                // makes that fall out. A row swept away and later kept
+                // comes back; a row kept and later swept goes.
+                EventPayload::Render { of, .. } => {
+                    lookup.remove(of);
+                }
+                _ => {}
             }
         }
         lookup

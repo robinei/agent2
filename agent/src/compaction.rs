@@ -184,6 +184,32 @@ pub fn compact(tree: &Tree, spine: &Spine, ops: &[CompactionOp]) -> Vec<EventPay
         .map(|e| e.id)
         .collect();
 
+    // **Within one program, the specific beats the sweep.** A batch
+    // that says `keep(22); remove(10, 40)` means "this range except
+    // that", and the batch is declarative — `compact` validates it as a
+    // whole — so the order the two lines were written in cannot be what
+    // decides. A keep made *earlier*, in some previous reply, is not
+    // protected: that was a decision taken with less knowledge than the
+    // sweep being written now, and a later edit wins.
+    let this_program = tree
+        .path_events(spine.leaf_id)
+        .iter()
+        .rposition(|e| matches!(e.payload, EventPayload::Reply | EventPayload::Restart))
+        .map(|i| tree.path_events(spine.leaf_id)[i].id);
+    let kept_here: std::collections::HashSet<EventId> = tree
+        .path_events(spine.leaf_id)
+        .iter()
+        .filter(|e| this_program.is_some_and(|p| e.id > p))
+        .filter_map(|e| match &e.payload {
+            EventPayload::Render {
+                of,
+                mode: crate::types::RenderMode::Kept,
+                ..
+            } => Some(*of),
+            _ => None,
+        })
+        .collect();
+
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
     for op in ops {
@@ -198,6 +224,14 @@ pub fn compact(tree: &Tree, spine: &Spine, ops: &[CompactionOp]) -> Vec<EventPay
             let EventPayload::Compacted { of, .. } = &payload else {
                 unreachable!("into_payloads only builds Compacted")
             };
+            // The sweep steps over what this same program kept; a
+            // `remove(id)` naming one outright still takes it, because
+            // that is not a sweep and says exactly which row it means.
+            if matches!(op, CompactionOp::Remove { from, to } if from != to)
+                && kept_here.contains(of)
+            {
+                continue;
+            }
             // One op per entry: a later op on an entry an earlier op
             // already claimed is dropped, so a range and a replacement
             // that overlap resolve in the order they were written.
@@ -584,6 +618,152 @@ mod tests {
                 .any(|p| matches!(p, EventPayload::Compacted { of, .. } if *of == note)),
             "the note is inside the range: {forwards:?}"
         );
+    }
+
+    /// **Within one program the specific beats the sweep.** A batch
+    /// reading `keep(call); remove(everything)` is one decision written
+    /// in two lines — "all of this except that" — so the line order
+    /// cannot be what settles it, and the sweep steps over what this
+    /// same program kept. Naming the row outright is not a sweep: it
+    /// says exactly which row it means, and it still takes it.
+    #[test]
+    fn a_sweep_steps_over_what_this_program_kept_but_a_named_remove_does_not() {
+        let build = || {
+            let (mut tree, mut spine, _reply, ret) = branch_with_a_report();
+            let call = tree
+                .path_events(spine.leaf_id)
+                .iter()
+                .find(|e| matches!(e.payload, EventPayload::Call(_)))
+                .unwrap()
+                .id;
+            tree.append(
+                &mut spine,
+                EventPayload::Render {
+                    of: call,
+                    mode: crate::types::RenderMode::Kept,
+                    value: serde_json::json!({"status": 0}),
+                },
+            )
+            .unwrap();
+            (tree, spine, call, ret)
+        };
+
+        let (tree, spine, call, ret) = build();
+        let ids: Vec<EventId> = tree.path_events(spine.leaf_id).iter().map(|e| e.id).collect();
+        let sweep = compact(
+            &tree,
+            &spine,
+            &[CompactionOp::Remove {
+                from: *ids.first().unwrap(),
+                to: *ids.last().unwrap(),
+            }],
+        );
+        assert!(
+            !sweep
+                .iter()
+                .any(|p| matches!(p, EventPayload::Compacted { of, .. } if *of == call)),
+            "the sweep took the row this program kept: {sweep:?}"
+        );
+        assert!(
+            sweep
+                .iter()
+                .any(|p| matches!(p, EventPayload::Compacted { of, .. } if *of == ret)),
+            "the sweep applied to everything else: {sweep:?}"
+        );
+
+        let named = compact(
+            &tree,
+            &spine,
+            &[CompactionOp::Remove {
+                from: call,
+                to: call,
+            }],
+        );
+        assert!(
+            named
+                .iter()
+                .any(|p| matches!(p, EventPayload::Compacted { of, .. } if *of == call)),
+            "naming the row is not a sweep: {named:?}"
+        );
+    }
+
+    /// **A keep from an earlier reply is not protected.** It was taken
+    /// with less knowledge than the sweep being written now, and the
+    /// whole point of `remove` is that it can reach the rows a past
+    /// program decided to hang on to. Same fixture as above, one more
+    /// program started after the keep.
+    #[test]
+    fn a_sweep_takes_what_an_earlier_program_kept() {
+        let (mut tree, mut spine, _reply, _ret) = branch_with_a_report();
+        let call = tree
+            .path_events(spine.leaf_id)
+            .iter()
+            .find(|e| matches!(e.payload, EventPayload::Call(_)))
+            .unwrap()
+            .id;
+        tree.append(
+            &mut spine,
+            EventPayload::Render {
+                of: call,
+                mode: crate::types::RenderMode::Kept,
+                value: serde_json::json!({"status": 0}),
+            },
+        )
+        .unwrap();
+        tree.append(&mut spine, EventPayload::Restart).unwrap();
+
+        let ids: Vec<EventId> = tree.path_events(spine.leaf_id).iter().map(|e| e.id).collect();
+        let sweep = compact(
+            &tree,
+            &spine,
+            &[CompactionOp::Remove {
+                from: *ids.first().unwrap(),
+                to: *ids.last().unwrap(),
+            }],
+        );
+        assert!(
+            sweep
+                .iter()
+                .any(|p| matches!(p, EventPayload::Compacted { of, .. } if *of == call)),
+            "a keep from a past program outlived the sweep: {sweep:?}"
+        );
+    }
+
+    /// **`keep` and `remove` edit one thing — does this row render —
+    /// so the last write on the path wins.** A row swept away and later
+    /// kept comes back; the reverse order goes the other way. Without
+    /// this a compaction program could not un-remove a row it had just
+    /// decided it wanted after all, and a `keep` would have been
+    /// permanent, which nothing else in the log is.
+    #[test]
+    fn keeping_a_removed_row_brings_it_back_and_removing_a_kept_one_takes_it() {
+        for kept_last in [true, false] {
+            let (mut tree, mut spine, _reply, ret) = branch_with_a_report();
+            let compacted = EventPayload::Compacted {
+                of: ret,
+                text: Some("gone".into()),
+                window: None,
+            };
+            let kept = EventPayload::Render {
+                of: ret,
+                mode: crate::types::RenderMode::Kept,
+                value: serde_json::Value::Null,
+            };
+            let (first, second) = if kept_last {
+                (compacted, kept)
+            } else {
+                (kept, compacted)
+            };
+            tree.append(&mut spine, first).unwrap();
+            tree.append(&mut spine, second).unwrap();
+
+            let lookup = tree.compacted_lookup(spine.leaf_id);
+            assert_eq!(
+                lookup.contains_key(&ret),
+                !kept_last,
+                "kept_last={kept_last}: {lookup:?}"
+            );
+        }
     }
 
     /// One op per row still holds — the second op on an id is dropped
