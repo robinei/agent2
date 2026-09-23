@@ -1431,11 +1431,101 @@ fn render_handback(h: &Handback<'_>, budget: usize) -> String {
 /// `None` where the measure is tokens: the split is known in bytes and
 /// there is no tokenizer here to convert it, and a number in the wrong
 /// unit is worse than no number.
+/// The heaviest addressable entries in a rendered document, as
+/// `(id, bytes, replies_ago)`, biggest first.
+///
+/// **The one fact a compaction program cannot see.** It is shown a menu
+/// of thirty rows and its own replies above them, and nothing in either
+/// says which of them is the 4 KB one: a call's row reads `→ ok, 210
+/// bytes` about a result that is not rendered at all, a note's row is
+/// clipped at 32 KB without saying where in that range it falls, and a
+/// block of its own reply has no size on it anywhere. So it picks by
+/// what it remembers being long, which is not the same list.
+///
+/// **Report-only, and best effort.** It attributes every byte of the
+/// rendered conversation to the last id it saw announced — a `↓
+/// history[N]` line above a block, or a `- \`[N]\`` menu row — which is
+/// how the document announces them and therefore what the model is
+/// reading too. A byte before the first id belongs to nothing and is
+/// dropped. Nothing acts on this; it tells the program where to look.
+pub(crate) fn heaviest_rows(
+    doc: &crate::document::Document,
+    ages: &std::collections::HashMap<u64, usize>,
+    want: usize,
+) -> Vec<(u64, usize, usize)> {
+    let mut weight: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
+    for message in doc.conversation() {
+        // A message boundary ends whatever block was open: the next
+        // one's bytes are not the last one's, whatever it announced.
+        let mut current: Option<u64> = None;
+        for line in message.content.split_inclusive('\n') {
+            if let Some(id) = announced_id(line) {
+                current = Some(id);
+            }
+            if let Some(id) = current {
+                *weight.entry(id).or_default() += line.len();
+            }
+        }
+    }
+    let mut rows: Vec<(u64, usize, usize)> = weight
+        .into_iter()
+        .map(|(id, bytes)| (id, bytes, ages.get(&id).copied().unwrap_or(0)))
+        .collect();
+    // Biggest first, and by id where two are the same size, so the line
+    // is the same line twice for the same document.
+    rows.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    rows.truncate(want);
+    rows
+}
+
+/// The id a line announces, if it announces one: `↓ history[12]` above
+/// a block, or `- \`[12]\`` at the head of a menu row.
+fn announced_id(line: &str) -> Option<u64> {
+    let rest = match line.trim_start().strip_prefix(crate::document::BLOCK_ARROW) {
+        Some(rest) => rest.strip_prefix(" history[")?,
+        None => line.trim_start().strip_prefix("- `[")?,
+    };
+    let close = rest.find(|c: char| !c.is_ascii_digit())?;
+    rest[..close].parse().ok()
+}
+
+/// One line naming the heaviest entries and how long each has sat
+/// there, for the compaction directive to carry. Empty when there is
+/// nothing worth naming.
+pub(crate) fn heaviest_line(rows: &[(u64, usize, usize)]) -> String {
+    // Under a line of text is not worth a reader's attention, and a
+    // list of four such rows is worse than no list: it says "these are
+    // the ones" about entries whose removal frees nothing.
+    let named: Vec<String> = rows
+        .iter()
+        .filter(|(_, bytes, _)| *bytes >= 512)
+        .map(|(id, bytes, age)| {
+            let ago = match age {
+                0 => "this reply".to_owned(),
+                1 => "1 reply ago".to_owned(),
+                n => format!("{n} replies ago"),
+            };
+            format!("#{id} {:.1} KB, {ago}", *bytes as f64 / 1024.0)
+        })
+        .collect();
+    if named.is_empty() {
+        return String::new();
+    }
+    format!(
+        "\n\n**The heaviest entries, and how long each has been in front of you:** {}. \
+         Size and age are not the same reason to drop something — an entry you read once \
+         and have been carrying for eleven replies is the cheap one to lose, and the big \
+         one you were just handed may be the task.",
+        named.join(", ")
+    )
+}
+
 pub(crate) fn compaction_message(
     measured: usize,
     limit: usize,
     unit: crate::types::Measure,
     fixed: Option<usize>,
+    heaviest: &str,
 ) -> String {
     let noun = unit.noun();
     // Built from the constant rather than spelled out, because a
@@ -1493,7 +1583,7 @@ pub(crate) fn compaction_message(
          never off the log: `history.fetch(id)` still returns it whole, so an id you keep \
          is an id you can still read. So drop whatever you judge least useful to have in \
          front of you from here, which is a judgement only you can make: you are the one \
-         who has read this conversation. The task itself is never a target.\n\n\
+         who has read this conversation. The task itself is never a target.{heaviest}\n\n\
          Return when you are done. Do not do anything else."
     )
 }
@@ -2182,6 +2272,70 @@ mod tests {
     }
 
     /// Every report kind renders from fixture events alone — no VM, no
+    /// **The heaviest line reads the document the way the model does.**
+    ///
+    /// Every byte belongs to the last id the page announced — a `↓
+    /// history[N]` above a block, or a `- `[N]`` at the head of a menu
+    /// row — because those are the only two places the document says an
+    /// id out loud, so anything else would be attributing bytes by a
+    /// rule the reader cannot check.
+    #[test]
+    fn the_heaviest_line_names_the_big_row_and_not_the_small_ones() {
+        let msg = |role, content: String| crate::document::ChatMessage {
+            role,
+            content,
+            call: None,
+            result_for: None,
+            thinking: None,
+        };
+        let doc = crate::document::Document {
+            messages: vec![
+                msg(
+                    crate::document::ChatRole::Assistant,
+                    format!(
+                        "{} history[7]\n{}\n",
+                        crate::document::BLOCK_ARROW,
+                        "x".repeat(4096)
+                    ),
+                ),
+                msg(
+                    crate::document::ChatRole::User,
+                    "- `[9]` `bash(\"ls\")` → ok, 12 bytes\n- `[11]` noted: 3\n".to_owned(),
+                ),
+            ],
+            preamble: 0,
+        };
+        let ages = std::collections::HashMap::from([(7, 11), (9, 2), (11, 0)]);
+        let rows = heaviest_rows(&doc, &ages, 5);
+        assert_eq!(rows.first().map(|r| r.0), Some(7), "biggest first: {rows:?}");
+        assert!(rows[0].1 > 4000, "it carries the block's bytes: {rows:?}");
+
+        let line = heaviest_line(&rows);
+        assert!(line.contains("#7 4.0 KB, 11 replies ago"), "{line}");
+        // The two small rows are named nowhere: a list that included
+        // them would say "these are the ones" about entries whose
+        // removal frees nothing.
+        assert!(!line.contains("#9") && !line.contains("#11"), "{line}");
+    }
+
+    /// A document with nothing heavy in it gets no line at all, rather
+    /// than a line naming its three biggest 40-byte rows.
+    #[test]
+    fn a_light_document_gets_no_heaviest_line() {
+        let doc = crate::document::Document {
+            messages: vec![crate::document::ChatMessage {
+                role: crate::document::ChatRole::User,
+                content: "- `[9]` noted: 3\n".to_owned(),
+                call: None,
+                result_for: None,
+                thinking: None,
+            }],
+            preamble: 0,
+        };
+        let rows = heaviest_rows(&doc, &std::collections::HashMap::new(), 5);
+        assert!(heaviest_line(&rows).is_empty(), "{rows:?}");
+    }
+
     /// live state. This is the whole claim of "reports are derived".
     #[test]
     fn every_report_kind_renders_from_the_log() {
@@ -2325,7 +2479,7 @@ mod tests {
         // interruption and carries on with the task — which is what a
         // live run did on 2026-09-16, answering the user's question
         // instead of compacting anything.
-        let text = compaction_message(60_555, 32_768, crate::types::Measure::Bytes, None);
+        let text = compaction_message(60_555, 32_768, crate::types::Measure::Bytes, None, "");
         assert!(text.contains("60555 bytes"), "says how big it is: {text}");
         assert!(
             text.contains("32768-byte budget"),
@@ -2334,7 +2488,7 @@ mod tests {
         // And when the count is what filled up, it says so in tokens —
         // naming a byte budget that is not the binding constraint asks
         // the handler to shrink against the wrong number.
-        let counted = compaction_message(43_100, 57_344, crate::types::Measure::Tokens, None);
+        let counted = compaction_message(43_100, 57_344, crate::types::Measure::Tokens, None, "");
         assert!(counted.contains("43100 tokens"), "{counted}");
         assert!(counted.contains("57344-token budget"), "{counted}");
         assert!(text.contains("compaction program"), "{text}");
@@ -2391,7 +2545,7 @@ mod tests {
     /// was more than half of a 7,668-byte conversation.
     #[test]
     fn the_compaction_directive_says_how_much_is_actually_yours() {
-        let with = compaction_message(35_552, 42_000, crate::types::Measure::Bytes, Some(27_797));
+        let with = compaction_message(35_552, 42_000, crate::types::Measure::Bytes, Some(27_797), "");
         assert!(with.contains("27797 is the card"), "{with}");
         assert!(
             with.contains("conversation itself is 7755"),
@@ -2401,7 +2555,7 @@ mod tests {
         // In tokens the split is not knowable — it is measured in bytes
         // and there is no tokenizer here. A number in the wrong unit is
         // worse than no number.
-        let tokens = compaction_message(43_100, 57_344, crate::types::Measure::Tokens, None);
+        let tokens = compaction_message(43_100, 57_344, crate::types::Measure::Tokens, None, "");
         assert!(!tokens.contains("is the card"), "{tokens}");
     }
 

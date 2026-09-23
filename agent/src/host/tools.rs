@@ -181,7 +181,7 @@ fn atomic_write(path: &Path, content: &str) -> Result<(), String> {
 fn read_file_def() -> ToolDef {
     ToolDef {
         name: "read_file".into(),
-        description: "Read a UTF-8 text file. `version` is a content hash — hand it to `replace_file` so the write fails if the file moved under you. `from`/`to` are 1-based inclusive lines."
+        description: "Read a UTF-8 text file. The text lands on the record, not in front of you: `history.peek(f)` puts it in front of the next reply only, `history.keep(f)` from here on, and neither is needed if this program is the one doing the reading. `version` is a content hash — hand it to `replace_file` so the write fails if the file moved under you. `from`/`to` are 1-based inclusive lines."
             .into(),
         input_schema: json!({
             "type": "array",

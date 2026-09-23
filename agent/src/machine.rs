@@ -135,6 +135,13 @@ pub const TOOL_LIST_AGENTS: &str = "list_agents";
 /// Open-post ids named in the request's trailing note before it says
 /// "and N more" — a bounded line, like every other rendered bound.
 const OPEN_NOTE_MAX_IDS: usize = 8;
+/// How many entries the compaction directive names as the heaviest.
+///
+/// Short on purpose. The list is a place to look first, not the plan —
+/// a compaction program that worked only through this list would be
+/// choosing by size alone, which is the choice the directive spends
+/// three paragraphs arguing against.
+const HEAVIEST_NAMED: usize = 5;
 
 /// The trailing presence line, the two ways round. It is deliberately
 /// about the *client*, not the person: attached means a client is
@@ -4193,9 +4200,8 @@ impl Runner {
                     // job rather than the window — see
                     // `compaction_message`. Rendering again costs a
                     // pass, and this runs once per compaction.
+                    let doc = crate::document::render(tree, &self.spine, self.document_budget());
                     let fixed = matches!(unit, crate::types::Measure::Bytes).then(|| {
-                        let doc =
-                            crate::document::render(tree, &self.spine, self.document_budget());
                         crate::compaction::rendered_size(&doc)
                             - doc
                                 .conversation()
@@ -4203,12 +4209,37 @@ impl Runner {
                                 .map(|m| m.content.len())
                                 .sum::<usize>()
                     });
+                    // What is big and what is stale, which the menu
+                    // says nothing about — see `heaviest_rows`.
+                    let heaviest = crate::report::heaviest_line(&crate::report::heaviest_rows(
+                        &doc,
+                        &self.row_ages(tree),
+                        HEAVIEST_NAMED,
+                    ));
                     Some(crate::report::compaction_message(
-                        *measured, *limit, *unit, fixed,
+                        *measured, *limit, *unit, fixed, &heaviest,
                     ))
                 }
                 _ => None,
             })
+    }
+
+    /// How many replies ago each entry on this path was written —
+    /// the "how long have I been carrying this" half of
+    /// [`crate::report::heaviest_rows`].
+    fn row_ages(&self, tree: &Tree) -> std::collections::HashMap<u64, usize> {
+        let path = tree.path_events(self.spine.leaf_id);
+        let replies: Vec<EventId> = path
+            .iter()
+            .filter(|e| matches!(e.payload, EventPayload::Reply | EventPayload::Restart))
+            .map(|e| e.id)
+            .collect();
+        path.iter()
+            .map(|e| {
+                let after = replies.iter().filter(|r| **r > e.id).count();
+                (e.id.as_u64(), after)
+            })
+            .collect()
     }
 
     /// The trailing **ephemeral** line: per-request facts, emitted after
