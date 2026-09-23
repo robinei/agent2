@@ -68,15 +68,12 @@ pub enum CompactionOp {
     /// and stop costing anything.
     Remove { from: EventId, to: EventId },
     /// Show `text` in place of this entry's content.
-    Replace { id: EventId, text: String },
-    /// Show a window of this entry's own value, in bytes.
     ///
-    /// **It carries no bytes.** Paging a long row with `Replace` writes
-    /// the same text to the log once per window; this writes two
-    /// numbers. That is the whole difference, and it is also what keeps
-    /// `Replace` meaning one thing — say something else here — rather
-    /// than two.
-    Slice { id: EventId, from: u32, to: u32 },
+    /// To show *part* of what is already there rather than something
+    /// standing in for it, the verb is `keep`/`peek` with a projection:
+    /// `history.keep(id, v => v.slice(0, 4096))`. This one is for words
+    /// the program writes.
+    Replace { id: EventId, text: String },
 }
 
 impl CompactionOp {
@@ -95,7 +92,6 @@ impl CompactionOp {
                 .map(|id| EventPayload::Compacted {
                     of: *id,
                     text: None,
-                    window: None,
                 })
                 .collect(),
             CompactionOp::Replace { id, text } => present
@@ -104,16 +100,6 @@ impl CompactionOp {
                 .map(|id| EventPayload::Compacted {
                     of: *id,
                     text: Some(text.clone()),
-                    window: None,
-                })
-                .collect(),
-            CompactionOp::Slice { id, from, to } => present
-                .iter()
-                .filter(|p| **p == id)
-                .map(|id| EventPayload::Compacted {
-                    of: *id,
-                    text: None,
-                    window: Some(crate::types::Window { from, to }),
                 })
                 .collect(),
         }
@@ -315,7 +301,6 @@ pub fn floor_size(tree: &Tree, spine: &Spine, budget: usize) -> usize {
                 e.id,
                 crate::tree::CompactedView {
                     text: None,
-                    window: None,
                 },
             )
         })
@@ -742,7 +727,6 @@ mod tests {
             let compacted = EventPayload::Compacted {
                 of: ret,
                 text: Some("gone".into()),
-                window: None,
             };
             let kept = EventPayload::Render {
                 of: ret,
@@ -807,7 +791,6 @@ mod tests {
             EventPayload::Compacted {
                 of: note,
                 text: None,
-                window: None,
             }
         );
     }
@@ -825,7 +808,6 @@ mod tests {
             EventPayload::Compacted {
                 of: note,
                 text: Some("note was long".into()),
-                window: None,
             }
         );
     }

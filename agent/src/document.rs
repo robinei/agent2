@@ -2230,7 +2230,6 @@ mod tests {
             EventPayload::Compacted {
                 of: note,
                 text: Some("the finding, in one line".into()),
-                window: None,
             },
         )
         .unwrap();
@@ -2279,7 +2278,6 @@ mod tests {
                 EventPayload::Compacted {
                     of: program,
                     text,
-                    window: None,
                 },
             )
             .unwrap();

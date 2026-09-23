@@ -154,11 +154,6 @@ pub struct CompactedView {
     /// `None` ⇒ the entry renders nothing at all; `Some` ⇒ this is shown
     /// in its place.
     pub text: Option<String>,
-    /// Set instead of `text` when the entry shows a window of its own
-    /// value rather than something standing in for it. The two are
-    /// exclusive: `replace` says something else, `slice` shows part of
-    /// what is there.
-    pub window: Option<crate::types::Window>,
 }
 
 impl Tree {
@@ -848,14 +843,8 @@ impl Tree {
         let mut lookup = HashMap::new();
         for event in self.path_events(leaf) {
             match &event.payload {
-                EventPayload::Compacted { of, text, window } => {
-                    lookup.insert(
-                        *of,
-                        CompactedView {
-                            text: text.clone(),
-                            window: *window,
-                        },
-                    );
+                EventPayload::Compacted { of, text } => {
+                    lookup.insert(*of, CompactedView { text: text.clone() });
                 }
                 // **`keep`/`peek` and `remove` are edits to one thing:
                 // does this row render.** So they resolve the same way —

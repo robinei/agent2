@@ -130,7 +130,6 @@ impl super::Compiler {
                                 "fetch" => "fetch_history",
                                 "remove" => "remove_history",
                                 "replace" => "replace_history",
-                                "slice" => "slice_history",
                                 // Through the helper, so the projection
                                 // may be a lambda: a settle verb takes
                                 // values, and a function pushed onto
@@ -152,7 +151,7 @@ impl super::Compiler {
                                 }
                                 _ => {
                                     let known =
-                                        "append, fetch, keep, peek, remove, replace and slice";
+                                        "append, fetch, keep, peek, remove and replace";
                                     return self.error(
                                         span,
                                         format!("`history.{method}` is not a thing — history has {known}"),
@@ -692,7 +691,7 @@ impl super::Compiler {
             }
             "spawn" | "fork" | "list_agents" | "fetch_history" | "answer" | "append_history"
             | "keep_history" | "peek_history"
-            | "remove_history" | "replace_history" | "slice_history" => {
+            | "remove_history" | "replace_history" => {
                 // **The settle-at-dispatch verbs.** None of these leaves
                 // the frame that called it: the host answers each from
                 // the log or the tree it already has — `fetch_history`

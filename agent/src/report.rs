@@ -1462,10 +1462,10 @@ pub(crate) fn compaction_message(
          return.\n\n\
          `history.remove(id)` shows nothing for that entry from here on, and \
          `history.remove(from, to)` does the same for every entry in an inclusive range. \
-         `history.replace(id, text)` shows `text` in its place instead, and \
-         `history.slice(id, from, to)` shows a window of what is already there, in bytes, \
-         writing nothing — the first 500 of a long note, say, where a summary of it would \
-         cost you the words to write one. Everything carrying \
+         `history.replace(id, text)` shows `text` in its place instead — and `text` can be \
+         a piece of what is already there rather than a summary of it, `(await \
+         history.fetch(id)).slice(0, 500)`, where writing the summary would cost you more \
+         than the 500 characters. Everything carrying \
          an id above can be named — a report, a note, a post, any single line of a \
          report's menu, and **any block of any reply you have written**, which is what the \
          `{arrow} history[12]` line above a block is for. Anything else you name is simply \
@@ -1750,13 +1750,9 @@ fn compacted_rows(
 ) -> std::collections::HashMap<EventId, crate::tree::CompactedView> {
     path.iter()
         .filter_map(|e| match &e.payload {
-            EventPayload::Compacted { of, text, window } => Some((
-                *of,
-                crate::tree::CompactedView {
-                    text: text.clone(),
-                    window: *window,
-                },
-            )),
+            EventPayload::Compacted { of, text } => {
+                Some((*of, crate::tree::CompactedView { text: text.clone() }))
+            }
             _ => None,
         })
         .collect()
@@ -3050,7 +3046,6 @@ mod tests {
                 EventPayload::Compacted {
                     of: EventId::new(5),
                     text: None,
-                    window: None,
                 },
             ),
             ev(
@@ -3058,7 +3053,6 @@ mod tests {
                 EventPayload::Compacted {
                     of: EventId::new(6),
                     text: Some("kept, shortened".into()),
-                    window: None,
                 },
             ),
         ];

@@ -125,14 +125,6 @@ pub const TOOL_KEEP_HISTORY: &str = "keep_history";
 pub const TOOL_PEEK_HISTORY: &str = "peek_history";
 pub const TOOL_REMOVE_HISTORY: &str = "remove_history";
 pub const TOOL_REPLACE_HISTORY: &str = "replace_history";
-/// `history.slice(id, from, to?)` — show a window of an entry's own
-/// value rather than something standing in for it.
-///
-/// **The one compaction op that writes no bytes.** Reading a long row
-/// a window at a time through `replace` puts the same text on the log
-/// once per window; this puts two numbers there, and leaves `replace`
-/// meaning one thing — say something else here.
-pub const TOOL_SLICE_HISTORY: &str = "slice_history";
 /// `list_agents()` — every agent in this subtree, with status, exactly
 /// as the card has advertised since phase 20. It is served by the
 /// host's `serve_agents` (the one implementation, shared with
@@ -2877,7 +2869,7 @@ impl Runner {
                 self.settle(Ok(serde_json::json!(id.as_u64())));
                 Ok(true)
             }
-            TOOL_REMOVE_HISTORY | TOOL_REPLACE_HISTORY | TOOL_SLICE_HISTORY => {
+            TOOL_REMOVE_HISTORY | TOOL_REPLACE_HISTORY => {
                 // Nothing leaves the process and nothing settles later.
                 // The op joins the batch this handler is building and
                 // the value lands at once, so a compaction program reads
@@ -2959,26 +2951,6 @@ impl Runner {
             CompactionOp::Remove {
                 from: first.min(last),
                 to: first.max(last),
-            }
-        } else if name == TOOL_SLICE_HISTORY {
-            // A window is half-open and in bytes, so the numbers a
-            // program passes here are the ones it would pass to
-            // `content.slice(a, b)` — `.length` counts UTF-8 bytes in
-            // this dialect, and two units for one idea is how an
-            // off-by-one becomes a mystery.
-            let num = |n: usize| args.get(n).and_then(|v| v.as_u64());
-            let from = num(1).unwrap_or(0);
-            let to = num(2).unwrap_or(from + crate::report::NOTE_ROW_MAX_BYTES as u64);
-            if to <= from {
-                return Err(format!(
-                    "{TOOL_SLICE_HISTORY}(id, from, to): `to` is {to} and `from` is {from}, \
-                     so the window is empty. It is half-open, like `content.slice(a, b)`."
-                ));
-            }
-            CompactionOp::Slice {
-                id: first,
-                from: from.min(u32::MAX as u64) as u32,
-                to: to.min(u32::MAX as u64) as u32,
             }
         } else {
             let Some(text) = args.get(1).and_then(|v| v.as_str()) else {
@@ -4150,11 +4122,7 @@ impl Runner {
         for of in blocks {
             tree.append(
                 &mut self.spine,
-                EventPayload::Compacted {
-                    of,
-                    text: None,
-                    window: None,
-                },
+                EventPayload::Compacted { of, text: None },
             )?;
         }
         Ok(())
@@ -4711,40 +4679,32 @@ pub(crate) fn note_display(value: &serde_json::Value) -> String {
 ///
 /// **And it names `replace`, not `append`, for the next window.**
 /// Appending each page would put every window in the document at once,
-/// which is the cost this bound exists to avoid; replacing moves the
+/// which is the cost this bound exists to avoid; replacing *moves* the
 /// one row's view and leaves the context flat. `fetch` still returns
-/// the original whole afterwards, so the bytes to slice the next window
+/// the original whole afterwards, so the bytes to cut the next window
 /// from are always in reach — see
 /// `paging_a_row_moves_its_window_and_leaves_the_value_whole`.
-fn note_row_windowed(
-    id: u64,
-    value: &serde_json::Value,
-    window: Option<crate::types::Window>,
-) -> String {
+///
+/// There used to be a third verb for this, `history.slice(id, from,
+/// to)`, whose whole claim was that it wrote two numbers to the log
+/// instead of the window's text. That bought nothing the reader can
+/// see: the document is the rationed thing, and `replace` already
+/// keeps it flat. What it cost was a verb — and a second meaning for
+/// what a `Compacted` event is.
+fn note_row(id: u64, value: &serde_json::Value) -> String {
     let full = note_display(value);
     let cap = crate::report::NOTE_ROW_MAX_BYTES;
-    let (from, to) = match window {
-        Some(w) => (w.from as usize, (w.to as usize).min(full.len())),
-        None => (0, cap.min(full.len())),
-    };
-    // A window past the end, or one the value shrank out from under,
-    // shows nothing rather than panicking on a slice.
-    let from = from.min(full.len());
-    let to = to.max(from).min(from + cap);
-    let (mut a, mut b) = (from, to);
-    while !full.is_char_boundary(a) {
-        a -= 1;
-    }
+    let mut b = cap.min(full.len());
     while !full.is_char_boundary(b) {
         b -= 1;
     }
-    let shown = crate::document::escape_untrusted(&full[a..b]);
-    if a == 0 && b == full.len() {
+    let shown = crate::document::escape_untrusted(&full[..b]);
+    if b == full.len() {
         return format!("appended: {shown}");
     }
     format!(
-        "appended: {shown}\n  … bytes {a}–{b} of {} — `history.fetch({id})` has all of it, \
-         and `history.slice({id}, {b})` moves this window without writing anything",
+        "appended: {shown}\n  … {b} of {} bytes — `history.fetch({id})` has all of it, and \
+         `history.replace({id}, …)` moves this window onto the next stretch",
         full.len(),
     )
 }
@@ -4857,10 +4817,7 @@ pub(crate) fn menu_rows(
         .filter(|e| {
             !matches!(
                 compacted.get(&e.id),
-                Some(crate::tree::CompactedView {
-                    text: None,
-                    window: None
-                })
+                Some(crate::tree::CompactedView { text: None })
             )
         })
         .filter_map(|event| {
@@ -4872,31 +4829,15 @@ pub(crate) fn menu_rows(
             // had tried to shorten. Now that they are one list, a
             // `history.replace` that did not shrink the thing it named
             // would be the same broken promise a `history.remove` was.
-            match compacted.get(&event.id) {
-                // Something else stands here.
-                Some(crate::tree::CompactedView {
-                    text: Some(text), ..
-                }) => {
-                    return Some(Artifact {
-                        id,
-                        label: String::new(),
-                        state: ArtifactState::Whole(format!("… {text}")),
-                    });
-                }
-                // A window of what is already here — no text was
-                // written to say so, which is the whole point.
-                Some(crate::tree::CompactedView {
-                    window: Some(w), ..
-                }) => {
-                    if let EventPayload::Note { value, .. } = &event.payload {
-                        return Some(Artifact {
-                            id,
-                            label: String::new(),
-                            state: ArtifactState::Whole(note_row_windowed(id, value, Some(*w))),
-                        });
-                    }
-                }
-                _ => {}
+            // Something else stands here.
+            if let Some(crate::tree::CompactedView { text: Some(text) }) =
+                compacted.get(&event.id)
+            {
+                return Some(Artifact {
+                    id,
+                    label: String::new(),
+                    state: ArtifactState::Whole(format!("… {text}")),
+                });
             }
             match &event.payload {
                 // **A `tell` gets no row.** Its text is already in the
@@ -5060,7 +5001,7 @@ pub(crate) fn menu_rows(
                 EventPayload::Note { value, .. } => Some(Artifact {
                     id,
                     label: String::new(),
-                    state: ArtifactState::Whole(note_row_windowed(id, value, None)),
+                    state: ArtifactState::Whole(note_row(id, value)),
                 }),
                 _ => None,
             }
@@ -7388,67 +7329,6 @@ mod tests {
             r.ended,
             Ending::Completed(Some(json!("the check disagrees")))
         );
-    }
-
-    /// **`slice` pages a row and writes no bytes to do it.**
-    ///
-    /// That is the difference from `replace`, which would put the same
-    /// text on the log once per window. Two numbers instead, and
-    /// `replace` goes on meaning one thing — say something else here.
-    #[test]
-    fn slicing_a_row_moves_its_window_without_writing_any_bytes() {
-        let mut c = Conversation::new();
-        let n = crate::report::NOTE_ROW_MAX_BYTES * 2;
-        let r = c.reply(&format!(
-            "```js\nhistory.append(\"a\".repeat({n}) + \"TAIL\");\n```\n"
-        ));
-        let id = r.row().id;
-
-        // The last window of the value, named by offset alone.
-        let sliced = c.reply(&format!(
-            "```js\nhistory.slice({}, {}, {});\n```\n",
-            id.as_u64(),
-            n - 8,
-            n + 6
-        ));
-        assert_eq!(sliced.compacted, [id], "a shadow was written");
-
-        let shown = c.row_shown(id);
-        assert!(shown.contains("TAIL"), "the window moved: {shown}");
-        assert!(shown.len() < 200, "and it is small: {} bytes", shown.len());
-        assert_eq!(
-            c.rows_named(id),
-            1,
-            "a window moves a row, it does not add one"
-        );
-
-        // The value behind it is untouched.
-        let back = c.reply(&format!(
-            "```js\nhistory.append((await fetch_history({})).length);\n```\n",
-            id.as_u64()
-        ));
-        assert_eq!(
-            back.row().value,
-            json!(n + 4),
-            "fetch still hands back the whole value"
-        );
-    }
-
-    /// An empty window is a mistake with an obvious cause, so it says
-    /// which way round the arguments go rather than showing nothing.
-    #[test]
-    fn an_empty_window_is_refused_by_name() {
-        let mut c = Conversation::new();
-        let r = c.reply(
-            "```js\nhistory.append(\"hello there\");\n\
-             try { history.slice(4, 8, 2); } catch (e) { history.append(String(e)); }\n```\n",
-        );
-        let said = r
-            .values()
-            .last()
-            .and_then(|v| v.as_str())
-            .unwrap_or_default();
-        assert!(said.contains("half-open"), "names the convention: {said}");
     }
 
     /// **Paging moves one row's window; it does not add rows.**

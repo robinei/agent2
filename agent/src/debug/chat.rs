@@ -2154,7 +2154,6 @@ mod tests {
             EventPayload::Compacted {
                 of: EventId::new(2),
                 text: None,
-                window: None,
             },
         ));
         let rows = chat.rows(None, 80, None);
@@ -2175,7 +2174,6 @@ mod tests {
             EventPayload::Compacted {
                 of: EventId::new(3),
                 text: Some("asked about two files".into()),
-                window: None,
             },
         ));
         let rows = chat.rows(None, 80, None);

@@ -151,19 +151,8 @@ fn line_for(tree: &Tree, path: &[&Event], event: &Event) -> Option<String> {
                 clip(&value.to_string())
             )
         }
-        EventPayload::Compacted { of, text, window } => {
-            let how = match (text, window) {
-                (Some(_), _) => "replaced",
-                (None, Some(w)) => {
-                    return Some(format!(
-                        "#{id}    ✂ #{} → window {}..{}",
-                        of.as_u64(),
-                        w.from,
-                        w.to
-                    ));
-                }
-                (None, None) => "removed",
-            };
+        EventPayload::Compacted { of, text } => {
+            let how = if text.is_some() { "replaced" } else { "removed" };
             format!("#{id}    ✂ #{} {how}", of.as_u64())
         }
         // **Finishing and handing on are one ending with a flag on

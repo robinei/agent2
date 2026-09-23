@@ -127,10 +127,20 @@ declare namespace history {
 
   **Key it by the name the thing already has**, as a quoted string: `{ "src/shipping.py": f.content }`, never `{ shipping_py: … }`. Mangling a path, command or id drops the only thing tying the row to the call it came from. */
   function append(value: unknown): number;
-  /** Read any entry back, whole, by its id — including ones `remove` took out of view. A call's row gives the tool's own result, the object its signature describes: `read_file` hands back `{ content, version }`, not the text. The value goes straight to this block: `const f = await history.fetch(9)`, and the next line already has `f.content`. Fetch in the reply that uses it. */
+  /** Read any entry back, whole, by its id — including ones `remove` took out of view. A call's row gives the tool's own result, the object its signature describes: `read_file` hands back `{ content, version }`, not the text. The value goes straight to this block: `const f = await history.fetch(9)`, and the next line already has `f.content`. Fetch in the reply that uses it.
+
+  **A row shows its first 32 KB and says so.** `fetch` hands back all of it however long it is. */
   function fetch(id: number): unknown;
-  /** **A row shows its first 32 KB**; this moves that window. `from`/`to` in bytes, half-open, the offsets `content.slice(from, to)` takes, `to` defaulting to a windowful. It writes nothing, so move it as often as you like. `slice` to keep going through one row; a second `append` when you mean to keep both — `f.content.match(/## Decision[\s\S]+/)[0]` beats a windowful. */
-  function slice(id: number, from: number, to?: number): void;
+  /** Show a result you already have, from here on. Give it the result or its id — `history.keep(f)` or `history.keep(f.id)` — and a projection when you want part of it: `history.keep(f, v => v.content.slice(0, 2000))`.
+
+  **This is the other way to read.** `append` copies bytes into a row of your own; `keep` points at the result that is already on the record, so the same file in front of you is not also stored twice. Append a conclusion you wrote; keep a result you were given.
+
+  Leave the projection out to show what it showed last time. */
+  function keep(result: unknown, project?: unknown): number;
+  /** The same, for exactly one reply: in front of you now, gone from the next turn.
+
+  **For what you need to look at once** — the file you are about to edit, the listing you are about to take four paths out of. `peek` again to have it another turn; `keep` when it turns out to be load-bearing. Nothing is lost either way: `fetch` still answers for it. */
+  function peek(result: unknown, project?: unknown): number;
   /** Stop showing these entries — one id, or an inclusive range — once you are finished with them: the file you appended in order to read and have read, the listing you already took four paths out of. `fetch` still answers; the conversation stops carrying them. **Only while the row is recent**: what a row shows is part of every turn after it, so rewriting the oldest row in a long conversation costs the whole conversation. Old and bulky is the compactor's job. */
   function remove(from: number, to?: number): void;
   /** Show `text` in place of that entry — when it is worth one line but not eighty, or when you have found out it is wrong. Spend the words on what you concluded, not on saying something was removed. Never replace an entry already showing as `[id] … text`: it is already standing in for something longer. */
