@@ -1277,21 +1277,12 @@ pub(crate) fn render_with_lookup(
                     None if text.is_empty() && had_blocks => None,
                     None if text.is_empty() => Some(EMPTY_REPLY_NOTE.to_owned()),
                     None => {
-                        // **Before annotation**, because both detectors
-                        // read the reply as the model wrote it and a
-                        // `【↓ history[4]】` line is not a line the
-                        // model wrote.
-                        let could_not_run =
-                            (!ran_a_cell).then(|| did_not_run_note(&text)).flatten();
                         let moved = cuts.get(&id).map(|cs| remap_cuts(cs, &part_spans));
                         let mut text = annotate_history_calls(
                             &text,
                             moved.as_ref(),
                             &std::mem::take(&mut blocks),
                         );
-                        if let Some(note) = could_not_run {
-                            text.insert_str(0, &note);
-                        }
                         // **And why it stops, when it stopped early.**
                         // A reply cut off used to trail away with no
                         // marker, so the model saw itself break off
@@ -1402,49 +1393,6 @@ pub(crate) fn render_with_lookup(
 pub const EMPTY_REPLY_NOTE: &str =
     "— this reply arrived empty: nothing was written, so nothing ran —";
 
-/// **A reply whose syntax could not run, marked where it is and for as
-/// long as it is.**
-///
-/// Two of `Runner::stopped_short`'s prods are about a *defect in the
-/// reply*: a tool call in another harness's syntax, and a program with
-/// the fence left off. Both were told to the model once, in the tail of
-/// the request that woke it — and the reply itself stayed in the
-/// document verbatim and unmarked, forever, as a clean example of
-/// something it had written. `FOREIGN_TOOL_CALL_NOTICE`'s own
-/// measurement is what that produces: a card sentence forbidding the
-/// syntax "was tried first and ignored 3/3 — the model complied on one
-/// reply and drifted back on the next". An ephemeral correction above
-/// a permanent example loses.
-///
-/// So the correction goes on the thing it corrects, which is what
-/// [`EMPTY_REPLY_NOTE`] and [`cut_off_note`] already do for the two
-/// defects that were noticed earlier. The tail still carries what to do
-/// *now*; this carries what the reply is, for as long as the reply is
-/// read.
-///
-/// **Only when the reply ran nothing**, which is the same guard
-/// `stopped_short` applies, so the mark and the prod cannot disagree.
-/// It is also what keeps a reply that quotes `<tool_call>` inside a
-/// ```text block while explaining it from being branded — it will
-/// almost always have run something too, and a wrong mark here is
-/// wrong for the life of the log rather than for one turn.
-fn did_not_run_note(text: &str) -> Option<String> {
-    let what = if crate::machine::foreign_tool_call(text) {
-        "not parsed — this syntax is not read here"
-    } else if crate::machine::unfenced_program(text) {
-        "not fenced — code runs only inside a ```js block"
-    } else {
-        return None;
-    };
-    // `↓` because it points at what follows it, which is the rule the
-    // card states for every arrow: it names something of the model's
-    // that is still there. See [`BLOCK_ARROW`].
-    Some(format!(
-        "{FENCE_OPEN}{BLOCK_ARROW} {what}, so none of it ran and it reached \
-         the person as text{FENCE_CLOSE}\n"
-    ))
-}
-
 fn cut_off_note(how: &ReplyEnd) -> Option<&'static str> {
     match how {
         ReplyEnd::Finished => None,
@@ -1485,10 +1433,12 @@ fn push_flush(messages: &mut Vec<ChatMessage>, pending: &mut Vec<String>) {
 /// [`push_flush`] for the gap **before an assistant turn**, where an
 /// empty one cannot simply be dropped.
 ///
-/// Some wakes put nothing on the record. A `stopped_short` prod rides
-/// the ephemeral tail and is never logged; so does a compaction
-/// directive. The reply each one earns therefore follows the reply
-/// before it with no event in between — and dropping the empty turn
+/// Some wakes put nothing on the record. A compaction directive rides
+/// the ephemeral tail and is never logged; so does the one
+/// `stopped_short` prod that is about no defect
+/// (`machine::NOT_FINISHED_NOTICE`). The reply each one earns
+/// therefore follows the reply before it with no event in between —
+/// and dropping the empty turn
 /// leaves two assistant messages back to back, which is not a shape
 /// the transport has, and gives the model no boundary between one of
 /// its replies and the next.

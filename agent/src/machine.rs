@@ -194,13 +194,13 @@ const ABSENT: &str = "- No client is attached; an ask() stays open until someone
 ///
 /// A completion that arrives with neither content nor thinking would
 /// make this sentence wrong. None has.
-const EMPTY_REPLY_NOTICE: &str = "- Your last reply arrived empty: the whole completion went to \
+const EMPTY_REPLY_NOTICE: &str = "Your last reply arrived empty: the whole completion went to \
      reasoning and nothing was written, so nothing ran and nobody was told anything. Write the \
      reply this time — prose for what you are about to do, a ```js block for the doing.";
 
 /// Woken after a reply that wrote a tool call in another harness's
 /// syntax — see [`Runner::stopped_short`].
-const FOREIGN_TOOL_CALL_NOTICE: &str = "- Your last reply contained a tool call in a syntax this \
+const FOREIGN_TOOL_CALL_NOTICE: &str = "Your last reply contained a tool call in a syntax this \
      harness does not read — `<tool_call>`, `<function=…>` or similar. It was not parsed. It \
      reached the person as literal text, the call never happened, and nothing ran. **Code here \
      runs only inside a fenced ```js block**: write `await tools.bash(\"…\")` in one, and the \
@@ -449,7 +449,7 @@ const NO_REHEARSAL_TAIL: &str =
 /// a model quoting one of these in a sentence would be a false
 /// positive, and the cost of that is one extra turn, against a run
 /// silently abandoning its task.
-pub(crate) fn foreign_tool_call(text: &str) -> bool {
+fn foreign_tool_call(text: &str) -> bool {
     const SHAPES: [&str; 7] = [
         "<tool_call>",
         "<function=",
@@ -464,7 +464,7 @@ pub(crate) fn foreign_tool_call(text: &str) -> bool {
 
 /// Woken after a reply that was a program with the fence left off —
 /// see [`unfenced_program`].
-const UNFENCED_PROGRAM_NOTICE: &str = "- Your last reply was a program with no fence around it, so \
+const UNFENCED_PROGRAM_NOTICE: &str = "Your last reply was a program with no fence around it, so \
      nothing ran — the text went to the person as their answer instead. **Code runs only inside \
      a fenced ```js block.** Write the same lines again inside one; the work you meant to do is \
      still undone.";
@@ -491,7 +491,7 @@ const UNFENCED_PROGRAM_NOTICE: &str = "- Your last reply was a program with no f
 /// keeps its other lines. That is why this reads whole lines rather
 /// than searching for a substring: 1 prose segment in 1,686 across the
 /// kept corpus matches, and it is the one this was written for.
-pub(crate) fn unfenced_program(text: &str) -> bool {
+fn unfenced_program(text: &str) -> bool {
     if text.contains("```") {
         return false;
     }
@@ -1106,17 +1106,17 @@ pub struct Runner {
     /// was not rested. The next request's tail says so — see
     /// [`SILENT_FINISH`].
     finish_ignored: bool,
-    /// The prod [`Runner::stopped_short`] raised for the request being
-    /// built, if it raised one.
+    /// The **one** prod [`Runner::stopped_short`] raises that is not
+    /// written to the log: [`NOT_FINISHED_NOTICE`], carried in the tail
+    /// of the request it is about and nowhere else.
     ///
-    /// **All four ride the tail, and none is logged.** Every word of
-    /// every one of them is about the reply immediately above it —
-    /// "your last reply arrived empty", "it is your last" — so a row
-    /// under `# NEW EVENTS` is a standing instruction to a branch that
-    /// has long since moved on, re-read and paid for on every request
-    /// after. They were `Post`s until 2026-09-24, and the reply each
-    /// one is about is directly above it in the document, so nothing is
-    /// lost by not restating it there.
+    /// The other three describe a defect in the reply, and a mistake
+    /// that leaves no trace exerts no pressure — see the wake in
+    /// `prompt_if_needed`. This one describes no defect: a prose-only
+    /// reply is how a question gets answered. What it says is that
+    /// *this* request is the last ask, which is false the moment the
+    /// next reply speaks, so it belongs where a right-now fact
+    /// belongs.
     ///
     /// Set when the branch is woken and cleared by the next reply's own
     /// outcome, so it is true of exactly one request.
@@ -4096,13 +4096,41 @@ impl Runner {
         // what *this* function is in the middle of doing, and `deliver`
         // comes back here to decide whether to do it — which is a cycle
         // with no base case, and was one until the stack overflowed.
-        // **Nothing is logged.** These were harness `Post`s until
-        // 2026-09-24, which put a one-request fact on the record
-        // forever; the field's own doc says why that is wrong. The wake
-        // does not depend on a post either way — `needs_prompt` reads
-        // `stopped_short` directly — so the branch still gets its one
-        // retry, with a request whose only new content is the tail.
-        self.stopped_short = self.stopped_short(tree);
+        if let Some(text) = self.stopped_short(tree) {
+            // **A mistake that leaves no trace exerts no pressure.**
+            // All four of these rode the tail for an afternoon, on the
+            // reasoning that a fact true of one request should not be
+            // read on every request after it. That is right about the
+            // next completion and wrong about everything else: this log
+            // is the record of what the branch did, and a reply whose
+            // failure is written beside it is a different artifact from
+            // one where the failure is invisible — in this session,
+            // where the model reads its own history, and in any corpus
+            // built from these logs later.
+            //
+            // The three that describe a *defect in the reply* go back
+            // on the record. `NOT_FINISHED_NOTICE` does not: a
+            // prose-only reply is not a mistake — it is how a question
+            // gets answered — and every word of that one ("asked
+            // once", "it is your last") is false the moment the next
+            // reply speaks.
+            if text == NOT_FINISHED_NOTICE {
+                self.stopped_short = Some(text);
+            } else {
+                tree.append(
+                    &mut self.spine,
+                    EventPayload::Post {
+                        from: Author::Harness,
+                        origin: Origin::Direct {
+                            text: text.to_owned(),
+                            input: serde_json::Value::Null,
+                            options: Vec::new(),
+                            expects_reply: false,
+                        },
+                    },
+                )?;
+            }
+        }
         // Checked before the request is built, not after: a document
         // over budget is over budget *for this request*, and the whole
         // point is to not send it. The handler's own request is built
@@ -8244,93 +8272,18 @@ mod tests {
         assert!(
             c.runner()
                 .request_tail(c.tree())
-                .is_some_and(|t| t.contains("program with no fence")),
-            "the branch is woken and told why, in the tail"
+                .is_some_and(|t| !t.contains("program with no fence")),
+            "the notice is a post, not a tail line"
         );
-        // **And told once.** The prod is about the reply directly
-        // above it, so it is not written into the history — see
-        // `Runner::stopped_short` the field.
+        // **On the record, not in the tail.** A mistake that leaves no
+        // trace exerts no pressure — see `prompt_if_needed`.
         assert!(
-            !c.tree().events.values().any(|e| matches!(
+            c.tree().events.values().any(|e| matches!(
                 &e.payload,
                 EventPayload::Post { origin, .. }
                     if format!("{origin:?}").contains("no fence around it")
             )),
-            "and nothing of it is on the log"
-        );
-    }
-
-    /// **The correction outlives the prod, because the reply does.**
-    ///
-    /// Both of these prods are about a defect in the reply, and both
-    /// ride the ephemeral tail — so a turn later the reply is still
-    /// there and the only thing saying it failed is gone. What is left
-    /// is a clean example, in the model's own voice, of writing a tool
-    /// call in a syntax that does not run. The measurement behind
-    /// `FOREIGN_TOOL_CALL_NOTICE` is exactly that shape: a card
-    /// sentence forbidding it was "ignored 3/3 — the model complied on
-    /// one reply and drifted back on the next".
-    ///
-    /// So the verdict is marked on the turn, above the text it is
-    /// about, for as long as the turn is read — which is what an empty
-    /// reply and a cut-off reply already get.
-    #[test]
-    fn a_reply_whose_syntax_could_not_run_says_so_for_as_long_as_it_is_read() {
-        let marked = |reply: &str| {
-            let mut c = Conversation::new();
-            c.user_says("go");
-            c.reply(reply);
-            // A turn later: the prod that woke it is long gone.
-            c.reply("```js\nlet z = 1;\n```\n");
-            assert!(
-                !c.runner()
-                    .request_tail(c.tree())
-                    .unwrap_or_default()
-                    .contains("reached the person"),
-                "the prod is spent"
-            );
-            let m = c.runner().document(c.tree(), 64 * 1024).messages;
-            m.iter()
-                .rev()
-                .find(|x| {
-                    x.role == crate::document::ChatRole::Assistant && !x.content.contains("let z")
-                })
-                .expect("the reply is still in the document")
-                .content
-                .clone()
-        };
-
-        let foreign = marked(
-            "Let me look.\n\n<tool_call>\n<function=bash>\n             <parameter=command>\nls -la\n</parameter>\n</function>\n</tool_call>",
-        );
-        assert!(
-            foreign.starts_with(&format!(
-                "{}{} not parsed",
-                crate::document::FENCE_OPEN,
-                crate::document::BLOCK_ARROW
-            )),
-            "the verdict is the first thing read, before the thing it is about: {foreign}"
-        );
-        assert!(
-            foreign.contains("<tool_call>"),
-            "and what was written is still what is shown — the person saw it: {foreign}"
-        );
-
-        let unfenced = marked("tell(\"The closing balance is 1200.\");\nfinish();\n");
-        assert!(
-            unfenced.contains("not fenced") && unfenced.contains("reached the person as text"),
-            "{unfenced}"
-        );
-
-        // A reply that ran something is not branded on a shape it may
-        // merely have been quoting — the same guard `stopped_short`
-        // applies, and a wrong mark here is wrong for the life of the
-        // log rather than for one turn.
-        let quoted =
-            marked("Other harnesses write `<tool_call>` for this.\n\n```js\nlet a = 1;\n```\n");
-        assert!(
-            !quoted.contains("not parsed"),
-            "a reply that ran a cell is left alone: {quoted}"
+            "the branch is woken and told why"
         );
     }
 
@@ -10831,19 +10784,12 @@ mod tests {
         );
 
         assert!(!r.rests, "the work is not finished");
-        // And it is *told* why, in the tail of the request that wakes
-        // it — which names the one channel that runs. Not on the log:
-        // the prod is about the reply directly above it, and a request
-        // later it is a standing instruction about a reply nobody can
-        // still see.
-        let tail = c.runner().request_tail(c.tree()).expect("a tail");
+        // And it is *told* why, in the channel it demonstrably reads —
+        // and on the record, beside the reply it is about, so the
+        // mistake is not invisible a turn later.
         assert!(
-            tail.contains("syntax this harness does not read") && tail.contains("```js"),
-            "the prod names the one channel that runs: {tail}"
-        );
-        assert!(
-            r.notices.is_empty(),
-            "and nothing was logged: {:?}",
+            r.notices.last().is_some_and(|n| n.contains("```js")),
+            "the notice names the one channel that runs: {:?}",
             r.notices
         );
     }
