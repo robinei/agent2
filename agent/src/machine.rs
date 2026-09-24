@@ -5399,9 +5399,25 @@ fn substitute_within(
     }
 }
 
-/// What stands in the substituted bytes' place: what was there, where
-/// it still is, and the one verb that puts it back in front of the
-/// reply. Short, because it is stored for the life of the row.
+/// What stands in the substituted bytes' place: where they still are,
+/// **why printing them could never have worked**, and the verb that
+/// does what the print was reaching for. Short, because it is stored
+/// for the life of the row.
+///
+/// **The middle clause is the one that was missing.** The first
+/// version named the row and named a verb, and a live run
+/// (2026-09-24, `live/t3`) shows a model reading it, understanding it
+/// exactly — "if I print it again, it'll be substituted again. Hmm."
+/// — and printing the same four rows back in four consecutive
+/// replies. It knew where the bytes were. What it did not have was a
+/// reason, so each reply re-tried the print as though the last one had
+/// been unlucky. A rule with a *because* in it is one a reply can
+/// apply to the next case instead of rediscovering.
+///
+/// **`peek`, not `keep`.** A row printed back is one the reply wants
+/// to look at, which is what `peek` is for; `keep` is the standing
+/// cost, and naming it here asked the model to pay by the turn for a
+/// thing it needed once.
 ///
 /// **Fenced, because the harness wrote it.** `【…】` marks every span
 /// this harness puts inside the model's own content — the `↓` above a
@@ -5414,7 +5430,8 @@ fn reference_to(row: EventId, bytes: usize) -> String {
     let id = row.as_u64();
     let (open, close) = (crate::document::FENCE_OPEN, crate::document::FENCE_CLOSE);
     format!(
-        "{open}← the {bytes} bytes already on [{id}]; history.keep({id}) shows them here{close}"
+        "{open}← [{id}] already holds these {bytes} bytes; a print cannot show you a row — \
+         history.peek({id}) puts them in front of your next reply{close}"
     )
 }
 
@@ -5454,8 +5471,8 @@ fn copy_of<'v>(
                     let Some(at) = row.find(block) else { continue };
                     let shared = overlap_len(s, row, at, block);
                     // **A reference can only stand in for a repeat, not
-                    // for a selection.** `← the N bytes already on [17]`
-                    // is a true account of what was written only if what
+                    // for a selection.** `← [17] already holds these N
+                    // bytes` is a true account of what was written only if what
                     // was written *was* that row. A slice of it is the
                     // reply choosing what to look at — which is what the
                     // console is for — and a reference loses which slice
@@ -10287,8 +10304,13 @@ mod tests {
         let stored = v["snapshot"].as_str().expect("still a string");
         assert!(
             stored.contains(&format!("[{row}]"))
-                && stored.contains(&format!("history.keep({row})")),
+                && stored.contains(&format!("history.peek({row})")),
             "the reference names the row and the verb: {stored}"
+        );
+        assert!(
+            stored.contains("cannot show you a row"),
+            "and says why the print could never have worked, which is the half a \
+             live run showed a model understanding and then ignoring: {stored}"
         );
         assert!(
             !stored.contains("migrating batch"),
