@@ -12455,13 +12455,35 @@ mod tests {
         drain(state, tree, out);
     }
 
-    /// Whether the branch's most recent reply trapped on a name the
-    /// *previous* reply declared — which is what a leaked VM looks like.
+    /// A cell that reports whether it can still see a binding the
+    /// *previous* reply made — which is what a leaked VM looks like.
+    ///
+    /// **Not "did it say `already declared`".** That was the detector
+    /// until the redeclaration diagnostic was removed on 2026-09-25,
+    /// and a detector spelled as an error message stops detecting the
+    /// moment the message does — silently, and green. Both tests below
+    /// went on passing while asserting nothing. A fresh VM has simply
+    /// never heard of the name, so reading it throws; this asks.
+    const LEAK_PROBE: &str = "try { marker_from_reply_one; console.log(\"LEAKED\"); } \
+         catch (e) { console.log(\"FRESH\"); }\n";
+
+    /// Whether the branch ever printed the word the probe prints when
+    /// reply 1's binding was still in scope.
     fn leaked_binding(state: &Runner, tree: &Tree) -> bool {
-        state.agent_segment(tree).iter().any(|e| {
-            matches!(&e.payload, EventPayload::Handback { how: cause, .. }
-                if format!("{cause:?}").contains("already declared"))
-        })
+        // **Console lines only.** The cell's own source is on the log
+        // too and it contains both words, so a looser scan reports a
+        // leak for every run — including a fresh VM.
+        let seen = |needle: &str| {
+            state.agent_segment(tree).iter().any(|e| {
+                matches!(&e.payload, EventPayload::Console { lines, .. }
+                    if lines.iter().any(|l| l.contains(needle)))
+            })
+        };
+        assert!(
+            seen("LEAKED") || seen("FRESH"),
+            "the probe never ran, so this test is asserting nothing"
+        );
+        seen("LEAKED")
     }
 
     /// **A trap in reply N leaves reply N+1 a fresh VM** — the case the
@@ -12479,7 +12501,8 @@ mod tests {
             &mut state,
             &mut tree,
             1,
-            "```js\nconst files = 1;\nundefined_thing_here();\n```\n",
+            "```js\nconst files = 1;\nconst marker_from_reply_one = 1;\n\
+             undefined_thing_here();\n```\n",
         );
         assert!(!state.parked.is_empty(), "it trapped");
 
@@ -12488,7 +12511,9 @@ mod tests {
             &mut state,
             &mut tree,
             2,
-            "```js\nconst files = 2;\nconsole.log(\"second reply ran\");\n```\n",
+            &format!(
+                "```js\nconst files = 2;\nconsole.log(\"second reply ran\");\n{LEAK_PROBE}```\n"
+            ),
         );
         assert!(!leaked_binding(&state, &tree), "reply 2 got a fresh VM");
         assert!(
@@ -12516,7 +12541,7 @@ mod tests {
             &mut state,
             &mut tree,
             1,
-            &["```js\nconst files = 1;\n```\n"],
+            &["```js\nconst files = 1;\nconst marker_from_reply_one = 1;\n```\n"],
         );
 
         // Reply 2 arrives under the next generation.
@@ -12524,7 +12549,7 @@ mod tests {
             &mut state,
             &mut tree,
             2,
-            "```js\nconst files = 2;\nconsole.log(\"still fine\");\n```\n",
+            &format!("```js\nconst files = 2;\nconsole.log(\"still fine\");\n{LEAK_PROBE}```\n"),
         );
         assert!(!leaked_binding(&state, &tree), "reply 2 got a fresh VM");
     }

@@ -298,16 +298,34 @@ fn an_undeclared_name_is_reported_and_names_it() {
     );
 }
 
-/// A redeclaration across fragments. `oxc` catches `let x; let x;` inside one
-/// parse, but each fragment is parsed on its own, so the collision is only
-/// visible to the accumulated scope — which is where this check lives.
+/// **A redeclaration across fragments shadows**, the way
+/// `{ first; { second; } }` would.
+///
+/// It was a hard error until 2026-09-25, on the reasoning that a
+/// silently stranded binding is worse than a diagnostic — and that was
+/// measured: four of four cases were the *same statement written
+/// twice*, a caller redoing work rather than running out of names.
+/// That stopped being true. Across two live runs the three collisions
+/// were three pairs of entirely different commands competing for `r`,
+/// because a reply now writes one call and one `peek` per cell and
+/// `r` is what a result gets called. The error cost half a reply each
+/// time; shadowing costs nothing and is what every REPL does.
+///
+/// Reading the older binding *before* the new declaration still sees
+/// the old value, which is friendlier than real JS — a literal nested
+/// block would put it in the temporal dead zone.
 #[test]
-fn a_redeclaration_across_fragments_is_caught() {
-    let errs = errs_from(&["let dup = 1;", "let dup = 2;"]);
-    assert!(
-        errs.iter()
-            .any(|e| e.contains("dup") && e.contains("already declared")),
-        "expected a redeclaration diagnostic: {errs:?}"
+fn a_redeclaration_across_fragments_shadows() {
+    let repl = run_all(&[
+        "let dup = 1;\nlet keep_me = 7;",
+        "console.log(dup);\nlet dup = 2;\nconsole.log(dup);",
+        "console.log(dup);\nconsole.log(keep_me);",
+    ]);
+    assert_eq!(
+        console(&repl),
+        vec!["1", "2", "2", "7"],
+        "the old value reads until the new declaration, then the new one \
+         stands — and an untouched name from the first fragment survives"
     );
 }
 

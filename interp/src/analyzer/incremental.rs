@@ -22,16 +22,14 @@
 //! needs nothing done before its children, and every genuine parent/child pair
 //! still has the child lower.
 
-use indexmap::IndexMap;
 use oxc_ast::ast;
 
 use crate::diag::Diagnostic;
-use crate::span::Span;
 
 use super::captures::{ProgramAnalysis, finalize_tables};
 use super::const_fns::resolve_const_functions;
 use super::scope::FuncScope;
-use super::{Analyzer, BlockScopes, NameRes};
+use super::{Analyzer, BlockScopes};
 
 /// The root scope's index in an incremental unit. Fixed, because the root is
 /// the one scope that outlives every fragment.
@@ -119,10 +117,6 @@ impl IncrementalAnalyzer {
         };
 
         let first_new_slot = self.next_slot;
-        // Top-level bindings as they stood before this fragment, so a
-        // redeclaration can be told from a fresh name. Only the outermost
-        // block scope: a `let` inside a nested block legitimately shadows.
-        let before: IndexMap<String, NameRes> = top_level_bindings(&self.block_scopes);
 
         // Take the root out to walk into it; `pristine` meanwhile receives
         // this fragment's nested function scopes, which `push_scope` numbers
@@ -164,8 +158,7 @@ impl IncrementalAnalyzer {
 
         self.next_label = analyzer.next_label;
         self.next_block = analyzer.next_block;
-        let mut diagnostics = analyzer.diagnostics;
-        diagnostics.extend(self.redeclarations(&before));
+        let diagnostics = analyzer.diagnostics;
 
         // Re-resolve from the pristine copy. Cloning is what keeps this
         // idempotent: the passes below rewrite capture state in place and
@@ -197,114 +190,5 @@ impl IncrementalAnalyzer {
             diagnostics,
             first_new_slot,
         }
-    }
-
-    /// Top-level names this fragment declared a *second* time.
-    ///
-    /// Each fragment is parsed on its own, so `oxc` — which catches
-    /// `let x; let x;` within one parse as a syntax error — cannot see a
-    /// collision that spans fragments. The walk quietly allocates a fresh slot
-    /// and shadows instead, which would silently strand the old binding, so the
-    /// check belongs here: a name whose outermost-scope entry now points
-    /// somewhere new was declared twice.
-    fn redeclarations(&self, before: &IndexMap<String, NameRes>) -> Vec<Diagnostic> {
-        let after = top_level_bindings(&self.block_scopes);
-        let mut out = Vec::new();
-        for (name, old) in before {
-            let Some(new) = after.get(name) else {
-                continue;
-            };
-            if same_binding(old, new) {
-                continue;
-            }
-            // Report at the offending declaration: the binding occurrence
-            // that took the new slot, when there is one.
-            let span = match new {
-                NameRes::Slot { slot, .. } => self.pristine[ROOT]
-                    .binding_spans
-                    .iter()
-                    .find(|(_, own, _)| own == slot)
-                    .map(|(span, _, _)| *span)
-                    .unwrap_or(0),
-                NameRes::Const(_) => 0,
-            };
-            out.push(Diagnostic {
-                span: Span::point(span),
-                // **Say which scope, because that is the surprise.**
-                // This check only ever fires across fragments — a
-                // collision inside one parse is caught as a syntax
-                // error before it gets here — so the name being
-                // redeclared is always one that something *earlier*
-                // bound, in a scope the new code did not open and
-                // cannot see the top of. A bare "already declared"
-                // sends a reader looking for the other declaration in
-                // the fragment in front of them, where it is not.
-                //
-                // Live, across 96 kept runs of the agent that embeds
-                // this crate, six programs died here — on `f`, `r`,
-                // `refs`, `files`, `names` and `t`, all of them the
-                // second `const` of a name a previous fragment had
-                // already taken.
-                //
-                // **And it is not a naming collision.** Looked at
-                // again on 2026-09-20 with the failing line beside the
-                // binding it clashed with: four of four were the same
-                // statement written twice —
-                // `const f = await tools.read_file("helpers.py");`
-                // above and below. The caller is not running out of
-                // names, it is redoing work, and the binding it wants
-                // is still sitting there. So the remedy the message
-                // leads with is *use it*; renaming would keep the
-                // second read and hide the waste, which is also why
-                // this diagnostic is worth having rather than quietly
-                // shadowing.
-                // **"Earlier in this reply", not "earlier".** It used to
-                // say "what ran before it", which reads as everything
-                // that has ever run — and across replies no scope is
-                // shared at all, so a reader taking it that way would
-                // expect a binding from a previous reply to still be
-                // there and get a `ReferenceError` instead. The scope
-                // this shares is one reply's, and the message has to
-                // say which.
-                message: format!(
-                    "`{name}` is already declared — the blocks of one reply share a scope, \
-                     so `{name}` is still bound to whatever an earlier block *in this reply* \
-                     gave it. If that is the value you want, use it; it does not need \
-                     fetching twice. If you want a different one, give it a different name."
-                ),
-                kind: crate::diag::DiagKind::Semantic,
-            });
-        }
-        out
-    }
-}
-
-/// The outermost block scope's bindings, by name. Only the outermost: a `let`
-/// inside a nested block legitimately shadows a top-level name, and is not a
-/// redeclaration.
-fn top_level_bindings(block_scopes: &BlockScopes) -> IndexMap<String, NameRes> {
-    block_scopes
-        .first()
-        .map(|top| {
-            top.names
-                .iter()
-                .map(|(name, res)| (name.clone(), res.clone()))
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-/// Whether two resolutions of one name are the same binding.
-///
-/// Every `let`/`const` gets a unique slot — never reused, even when shadowing —
-/// so a changed slot is a redeclaration. A literal `const` occupies no slot at
-/// all, so it is compared by value instead; redeclaring one to the *identical*
-/// literal therefore goes unreported, which is the one case where nothing
-/// observable changes anyway.
-fn same_binding(a: &NameRes, b: &NameRes) -> bool {
-    match (a, b) {
-        (NameRes::Slot { slot: x, .. }, NameRes::Slot { slot: y, .. }) => x == y,
-        (NameRes::Const(x), NameRes::Const(y)) => x == y,
-        _ => false,
     }
 }
