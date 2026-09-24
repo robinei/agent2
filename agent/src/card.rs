@@ -65,6 +65,7 @@ pub fn embedded() -> Card {
             exemplar!("05-keep"),
             exemplar!("06-fork"),
             exemplar!("07-supervise"),
+            exemplar!("08-watch"),
         ],
     }
 }
@@ -1965,7 +1966,7 @@ mod tests {
     #[test]
     fn the_exemplars_demonstrate_the_endings_and_the_shapes() {
         let ex = exemplars();
-        assert_eq!(ex.len(), 7, "seven, and each earns its place");
+        assert_eq!(ex.len(), 8, "eight, and each earns its place");
         assert!(
             ex[0].assistant.contains("finish()") && ex[0].assistant.contains("tell("),
             "the first ends a finished task, and says the answer on its way out: {}",
@@ -2118,6 +2119,34 @@ mod tests {
              the finishing shape is the only one demonstrated",
             ex.len()
         );
+        // **The eighth polls; the seventh must not.** They look alike
+        // and are opposites. A helper you spawned settles its own `ask`,
+        // so polling a roster for it is a race — the seventh waited on
+        // `list_agents` until nothing was `running`, which a freshly
+        // told helper answers `queued` at best, and decided the work was
+        // done before it had begun (6254690). State out in the world
+        // announces nothing, so looking again *is* the only way to know,
+        // and `wait_until` is what makes the looking bounded.
+        //
+        // That removal left `wait_until` with no worked example at all,
+        // and across every run logged to 2026-09-24 nothing has ever
+        // called it. An exemplar beats a rule every time the two have
+        // been measured here (p=0.0057), so a verb with no exemplar is
+        // a verb the model does not have.
+        assert!(
+            ex[7].assistant.contains("tools.wait_until(")
+                && ex[7].assistant.contains("for (")
+                && !ex[7].assistant.contains("list_agents")
+                && !ex[7].assistant.contains("spawn("),
+            "the eighth polls the world on a bounded loop, and is not about helpers: {}",
+            ex[7].assistant
+        );
+        assert!(
+            ex[7].assistant.contains("return "),
+            "and says so when it runs out of looks rather than ending quiet: {}",
+            ex[7].assistant
+        );
+
         // Short enough to be a shape rather than a technique to copy —
         // a live run on 2026-09-17 reproduced a long exemplar verbatim,
         // invented names and all, into a repo that had none of them. The
