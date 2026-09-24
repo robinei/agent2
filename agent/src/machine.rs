@@ -3622,6 +3622,8 @@ impl Runner {
                     stack: Vec::new(),
                 },
             )?;
+            let mut console = console;
+            substitute_printed_rows(&mut console, tree, self.spine.leaf_id);
             tree.append(&mut self.spine, EventPayload::Console { lines: console })?;
             if decision == "resume" {
                 // Revive the old run's own in-flight calls. They were
@@ -3743,13 +3745,15 @@ impl Runner {
         // everything the first already carried, and the report here
         // replayed output the model read a reply earlier. See
         // `Run::console_logged`.
+        let mut printed = crate::report::cap_console(
+            &run.vm.console_lines[run.console_logged.min(run.vm.console_lines.len())..],
+            &format!("console event follows #{}", outcome.as_u64()),
+        );
+        substitute_printed_rows(&mut printed, tree, self.spine.leaf_id);
         tree.append(
             &mut self.spine,
             EventPayload::Console {
-                lines: crate::report::cap_console(
-                    &run.vm.console_lines[run.console_logged.min(run.vm.console_lines.len())..],
-                    &format!("console event follows #{}", outcome.as_u64()),
-                ),
+                lines: printed,
             },
         )?;
 
@@ -3943,13 +3947,15 @@ impl Runner {
                 stack,
             },
         )?;
+        let mut printed = crate::report::cap_console(
+            &console,
+            &format!("console event follows #{}", outcome.as_u64()),
+        );
+        substitute_printed_rows(&mut printed, tree, self.spine.leaf_id);
         tree.append(
             &mut self.spine,
             EventPayload::Console {
-                lines: crate::report::cap_console(
-                    &console,
-                    &format!("console event follows #{}", outcome.as_u64()),
-                ),
+                lines: printed,
             },
         )?;
         // A handover is the exception to everything below: it does ask,
@@ -4515,31 +4521,6 @@ impl Runner {
     ///   the model needs the id to reach for `answer` even when only one
     ///   post is open.
     /// - **presence**: whether a client is attached right now.
-    /// The row the last program's console output repeats, if it does.
-    fn console_repeats_a_row(&self, tree: &Tree) -> Option<(EventId, usize)> {
-        let path = tree.path_events(self.spine.leaf_id);
-        let printed = path.iter().rev().find_map(|e| match &e.payload {
-            EventPayload::Console { lines, .. } => Some(lines),
-            _ => None,
-        })?;
-        // **Joined, because the console is kept as lines.** A program
-        // that prints a row prints it one line at a time, and forty
-        // lines of forty bytes are each far under the threshold that
-        // decides what counts as a copy — so comparing them
-        // one by one finds nothing however much was repeated. What was
-        // printed is the lines put back together.
-        let printed = printed.join("\n");
-        let mine = [printed.as_str()];
-        let rows = path.iter().filter_map(|e| match &e.payload {
-            EventPayload::Result {
-                call,
-                outcome: Outcome::Delivered(v),
-            } => Some((*call, v)),
-            _ => None,
-        });
-        copy_of(&mine, rows)
-    }
-
     pub(crate) fn request_tail(&self, tree: &Tree) -> Option<String> {
         // While a compaction is outstanding the directive *is* the tail,
         // and nothing else rides with it — the directive's own words are
@@ -4654,26 +4635,6 @@ impl Runner {
         // nothing downstream has to cope with them — but a silent
         // deletion teaches nothing, and the ids in what was deleted
         // were guesses the model may still be reasoning from.
-        // **Printing a row's bytes is the same mistake as noting
-        // them, one reply cheaper.** `note` copies them onto the
-        // record for good and is refused; the console copies them into
-        // one request and is not — but a program that fetches four
-        // rows and prints all four has still paid for those bytes
-        // twice and put them where nothing can `keep` them. Live on
-        // 2026-09-24: one program printed 10,137 bytes across 217
-        // lines, almost all of it the contents of rows it had fetched
-        // two lines earlier, and 17 of those lines were dropped for
-        // the budget.
-        //
-        // A line, not a refusal: the console is where a program is
-        // *supposed* to be able to say anything, and a value it
-        // computed from a row is its own even when it looks alike.
-        if let Some((row, bytes)) = self.console_repeats_a_row(tree) {
-            let id = row.as_u64();
-            lines.push(format!(
-                "- your last program printed {bytes} bytes that are already on `[{id}]`.                  `history.keep({id})` shows that row without printing it, and survives                  the next reply — the console does not."
-            ));
-        }
         if self.annotations_stripped > 0 {
             let n = self.annotations_stripped;
             lines.push(format!(
@@ -5317,6 +5278,39 @@ fn substitute_copied_rows(value: &mut serde_json::Value, tree: &Tree, leaf: Even
         })
         .collect();
     substitute_within(value, &rows)
+}
+
+/// The same for what a program printed.
+///
+/// **A print is one entry now, so it can be one reference.** Splitting
+/// on newlines used to make this impossible: forty lines of forty
+/// bytes are each far under what counts as a copy, so a program that
+/// printed a whole row one line at a time matched nothing however much
+/// it repeated. Whole prints match, and a print that is a row's bytes
+/// becomes a pointer to the row.
+///
+/// Done before the append, like a note's, so what the log holds and
+/// what `history.fetch` hands back are the same thing. The console
+/// section is not free either — it is rendered into the report and
+/// paid for on every turn the report survives, which is what made one
+/// live program's 10,137 printed bytes worth having.
+fn substitute_printed_rows(lines: &mut [String], tree: &Tree, leaf: EventId) {
+    let path = tree.path_events(leaf);
+    let rows: Vec<(EventId, &serde_json::Value)> = path
+        .iter()
+        .filter_map(|e| match &e.payload {
+            EventPayload::Result {
+                call,
+                outcome: Outcome::Delivered(v),
+            } => Some((*call, v)),
+            _ => None,
+        })
+        .collect();
+    for line in lines.iter_mut() {
+        if let Some((row, bytes)) = copy_of(&[line.as_str()], rows.iter().copied()) {
+            *line = reference_to(row, bytes);
+        }
+    }
 }
 
 /// Rewrite every copied string in `value`, returning how many were
@@ -10033,67 +10027,38 @@ mod tests {
         assert!(tail.contains("34734"), "with the numbers it fired on");
     }
 
-    /// **Printing a result's bytes is told about, the way copying them
-    /// into a note has been.**
+    /// **A print of a row's bytes becomes a reference to the row.**
     ///
     /// Measured on the card of 2026-09-24: 9 of 60 first replies to a
     /// reading task wrote `console.log(f.content)`, and two wordings
     /// failed to shift them — a closing consequence and a flat ban
     /// naming the syntax performed identically, 9/60 against 11/60,
-    /// p=0.81. The report was the channel that had never said anything
-    /// about it: `copied_note` fires when a run copies a row's bytes
-    /// into a note, and was blind to the run printing them instead.
+    /// p=0.81. So the report was made to say something about it, which
+    /// was the channel that never had. This goes one further: saying
+    /// costs the bytes anyway, and the console is rendered into a
+    /// report that is paid for on every turn it survives. A reference
+    /// says the same thing and does not.
     ///
-    /// Containment, not equality — a program writes `console.log("X:\n"
-    /// + f.content)`, and an equality test sees nothing wrong with it.
+    /// Live on 2026-09-24 one program fetched five rows and printed
+    /// all five contents — 10,137 bytes over 217 lines, 17 of them
+    /// dropped for the budget.
+    ///
+    /// **Only possible since a print became one entry.** Split on
+    /// newlines, forty lines of forty bytes were each far under what
+    /// counts as a copy, so printing a whole row one line at a time
+    /// matched nothing however much it repeated. Containment, not
+    /// equality, for the same reason it always was: a program writes
+    /// `console.log("X:\n" + f.content)`.
     #[test]
-    fn printing_a_results_bytes_is_named_in_the_report() {
-        let mut c = Conversation::new();
+    fn printing_a_row_back_stores_a_reference_to_it() {
         let body = "warning: unused\n".repeat(60);
-        c.answers("bash", serde_json::json!({ "status": 0, "stdout": body }));
-        c.reply("```js\nconst r = await tools.bash(\"build\");\nconsole.log(\"out:\\n\" + r.stdout);\n```\n");
-
-        let doc = c.document();
-        assert!(
-            doc.contains("You printed the bytes of"),
-            "the report says so: {doc}"
-        );
-        assert!(
-            doc.contains("history.keep(id)") && doc.contains("history.peek(id)"),
-            "and names what to do instead"
-        );
-
-        // A trace of what happened is the channel's job and draws
-        // nothing — otherwise the advisory would fire on every loop
-        // the card asks for.
         let mut c = Conversation::new();
-        c.answers("bash", serde_json::json!({ "status": 0, "stdout": body }));
-        c.reply("```js\nconst r = await tools.bash(\"build\");\nconsole.log(\"lines:\", r.stdout.split(\"\\n\").length);\n```\n");
-        assert!(
-            !c.document().contains("You printed the bytes of"),
-            "a count is not a payload: {}",
-            c.document()
-        );
-    }
-
-/// **Printing a row's bytes is noticed, and the row is named.** Live
-    /// on 2026-09-24 a program fetched five rows and printed all five
-    /// contents — 10,137 bytes across 217 lines, 17 of them dropped
-    /// for the budget. The console is not a row: nothing can `keep`
-    /// it, and it goes when the report around it goes. So those bytes
-    /// were paid for twice and landed where they could not be read
-    /// again.
-    ///
-    /// A line rather than a refusal — the console is the one channel a
-    /// program may say anything on, and a value computed from a row is
-    /// its own even when it looks alike.
-    #[test]
-    fn printing_a_row_back_is_noticed_and_the_row_is_named() {
-        let bulk = "matched line in the config, with some detail\n".repeat(40);
-        let mut c = Conversation::new();
-        c.answers("bash", serde_json::json!({ "status": 0, "stdout": bulk.clone() }));
+        c.answers("bash", serde_json::json!({ "status": 0, "stdout": body.clone() }));
         c.user_says("go");
-        c.reply("```js\nconst r = await tools.bash(\"grep x .\");\n```\n");
+        c.reply(
+            "```js\nconst r = await tools.bash(\"build\");\n\
+             console.log(\"out:\\n\" + r.stdout);\n```\n",
+        );
         let row = c
             .tree()
             .path_events(c.runner().spine.leaf_id)
@@ -10105,36 +10070,44 @@ mod tests {
                 _ => None,
             })
             .expect("the call is on the record");
-        c.reply(
-            &"```js\nconsole.log((await history.fetch(ROW)).stdout);\n```\n"
-                .replace("ROW", &row.to_string()),
+
+        let printed = c
+            .tree()
+            .path_events(c.runner().spine.leaf_id)
+            .iter()
+            .rev()
+            .find_map(|e| match &e.payload {
+                EventPayload::Console { lines } if !lines.is_empty() => Some(lines.clone()),
+                _ => None,
+            })
+            .expect("something was printed");
+        assert_eq!(printed.len(), 1, "one print, one entry: {printed:?}");
+        assert!(
+            printed[0].contains(&format!("[{row}]")),
+            "the entry names the row it repeated: {printed:?}"
+        );
+        assert!(
+            !printed[0].contains("warning: unused"),
+            "and the bytes are not stored twice: {printed:?}"
         );
 
-        let doc = c.document();
-        assert!(
-            doc.contains(&format!("already on `[{row}]`")),
-            "the tail names the row it repeated: {doc}"
-        );
-        assert!(
-            doc.contains(&format!("history.keep({row})")),
-            "and the verb that shows it without printing: {doc}"
-        );
-
-        // A program that prints what it worked out, rather than what it
-        // was given, is left alone.
+        // A trace of what happened is the channel's job and is left
+        // alone — otherwise this would fire on every loop the card
+        // asks for.
         let mut c = Conversation::new();
-        c.answers("bash", serde_json::json!({ "status": 0, "stdout": bulk }));
+        c.answers("bash", serde_json::json!({ "status": 0, "stdout": body }));
         c.user_says("go");
         c.reply(
-            "```js\nconst r = await tools.bash(\"grep x .\");\n\
-             console.log(`${r.stdout.split(\"\\n\").length} lines matched`);\n```\n",
+            "```js\nconst r = await tools.bash(\"build\");\n\
+             console.log(\"lines:\", r.stdout.split(\"\\n\").length);\n```\n",
         );
         assert!(
-            !c.document().contains("already on `["),
-            "a count is not the bytes it counted: {}",
+            c.document().contains("lines: 61"),
+            "a count is not a payload: {}",
             c.document()
         );
     }
+
 
     /// **A note that copies a row stores a reference to it instead.**
     /// `note` is for what a reply worked out; `keep` is for bytes it was
