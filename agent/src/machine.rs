@@ -207,13 +207,6 @@ const FOREIGN_TOOL_CALL_NOTICE: &str = "Your last reply contained a tool call in
      block executes as you finish it. Write the block now; the work you meant to do is still \
      undone.";
 
-/// Woken after a reply that carried on the branch's own work and then
-/// ran nothing — see [`Runner::stopped_short`].
-const STOPPED_SHORT_NOTICE: &str = "Your last reply ran nothing, and nobody had asked you \
-     anything — so the work stopped where it was rather than finishing. If the task really is \
-     done, say so with `finish(text)` inside a ```js block. Otherwise carry on from where you left \
-     off.";
-
 /// **What a reply with no block does, said while it would be a
 /// mistake.**
 ///
@@ -314,8 +307,22 @@ pub(crate) const FINISH_MARK: &str = "∎";
 /// itself finished — so the branch cannot tell a conclusion from a
 /// thought said aloud.
 const NOT_FINISHED_NOTICE: &str = "- Your last reply ran no program and did not end with ∎, so \
-     the task is still open. If it was the answer, say it again with ∎ at the end. If you were \
-     thinking aloud, that belongs in reasoning — carry on with the work.";
+     the task is still open. **If you reply once more with prose alone, that reply is your \
+     last** — this is asked once. If you are already done, reply with a single ∎ and nothing \
+     else. If you were thinking aloud, that belongs in reasoning: carry on with the work.";
+
+/// Sent when a reply wrote `∎` and ran a program in the same breath.
+/// The mark was deleted before the reply was logged — see
+/// [`crate::notebook::strip_finish_marks`] for why it cannot be
+/// honoured there — and this is the request that says so, once.
+///
+/// It ends the same way `NOT_FINISHED_NOTICE` does, because the model
+/// is in the same position after reading it: the work may well be done,
+/// and there is a one-character way to say so.
+const FINISH_MARK_BESIDE_A_PROGRAM: &str = "- Your last reply ended with ∎ *and* ran a program, \
+     so the mark was removed. Prose is written before the block under it runs, so ∎ there claims \
+     an outcome you had not seen yet; inside a program, finish() does that job and can see the \
+     result. The outcome is above: if the work is done, reply with a single ∎ and nothing else.";
 
 /// **The reply-shape line**, for the request where someone has just
 /// asked something and the branch has no work of its own outstanding.
@@ -939,6 +946,12 @@ pub struct Runner {
     /// read off the notebook because the tail that reports it is built
     /// *after* the reply ends, by which time the notebook is gone.
     annotations_stripped: usize,
+    /// Finish marks deleted from the reply that just ended, for the
+    /// same reason and by the same route — see
+    /// [`crate::notebook::strip_finish_marks`]. Read off the notebook
+    /// when it closes rather than as text arrives, because the mark is
+    /// only decidable once the whole reply is in hand.
+    finish_marks_stripped: usize,
     /// The reply this generation has produced so far, verbatim.
     ///
     /// **Kept here rather than read off the run**, because the run does
@@ -1037,20 +1050,11 @@ pub struct Runner {
     /// single moment that fact becomes true; `finish_program`'s own
     /// comment is where the polarity this exists to flip is explained.
     finished: bool,
-    /// Whether a reply that ran nothing and answered nobody wakes the
-    /// branch — the third branch of [`stopped_short`](Self::stopped_short),
-    /// which is where the measurement behind this lives.
-    ///
-    /// **A field, not an `env::var` at the point of use.** The same
-    /// mistake was made once with the transport and undone for the
-    /// reason stated there: a process-global read cannot be set two
-    /// ways at once, so the tests for on and off could not run beside
-    /// each other. Read from `AGENT2_STOPPED_SHORT_NOTICE` when the
-    /// runner is built, and settable directly in a test.
-    nudge_when_nothing_ran: bool,
     /// Whether the tail carries [`REPLY_SHAPE_TAIL`] on a request that
-    /// is answering a post. A field for the same reason as the line
-    /// above: an arm has to be settable per-runner, not per-process.
+    /// is answering a post. A field rather than an `env::var` at the
+    /// point of use: a process-global read cannot be set two ways at
+    /// once, so the tests for on and off could not run beside each
+    /// other.
     reply_shape_tail: bool,
     /// The rehearsal-ban line this branch's tail carries, if any.
     ///
@@ -1235,11 +1239,6 @@ impl Runner {
             bytes_per_token: None,
             pending_edits: Vec::new(),
             finished: false,
-            // Off unless asked for: of the thirteen times this fired
-            // across 382 kept runs, twelve woke a branch whose next
-            // reply was `done();`. See `stopped_short`.
-            nudge_when_nothing_ran: std::env::var("AGENT2_STOPPED_SHORT_NOTICE")
-                .is_ok_and(|v| v != "0"),
             reply_shape_tail: std::env::var("AGENT2_REPLY_SHAPE_TAIL").is_ok_and(|v| v != "0"),
             no_rehearsal_tail: match std::env::var("AGENT2_NO_REHEARSAL_TAIL") {
                 Ok(v) if v == "0" => None,
@@ -1263,6 +1262,7 @@ impl Runner {
             next_prompt_floor: Counted::Never,
             pause_falsifies_the_rest: false,
             annotations_stripped: 0,
+            finish_marks_stripped: 0,
             streaming_reply: String::new(),
             pending_decision: None,
             reply_id: EventId::new(1),
@@ -1625,8 +1625,8 @@ impl Runner {
         if unfenced_program(&last.text) {
             return Some(UNFENCED_PROGRAM_NOTICE.to_owned());
         }
-        // **Off by default, and the code stays.** Of the thirteen times
-        // this last branch fired across 382 kept runs, twelve woke a
+        // **What this used to be, and why it was off.** Of the thirteen
+        // times this last branch fired across 382 kept runs, twelve woke a
         // branch whose next reply was, verbatim, `done();` — a model
         // that had finished the work and had not said so in the one
         // syntax that rests a branch. One round trip each, and those
@@ -1641,9 +1641,7 @@ impl Runner {
         // after doing work, and none finishes after simply concluding —
         // and prodding is the wrong place to fix that.
         //
-        // `AGENT2_STOPPED_SHORT_NOTICE=1` brings it back, because one
-        // rescue in thirteen is not nothing and this is a number to
-        // re-measure rather than a question to settle by comment. The
+        // The knob that held it off is gone with the mark below. The
         // two branches above are untouched: an empty completion
         // (2026-09-19: the whole completion went to reasoning, the
         // branch rested, the harness exited 0 with the task untouched)
@@ -3757,15 +3755,23 @@ impl Runner {
             serde_json::Value::Null => None,
             v => Some(v.clone()),
         };
-        // **Either ending counts.** `finish()` sets the VM's flag;
-        // `∎` in the prose says the same thing without a program, which
-        // is the only way a reply that concluded in words can say it.
-        // A reply that does both is not a contradiction — it is a
-        // program that finished and a sentence that said so.
+        // **`∎` ends a reply that ran nothing; `finish()` ends one that
+        // ran something.** They are not two spellings of one thing.
+        //
+        // Prose is written before any block in the same reply runs —
+        // the card says so in as many words — so `∎` beside a block is
+        // a *prediction* that the block will go well. Honour it and a
+        // check that fails still rests the branch, which is the one
+        // thing `finish()`'s own declaration forbids: "Never finish on
+        // a failure." `finish()` can be conditional because it sits
+        // inside the program and sees the result; a mark in the prose
+        // cannot.
+        //
+        // So each verb is honoured only where it can be right.
         let marked = self
             .replies(tree)
             .last()
-            .is_some_and(|r| r.text.contains(FINISH_MARK));
+            .is_some_and(|r| !r.ran && r.text.contains(FINISH_MARK));
         let rested = (self.finished || marked) && self.said_something(tree);
         let outcome = tree.append(
             &mut self.spine,
@@ -4699,6 +4705,9 @@ impl Runner {
                 crate::document::FENCE_OPEN,
                 crate::document::FENCE_CLOSE,
             ));
+        }
+        if self.finish_marks_stripped > 0 {
+            lines.push(FINISH_MARK_BESIDE_A_PROGRAM.to_owned());
         }
         if self.reply_shape_tail && self.answering_a_post(tree) {
             lines.push(REPLY_SHAPE_TAIL.to_owned());
@@ -5958,6 +5967,21 @@ impl Runner {
         self.parked.last().map(|p| &p.run)
     }
 
+    /// Carry the closed notebook's finish-mark count onto the runner.
+    ///
+    /// Called from every path that ends a reply, for the reason the
+    /// field gives: the tail that reports it is built after the
+    /// notebook is gone.
+    fn note_finish_marks(&mut self) {
+        if let Some(n) = self
+            .run_ref()
+            .and_then(|r| r.notebook.as_ref())
+            .map(crate::notebook::Notebook::finish_marks_stripped)
+        {
+            self.finish_marks_stripped = n;
+        }
+    }
+
     /// Take text into the reply and record whatever parts it completed —
     /// without running any of them.
     ///
@@ -6030,6 +6054,7 @@ impl Runner {
                     Some(notebook) => notebook.end_truncated(truncated),
                     None => Vec::new(),
                 };
+                self.note_finish_marks();
                 self.log_parts(tree, &tail)?;
             }
             return Ok(None);
@@ -6056,6 +6081,7 @@ impl Runner {
             },
             None => return Ok(Some(Vec::new())),
         };
+        self.note_finish_marks();
         self.log_parts(tree, &tail)?;
         // **The end is logged last.** Trailing prose only becomes a
         // piece when the reply ends, so draining it first is what keeps
@@ -6199,10 +6225,15 @@ impl Runner {
         // `is_ended` guards the repeat: the frame stays on `parked`
         // across as many replies as it takes to decide about it, where
         // it used to be moved off `phase` exactly once.
+        let mut ended_a_parked_reply = false;
         if let Some(notebook) = self.parked.last_mut().and_then(|p| p.run.notebook.as_mut())
             && !notebook.is_ended()
         {
             notebook.end();
+            ended_a_parked_reply = true;
+        }
+        if ended_a_parked_reply {
+            self.note_finish_marks();
         }
         self.generation += 1;
         // **The reply is logged before a byte of it arrives** (28).
@@ -6340,6 +6371,7 @@ impl Runner {
         // which is where every other reply gets its `end()`.
         if let Some(notebook) = self.run_mut().and_then(|r| r.notebook.as_mut()) {
             let tail = notebook.end();
+            self.note_finish_marks();
             self.log_parts(tree, &tail)?;
         }
         self.finish_notebook_generation(tree, None, None)?;
@@ -8948,7 +8980,6 @@ mod tests {
     /// is for. Returning it puts the lifetime in the caller's hands
     /// without asking the caller to know any of this — the one shape
     /// that cannot fall behind as tests are added.
-
     fn crowded() -> (Tree, Runner, usize, std::sync::MutexGuard<'static, ()>) {
         let env = env_lock();
         let (mut tree, mut state) = setup();
@@ -10741,6 +10772,82 @@ mod tests {
         );
     }
 
+    /// **The mark beside a program is not an ending, and does not stay
+    /// on the log.**
+    ///
+    /// Prose is written before the block under it runs, so `∎` there is
+    /// a claim about a result nobody has seen — see
+    /// [`crate::notebook::strip_finish_marks`]. Honouring it would rest
+    /// the branch on a failure; leaving it in place would teach the
+    /// model, from its own turn, that the mark does nothing. So it is
+    /// deleted before the reply is logged, and the next request says
+    /// what happened.
+    #[test]
+    fn a_finish_mark_beside_a_program_is_taken_out_and_the_next_request_says_so() {
+        let mut c = Conversation::new();
+        c.user_says("go");
+        c.reply("Reading it now.\n\n```js\nlet a = 1;\n```\n\nThat settles it. ∎\n");
+
+        assert_eq!(
+            c.status(),
+            "awaiting llm",
+            "a reply that ran a cell is not rested by a mark in its prose"
+        );
+
+        let doc = crate::document::render(c.tree(), &c.runner().spine, 64 * 1024);
+        let assistant: String = doc
+            .conversation()
+            .iter()
+            .filter(|m| m.role == crate::document::ChatRole::Assistant)
+            .map(|m| m.content.as_str())
+            .collect();
+        assert!(
+            assistant.contains("That settles it."),
+            "the sentence stands: {assistant}"
+        );
+        assert!(
+            !assistant.contains(FINISH_MARK),
+            "and the mark does not, so the turn is not an example of one that failed: {assistant}"
+        );
+
+        let tail = c.runner().request_tail(c.tree()).expect("a tail");
+        assert!(
+            tail.contains("ended with ∎ *and* ran a program"),
+            "the request that follows says why it went: {tail}"
+        );
+    }
+
+    /// And it is said once. The count belongs to the reply that earned
+    /// it, so the next reply — which wrote no mark — clears it.
+    #[test]
+    fn the_stripped_mark_is_reported_for_one_request_only() {
+        let mut c = Conversation::new();
+        c.user_says("go");
+        c.reply("```js\nlet a = 1;\n```\n\nDone. ∎\n");
+        assert!(
+            c.runner()
+                .request_tail(c.tree())
+                .expect("a tail")
+                .contains("ran a program"),
+            "said on the request after the reply that wrote it"
+        );
+        c.reply("```js\nlet b = 2;\n```\n");
+        assert!(
+            !c.runner()
+                .request_tail(c.tree())
+                .expect("a tail")
+                .contains("ran a program, \n"),
+            "and not again"
+        );
+        assert!(
+            !c.runner()
+                .request_tail(c.tree())
+                .expect("a tail")
+                .contains("the mark was removed"),
+            "and not again"
+        );
+    }
+
 
     /// **A `finish()` that said nothing is not honoured**, and the next
     /// request says why. The pairing used to be the verb's arity —
@@ -10908,7 +11015,6 @@ mod tests {
     #[test]
     fn a_continuation_that_ran_nothing_is_asked_again() {
         let (mut tree, mut state) = setup_under();
-        state.nudge_when_nothing_ran = true;
         user_post(&mut state, &mut tree, "go");
         let out = state
             .step(&mut tree, StepInput::LlmResponse(llm_program("let a = 1;")))

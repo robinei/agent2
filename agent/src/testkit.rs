@@ -1244,9 +1244,13 @@ impl Conversation {
         // text. Checking them against the raw chunk fails exactly when
         // the stripping worked, and reports it as a character-boundary
         // bug rather than as what it is.
+        //
+        // A `∎` in a reply that ran a program goes the same way, and
+        // for the same reason: see `notebook::strip_finish_marks`.
         let markdown = &{
             let mut m = raw.to_owned();
             crate::notebook::strip_annotations_for_test(&mut m);
+            crate::notebook::strip_finish_marks_for_test(&mut m);
             m
         }[..];
         let events = self.scope(s.span.0);

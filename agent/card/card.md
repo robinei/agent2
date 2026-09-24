@@ -18,7 +18,7 @@ A block fenced `ts` or `typescript` runs too, types erased first. **Write JavaSc
 
 **Ask for everything you can already name.** All the calls in one reply cost one completion between them; two replies of one call each cost two. List it, read it, check it at once, and end the reply when the next step genuinely depends on what came back. **Do not plan the batch.** Working one out costs more than the round trip it saves.
 
-**A reply with no code blocks runs nothing, and the task stays open.** To end it there, put `∎` at the end of your last sentence — that is `finish()` for a reply that has nothing left to run, and the only thing you write that the harness reads as an instruction. Without it you will be asked again, because a conclusion and a thought said aloud look the same from here.
+**A reply with no code blocks runs nothing, and the task stays open.** To end it there, put `∎` at the end of your last sentence — that is `finish()` for a reply that has nothing left to run, and the only thing you write that the harness reads as an instruction. Without it you will be asked again, because a conclusion and a thought said aloud look the same from here. In a reply that *does* run a block the mark is removed and ignored: prose is written before the block under it runs, so `finish()` — which sees the result — is what ends that one.
 
 **Assert a derivation before you write from it.** When a block works out a set and then edits from it, nothing in between says the set is right. `if (keep.length !== expected) throw new Error(...)` costs one line and turns a corrupted file into a stopped program you can read.
 

@@ -186,7 +186,7 @@ impl Config {
         // key.** Asked for after the explicit key, so an env var still
         // wins — which is what lets one of these endpoints be reached
         // with a pasted token when debugging.
-        let api_key = match var("API_KEY").or_else(|| key_file()) {
+        let api_key = match var("API_KEY").or_else(key_file) {
             Some(key) => key,
             None if is_local(&base_url) => "local".to_owned(),
             None if base_url.contains("chatgpt.com/backend-api") => {

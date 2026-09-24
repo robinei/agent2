@@ -64,6 +64,8 @@ pub struct Notebook {
     reply: String,
     /// Harness annotations taken out of it — see [`strip_annotations`].
     stripped: usize,
+    /// Finish marks taken out of it — see [`strip_finish_marks`].
+    finish_marks: usize,
     stream: Stream,
     /// Pieces that are complete but not yet acted on, in source order.
     ///
@@ -108,6 +110,7 @@ impl Notebook {
             base_blank,
             reply: String::new(),
             stripped: 0,
+            finish_marks: 0,
             stream: Stream::new(),
             queued: std::collections::VecDeque::new(),
             ended: false,
@@ -155,6 +158,13 @@ impl Notebook {
         self.stripped
     }
 
+    /// How many finish marks were taken out of this reply because it
+    /// ran a program — see [`strip_finish_marks`]. The request after it
+    /// says so, once (`Runner::request_tail`).
+    pub fn finish_marks_stripped(&self) -> usize {
+        self.finish_marks
+    }
+
     fn drop_leaked_reasoning(&mut self) {
         strip_leaked_reasoning(&mut self.reply, self.stream.consumed());
     }
@@ -168,6 +178,9 @@ impl Notebook {
     /// The completion is over because the token budget ran out. The cells
     /// that closed stand; the half-written one after them was never a cell.
     pub fn end_truncated(&mut self, truncated: bool) -> Vec<Piece> {
+        // **Before the last pieces are cut**, so the mark never reaches
+        // the log and never comes back at the model as its own words.
+        self.finish_marks += strip_finish_marks(&mut self.reply, self.stream.consumed());
         let pieces = self.stream.finish(&self.reply);
         self.queue(&pieces);
         self.ended = true;
@@ -597,6 +610,69 @@ fn strip_annotations(reply: &mut String, consumed: usize) -> usize {
     removed
 }
 
+/// **Take `∎` out of a reply that also ran a program.**
+///
+/// The mark ends a reply that runs nothing. It cannot end one that runs
+/// something, because prose is written *before* the block under it runs:
+/// a mark beside a cell is a prediction that the cell will go well, and
+/// honouring it would rest the branch on a result nobody has seen — the
+/// one thing `finish()`'s own declaration forbids. So the mark is
+/// ignored there, and ignoring it silently is what leaves a false
+/// lesson behind: the model reads its own last turn ending in `∎`,
+/// sees that it was asked again, and learns that the mark does nothing.
+///
+/// Deleting it before the reply is logged is what keeps that lesson out
+/// of the model's own mouth. The count goes to the next request's tail,
+/// which says what happened and why — see `Runner::request_tail`.
+///
+/// **Only in the prose**, and only past `consumed`: a cell's source is
+/// left alone (`∎` is not an identifier character, so it can only be
+/// there inside a string or a comment, and neither is the harness's to
+/// rewrite), and a piece already handed out has reached the person.
+/// [`strip_finish_marks`] over a whole reply, for tests that need to
+/// say what one looks like once the harness has cleaned it.
+///
+/// The `from` is not zero: the strip runs when the reply ends, and by
+/// then `Stream::consumed` sits at the end of the last cell — prose is
+/// only handed out when the cell *after* it opens, so that holds
+/// whether the reply arrived in one piece or in a hundred.
+#[cfg(test)]
+pub(crate) fn strip_finish_marks_for_test(reply: &mut String) {
+    let from = split_cells(reply).last().map_or(0, |c| c.outer_end);
+    strip_finish_marks(reply, from);
+}
+
+fn strip_finish_marks(reply: &mut String, from: usize) -> usize {
+    let cells = split_cells(reply);
+    if cells.is_empty() {
+        return 0; // a reply that ran nothing: the mark is the ending
+    }
+    let from = from.min(reply.len());
+    // The prose gaps past `from`, then walked back to front so the
+    // earlier ones keep the offsets this found them at.
+    let mut gaps: Vec<(usize, usize)> = Vec::new();
+    let mut at = from;
+    for cell in &cells {
+        if cell.outer_end <= at {
+            continue;
+        }
+        if cell.outer_start > at {
+            gaps.push((at, cell.outer_start));
+        }
+        at = cell.outer_end;
+    }
+    if at < reply.len() {
+        gaps.push((at, reply.len()));
+    }
+    let mut removed = 0;
+    for (start, end) in gaps.into_iter().rev() {
+        let cleaned = reply[start..end].replace(crate::machine::FINISH_MARK, "");
+        removed += (end - start - cleaned.len()) / crate::machine::FINISH_MARK.len();
+        reply.replace_range(start..end, &cleaned);
+    }
+    removed
+}
+
 fn strip_leaked_reasoning(reply: &mut String, from: usize) -> bool {
     let Some(rel) = reply[from..].find(CLOSE_THINK) else {
         return false;
@@ -908,6 +984,41 @@ mod tests {
         );
         assert!(!r.text.contains("leaked thinking"), "{:?}", r.text);
         assert!(r.text.contains("after"), "{:?}", r.text);
+    }
+
+    /// **A reply that ran nothing keeps its mark** — that is the whole
+    /// case the mark exists for, and there is nothing to strip it
+    /// against.
+    #[test]
+    fn a_prose_only_reply_keeps_its_finish_mark() {
+        let md = "The limit is 65536 bytes. ∎\n";
+        let mut text = md.to_owned();
+        strip_finish_marks_for_test(&mut text);
+        assert_eq!(text, md);
+    }
+
+    /// And one that ran something loses it, wherever in the trailing
+    /// prose it sits.
+    #[test]
+    fn a_reply_that_ran_something_loses_its_finish_mark() {
+        let mut text = "Reading.\n\n```js\nlet a = 1;\n```\n\nThat settles it. ∎\n".to_owned();
+        strip_finish_marks_for_test(&mut text);
+        assert_eq!(
+            text, "Reading.\n\n```js\nlet a = 1;\n```\n\nThat settles it. \n",
+            "the sentence stands and the mark does not"
+        );
+    }
+
+    /// **The cell's own source is not the harness's to rewrite.** `∎`
+    /// is not an identifier character, so it can only be in a string or
+    /// a comment — and a strip that reached in there would change what
+    /// the program does.
+    #[test]
+    fn a_mark_inside_a_cell_is_left_alone() {
+        let md = "```js\nconst end = \"∎\";\n```\n\nDone.\n";
+        let mut text = md.to_owned();
+        strip_finish_marks_for_test(&mut text);
+        assert_eq!(text, md);
     }
 
     /// No tag, no repair — the overwhelmingly common case pays nothing
