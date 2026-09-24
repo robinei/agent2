@@ -40,6 +40,25 @@ export DEEPSEEK_MODEL="$LOCAL_MODEL"
 # the context end.
 export DEEPSEEK_MAX_TOKENS="${DEEPSEEK_MAX_TOKENS:-24000}"
 
+# **`high` is not a level this box understands.** The harness defaults
+# to it (`openai_completions.rs`'s DEFAULT_EFFORT), which is right for
+# the OpenAI-shaped paid endpoints and wrong here: Qwen3.8-27B's chat
+# template accepts `xhigh` (its own default), `medium` and `low`, and
+# rejects anything else outright —
+#
+#   Jinja Exception: Unexpected reasoning effort high.
+#   Supported types are xhigh (default), medium, and low.
+#
+# which arrives as a 500 and reads, up in drive.py, as "agent exited 1
+# without writing a program": a whole suite of NO RUNs for a setting
+# neither the harness nor the driver has any business knowing. The box
+# is this file's business, so it is set here.
+#
+# `medium` rather than `xhigh` because this box serves one slot and the
+# arms are about which verbs the model reaches for, not how hard it
+# thinks. Override for a thinking-level sweep.
+export DEEPSEEK_REASONING_EFFORT="${DEEPSEEK_REASONING_EFFORT:-medium}"
+
 if ! curl -sf --max-time 10 "$LOCAL_BASE_URL/models" >/dev/null; then
   echo "evals/local.sh: no model server at $LOCAL_BASE_URL" >&2
   echo "  set LOCAL_BASE_URL, or start the box." >&2

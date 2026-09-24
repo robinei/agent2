@@ -1078,22 +1078,48 @@ def main():
     # Each agent authenticates its own way: ours from the environment,
     # pi from its own config under PI_HOME.
     where = os.environ.get("AGENT2_BASE_URL", os.environ.get("DEEPSEEK_BASE_URL", CLIENT_DEFAULT_BASE_URL))
-    # Three ways to be authorised, and the guard has to know all of
+    # Four ways to be authorised, and the guard has to know all of
     # them or it refuses a run that would have worked. The third is a
     # stored subscription token, which `agent login` writes and the
     # harness reads for the ChatGPT backend — there is no key to set.
+    #
+    # **The fourth is `AGENT2_API_KEY_FILE`**, which names a file the
+    # harness reads the key out of, so the key itself never reaches a
+    # command line, a shell history or the process table. It was added
+    # to the harness and not to this guard, which is the failure the
+    # sentence above describes: on 2026-09-25 a whole suite refused to
+    # start against a perfectly good credential, and the message told
+    # the operator to set the variable they had deliberately not set.
+    #
+    # Checked by reading it, not by its presence alone. A misspelt path
+    # passes a presence test and then fails every run in the suite, one
+    # provider error at a time; here it is one refusal with the path in
+    # it. Only the length is looked at.
+    def key_file_ok() -> bool:
+        path = os.environ.get("AGENT2_API_KEY_FILE", os.environ.get("DEEPSEEK_API_KEY_FILE"))
+        if not path:
+            return False
+        try:
+            if Path(path).read_text().strip():
+                return True
+            print(f"{path}: empty, so it holds no key", file=sys.stderr)
+        except OSError as e:
+            print(f"{path}: {e}", file=sys.stderr)
+        return False
+
     signed_in = (Path(os.environ.get("AGENT2_STATE_DIR", Path.home() / ".agent2"))
                  / "openai-codex.json").exists()
     if (
         args.agent == "code"
         and "AGENT2_API_KEY" not in os.environ
         and "DEEPSEEK_API_KEY" not in os.environ
+        and not key_file_ok()
         and not endpoint_is_local(where)
         and not ("chatgpt.com/backend-api" in where and signed_in)
     ):
         print(
-            f"No credential for {where}: set AGENT2_API_KEY, or run `agent login` "
-            "for a ChatGPT subscription endpoint.",
+            f"No credential for {where}: set AGENT2_API_KEY or AGENT2_API_KEY_FILE, "
+            "or run `agent login` for a ChatGPT subscription endpoint.",
             file=sys.stderr,
         )
         return 2
