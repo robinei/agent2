@@ -1252,6 +1252,24 @@ pub(crate) fn render_with_lookup(
     push_flush(&mut messages, &mut before);
     push_flush(&mut messages, &mut pending);
 
+    // **Where the examples stop and the work starts.** The worked
+    // examples are turns in the user and assistant roles, which is
+    // what makes them worth having — a program in the assistant role
+    // outweighs the same bytes quoted in a system prompt, measured.
+    // The cost of that is a model reading four sessions that are not
+    // its own, directly above the one that is, and the `*[worked
+    // example]*` marker on each says what they are without ever
+    // saying where they end.
+    //
+    // So the first turn of the real conversation says so itself. One
+    // line, once: everything after it is this session, and the ids in
+    // it are ids that `history.fetch` will actually find — which the
+    // ids above it are not.
+    if preamble > 1
+        && let Some(first) = messages.get_mut(preamble)
+    {
+        first.content = format!("{REAL_HEADING}\n\n{}", first.content);
+    }
     Document { messages, preamble }
 }
 
@@ -1320,6 +1338,10 @@ fn push_flush(messages: &mut Vec<ChatMessage>, pending: &mut Vec<String>) {
 /// readable from the markup rather than from having learned which
 /// headings group with which.
 pub const TURN_HEADING: &str = "# NEW EVENTS";
+
+/// Opens the first turn of the real conversation, when worked examples
+/// came before it. See the call site in `render_from`.
+pub const REAL_HEADING: &str = "# REAL — NOT CONNECTED TO THE EXAMPLES ABOVE";
 
 /// What arrivals render under once a run has already been reported in
 /// the same turn — see the call site for why only then.
@@ -1425,6 +1447,43 @@ fn worked_examples(exemplars: &[Exemplar]) -> Vec<ChatMessage> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::testkit::Conversation;
+
+    /// **The examples say what they are; this says where they end.**
+    /// Four sessions that are not the model's own sit directly above
+    /// the one that is, and each is marked — but a marker on every
+    /// example still never says which turn is the first real one. The
+    /// ids differ too: an id in an example refers to a row that
+    /// `history.fetch` will not find.
+    #[test]
+    fn the_first_real_turn_says_it_is_not_one_of_the_examples() {
+        let mut c = Conversation::new();
+        c.user_says("the actual task");
+        let doc = c.document();
+        let (before, after) = doc
+            .split_once(super::REAL_HEADING)
+            .expect("the boundary is marked");
+        assert!(
+            after.contains("the actual task"),
+            "and it opens the turn the task arrives in: {after}"
+        );
+        assert!(
+            before.contains("worked example"),
+            "with the examples on the other side of it: {before}"
+        );
+        assert_eq!(
+            doc.matches(super::REAL_HEADING).count(),
+            1,
+            "said once, not on every turn"
+        );
+
+        // Nothing to divide, nothing to say: a conversation with no
+        // examples in front of it has no boundary to mark.
+        let mut bare = Conversation::for_exemplar_generation("c", "");
+        bare.user_says("the actual task");
+        assert!(!bare.document().contains(super::REAL_HEADING));
+    }
 
     /// **The whole prefix belongs to the conversation, not to today's
     /// card.** `Agent.system` was snapshotted for exactly this reason
