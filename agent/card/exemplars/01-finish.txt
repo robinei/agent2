@@ -1,1 +1,9 @@
-the old hostname is still in the config — sort it out
+# NEW EVENTS
+
+`[2]` user told you: the old hostname is still in the config — sort it out
+
+## RIGHT NOW
+
+- No client is attached; an ask() stays open until someone answers it.
+- Your reply is markdown and reaches the person as written. Only a ```js block runs; ```text and unfenced code do nothing.
+- Thinking is for reasoning! Never draft code blocks! One-shot them in the reply.

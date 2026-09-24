@@ -223,6 +223,15 @@ pub(crate) fn generate(js_of: impl Fn(&str) -> String) -> Vec<Exemplar> {
         // would have been sent.
         let user = last_user_turn(&c);
         let js = resolve_rows(&js_of(step.stem), &c);
+        // **The resolved source is what ships.** `embedded()` reads
+        // these `.js` files for the assistant side, so a file left
+        // holding `CONF_ROW` would put that token in front of the
+        // model. The generator owns the substitution and writes it
+        // back, which also keeps the id in the reply and the id in the
+        // report above it from ever disagreeing.
+        if js != js_of(step.stem) {
+            std::fs::write(format!("card/exemplars/{}.js", step.stem), &js).expect("write");
+        }
         c.reply(&js);
         for reply in step.answers {
             let Some(open) = unanswered_ask(&c) else { break };
@@ -258,18 +267,135 @@ fn assistant_turn(c: &Conversation) -> String {
         .unwrap_or_default()
 }
 
+/// Run the series against the shipped `.js` replies.
+pub(crate) fn from_shipped() -> Vec<Exemplar> {
+    generate(|stem| {
+        std::fs::read_to_string(format!("card/exemplars/{stem}.js"))
+            .unwrap_or_else(|e| panic!("card/exemplars/{stem}.js: {e}"))
+    })
+}
+
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// **The turns the model reads are the turns the renderer
+    /// produces.** This is the whole point of generating them: if
+    /// `document.rs` changes what a report looks like, the examples
+    /// change with it or this fails. They used to be a `format!` that
+    /// imitated a report and could drift from it silently — and did,
+    /// for as long as reports have had sections.
+    ///
+    /// Run with `UPDATE_EXEMPLARS=1` to re-record.
     #[test]
-    fn show() {
-        let out = super::generate(|stem| {
-            std::fs::read_to_string(format!("card/exemplars/{stem}.js")).unwrap()
-        });
-        for (i, ex) in out.iter().enumerate() {
-            println!("\n════ USER {i} ════\n{}", ex.user);
-            println!("\n════ ASSISTANT {i} ════\n{}", ex.assistant);
+    fn the_worked_examples_are_what_the_renderer_produces() {
+        let made = from_shipped();
+        assert_eq!(made.len(), SERIES.len(), "one exemplar per step");
+
+        let update = std::env::var("UPDATE_EXEMPLARS").is_ok();
+        let mut stale = Vec::new();
+        for (step, ex) in SERIES.iter().zip(&made) {
+            let path = format!("card/exemplars/{}.txt", step.stem);
+            let want = std::fs::read_to_string(&path).unwrap_or_default();
+            if want == ex.user {
+                continue;
+            }
+            if update {
+                std::fs::write(&path, &ex.user).expect("write");
+            } else {
+                stale.push(step.stem);
+            }
         }
-        println!("\n{} exemplars", out.len());
+        assert!(
+            stale.is_empty(),
+            "these worked examples no longer match what the renderer produces: {stale:?}\n\
+             re-record with `UPDATE_EXEMPLARS=1 cargo test -p agent \
+             the_worked_examples_are_what_the_renderer_produces`"
+        );
+    }
+
+    /// **The shipped order is the order they were run in.** They are
+    /// one session, so `09-act` fetches a row `05-keep` kept and
+    /// `04-many` sweeps what `02-continue` found. Shipping them in
+    /// writing order — which is what `embedded()` did for as long as
+    /// they stood alone — would leave those replies naming rows that
+    /// are not above them.
+    #[test]
+    fn the_shipped_examples_are_the_series_in_its_own_order() {
+        let shipped: Vec<&str> = crate::card::embedded()
+            .exemplars
+            .iter()
+            .map(|e| {
+                SERIES
+                    .iter()
+                    .find(|s| {
+                        std::fs::read_to_string(format!("card/exemplars/{}.txt", s.stem))
+                            .is_ok_and(|t| t == e.user)
+                    })
+                    .map(|s| s.stem)
+                    .unwrap_or("<not a generated turn>")
+            })
+            .collect();
+        let want: Vec<&str> = SERIES.iter().map(|s| s.stem).collect();
+        assert_eq!(shipped, want, "shipped order must match the series");
+    }
+
+    /// **The snapshot has to contain the things it exists to pin.**
+    ///
+    /// A comparison against a committed file passes just as happily
+    /// when both sides are empty, and this session has already found a
+    /// vocabulary guard reading 4% of its file and a conformance gate
+    /// green on none of its 53,658. So the examples are asserted to
+    /// carry the sections a report has — the ones no example carried
+    /// before any of this, and the reason a live run spent 44% of its
+    /// reasoning asking whether `console.log` comes back.
+    #[test]
+    fn the_examples_show_what_comes_back() {
+        let made = from_shipped();
+        let all = made
+            .iter()
+            .map(|e| e.user.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        for section in [
+            "## RAN YOUR PROGRAM",
+            "### rows it added",
+            "### it printed",
+            "## RIGHT NOW",
+            "### peeked — here for this reply only",
+            "## MESSAGES",
+            "noted:",
+            "you told user:",
+        ] {
+            assert!(
+                all.contains(section),
+                "no worked example shows {section:?} — the half of the loop the model \
+                 cannot otherwise see"
+            );
+        }
+
+        // A reply that names a row it was shown, which is the thing a
+        // single-turn example can never demonstrate.
+        let act = &made[SERIES.iter().position(|s| s.stem == "09-act").expect("09-act")];
+        assert!(
+            act.user.contains("read_file(\"CONF.json\")"),
+            "the turn before it was shown that row: {}",
+            act.user
+        );
+
+        // Every program ran. The last step's report is never captured —
+        // the series ends on a reply — so a trap there would otherwise
+        // be invisible.
+        assert_eq!(
+            made.iter().filter(|e| e.user.contains("It completed.")).count(),
+            SERIES.len() - 1,
+            "every reply but the last is reported as having completed"
+        );
+        assert!(
+            !all.contains("uncaught") && !all.contains("is not defined"),
+            "no worked example is a program that broke"
+        );
     }
 }
 

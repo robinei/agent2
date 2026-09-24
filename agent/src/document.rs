@@ -1406,22 +1406,25 @@ fn worked_examples(exemplars: &[Exemplar]) -> Vec<ChatMessage> {
     exemplars
         .iter()
         .flat_map(|ex| {
-            // **Shaped like a real one.** An example's request sits
-            // immediately before the conversation's own first user
-            // turn, and a user turn is `# NEW EVENTS` with the person's
-            // words as one row among whatever else arrived. Four
-            // requests in a different shape, in the position the model
-            // reads last before writing, teach a format the document
-            // then does not use. No `[id]`, though: an exemplar is
-            // preamble, not an event, and inventing one would be a
-            // reference to nothing (see this function's own doc).
+            // **Rendered by this same function, not shaped like it.**
+            // This used to assemble the turn here — a `TURN_HEADING`,
+            // the marker, and "the user told you: …" — which shared one
+            // constant with the real thing and duplicated the rest.
+            // The comment said "shaped like a real one", and that was
+            // the admission: a real user turn carries
+            // `## RAN YOUR PROGRAM`, `### rows it added`,
+            // `### it printed` and `## RIGHT NOW`, and the imitation
+            // carried none of them.
+            //
+            // `exemplar_gen` now runs the examples as one session and
+            // takes these turns from `render_from` below, so the shape
+            // cannot drift from the shape they teach. The ids in them
+            // are real ids of that session — which is why the first
+            // turn of the real conversation opens with `REAL_HEADING`,
+            // saying where they stop meaning anything.
             let request = ChatMessage::text(
                 ChatRole::User,
-                format!(
-                    "{TURN_HEADING}\n\n*[worked example, not this conversation]*\n\nthe user \
-                     told you: {}",
-                    ex.user
-                ),
+                format!("*[worked example, not this conversation]*\n\n{}", ex.user),
             );
             // Marked on **both** sides (both the request above and the
             // program below, whichever wire shape carries it). Only the

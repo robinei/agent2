@@ -1,1 +1,22 @@
-run the integration suite for every package and tell me which ones fail
+# NEW EVENTS
+
+## RAN YOUR PROGRAM
+
+It completed.
+
+### rows it added
+`history.fetch(id)` for any of them.
+
+- `[154]` `bash("CHECK 2>&1")` → ok, {status, stdout, stderr, id}, 106 bytes
+- `[158]` you told user: settled on check 1
+
+## MESSAGES
+
+`[162]` user told you: run the integration suite for every package and tell me which ones fail
+
+## RIGHT NOW
+
+- 51 rows, #6–#159. history.fetch(id) for any of them; a report lists only what is new.
+- No client is attached; an ask() stays open until someone answers it.
+- Your reply is markdown and reaches the person as written. Only a ```js block runs; ```text and unfenced code do nothing.
+- Thinking is for reasoning! Never draft code blocks! One-shot them in the reply.

@@ -8149,7 +8149,11 @@ mod tests {
                 .unwrap();
             drain(&mut state, &mut tree, out);
             let doc = crate::document::render(&tree, &state.spine, 64 * 1024);
-            let text: String = doc.messages.iter().map(|m| m.content.as_str()).collect();
+            // **The conversation, not the whole document.** The worked
+            // examples are rendered turns and one of them notes
+            // something, so a scan over every message finds *its* row
+            // first and this compares an example against itself.
+            let text: String = doc.conversation().iter().map(|m| m.content.as_str()).collect();
             let at = text.find("noted: ").expect("a note row");
             text[at..].lines().next().unwrap().to_owned()
         };
@@ -9588,7 +9592,14 @@ mod tests {
             !after.contains("PEEKED-VALUE"),
             "the peek was spent by the reply after it: {after}"
         );
-        assert!(!after.contains("### peeked"), "and its block went too");
+        // Scoped past the preamble: a worked example demonstrates
+        // `peek`, so its own `### peeked` block is rendered there for
+        // good and says nothing about this branch's.
+        assert!(
+            !after[after.find(crate::document::REAL_HEADING).unwrap_or(0)..]
+                .contains("### peeked"),
+            "and its block went too"
+        );
     }
 
     /// **A kept value renders on the row's own line, not beside it.**
@@ -9642,14 +9653,20 @@ mod tests {
         let mut c = Conversation::new();
         c.answers("echo", serde_json::json!({ "out": "ECHOED" }));
         c.reply("```js\nhistory.keep(await tools.echo(1));\n```\n");
+        // Past the preamble: an example demonstrates `peek` and its
+        // block is rendered there permanently.
+        let live = |c: &Conversation| {
+            let d = c.document();
+            d[d.find(crate::document::REAL_HEADING).unwrap_or(0)..].to_owned()
+        };
         assert!(
-            !c.document().contains("### peeked"),
+            !live(&c).contains("### peeked"),
             "a keep is inline, not in the tail"
         );
 
         // A later reply peeks the same result: one more turn, then out.
         c.reply("```js\nhistory.peek(4);\n```\n");
-        let once_more = c.document();
+        let once_more = live(&c);
         assert!(
             once_more.contains("### peeked"),
             "the keep was retired into a peek: {once_more}"
@@ -10563,8 +10580,14 @@ mod tests {
 
         let second = state.render_messages_for_test(&tree);
         assert_eq!(
+            // **Counted over the conversation, not the preamble.** The
+            // worked examples are rendered turns now, so each carries
+            // the `## RIGHT NOW` of the request it was captured in.
+            // Those are frozen preamble, like the system message; the
+            // invariant here is that the *live* request has one tail,
+            // on its last turn.
             second
-                .messages
+                .conversation()
                 .iter()
                 .filter(|m| m.content.contains("## RIGHT NOW"))
                 .count(),

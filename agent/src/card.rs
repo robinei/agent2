@@ -57,15 +57,25 @@ pub fn embedded() -> Card {
     }
     Card {
         text: include_str!("../card/card.md").to_owned(),
+        // **In the order they happened**, which is not the order they
+        // were written in. They are one session now — a reply can act
+        // on what the turn before it was shown — so `09-act` follows
+        // `05-keep` because it fetches the row `05-keep` kept, and
+        // `04-many` follows `02-continue` because it sweeps what that
+        // one found. Shuffle them and the ids point at nothing.
+        //
+        // `exemplar_gen::SERIES` is the same order and a test pins the
+        // two together.
         exemplars: vec![
             exemplar!("01-finish"),
             exemplar!("02-continue"),
-            exemplar!("03-ask"),
             exemplar!("04-many"),
+            exemplar!("03-ask"),
             exemplar!("05-keep"),
+            exemplar!("09-act"),
             exemplar!("06-fork"),
-            exemplar!("07-supervise"),
             exemplar!("08-watch"),
+            exemplar!("07-supervise"),
         ],
     }
 }
@@ -759,6 +769,22 @@ mod tests {
 
     fn exemplars() -> Vec<Exemplar> {
         embedded().exemplars
+    }
+
+    /// The worked example that demonstrates `needle`, **found by what
+    /// it does rather than by where it sits**.
+    ///
+    /// These assertions used to index — `ex[5]` was the fork one —
+    /// which tied every claim to a position in `embedded()`. The
+    /// examples are one session now and ship in the order they
+    /// happened, so a step inserted in the middle would silently move
+    /// every assertion onto a different example and go on passing.
+    fn with(needle: &str) -> String {
+        exemplars()
+            .into_iter()
+            .find(|e| e.assistant.contains(needle))
+            .unwrap_or_else(|| panic!("no worked example calls {needle}"))
+            .assistant
     }
 
     use crate::host::{ToolDef, ToolRegistry};
@@ -1650,6 +1676,12 @@ mod tests {
             }),
             "replace_file" | "write_file" | "create_file" => json!({ "version": "v2" }),
             "ask" => json!("4"),
+            // A fetched row answers in the shape the row's own call
+            // did — `09-act` fetches the read it was shown and edits
+            // `content`. Without this the stub hands back null and the
+            // example traps on a property of nothing, which says
+            // something about the stub and nothing about the example.
+            "fetch_history" => json!({ "content": "{ \"retries\": 3 }\n", "version": "v1" }),
             "spawn" | "fork" => json!({ "agent": 2 }),
             // **Idle, so a supervision loop ends.** The seventh
             // exemplar waits while helpers work; against a roster that
@@ -2033,19 +2065,20 @@ mod tests {
     #[test]
     fn the_exemplars_demonstrate_the_endings_and_the_shapes() {
         let ex = exemplars();
-        assert_eq!(ex.len(), 8, "eight, and each earns its place");
+        assert_eq!(ex.len(), 9, "nine, and each earns its place");
+
         assert!(
-            ex[0].assistant.contains("finish()") && ex[0].assistant.contains("tell("),
+            with("Edit.replaceOnce").contains("finish()") && with("Edit.replaceOnce").contains("tell("),
             "the first ends a finished task, and says the answer on its way out: {}",
-            ex[0].assistant
+            with("Edit.replaceOnce")
         );
         // **`history.note`, not `finish()`.** What the second
         // exemplar demonstrates is handing a finding on to the next
         // reply and *not* ending the task.
         assert!(
-            ex[1].assistant.contains("history.note") && !ex[1].assistant.contains("finish("),
+            with("mentions_old_host").contains("history.note") && !with("mentions_old_host").contains("finish("),
             "the second hands on and does not stop: {}",
-            ex[1].assistant
+            with("mentions_old_host")
         );
         // **`choose`, not `ask`.** The awaited value is the whole point
         // of the third exemplar: a free-form `ask` answered in prose
@@ -2058,11 +2091,11 @@ mod tests {
         // it: it arrives as a resumable condition, and the program
         // written *then* is the one that judges their words.
         assert!(
-            ex[2].assistant.contains("await choose(")
-                && ex[2].assistant.contains("===")
-                && ex[2].assistant.contains("finish("),
+            with("await choose(").contains("await choose(")
+                && with("await choose(").contains("===")
+                && with("await choose(").contains("finish("),
             "the third offers a bounded choice and acts on the answer: {}",
-            ex[2].assistant
+            with("await choose(")
         );
         // **The fifth appends twice, and that is the point.** A return
         // is one row however much is packed into it, so a later
@@ -2083,9 +2116,9 @@ mod tests {
         // correctly which attributes were pointless, trapped on
         // `fmt is not defined`, and lost the whole analysis.
         assert!(
-            ex[4].assistant.matches("history.note").count() == 2,
+            with("why_check_fails").matches("history.note").count() == 2,
             "the fifth appends separately, a row each: {}",
-            ex[4].assistant
+            with("why_check_fails")
         );
         // Per-item findings belong in `console.log`, not `append`: 200
         // appends would be 200 permanent rows, which is the firehose
@@ -2108,24 +2141,24 @@ mod tests {
         // `deepseek-v4-flash` run on 2026-09-23 reproduced the copy
         // exactly, keys and all, for two 26 KB files.
         assert!(
-            ex[5].assistant.contains("fork()")
-                && ex[5].assistant.contains("f.id")
-                && ex[5].assistant.contains("history.fetch")
-                && !ex[5].assistant.contains("history.note"),
+            with("fork()").contains("fork()")
+                && with("fork()").contains("f.id")
+                && with("fork()").contains("history.fetch")
+                && !with("fork()").contains("history.note"),
             "the sixth forks and points at the rows the reads already are: {}",
-            ex[5].assistant
+            with("fork()")
         );
         assert!(
-            ex[6].assistant.contains("spawn(")
-                && ex[6].assistant.contains("ask(")
-                && !ex[6].assistant.contains("list_agents"),
+            with("spawn(").contains("spawn(")
+                && with("spawn(").contains("ask(")
+                && !with("spawn(").contains("list_agents"),
             "the seventh waits with ask, not by polling a roster: {}",
-            ex[6].assistant
+            with("spawn(")
         );
         assert!(
-            ex[3].assistant.contains("console.log") && !ex[3].assistant.contains("history.note"),
+            with("Edit.replaceAll").contains("console.log") && !with("Edit.replaceAll").contains("history.note"),
             "the loop prints per item rather than appending: {}",
-            ex[3].assistant
+            with("Edit.replaceAll")
         );
         // **The fourth is the whole structural argument for code mode**
         // — N items in one completion, where a tool loop spends N round
@@ -2135,9 +2168,9 @@ mod tests {
         // model almost never reaches for. It carries both in one
         // program: enumerate, read in parallel, edit each, verify once.
         assert!(
-            ex[3].assistant.contains("Promise.all") && ex[3].assistant.contains("for ("),
+            with("Edit.replaceAll").contains("Promise.all") && with("Edit.replaceAll").contains("for ("),
             "the fourth does many at once: {}",
-            ex[3].assistant
+            with("Edit.replaceAll")
         );
         // **The finishing one changes something and checks it.** It used
         // to be `bash("make check")` → `tell` → `finish(text)`, against the
@@ -2149,9 +2182,9 @@ mod tests {
         // 10 KB card and the only place the model sees the work done
         // rather than described, so one of them does the work.
         assert!(
-            ex[0].assistant.contains("replace_file") && ex[0].assistant.contains("bash"),
+            with("Edit.replaceOnce").contains("replace_file") && with("Edit.replaceOnce").contains("bash"),
             "the first edits and then runs the thing that would fail: {}",
-            ex[0].assistant
+            with("Edit.replaceOnce")
         );
         // **Whatever finishes, speaks.** A reply that rests having told
         // nobody anything is a run that ended without a word (measured
@@ -2201,17 +2234,17 @@ mod tests {
         // been measured here (p=0.0057), so a verb with no exemplar is
         // a verb the model does not have.
         assert!(
-            ex[7].assistant.contains("tools.wait_until(")
-                && ex[7].assistant.contains("for (")
-                && !ex[7].assistant.contains("list_agents")
-                && !ex[7].assistant.contains("spawn("),
+            with("tools.wait_until(").contains("tools.wait_until(")
+                && with("tools.wait_until(").contains("for (")
+                && !with("tools.wait_until(").contains("list_agents")
+                && !with("tools.wait_until(").contains("spawn("),
             "the eighth polls the world on a bounded loop, and is not about helpers: {}",
-            ex[7].assistant
+            with("tools.wait_until(")
         );
         assert!(
-            ex[7].assistant.contains("return "),
+            with("tools.wait_until(").contains("return "),
             "and says so when it runs out of looks rather than ending quiet: {}",
-            ex[7].assistant
+            with("tools.wait_until(")
         );
 
         // Short enough to be a shape rather than a technique to copy —
@@ -2370,16 +2403,16 @@ mod tests {
         // The first finishes a task it actually changed, and checks the
         // change by running the thing that would fail.
         assert!(
-            ex[0].assistant.contains("finish(") && ex[0].assistant.contains("tools.replace_file"),
+            with("Edit.replaceOnce").contains("finish(") && with("Edit.replaceOnce").contains("tools.replace_file"),
             "the first changes something and finishes: {}",
-            ex[0].assistant
+            with("Edit.replaceOnce")
         );
         // The second hands on without stopping — which is now `append`,
         // there being no `return`.
         assert!(
-            ex[1].assistant.contains("history.note") && !ex[1].assistant.contains("finish("),
+            with("mentions_old_host").contains("history.note") && !with("mentions_old_host").contains("finish("),
             "the second hands on and does not stop: {}",
-            ex[1].assistant
+            with("mentions_old_host")
         );
         // The third offers a *bounded* choice and acts on the answer. The
         // awaited value is the point: a free-form `ask` answered in prose
@@ -2388,39 +2421,39 @@ mod tests {
         // stops nothing, so a guard that used it would write the file it
         // meant to leave alone (D8).
         assert!(
-            ex[2].assistant.contains("await choose(")
-                && ex[2].assistant.contains("===")
-                && ex[2].assistant.contains("} else {")
-                && ex[2].assistant.contains("finish("),
+            with("await choose(").contains("await choose(")
+                && with("await choose(").contains("===")
+                && with("await choose(").contains("} else {")
+                && with("await choose(").contains("finish("),
             "the third offers a bounded choice and guards with else: {}",
-            ex[2].assistant
+            with("await choose(")
         );
         // The fourth does many at once — the structural argument for code
         // mode — and prints per item rather than appending 200 rows.
         assert!(
-            ex[3].assistant.contains("Promise.all")
-                && ex[3].assistant.contains("for (")
-                && ex[3].assistant.contains("console.log")
-                && !ex[3].assistant.contains("history.note"),
+            with("Edit.replaceAll").contains("Promise.all")
+                && with("Edit.replaceAll").contains("for (")
+                && with("Edit.replaceAll").contains("console.log")
+                && !with("Edit.replaceAll").contains("history.note"),
             "the fourth does many at once and prints per item: {}",
-            ex[3].assistant
+            with("Edit.replaceAll")
         );
         // It is also the one that demonstrates the shared scope: it binds
         // in one cell and uses the binding in the next, which is the thing
         // about this transport a declaration cannot show.
-        let cells = crate::notebook::split_cells(&ex[3].assistant);
+        let cells = crate::notebook::split_cells(&with("Edit.replaceAll"));
         assert!(cells.len() >= 2, "the fourth spans two cells");
         assert!(
-            cells[0].slice(&ex[3].assistant).contains("const hits")
-                && cells[1].slice(&ex[3].assistant).contains("hits.length"),
+            cells[0].slice(&with("Edit.replaceAll")).contains("const hits")
+                && cells[1].slice(&with("Edit.replaceAll")).contains("hits.length"),
             "the fourth binds in one cell and reads it in the next"
         );
         // The fifth keeps two rows rather than one fat value, so a later
         // compaction can drop one and leave the other exact.
         assert!(
-            ex[4].assistant.matches("history.note").count() >= 2,
+            with("why_check_fails").matches("history.note").count() >= 2,
             "the fifth appends separately, a row each: {}",
-            ex[4].assistant
+            with("why_check_fails")
         );
     }
 

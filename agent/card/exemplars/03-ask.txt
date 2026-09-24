@@ -1,1 +1,40 @@
-this setting looks stale — can you sort it out?
+# NEW EVENTS
+
+## RAN YOUR PROGRAM
+
+It completed.
+
+### rows it added
+`history.fetch(id)` for any of them.
+
+- `[38]` `bash("grep -rl OLD .")` → ok, {status, stdout, stderr, id}, 62 bytes
+- `[42]` `read_file("PATH")` → ok, {content, version, id}, 65 bytes
+- `[43]` `read_file("src/one.rs")` → ok, {content, version, id}, 65 bytes
+- `[47]` `replace_file("PATH", "// one\nNEW\nfn thing() {}\n", "v1")` → ok, {version, diff, id}, 57 bytes
+- `[51]` `replace_file("src/one.rs", "// one\nNEW\nfn thing() {}\n", "v1")` → ok, {version, diff, id}, 57 bytes
+- `[54]` `bash("CHECK 2>&1")` → ok, {status, stdout, stderr, id}, 105 bytes
+- `[56]` you told user: 2 changed, CHECK passes.
+
+### it printed
+```text
+PATH changed
+src/one.rs changed
+```
+
+## MESSAGES
+
+`[60]` user told you: this setting looks stale — can you sort it out?
+
+## RIGHT NOW
+
+### peeked — here for this reply only
+
+- `[47]` `replace_file("PATH", "// one\nNEW\nfn thing() {}\n", "v1")` → ok, {version, diff, id}, 57 bytes
+  {"version":"v2","diff":"@@ -2 +2 @@\n-OLD\n+NEW","id":47}
+- `[51]` `replace_file("src/one.rs", "// one\nNEW\nfn thing() {}\n", "v1")` → ok, {version, diff, id}, 57 bytes
+  {"version":"v2","diff":"@@ -2 +2 @@\n-OLD\n+NEW","id":51}
+
+- 19 rows, #6–#57. history.fetch(id) for any of them; a report lists only what is new.
+- No client is attached; an ask() stays open until someone answers it.
+- Your reply is markdown and reaches the person as written. Only a ```js block runs; ```text and unfenced code do nothing.
+- Thinking is for reasoning! Never draft code blocks! One-shot them in the reply.
