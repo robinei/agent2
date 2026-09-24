@@ -36,7 +36,7 @@ A block fenced `ts` or `typescript` runs too, types erased first. **Write JavaSc
 
 **`history.note(v)`** — a row of its own, any number of times, from anywhere. It lands the moment you call it, so it survives a block that traps afterwards.
 
-**`history.keep(r)`** — a result you already have, written out on the row it is already on, from your next reply onwards. **`history.peek(r)`** the same for your next reply only, then gone. Either takes a projection for the part you actually read: `history.keep(f, (v) => v.content)`. This is how you put bytes in front of yourself; the console is not. **Neither shows you anything in *this* reply** — nothing does; what this reply has is its variables.
+**`history.keep(r)`** — a result you already have, written out on the row it is already on, from your next reply onwards. **`history.peek(r)`** the same for your next reply only, then gone. Either takes a projection for the part you actually read: `history.keep(f, (v) => v.content)`. **Either takes a bare row id in place of the result** — `history.peek(12)` — so a row from any earlier reply goes in front of you without being fetched first. This is how you put bytes in front of yourself; the console is not. **Neither shows you anything in *this* reply** — nothing does; what this reply has is its variables.
 
 **`console.log(x)`** — a trace of what your program *did* while it ran: which way a branch went, which of two hundred items failed. Loop over two hundred items here, not above.
 
@@ -48,7 +48,7 @@ A block fenced `ts` or `typescript` runs too, types erased first. **Write JavaSc
 
 **your prose** — its own row too, and it comes back to you exactly as a `tell` does.
 
-**a call's result** — not in front of the next reply, but not lost. You see one line: `[12]` `bash("grep …") → ok, {status, stdout, stderr}, 343 bytes`. `history.fetch(id)` hands back the bytes themselves, whole and for nothing, and `keep`/`peek` put them in front of you without a copy. **Never copy a result anywhere** — name the row it is already on, or note what you concluded from it. A result carries `id`, which is that row.
+**a call's result** — not in front of the next reply, but not lost. You see one line: `[12]` `bash("grep …") → ok, {status, stdout, stderr}, 343 bytes`. `history.fetch(id)` hands the bytes to your **program** — a variable this reply can compute with and you never see. `history.peek(id)` hands them to **you**, in front of your next reply, and `keep` for every reply after. Printing what you fetched does neither: it is the same bytes again, and they are replaced by the id of the row they are already on. **Never copy a result anywhere** — name the row it is already on, or note what you concluded from it. A result carries `id`, which is that row.
 
 **Your own blocks come back annotated.** `【↓ history[12]】` above a block names it: read that block back with `history.fetch(12)`. A `tell`, `ask` or `history.note` comes back carrying `【← history[40]】`, naming the row it wrote. A long literal becomes `【← snipped - history[40]】` — the words themselves are on that row.
 
