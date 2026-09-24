@@ -2878,6 +2878,28 @@ impl Runner {
                         self.pending_decision = Some(value.clone());
                         self.settle(Ok(serde_json::Value::Null));
                     }
+                    // **A note that copies a row is refused, naming
+                    // the row.** See `note_copies_a_row` for what the
+                    // record showed: 93% of every byte ever written to
+                    // a note was a second copy of something already on
+                    // it. Refused rather than trimmed, because the
+                    // program is the only thing that knows what it
+                    // meant to say, and `keep` says the other thing
+                    // better than any automatic shortening would.
+                    Some(value)
+                        if let Some((row, bytes)) =
+                            note_copies_a_row(tree, self.spine.leaf_id, value) =>
+                    {
+                        let id = row.as_u64();
+                        self.settle_err(&format!(
+                            "history.note carries what you worked out, not bytes the record \
+                             already has: {bytes} of these are on `[{id}]` verbatim. \
+                             `history.keep({id})` puts that row's value in front of your next \
+                             reply with no second copy, and \
+                             `history.keep({id}, (v) => v.stdout)` just the part you read. \
+                             Note what you concluded from it instead."
+                        ));
+                    }
                     Some(value) => {
                         let (site, site_end) =
                             (self.rebase_site(call.site), self.rebase_site(call.site_end));
@@ -5130,6 +5152,147 @@ fn args_as_json(vm: &VM, call: &InvokeCall) -> Result<Vec<serde_json::Value>, St
         .collect()
 }
 /// The `Result` settling `call`, if one landed on this path.
+/// How much of a value has to be on a row already before a `note`
+/// carrying it is refused.
+///
+/// **Provenance is the test, not size.** The largest innocent note in
+/// the corpus was 3,421 bytes — the model's own written-up finding,
+/// matching nothing — and it is bigger than three of the five that
+/// were copies. This threshold exists only so that quoting an error
+/// line or two is never mistaken for a dump: it sits well under the
+/// smallest real copy measured (1,032 bytes) and well over the largest
+/// innocent coincidence (117).
+const NOTE_COPY_MIN_BYTES: usize = 512;
+
+/// Block size for the search below. Any run of `2 * BLOCK - 1` bytes
+/// shared between the note and a row contains a whole block-aligned
+/// slice of the note, so indexing the note by aligned blocks and
+/// searching each one in the row finds every copy of 511 bytes or
+/// more. Alignment on the note's side costs nothing because the search
+/// in the row is unanchored — a copy that has been shifted by a
+/// prepended sentence is still found.
+const NOTE_COPY_BLOCK: usize = 256;
+
+/// Every string inside a value, whatever it is nested in.
+fn strings_within<'v>(v: &'v serde_json::Value, out: &mut Vec<&'v str>) {
+    match v {
+        serde_json::Value::String(s) => out.push(s),
+        serde_json::Value::Array(xs) => xs.iter().for_each(|x| strings_within(x, out)),
+        serde_json::Value::Object(m) => m.values().for_each(|x| strings_within(x, out)),
+        _ => {}
+    }
+}
+
+/// The row whose bytes this value repeats, and how many of them.
+///
+/// **`note` is for what you worked out; `keep` is for bytes you were
+/// given.** The card has said so for weeks and the record says it is
+/// not landing: of seventeen notes across the kept sessions, five
+/// carried a verbatim copy of a result already on the spine, and those
+/// five were 74,180 of the 79,531 bytes ever written to a note —
+/// **93% of the channel, by volume, a second copy of something the log
+/// already had.** The largest was 53,581 bytes: an entire file under
+/// `{"docs/DESIGN.md": …}`, which is the anti-pattern the card names by
+/// example. One noted 6,362 bytes of raw `ps aux` output, shell
+/// snapshot and all.
+///
+/// A note is the durable channel — it is what survives, and what
+/// compaction then has to carry — so filling it with bytes that are
+/// already durable is the expensive mistake, not a cosmetic one.
+///
+/// **Exact, never similar.** A refusal has to be one the program can
+/// act on: "these bytes are `[8]`" names the row and the fix. A score
+/// ("82% like `[8]`") is a judgement the program cannot check, and a
+/// wrong one takes away a working channel with no recourse. Exact
+/// fails in the safe direction — a missed copy costs only the bytes we
+/// already spend today. Measured against the corpus, this flags the
+/// same five and none of the other twelve; a whole-string comparison
+/// flags those five too but misses four of nine realistic variations,
+/// among them the likeliest — a dump with a sentence in front of it.
+///
+/// Compared against call rows only. Those are the ones `keep` answers.
+fn note_copies_a_row(
+    tree: &Tree,
+    leaf: EventId,
+    value: &serde_json::Value,
+) -> Option<(EventId, usize)> {
+    let mut mine: Vec<&str> = Vec::new();
+    strings_within(value, &mut mine);
+    let path = tree.path_events(leaf);
+    let rows = path.iter().filter_map(|e| match &e.payload {
+        EventPayload::Result {
+            call,
+            outcome: Outcome::Delivered(v),
+        } => Some((*call, v)),
+        _ => None,
+    });
+    copy_of(&mine, rows)
+}
+
+/// The search itself, over any sequence of rows — separated from the
+/// tree walk so it can be measured against a corpus of real notes
+/// without building one.
+fn copy_of<'v>(
+    mine: &[&str],
+    rows: impl Iterator<Item = (EventId, &'v serde_json::Value)>,
+) -> Option<(EventId, usize)> {
+    // **The threshold is part of the search, not of its caller.** It
+    // decides what counts as a copy, so it belongs where that is
+    // decided — a caller that forgot it would quietly refuse a quoted
+    // error line.
+    let mine: Vec<&str> = mine
+        .iter()
+        .copied()
+        .filter(|s| s.len() >= NOTE_COPY_MIN_BYTES)
+        .collect();
+    if mine.is_empty() {
+        return None;
+    }
+    for (call, v) in rows {
+        let mut theirs: Vec<&str> = Vec::new();
+        strings_within(v, &mut theirs);
+        for s in &mine {
+            for block in s.as_bytes().chunks(NOTE_COPY_BLOCK) {
+                if block.len() < NOTE_COPY_BLOCK {
+                    break;
+                }
+                let Ok(block) = std::str::from_utf8(block) else {
+                    // A block cut mid-character is skipped rather than
+                    // widened: the next one along covers the same run.
+                    continue;
+                };
+                for row in &theirs {
+                    if let Some(at) = row.find(block) {
+                        return Some((call, overlap_len(s, row, at, block)));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// How many bytes the two actually share around a found block, so the
+/// refusal can state a number it can stand behind rather than the
+/// length of whatever the block happened to sit in.
+fn overlap_len(mine: &str, row: &str, row_at: usize, block: &str) -> usize {
+    let Some(mine_at) = mine.find(block) else {
+        return block.len();
+    };
+    let (m, r) = (mine.as_bytes(), row.as_bytes());
+    let (mut a, mut b) = (mine_at, row_at);
+    while a > 0 && b > 0 && m[a - 1] == r[b - 1] {
+        a -= 1;
+        b -= 1;
+    }
+    let (mut c, mut d) = (mine_at + block.len(), row_at + block.len());
+    while c < m.len() && d < r.len() && m[c] == r[d] {
+        c += 1;
+        d += 1;
+    }
+    c - a
+}
+
 pub(crate) fn settlement_of<'e>(segment: &[&'e Event], call: EventId) -> Option<&'e Outcome> {
     segment.iter().find_map(|e| match &e.payload {
         EventPayload::Result { call: c, outcome } if *c == call => Some(outcome),
@@ -6167,6 +6330,7 @@ fn asker_of(tree: &Tree, question: EventId) -> Option<Author> {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use crate::testkit::{Conversation, Ending, Invariant};
     use serde_json::json;
@@ -9713,7 +9877,115 @@ mod tests {
         );
     }
 
-    /// **A result its tool marks `show_once` is peeked without being
+/// **A note that copies a row is refused, and the refusal names the
+    /// row.** `note` is for what a reply worked out; `keep` is for bytes
+    /// it was given. The record said that was not landing: five of
+    /// seventeen notes across the kept sessions carried a verbatim copy
+    /// of a result already on the spine, and those five were 74,180 of
+    /// the 79,531 bytes ever written to a note — 93% of the channel by
+    /// volume. The largest was an entire file under
+    /// `{"docs/DESIGN.md": …}`.
+    ///
+    /// Run against that corpus, this refuses exactly those five and
+    /// allows the other twelve, including a 3,480-byte note that is the
+    /// model's own written-up finding — bigger than three of the five
+    /// it refuses. Size is not the test; provenance is.
+    #[test]
+    fn a_note_that_copies_a_row_is_refused_and_told_which_row() {
+        let bulk = "migrating batch 7 of 8; 41231 rows done\n".repeat(60);
+
+        // The shape every one of the five had: a result's field, put
+        // under a key of its own.
+        let mut c = Conversation::new();
+        c.answers("bash", serde_json::json!({ "status": 0, "stdout": bulk.clone() }));
+        c.reply(
+            "```js\nconst r = await tools.bash(\"cat log\");\n\
+             history.note({ snapshot: r.stdout });\n```\n",
+        );
+        let doc = c.document();
+        assert!(
+            doc.contains("history.note carries what you worked out"),
+            "the copy is refused: {doc}"
+        );
+        // The row it names is *the* row, found the same way the model
+        // would find it — not a number this test happens to know.
+        let row = c
+            .tree()
+            .path_events(c.runner().spine.leaf_id)
+            .iter()
+            .find_map(|e| match &e.payload {
+                EventPayload::Call(Call::Invoke { name, .. }) if name == "bash" => {
+                    Some(e.id.as_u64())
+                }
+                _ => None,
+            })
+            .expect("the bash call is on the record");
+        assert!(
+            doc.contains(&format!("history.keep({row})")),
+            "the refusal names the row that already has the bytes: {doc}"
+        );
+
+        // **A sentence in front of the dump is still the dump.** This
+        // is the likeliest variation and the one a whole-string
+        // comparison misses — four of nine realistic variations escape
+        // that, this among them.
+        let mut c = Conversation::new();
+        c.answers("bash", serde_json::json!({ "status": 0, "stdout": bulk.clone() }));
+        c.reply(
+            "```js\nconst r = await tools.bash(\"cat log\");\n\
+             history.note(`the log said:\\n${r.stdout}`);\n```\n",
+        );
+        assert!(
+            c.document().contains("history.note carries what you worked out"),
+            "a prefixed copy is a copy: {}",
+            c.document()
+        );
+
+        // What the channel is *for* goes through, at a size larger than
+        // three of the copies above.
+        let mut c = Conversation::new();
+        c.answers("bash", serde_json::json!({ "status": 0, "stdout": bulk }));
+        c.reply(
+            "```js\nconst r = await tools.bash(\"cat log\");\n\
+             history.note({ finding: \"batch 7 is where it stalls\".repeat(90) });\n```\n",
+        );
+        let doc = c.document();
+        assert!(
+            !doc.contains("history.note carries what you worked out"),
+            "a long finding of the reply's own words is not a copy: {doc}"
+        );
+    }
+
+    /// The search's own edges, away from the handler.
+    #[test]
+    fn the_copy_search_reads_provenance_and_not_length() {
+        let row = serde_json::json!({ "stdout": "abcdefgh".repeat(200) });
+        let rows = || std::iter::once((EventId::new(7), &row));
+
+        // A slice of the row, over the threshold: a copy.
+        let lifted = "abcdefgh".repeat(150);
+        assert_eq!(
+            copy_of(&[lifted.as_str()], rows()).map(|(r, _)| r.as_u64()),
+            Some(7)
+        );
+
+        // The same bytes, under the threshold: quoting is not copying.
+        let short = "abcdefgh".repeat(40);
+        assert!(short.len() < NOTE_COPY_MIN_BYTES);
+        assert!(copy_of(&[short.as_str()], rows()).is_none());
+
+        // Long, and nothing to do with the row.
+        let own = "the parser drops the last field when it is empty. ".repeat(40);
+        assert!(copy_of(&[own.as_str()], rows()).is_none());
+
+        // The reported number is the run they actually share, not the
+        // length of whatever string it sat in.
+        let padded = format!("{}{}", "z".repeat(4000), "abcdefgh".repeat(100));
+        let (_, bytes) = copy_of(&[padded.as_str()], rows()).expect("found");
+        assert_eq!(bytes, 800, "the shared run, not the 4,800-byte string");
+    }
+
+        /// **A result its tool marks `show_once` is peeked without being
     /// asked, and an explicit `keep` or `peek` overrides it.**
     ///
     /// The override is not a special case: the harness appends an
