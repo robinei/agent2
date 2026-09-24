@@ -8,18 +8,24 @@ use conformance::runner::{TestOutcome, run_tests};
 /// is too heavy for `cargo test`; CI runs it explicitly:
 ///     cargo test -p conformance -- --ignored --nocapture
 ///
-/// **A diff of a dozen entries is not yet a signal.** The sweep is not
-/// reproducible: two runs of the *same binary* on 2026-09-24 gave
-/// 8,273 and 8,263 passes, and their regression lists differed by 19
-/// entries. Every one of those was annex-B block-scoped function
-/// hoisting (`annexB/language/{function,global}-code/*-existing-*fn-*`)
-/// plus a couple of `language/statements/function` neighbours — the
-/// same family each time, flipping in both directions.
+/// **The sweep is reproducible, and a diff means something.** It was
+/// not, briefly: two runs of the *same binary* on 2026-09-24 gave
+/// 8,273 and 8,263 passes with regression lists differing by 19
+/// entries, all annex-B block-scoped function hoisting. This comment
+/// used to say so and advise reading a diff by family, treating that
+/// family as noise.
 ///
-/// So read a diff by *family* before believing it: a change confined
-/// to those paths is the known noise, and anything outside them is
-/// real. Judging a change by the pass count alone will attribute ±10
-/// tests to whatever was edited last.
+/// That advice was wrong, and wrong in the expensive direction. The
+/// variance was a real defect — `register_const_fns` walked a
+/// `HashSet<usize>`, whose seed changes per process, to fill a
+/// name-keyed table that holds one entry per name — sitting on top of
+/// a real spec bug, block-level declarations being hoisted into the
+/// prologue instead of stored where they stand. Calling it noise is
+/// what a whole afternoon nearly did. Both are fixed (`298aa54`);
+/// annex-B passes went from a wandering 102–109 to a fixed 157.
+///
+/// So: read a diff. Every entry in one is now a change something
+/// made.
 #[test]
 #[ignore]
 fn expectations_match_committed() {
