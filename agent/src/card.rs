@@ -748,6 +748,7 @@ pub fn seed_exemplars() -> &'static [Exemplar] {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
 
     /// Tests hold the *embedded* card to its contract — the shipped
@@ -1940,13 +1941,20 @@ mod tests {
         // 2026-09-24 sat in that blind 96%: `keep_history` in the
         // keep/peek refusal and `note_history` in the one below it.
         //
-        // Not every `#[cfg(test)]` opens a block — that const is one
+        // Not every `#[cfg(test)]` opens a block — a `const` is one
         // line ending in `;`, and skipping to the next `}` past it
         // would swallow thousands of shipping lines, which is the same
-        // bug wearing the other hat. So: an item that opens a brace is
-        // skipped to its closing `}` in the first column (these are
-        // top-level items, so that brace is unambiguous); an item that
-        // ends in `;` is skipped alone.
+        // bug wearing the other hat. So: an item ending in `;` is
+        // skipped alone, and an item that opens a brace is skipped to
+        // the `}` **at the attribute's own indentation**.
+        //
+        // Indentation, not the first column, because a `#[cfg(test)]`
+        // inside an `impl` block closes at that block's indent — and
+        // matching on column 0 instead walks past it to the end of the
+        // `impl`, taking every shipping method with it. That is not
+        // hypothetical: adding one `#[cfg(test)]` constructor to
+        // `Runner` on 2026-09-24 hid the keep/peek refusal from this
+        // scan, and the reach assertion below is what said so.
         let shipping = |f: &str| -> String {
             let mut out = String::new();
             let mut lines = f.lines().peekable();
@@ -1956,12 +1964,14 @@ mod tests {
                     out.push('\n');
                     continue;
                 }
+                let indent = &line[..line.len() - line.trim_start().len()];
+                let closes = format!("{indent}}}");
                 let Some(item) = lines.next() else { break };
                 if !item.contains('{') && item.trim_end().ends_with(';') {
                     continue;
                 }
                 for rest in lines.by_ref() {
-                    if rest.starts_with('}') {
+                    if rest == closes {
                         break;
                     }
                 }

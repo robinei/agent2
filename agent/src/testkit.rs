@@ -419,9 +419,23 @@ impl Conversation {
         Self::with_charter("you are a test agent")
     }
 
+    /// A conversation carrying the real card but **no worked
+    /// examples**, for the generator that produces them — see
+    /// `Runner::new_root_without_exemplars`.
+    pub fn for_exemplar_generation(charter: &str, card: &str) -> Self {
+        let mut tree = Tree::new(None);
+        let runner = Runner::new_root_without_exemplars(&mut tree, charter, card)
+            .expect("a root runner");
+        Self::around(tree, runner)
+    }
+
     pub fn with_charter(charter: &str) -> Self {
         let mut tree = Tree::new(None);
         let runner = Runner::new_root(&mut tree, charter, "").expect("a root runner");
+        Self::around(tree, runner)
+    }
+
+    fn around(tree: Tree, runner: Runner) -> Self {
         Self {
             tree,
             runner,

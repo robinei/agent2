@@ -1120,6 +1120,28 @@ impl Runner {
     /// Root agent of a tree. `charter` is what the agent is for; the
     /// system prompt is assembled from it and the card and snapshotted on
     /// the `Agent` event.
+    /// A root whose agent carries **no worked examples**.
+    ///
+    /// For the generator that *produces* them (`card::generate`): it
+    /// renders a session through the real document path, and a session
+    /// seeded with the current exemplars would render those too — the
+    /// output would contain the input. Everything else about the root
+    /// is identical, the card included, because the generated turns
+    /// have to be the ones a real session would get.
+    #[cfg(test)]
+    pub fn new_root_without_exemplars(
+        tree: &mut Tree,
+        charter: impl Into<String>,
+        card: &str,
+    ) -> io::Result<Self> {
+        let charter = charter.into();
+        let system = assemble_system(card, &charter);
+        let spine = tree.start_agent(None, None, charter, None, system, Vec::new())?;
+        let mut state = Self::with_spine(tree, spine);
+        state.dialect_card = card.to_owned();
+        Ok(state)
+    }
+
     pub fn new_root(tree: &mut Tree, charter: impl Into<String>, card: &str) -> io::Result<Self> {
         let charter = charter.into();
         let system = assemble_system(card, &charter);
