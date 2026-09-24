@@ -194,13 +194,13 @@ const ABSENT: &str = "- No client is attached; an ask() stays open until someone
 ///
 /// A completion that arrives with neither content nor thinking would
 /// make this sentence wrong. None has.
-const EMPTY_REPLY_NOTICE: &str = "Your last reply arrived empty: the whole completion went to \
+const EMPTY_REPLY_NOTICE: &str = "- Your last reply arrived empty: the whole completion went to \
      reasoning and nothing was written, so nothing ran and nobody was told anything. Write the \
      reply this time — prose for what you are about to do, a ```js block for the doing.";
 
 /// Woken after a reply that wrote a tool call in another harness's
 /// syntax — see [`Runner::stopped_short`].
-const FOREIGN_TOOL_CALL_NOTICE: &str = "Your last reply contained a tool call in a syntax this \
+const FOREIGN_TOOL_CALL_NOTICE: &str = "- Your last reply contained a tool call in a syntax this \
      harness does not read — `<tool_call>`, `<function=…>` or similar. It was not parsed. It \
      reached the person as literal text, the call never happened, and nothing ran. **Code here \
      runs only inside a fenced ```js block**: write `await tools.bash(\"…\")` in one, and the \
@@ -464,7 +464,7 @@ fn foreign_tool_call(text: &str) -> bool {
 
 /// Woken after a reply that was a program with the fence left off —
 /// see [`unfenced_program`].
-const UNFENCED_PROGRAM_NOTICE: &str = "Your last reply was a program with no fence around it, so \
+const UNFENCED_PROGRAM_NOTICE: &str = "- Your last reply was a program with no fence around it, so \
      nothing ran — the text went to the person as their answer instead. **Code runs only inside \
      a fenced ```js block.** Write the same lines again inside one; the work you meant to do is \
      still undone.";
@@ -1106,12 +1106,21 @@ pub struct Runner {
     /// was not rested. The next request's tail says so — see
     /// [`SILENT_FINISH`].
     finish_ignored: bool,
-    /// The request being built is the one retry `stopped_short` allows
-    /// after a prose-only reply, so the tail carries
-    /// [`NOT_FINISHED_NOTICE`] — and nothing else does. Set when the
-    /// branch is woken and cleared by the next reply's own outcome, so
-    /// it is true of exactly one request.
-    prose_once_more: bool,
+    /// The prod [`Runner::stopped_short`] raised for the request being
+    /// built, if it raised one.
+    ///
+    /// **All four ride the tail, and none is logged.** Every word of
+    /// every one of them is about the reply immediately above it —
+    /// "your last reply arrived empty", "it is your last" — so a row
+    /// under `# NEW EVENTS` is a standing instruction to a branch that
+    /// has long since moved on, re-read and paid for on every request
+    /// after. They were `Post`s until 2026-09-24, and the reply each
+    /// one is about is directly above it in the document, so nothing is
+    /// lost by not restating it there.
+    ///
+    /// Set when the branch is woken and cleared by the next reply's own
+    /// outcome, so it is true of exactly one request.
+    stopped_short: Option<&'static str>,
     /// Runs suspended **beneath** the one currently in `phase`, each
     /// frozen exactly where it stopped, oldest first popped last (a
     /// stack) — see `Phase::Suspended`'s own doc for why this, and not
@@ -1274,7 +1283,7 @@ impl Runner {
             no_rehearsal_last: std::env::var("AGENT2_NO_REHEARSAL_LAST").map_or(true, |v| v != "0"),
             run_program: std::env::var("AGENT2_RUN_PROGRAM").is_ok_and(|v| v != "0"),
             finish_ignored: false,
-            prose_once_more: false,
+            stopped_short: None,
             spine,
             agent,
             branch,
@@ -1628,7 +1637,7 @@ impl Runner {
     /// **Bounded at one retry**, counting every trailing reply that ran
     /// nothing: twice in a row is a branch that cannot do this, and a
     /// third ask is a loop that bills for itself.
-    fn stopped_short(&self, tree: &Tree) -> Option<String> {
+    fn stopped_short(&self, tree: &Tree) -> Option<&'static str> {
         let replies = self.replies(tree);
         let last = replies.last()?;
         if last.ran || !last.handed_back {
@@ -1643,13 +1652,13 @@ impl Runner {
             return None;
         }
         if !last.spoke {
-            return Some(EMPTY_REPLY_NOTICE.to_owned());
+            return Some(EMPTY_REPLY_NOTICE);
         }
         if foreign_tool_call(&last.text) {
-            return Some(FOREIGN_TOOL_CALL_NOTICE.to_owned());
+            return Some(FOREIGN_TOOL_CALL_NOTICE);
         }
         if unfenced_program(&last.text) {
-            return Some(UNFENCED_PROGRAM_NOTICE.to_owned());
+            return Some(UNFENCED_PROGRAM_NOTICE);
         }
         // **What this used to be, and why it was off.** Of the thirteen
         // times this last branch fired across 382 kept runs, twelve woke a
@@ -1685,8 +1694,7 @@ impl Runner {
         // `FINISH_MARK` is that way. It costs a character at the end of
         // the sentence the model was writing anyway, so the wake it
         // earns is one the next reply can discharge without a program.
-        (!last.answering && !last.text.contains(FINISH_MARK))
-            .then(|| NOT_FINISHED_NOTICE.to_owned())
+        (!last.answering && !last.text.contains(FINISH_MARK)).then_some(NOT_FINISHED_NOTICE)
     }
 
     /// **Reconciliation's half of the trigger rule**: forget having shown
@@ -3869,9 +3877,9 @@ impl Runner {
         // request's tail can say why the branch is still going.
         self.finish_ignored = self.finished && !rested;
         // Cleared here, set below in `prompt_if_needed` if this very
-        // reply is what earns the warning — so the flag never outlives
-        // the request it describes.
-        self.prose_once_more = false;
+        // reply is what earns a prod — so it never outlives the
+        // request it describes.
+        self.stopped_short = None;
         if rested {
             // Matches `suspend`'s own depth>0 branch precedent: `shown`
             // advances here, marking this outcome accounted-for so
@@ -4088,33 +4096,13 @@ impl Runner {
         // what *this* function is in the middle of doing, and `deliver`
         // comes back here to decide whether to do it — which is a cycle
         // with no base case, and was one until the stack overflowed.
-        if let Some(text) = self.stopped_short(tree) {
-            // **One of the four is not logged.** Every word of
-            // `NOT_FINISHED_NOTICE` is about the reply immediately
-            // above it in the document, so a row under `# NEW EVENTS`
-            // would be a standing instruction to a branch three replies
-            // past caring, paid for on every request after. It rides
-            // the tail instead, which is re-emitted at the new end each
-            // time and written into the history never. The wake itself
-            // does not depend on either: `needs_prompt` reads
-            // `stopped_short` directly.
-            if text == NOT_FINISHED_NOTICE {
-                self.prose_once_more = true;
-            } else {
-                tree.append(
-                    &mut self.spine,
-                    EventPayload::Post {
-                        from: Author::Harness,
-                        origin: Origin::Direct {
-                            text,
-                            input: serde_json::Value::Null,
-                            options: Vec::new(),
-                            expects_reply: false,
-                        },
-                    },
-                )?;
-            }
-        }
+        // **Nothing is logged.** These were harness `Post`s until
+        // 2026-09-24, which put a one-request fact on the record
+        // forever; the field's own doc says why that is wrong. The wake
+        // does not depend on a post either way — `needs_prompt` reads
+        // `stopped_short` directly — so the branch still gets its one
+        // retry, with a request whose only new content is the tail.
+        self.stopped_short = self.stopped_short(tree);
         // Checked before the request is built, not after: a document
         // over budget is over budget *for this request*, and the whole
         // point is to not send it. The handler's own request is built
@@ -4725,8 +4713,8 @@ impl Runner {
         if self.finish_ignored {
             lines.push(SILENT_FINISH.to_owned());
         }
-        if self.prose_once_more {
-            lines.push(NOT_FINISHED_NOTICE.to_owned());
+        if let Some(prod) = self.stopped_short {
+            lines.push(prod.to_owned());
         }
         // **Said once, where a per-request fact belongs.** The spans
         // were deleted before the reply was logged or compiled, so
@@ -8256,16 +8244,19 @@ mod tests {
         assert!(
             c.runner()
                 .request_tail(c.tree())
-                .is_some_and(|t| !t.contains("program with no fence")),
-            "the notice is a post, not a tail line"
+                .is_some_and(|t| t.contains("program with no fence")),
+            "the branch is woken and told why, in the tail"
         );
+        // **And told once.** The prod is about the reply directly
+        // above it, so it is not written into the history — see
+        // `Runner::stopped_short` the field.
         assert!(
-            c.tree().events.values().any(|e| matches!(
+            !c.tree().events.values().any(|e| matches!(
                 &e.payload,
                 EventPayload::Post { origin, .. }
                     if format!("{origin:?}").contains("no fence around it")
             )),
-            "the branch is woken and told why"
+            "and nothing of it is on the log"
         );
     }
 
@@ -10766,10 +10757,19 @@ mod tests {
         );
 
         assert!(!r.rests, "the work is not finished");
-        // And it is *told* why, in the channel it demonstrably reads.
+        // And it is *told* why, in the tail of the request that wakes
+        // it — which names the one channel that runs. Not on the log:
+        // the prod is about the reply directly above it, and a request
+        // later it is a standing instruction about a reply nobody can
+        // still see.
+        let tail = c.runner().request_tail(c.tree()).expect("a tail");
         assert!(
-            r.notices.last().is_some_and(|n| n.contains("```js")),
-            "the notice names the one channel that runs: {:?}",
+            tail.contains("syntax this harness does not read") && tail.contains("```js"),
+            "the prod names the one channel that runs: {tail}"
+        );
+        assert!(
+            r.notices.is_empty(),
+            "and nothing was logged: {:?}",
             r.notices
         );
     }
@@ -11159,6 +11159,25 @@ mod tests {
             !last.content.contains(crate::document::TURN_HEADING),
             "and carries no events section, because there are no events: {:?}",
             last.content
+        );
+
+        // **And a request later, the gap says so for itself.** The
+        // readout is written into the record never, so without this the
+        // reply it earned would follow the prose-only one with nothing
+        // between them — two assistant messages back to back, and no
+        // boundary between one of the model's replies and the next.
+        c.reply("```js\nlet b = 2;\n```\n");
+        let msgs = c.runner().document(c.tree(), 64 * 1024).messages;
+        let gap = msgs
+            .windows(2)
+            .find(|w| w[1].content.contains("let b = 2"))
+            .map(|w| w[0].clone())
+            .expect("a turn before the reply that followed");
+        assert_eq!(gap.role, crate::document::ChatRole::User);
+        assert!(
+            gap.content.contains(crate::document::NOTHING_HAPPENED),
+            "the empty turn says what it is rather than vanishing: {:?}",
+            gap.content
         );
 
         // A reply that runs something discharges it, and the request

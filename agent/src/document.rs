@@ -1295,7 +1295,7 @@ pub(crate) fn render_with_lookup(
                 };
                 match content {
                     Some(content) => {
-                        push_flush(&mut messages, &mut before);
+                        push_flush_before_a_reply(&mut messages, &mut before);
                         let mut turn = assistant_turn(id, content);
                         if send_reasoning && !reply_thinking.is_empty() {
                             turn.thinking = Some(std::mem::take(&mut reply_thinking));
@@ -1429,6 +1429,35 @@ fn push_flush(messages: &mut Vec<ChatMessage>, pending: &mut Vec<String>) {
     }
     messages.push(flush_pending(pending));
 }
+
+/// [`push_flush`] for the gap **before an assistant turn**, where an
+/// empty one cannot simply be dropped.
+///
+/// Some wakes put nothing on the record. A `stopped_short` prod rides
+/// the ephemeral tail and is never logged; so does a compaction
+/// directive. The reply each one earns therefore follows the reply
+/// before it with no event in between — and dropping the empty turn
+/// leaves two assistant messages back to back, which is not a shape
+/// the transport has, and gives the model no boundary between one of
+/// its replies and the next.
+///
+/// So the turn is rendered, saying the one true thing there is to say
+/// about it. The readout that actually caused the wake is gone by
+/// then — it is re-emitted at the new end of every request and written
+/// into the history never — and that absence is what the line
+/// explains, so the model is not left inferring a cause for a turn
+/// that carried none.
+fn push_flush_before_a_reply(messages: &mut Vec<ChatMessage>, pending: &mut Vec<String>) {
+    if pending.is_empty() && matches!(messages.last(), Some(m) if m.role == ChatRole::Assistant) {
+        pending.push(NOTHING_HAPPENED.to_owned());
+    }
+    push_flush(messages, pending);
+}
+
+/// What a turn that carried no events says for itself — see
+/// [`push_flush_before_a_reply`].
+pub const NOTHING_HAPPENED: &str = "Nothing happened. That turn carried no events at all: only \
+     the RIGHT NOW readout, which is written into the record never and is gone from here.";
 
 /// **The user turn's own heading.** A message in the user role holds
 /// whatever the log gained since the last reply: a person's words, the
