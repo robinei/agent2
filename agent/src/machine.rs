@@ -5291,6 +5291,36 @@ pub(crate) fn menu_rows(
                     )),
                     shown: None,
                 }),
+                // **A call that delivered nothing gets no row.** The
+                // menu's whole promise is `history.fetch(id)`, and a
+                // fetch of one of these hands back `null` — the row
+                // advertises a round trip to nowhere.
+                //
+                // In practice this is `wait_until`, whose declared
+                // return *is* `null`, and a wait is the one call a
+                // program makes in bulk: the `08-watch` exemplar this
+                // harness ships loops twenty times, so following it
+                // spent forty of a twenty-entry menu on its own
+                // waiting and pushed every real row out under "(N
+                // older rows omitted)". Measured on the `s1-watch` run
+                // of 2026-09-24: six polls over sixty seconds, eleven
+                // rows, five of them `wait_until(…) → ok`.
+                //
+                // **Derived from the value, not from a flag on the
+                // tool.** Across every log in the corpus exactly one
+                // call has ever delivered `null`, so the rule needs no
+                // list to fall behind — see the vocabulary guard in
+                // `card.rs` for what a list that covers one of six
+                // costs. The call itself is not hidden: it is in the
+                // program's own source, right above.
+                EventPayload::Call(_)
+                    if matches!(
+                        settlement_of(settlements, event.id),
+                        Some(Outcome::Delivered(serde_json::Value::Null))
+                    ) =>
+                {
+                    None
+                }
                 // A row's label comes from the call *variant*; its value
                 // (or its absence) from the `Result`.
                 EventPayload::Call(call) => Some(Artifact {
@@ -8503,7 +8533,21 @@ mod tests {
         LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn crowded() -> (Tree, Runner, usize) {
+    /// **It hands back the lock, so no caller can forget it.**
+    /// `compaction_if_needed` reads `AGENT2_CONTEXT_TOKENS` fresh at
+    /// the point of use (`host::context_tokens`), and the tests that
+    /// set it change the budget every one of these compares against.
+    /// Six tests call `crowded()`; exactly one took `env_lock` itself,
+    /// with a comment explaining why — and the other five raced,
+    /// failing about one full-suite run in four while passing alone.
+    ///
+    /// A guard taken *inside* here would not do: it drops when this
+    /// returns, which is before the test does the compaction the lock
+    /// is for. Returning it puts the lifetime in the caller's hands
+    /// without asking the caller to know any of this — the one shape
+    /// that cannot fall behind as tests are added.
+    fn crowded() -> (Tree, Runner, usize, std::sync::MutexGuard<'static, ()>) {
+        let env = env_lock();
         let (mut tree, mut state) = setup();
         let rendered = |tree: &Tree, state: &Runner| {
             crate::compaction::rendered_size(&crate::document::render(
@@ -8527,7 +8571,7 @@ mod tests {
             }
             size = rendered(&tree, &state);
         }
-        (tree, state, size / 2)
+        (tree, state, size / 2, env)
     }
 
     /// Under budget, nothing fires — the check has to be able to say no
@@ -8552,7 +8596,7 @@ mod tests {
     /// numbers, and a request goes out for the handler.
     #[test]
     fn compaction_fires_over_budget_and_asks_for_a_program() {
-        let (mut tree, mut state, budget) = crowded();
+        let (mut tree, mut state, budget, _env) = crowded();
         let fired = state.compaction_if_needed(&mut tree, budget, 0.25).unwrap();
         assert!(matches!(fired, Some(StepOutput::LlmRequest(_))));
         assert!(state.compaction_requested, "a compaction was asked for");
@@ -8582,7 +8626,7 @@ mod tests {
     /// which is the lesser failure.
     #[test]
     fn compaction_gives_up_rather_than_looping_when_it_cannot_help() {
-        let (mut tree, mut state, budget) = crowded();
+        let (mut tree, mut state, budget, _env) = crowded();
         // A budget under the floor: nothing the handler removes can
         // bring the document beneath it.
         let impossible = 1024;
@@ -8625,7 +8669,7 @@ mod tests {
     /// time, which is what the old counter could not survive.
     #[test]
     fn the_compaction_bound_is_read_off_the_log_not_remembered() {
-        let (mut tree, state, budget) = crowded();
+        let (mut tree, state, budget, _env) = crowded();
         let mut leaf = state.spine.leaf_id;
         // The fixture's own budget: over it, and with a floor under it,
         // so every ask is one the floor guard allows. The bound is for
@@ -8677,7 +8721,7 @@ mod tests {
     /// request.
     #[test]
     fn the_compaction_request_reaches_the_model_but_is_not_a_row() {
-        let (mut tree, mut state, budget) = crowded();
+        let (mut tree, mut state, budget, _env) = crowded();
         // A real conversation has run a program before it is big enough
         // to compact, and the fold inserts a report where a program
         // handed back — so a branch with no `Turn` on it would not
@@ -8742,10 +8786,7 @@ mod tests {
     /// a handler that frees nothing from asking for itself forever.
     #[test]
     fn compaction_does_not_fire_while_already_compacting() {
-        // Reads the environment through `context_tokens`, so it waits
-        // for whoever is setting it — see `env_lock`.
-        let _env = env_lock();
-        let (mut tree, mut state, budget) = crowded();
+        let (mut tree, mut state, budget, _env) = crowded();
         state.compaction_if_needed(&mut tree, budget, 0.25).unwrap();
         let again = state.compaction_if_needed(&mut tree, budget, 0.25).unwrap();
         assert!(again.is_none());
@@ -8756,7 +8797,7 @@ mod tests {
     /// present underneath it.
     #[test]
     fn a_compaction_handler_commits_its_batch() {
-        let (mut tree, mut state, budget) = crowded();
+        let (mut tree, mut state, budget, _env) = crowded();
         let target = tree
             .events
             .values()

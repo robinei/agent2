@@ -692,19 +692,77 @@ pub(crate) fn render_row(a: &Artifact) -> String {
     }
 }
 
+/// Consecutive rows that are the same call, folded into one entry: the
+/// newest, plus the ids of the ones it repeats.
+///
+/// **A loop is one row per iteration and the menu holds twenty.** A
+/// program that watches something polls, and each poll is a row whose
+/// line is identical to the last but for a byte count. Folded, the run
+/// reads as its most recent row — the one a watcher actually wants —
+/// and every earlier id stays named, so nothing stops being fetchable.
+///
+/// **Only rows that are the same call *and* went the same way.** A
+/// failure never folds into the successes around it: the menu is the
+/// one place a failure's reason appears, and a run of twenty checks
+/// where the nineteenth broke is a run whose whole point is the
+/// nineteenth. Nor does a row showing a `keep`/`peek` value, which has
+/// a body of its own to print underneath.
+fn fold_repeats<'a>(artifacts: &[&'a Artifact]) -> Vec<(&'a Artifact, Vec<u64>)> {
+    let foldable =
+        |a: &Artifact| !a.label.is_empty() && a.shown.is_none() && matches!(a.state, ArtifactState::Delivered(_));
+    let mut out: Vec<(&Artifact, Vec<u64>)> = Vec::new();
+    for a in artifacts {
+        if let Some((last, earlier)) = out.last_mut()
+            && foldable(a)
+            && foldable(last)
+            && last.label == a.label
+        {
+            earlier.push(last.id);
+            *last = a;
+            continue;
+        }
+        out.push((a, Vec::new()));
+    }
+    out
+}
+
+/// How many repeated ids a folded line names before it gives a range
+/// instead. Past this the list is itself the wall of text it replaced.
+const FOLD_IDS_LISTED: usize = 8;
+
 fn render_row_list(heading: &str, artifacts: &[&Artifact]) -> Option<String> {
     if artifacts.is_empty() {
         return None;
     }
     let mut out = format!("{heading}\n`history.fetch(id)` for any of them.\n");
-    let start = artifacts.len().saturating_sub(MENU_MAX_ENTRIES);
+    // **Folded before the cap, so a loop cannot evict the real rows.**
+    // That was the whole failure: twenty iterations filled a
+    // twenty-entry menu with one repeated line and everything the run
+    // had actually read left under "(N older rows omitted)".
+    let folded = fold_repeats(artifacts);
+    let start = folded.len().saturating_sub(MENU_MAX_ENTRIES);
     if start > 0 {
         out.push_str(&format!(
             "\n({start} older rows omitted; their ids stay fetchable)"
         ));
     }
-    for a in &artifacts[start..] {
+    for (a, earlier) in &folded[start..] {
         out.push_str(&row_line(a));
+        if !earlier.is_empty() {
+            let ids = if earlier.len() <= FOLD_IDS_LISTED {
+                earlier
+                    .iter()
+                    .map(|i| format!("[{i}]"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            } else {
+                format!("[{}] … [{}]", earlier[0], earlier[earlier.len() - 1])
+            };
+            out.push_str(&format!(
+                " — and {} the same before it: {ids}",
+                earlier.len()
+            ));
+        }
         // Under the line, indented as a continuation of its bullet, so
         // a value of several lines still reads as belonging to the row
         // whose id is above it.
@@ -3306,6 +3364,137 @@ mod tests {
         }
         .render();
         assert_eq!(rendered, format!("{RUN_HEADING}\n\nIt completed."));
+    }
+
+    /// **A watch must not cost the menu.** A polling loop is one row
+    /// per iteration and the menu holds twenty, so twenty iterations —
+    /// what the `08-watch` exemplar this harness ships actually does —
+    /// filled it with one repeated line and pushed everything the run
+    /// had read out under "(N older rows omitted)".
+    ///
+    /// Measured on the `s1-watch` run of 2026-09-24: six polls over
+    /// sixty seconds, eleven rows, 1,507 bytes. Folded: two lines, 867.
+    #[test]
+    fn a_repeated_call_is_one_line_that_still_names_every_id() {
+        let rows: Vec<Artifact> = (0..25)
+            .map(|i| Artifact {
+                id: 10 + i,
+                label: "bash(\"cat /tmp/migration.log\")".into(),
+                state: ArtifactState::Delivered(json!({ "status": 0 })),
+                shown: None,
+            })
+            .collect();
+        let refs: Vec<&Artifact> = rows.iter().collect();
+        let out = render_row_list("### rows", &refs).unwrap();
+
+        assert_eq!(
+            out.matches("- `[").count(),
+            1,
+            "twenty-five polls are one line, not twenty-five: {out}"
+        );
+        assert!(
+            !out.contains("older rows omitted"),
+            "and folding happens before the cap, so nothing is evicted: {out}"
+        );
+        assert!(
+            out.contains("- `[34]`"),
+            "the newest is the row it reads as — the one a watcher wants: {out}"
+        );
+        assert!(
+            out.contains("and 24 the same before it: [10] … [33]"),
+            "past a handful the ids give a range rather than a second wall: {out}"
+        );
+
+        // Under the listing threshold every id is written out, because
+        // the only promise the menu makes is `history.fetch(id)`.
+        let few: Vec<&Artifact> = refs[..3].to_vec();
+        let out = render_row_list("### rows", &few).unwrap();
+        assert!(
+            out.contains("and 2 the same before it: [10] [11]"),
+            "{out}"
+        );
+    }
+
+    /// **A failure never folds into the successes around it.** The menu
+    /// is the one place a failure's reason appears — a result can be
+    /// fetched under its id, a rejection cannot — so a watch whose
+    /// nineteenth check broke is a watch whose whole point is the
+    /// nineteenth.
+    #[test]
+    fn a_failure_in_a_run_of_repeats_keeps_its_own_line() {
+        let row = |id: u64, state: ArtifactState| Artifact {
+            id,
+            label: "bash(\"check\")".into(),
+            state,
+            shown: None,
+        };
+        let rows = [
+            row(1, ArtifactState::Delivered(json!({ "status": 0 }))),
+            row(2, ArtifactState::Delivered(json!({ "status": 0 }))),
+            row(3, ArtifactState::Failed("no such file".into())),
+            row(4, ArtifactState::Delivered(json!({ "status": 0 }))),
+        ];
+        let refs: Vec<&Artifact> = rows.iter().collect();
+        let out = render_row_list("### rows", &refs).unwrap();
+        assert!(
+            out.contains("no such file"),
+            "the reason survives the fold: {out}"
+        );
+        assert_eq!(
+            out.matches("- `[").count(),
+            3,
+            "the two before it fold, the failure stands, the one after starts again: {out}"
+        );
+    }
+
+    /// **A call that delivered nothing is not a row.** The menu's whole
+    /// promise is `history.fetch(id)`, and fetching one of these hands
+    /// back `null`.
+    ///
+    /// In practice that is `wait_until`, whose declared return *is*
+    /// null — and across every log in the corpus on 2026-09-24 it was
+    /// the only call that had ever delivered one, which is why this
+    /// reads the value instead of keeping a list of tool names to fall
+    /// behind.
+    #[test]
+    fn a_call_that_delivered_nothing_is_not_advertised_as_fetchable() {
+        fn ev(id: u64, payload: EventPayload) -> Event {
+            Event {
+                id: EventId::new(id),
+                parent_id: None,
+                timestamp: jiff::Timestamp::UNIX_EPOCH,
+                payload,
+            }
+        }
+        let call = |id: u64, name: &str| {
+            ev(
+                id,
+                EventPayload::Call(Call::Invoke {
+                    name: name.into(),
+                    args: json!([]),
+                    site: 0,
+                }),
+            )
+        };
+        let settled = |id: u64, of: u64, v: serde_json::Value| {
+            ev(
+                id,
+                EventPayload::Result {
+                    call: EventId::new(of),
+                    outcome: Outcome::Delivered(v),
+                },
+            )
+        };
+        let owned = [
+            call(5, "bash"),
+            settled(6, 5, json!({ "status": 0 })),
+            call(7, "wait_until"),
+            settled(8, 7, json!(null)),
+        ];
+        let path: Vec<&Event> = owned.iter().collect();
+        let rows = crate::machine::menu_rows(&path, 0, &Default::default(), &path);
+        let ids: Vec<u64> = rows.iter().map(|a| a.id).collect();
+        assert_eq!(ids, vec![5], "the wait is not a row: {ids:?}");
     }
 
     /// **A removed row leaves the menu too.** `document.rs` drops a
