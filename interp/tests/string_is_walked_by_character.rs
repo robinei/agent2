@@ -270,7 +270,7 @@ fn trim_uses_the_js_whitespace_set() {
     assert_eq!(val(r#"return "﻿ hi  ".trim();"#), "hi");
     assert_eq!(val(r#"return " x".trimStart();"#), "x");
     // A zero-width space is *not* whitespace in JS and must survive.
-    assert_eq!(val(r#"return "​x".trim().length;"#), 2);
+    assert_eq!(val(r#"return "\u200Bx".trim().length;"#), 2);
 }
 
 /// **`Edit.*` offsets are the program's offsets.**
