@@ -3,6 +3,11 @@ use super::*;
 use crate::compiler::{ConstVal, namespace_constants};
 use crate::diag::Diagnostic;
 
+/// How much of an uncaught thrown string reaches the reader. Long
+/// enough for the harness's refusals, which are a short paragraph and
+/// exist to say what to write instead.
+const UNCAUGHT_MESSAGE_MAX_BYTES: usize = 2048;
+
 /// Whether a value is an *object* for `instanceof` purposes (Step 2b). JS
 /// `instanceof` spec: "If Type(relObj) is not Object, return false." The
 /// "object" types are the heap/structural types (Object/Array/Map/Set/
@@ -323,6 +328,43 @@ impl VM {
                 (obj.map.get("name"), obj.map.get("message"))
         {
             return format!("uncaught {}: {}", name.as_str(), msg.as_str());
+        }
+        // **A thrown string is a message, not a value being previewed.**
+        // This used to go through `preview`, which cuts a string at 40
+        // bytes — right for naming a value inside some *other* error,
+        // fatally wrong here, because an uncaught throw is the last
+        // thing the program gets to say.
+        //
+        // The harness refuses a bad call by throwing its explanation as
+        // a string (`Runner::settle_err`), so every one of those
+        // reached the model as its first 40 characters. Live on
+        // 2026-09-24: a program that called `history.keep` with an
+        // array was handed
+        //
+        //   uncaught exception: "keep_history(result) needs a tool result…"
+        //
+        // and none of the sentence that says to map `keep` over the
+        // rows instead. The refusal had been written that morning
+        // precisely so it would teach.
+        //
+        // Bounded, because a program may throw something bulky, but
+        // bounded where a paragraph fits rather than where a phrase
+        // does. The `{name, message}` branch above is not truncated at
+        // all; this is the same treatment for the same kind of text.
+        if let Value::String(s) = value {
+            let s = s.as_str();
+            if s.len() <= UNCAUGHT_MESSAGE_MAX_BYTES {
+                return format!("uncaught exception: \"{}\"", s.escape_debug());
+            }
+            let mut end = UNCAUGHT_MESSAGE_MAX_BYTES;
+            while !s.is_char_boundary(end) {
+                end -= 1;
+            }
+            return format!(
+                "uncaught exception: \"{}…\" [truncated; {} bytes total]",
+                s[..end].escape_debug(),
+                s.len()
+            );
         }
         format!("uncaught exception: {}", self.preview(value))
     }
