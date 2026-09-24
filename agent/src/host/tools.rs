@@ -207,7 +207,7 @@ fn read_file_def() -> ToolDef {
         // is presumably where this was copied from. A field a program
         // can branch on and never see is a dead branch in every program
         // that checks it.
-        returns: Some("{ content: string; version: string }".into()),
+        returns: Some("{ content: string; version: string; id: number }".into()),
         handler: Box::new(|args| {
             let path = args
                 .get(0)
@@ -278,7 +278,7 @@ fn create_file_def() -> ToolDef {
         }),
         guidelines: Vec::new(),
         example: Some("await tools.create_file(\"notes.md\", body);".into()),
-        returns: Some("{ version: string }".into()),
+        returns: Some("{ version: string; id: number }".into()),
         handler: Box::new(|args| {
             let path = args
                 .get(0)
@@ -336,7 +336,7 @@ fn replace_file_def() -> ToolDef {
         // declaration, two screens up, correctly writes the parameter
         // as `new_`. An example nobody can copy is worse than none.
         example: Some("const { diff } = await tools.replace_file(p, Edit.replaceOnce(f.content, old, replacement), f.version);".into()),
-        returns: Some("{ version: string; diff?: string }".into()),
+        returns: Some("{ version: string; diff?: string; id: number }".into()),
         handler: Box::new(|args| {
             let path = args
                 .get(0)
@@ -414,7 +414,8 @@ fn bash_def() -> ToolDef {
         ],
         example: Some("const r = await tools.bash(\"make check 2>&1\");".into()),
         returns: Some(
-            "{ status: number; stdout: string; stderr: string; truncated?: boolean }".into(),
+            "{ status: number; stdout: string; stderr: string; truncated?: boolean; id: number }"
+                .into(),
         ),
         handler: Box::new(|args| {
             // Accept the command as a string, or as an argv array joined
@@ -1279,5 +1280,145 @@ mod tests {
             "rejected fast, did not sleep: {:?}",
             start.elapsed()
         );
+    }
+
+    /// **Every field a tool promises is a field it delivers, and every
+    /// field it delivers is one it promised.**
+    ///
+    /// `returns` is the model's only statement of a result's shape — it
+    /// becomes the declaration's return type in the manifest, and a
+    /// program is written against it before any result exists. Nothing
+    /// checked it against a real call.
+    ///
+    /// Both directions, because they fail differently. A promised field
+    /// that never arrives is a program written for a shape that does
+    /// not exist. A delivered field that was never promised is one the
+    /// model can only find by accident — and `outline` shipped a
+    /// declared `"variable"` kind that no input could produce until
+    /// 4dc78f1, which is this test's shape one level down.
+    #[test]
+    fn every_returned_field_is_declared_and_every_declared_field_arrives() {
+        // A field name in a `{ a: T; b?: U }` return type. `?` marks a
+        // field that may legitimately be absent, so it is allowed to
+        // miss the delivered side but not to arrive undeclared.
+        fn declared(returns: &str) -> (Vec<String>, Vec<String>) {
+            let (mut all, mut required) = (Vec::new(), Vec::new());
+            // Split on `;` at depth zero only. A nested shape —
+            // `{ items: Array<{ name: string; kind: … }> }` — must not
+            // contribute `name` and `kind` as though they were fields
+            // of the result itself, which is what the first cut of this
+            // did and what made it fail on `outline`.
+            let body = returns.trim().trim_start_matches('{').trim_end_matches('}');
+            let (mut depth, mut start) = (0i32, 0usize);
+            let mut parts: Vec<&str> = Vec::new();
+            for (i, ch) in body.char_indices() {
+                match ch {
+                    '{' | '<' | '(' | '[' => depth += 1,
+                    '}' | '>' | ')' | ']' => depth -= 1,
+                    ';' if depth == 0 => {
+                        parts.push(&body[start..i]);
+                        start = i + 1;
+                    }
+                    _ => {}
+                }
+            }
+            parts.push(&body[start..]);
+            for part in parts {
+                let Some((lhs, _)) = part.split_once(':') else {
+                    continue;
+                };
+                let name = lhs.trim();
+                let (bare, optional) = match name.strip_suffix('?') {
+                    Some(b) => (b, true),
+                    None => (name, false),
+                };
+                if bare.is_empty() {
+                    continue;
+                }
+                all.push(bare.to_owned());
+                if !optional {
+                    required.push(bare.to_owned());
+                }
+            }
+            (all, required)
+        }
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let existing = dir.path().join("a.rs");
+        std::fs::write(&existing, "fn f() {}\n").unwrap();
+        let existing = existing.to_str().unwrap().to_owned();
+        let version = (read_file_def().handler)(serde_json::json!([existing.clone()]))
+            .unwrap()["version"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let fresh = dir.path().join("new.txt").to_str().unwrap().to_owned();
+
+        // One live call per tool, in the shape its own signature asks
+        // for. `wait_until` takes a deadline already past, which its
+        // description says resolves at once.
+        let calls: Vec<(ToolDef, serde_json::Value)> = vec![
+            (read_file_def(), serde_json::json!([existing.clone()])),
+            (bash_def(), serde_json::json!(["echo hi"])),
+            (create_file_def(), serde_json::json!([fresh, "x"])),
+            (
+                replace_file_def(),
+                serde_json::json!([existing.clone(), "fn g() {}\n", version]),
+            ),
+            (
+                super::super::structural::outline_def(),
+                serde_json::json!([existing.clone()]),
+            ),
+            (
+                super::super::structural::parse_errors_def(),
+                serde_json::json!([existing.clone()]),
+            ),
+            (wait_until_def(), serde_json::json!([1.0])),
+        ];
+
+        for (def, args) in calls {
+            let Some(returns) = def.returns.clone() else {
+                continue;
+            };
+            if returns.trim() == "null" {
+                continue;
+            }
+            let got = (def.handler)(args)
+                .unwrap_or_else(|e| panic!("{}: {e}", def.name));
+            if got.as_object().is_none() {
+                panic!("{}: returns {returns} but delivered {got}", def.name);
+            }
+            let (all, required) = declared(&returns);
+            // **What the model sees, not what the handler returned.**
+            // `machine.rs` injects `id` into every object result before
+            // it is logged, so that is part of the shape a program is
+            // written against — and every one of these declarations
+            // denied it existed while the card told the model to use
+            // `f.id`. Testing the handler alone could not see that;
+            // this is the layer the promise is actually made about.
+            let mut got = got;
+            if got.as_object().is_some() {
+                got.as_object_mut()
+                    .expect("checked")
+                    .insert("id".into(), serde_json::json!(1));
+            }
+            let obj = got.as_object().expect("checked");
+            for field in &required {
+                assert!(
+                    obj.contains_key(field),
+                    "{} promises `{field}` in `{returns}` and did not deliver it: {}",
+                    def.name,
+                    serde_json::to_string(&got).unwrap_or_default()
+                );
+            }
+            for field in obj.keys() {
+                assert!(
+                    all.contains(field),
+                    "{} delivered `{field}`, which `{returns}` never mentions — \
+                     the model can only find it by accident",
+                    def.name
+                );
+            }
+        }
     }
 }

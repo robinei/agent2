@@ -78,7 +78,7 @@ pub fn outline_def() -> ToolDef {
              \"struct\" | \"enum\" | \"trait\" | \"impl\" | \"module\" | \"const\" | \"static\" | \
              \"type\" | \"macro\" | \"interface\" | \"field\" | \"variable\"; start_line: number; \
              end_line: number; signature?: string; attributes?: string[]; doc?: string; \
-             parent?: string }> }"
+             parent?: string }>; id: number }"
                 .into(),
         ),
         handler: Box::new(|args| {
@@ -578,7 +578,9 @@ pub fn parse_errors_def() -> ToolDef {
             "Check content *before* writing it: pass `source` and `lang` with no path, and nothing touches disk.".into(),
         ],
         example: Some("const { ok } = await tools.parse_errors(null, candidate, lang);".into()),
-        returns: Some("{ ok: boolean; errors: Array<{ line: number; message: string }> }".into()),
+        returns: Some(
+            "{ ok: boolean; errors: Array<{ line: number; message: string }>; id: number }".into(),
+        ),
         handler: Box::new(|args| {
             let first = args.get(0);
             if first.is_none() || first == Some(&Value::Null) {

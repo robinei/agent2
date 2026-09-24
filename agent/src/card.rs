@@ -162,8 +162,17 @@ fn the_card_teaches_the_markers_the_document_uses() {
     );
 }
 
-/// The shipped manifest, as the model reads it — the two facts that
-/// were wrong in it, held.
+/// The shipped manifest, as the model reads it — the facts that were
+/// wrong in it, held.
+///
+/// **One of them was this test's own.** It asserted `read_file`
+/// "declares no field its handler cannot produce", which quietly made
+/// the handler the authority. It is not: `machine.rs` injects `id` into
+/// every object result before it is logged, so the model is handed
+/// `{ content, version, id }` while the manifest said
+/// `{ content, version }` — and the card tells it to use `f.id`. Six
+/// return types denied the field the card was pointing at, behind a
+/// green test, because the test was asking the wrong layer.
 #[test]
 fn the_shipped_manifest_tells_the_truth_about_itself() {
     let manifest = tool_manifest(&crate::host::tools::real_registry(), true);
@@ -188,8 +197,11 @@ fn the_shipped_manifest_tells_the_truth_about_itself() {
         "`outline`'s entries carry start_line/end_line, not `line`: {manifest}"
     );
     assert!(
-        manifest.contains("read_file(path: string, from?: number, to?: number): Promise<{ content: string; version: string }>"),
-        "`read_file` declares no field its handler cannot produce: {manifest}"
+        manifest.contains(
+            "read_file(path: string, from?: number, to?: number): \
+             Promise<{ content: string; version: string; id: number }>"
+        ),
+        "`read_file` declares every field the model is handed: {manifest}"
     );
 }
 
