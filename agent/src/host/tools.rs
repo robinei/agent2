@@ -526,6 +526,7 @@ fn read_file_def() -> ToolDef {
         // can branch on and never see is a dead branch in every program
         // that checks it.
         returns: Some("{ content: string; version: string; id: number }".into()),
+        show_once: false,
         handler: Box::new(|args| {
             let path = args
                 .get(0)
@@ -597,6 +598,7 @@ fn create_file_def() -> ToolDef {
         guidelines: Vec::new(),
         example: Some("await tools.create_file(\"notes.md\", body);".into()),
         returns: Some("{ version: string; id: number }".into()),
+        show_once: false,
         handler: Box::new(|args| {
             let path = args
                 .get(0)
@@ -655,6 +657,7 @@ fn replace_file_def() -> ToolDef {
         // as `new_`. An example nobody can copy is worse than none.
         example: Some("const { diff } = await tools.replace_file(p, Edit.replaceOnce(f.content, old, replacement), f.version);".into()),
         returns: Some("{ version: string; diff?: string; id: number }".into()),
+        show_once: true,
         handler: Box::new(|args| {
             let path = args
                 .get(0)
@@ -735,6 +738,7 @@ fn bash_def() -> ToolDef {
             "{ status: number; stdout: string; stderr: string; truncated?: boolean; id: number }"
                 .into(),
         ),
+        show_once: false,
         handler: Box::new(|args| {
             // Accept the command as a string, or as an argv array joined
             // with spaces (`bash(["mkdir","-p","/x"])` → "mkdir -p /x") —
@@ -1073,6 +1077,7 @@ fn wait_until_def() -> ToolDef {
         guidelines: Vec::new(),
         example: Some("await tools.wait_until(Date.now() + 5000);".into()),
         returns: Some("null".into()),
+        show_once: false,
         handler: Box::new(|args| {
             let target_ms = args
                 .get(0)

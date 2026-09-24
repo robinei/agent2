@@ -779,6 +779,7 @@ mod tests {
             example: None,
             returns: Some("{ body: string }".into()),
             handler: Box::new(|_| Ok(json!(null))),
+            show_once: false,
         });
         // A tool that supplies neither names nor a return type, to pin
         // that the manifest still renders it rather than dropping it.
@@ -790,6 +791,7 @@ mod tests {
             example: None,
             returns: None,
             handler: Box::new(|_| Ok(json!(null))),
+            show_once: false,
         });
         registry
     }
@@ -835,6 +837,7 @@ mod tests {
             example: Some("await tools.dig(2);".into()),
             returns: Some("{ depth: number }".into()),
             handler: Box::new(|_| Ok(json!(null))),
+            show_once: false,
         });
         let m = tool_manifest(&registry, false);
         assert!(m.contains("   * Dig a hole."), "{m}");

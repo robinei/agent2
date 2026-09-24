@@ -710,6 +710,7 @@ impl Conversation {
                 StepInput::ToolResults(vec![ToolResult {
                     call,
                     result: result.map_err(str::to_owned),
+                    show_once: false,
                 }]),
             )
             .expect("settle");
@@ -734,6 +735,7 @@ impl Conversation {
                 StepInput::ToolResults(vec![ToolResult {
                     call: ask,
                     result: Ok(value),
+                    show_once: false,
                 }]),
             )
             .expect("answer");
@@ -907,7 +909,20 @@ impl Conversation {
                                      `c.answers(\"{name}\", …)`"
                                 )),
                             };
-                            results.push(ToolResult { call, result });
+                            // **The real tool's own `show_once`.** A
+                            // stub answers for the handler, not for the
+                            // declaration — so a test sees the same
+                            // auto-peek a live run would, and a tool
+                            // that opts in cannot be green here and
+                            // different in production.
+                            let show_once = crate::host::tools::real_registry()
+                                .get(&name)
+                                .is_some_and(|d| d.show_once);
+                            results.push(ToolResult {
+                                call,
+                                result,
+                                show_once,
+                            });
                         }
                     }
                     StepOutput::Sends(ids) => {
@@ -918,6 +933,7 @@ impl Conversation {
                                 Some(false) => results.push(ToolResult {
                                     call: id,
                                     result: Ok(json!({ "post": serde_json::Value::Null })),
+                                    show_once: false,
                                 }),
                                 None => {}
                             }
@@ -928,6 +944,7 @@ impl Conversation {
                             results.push(ToolResult {
                                 call: id,
                                 result: Ok(json!({ "agent": id.as_u64() })),
+                                show_once: false,
                             });
                         }
                     }

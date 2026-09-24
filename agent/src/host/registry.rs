@@ -46,6 +46,26 @@ pub struct ToolDef {
     /// stderr, truncated? }"), which is a fact stated in the one format
     /// its reader is *least* practised at.
     pub returns: Option<String>,
+    /// **Show this result once, without being asked.** The harness
+    /// peeks it on the reply after the call — the same `history.peek`
+    /// an explicit call would make, so an explicit `keep` or `peek`
+    /// later simply wins by being later (`last_renders` takes the
+    /// newest `Render` on a row).
+    ///
+    /// For results whose row cannot answer the question the call asked.
+    /// `replace_file` returns a diff, and no model has ever asked to
+    /// see one — 0 of 3 calls, against 34 shows on `read_file`. Its row
+    /// says `ok, {version, diff, id}, 341 bytes`, which reports that
+    /// *something* changed and never what. `parse_errors` is worse: its
+    /// row reads `ok, {ok, errors, id}, 31 bytes`, where that leading
+    /// `ok` is the call succeeding and says nothing about whether the
+    /// file parsed.
+    ///
+    /// **Not a size rule.** `create_file` returns 41 bytes and its row
+    /// already carries all of them; showing `{version, id}` would be
+    /// noise. What decides is whether the row answers the question, not
+    /// how small the answer is.
+    pub show_once: bool,
     pub handler: Box<ToolHandler>,
 }
 

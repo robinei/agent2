@@ -81,6 +81,7 @@ pub fn outline_def() -> ToolDef {
              parent?: string }>; id: number }"
                 .into(),
         ),
+        show_once: false,
         handler: Box::new(|args| {
             let path = args
                 .get(0)
@@ -581,6 +582,7 @@ pub fn parse_errors_def() -> ToolDef {
         returns: Some(
             "{ ok: boolean; errors: Array<{ line: number; message: string }>; id: number }".into(),
         ),
+        show_once: true,
         handler: Box::new(|args| {
             let first = args.get(0);
             if first.is_none() || first == Some(&Value::Null) {

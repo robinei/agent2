@@ -3071,6 +3071,7 @@ mod tests {
             example: None,
             returns: None,
             handler: Box::new(|_| Ok(serde_json::json!({ "content": "x = 1\n", "version": "v1" }))),
+            show_once: false,
         });
         let session = Session::new(
             Tree::new(None),
@@ -5317,6 +5318,7 @@ mod tests {
                 std::thread::sleep(std::time::Duration::from_millis(100));
                 Ok(json!("done"))
             }),
+            show_once: false,
         });
         // The parent's one program spawns a child and asks it something,
         // parking on the `await` — no second completion for the parent

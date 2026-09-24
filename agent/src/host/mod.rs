@@ -300,6 +300,9 @@ pub(crate) enum LoopMsg {
         branch: BranchId,
         call: EventId,
         result: Result<serde_json::Value, String>,
+        /// The dispatching tool's `show_once` — read off its `ToolDef`
+        /// here, because the step machine has no registry to ask.
+        show_once: bool,
     },
     /// Fuel-slice continuation, re-enqueued between slices.
     Continue {
@@ -1043,6 +1046,7 @@ impl Session {
                                 branch: asker,
                                 call: send,
                                 result: Err(format!("subagent failed: {message}")),
+                                show_once: false,
                             });
                         }
                         Ok(())
@@ -1053,9 +1057,14 @@ impl Session {
                 branch,
                 call,
                 result,
+                show_once,
             } => self.step_branch(
                 branch,
-                StepInput::ToolResults(vec![ToolResult { call, result }]),
+                StepInput::ToolResults(vec![ToolResult {
+                    call,
+                    result,
+                    show_once,
+                }]),
             ),
             LoopMsg::WorkerDone => {
                 self.in_flight.fetch_sub(1, Ordering::SeqCst);
@@ -1695,6 +1704,9 @@ impl Session {
                     branch,
                     call: call.call,
                     result: self.serve_agents(agent, &call.args),
+                    // `list_agents` is a roster, and its row already
+                    // carries what it found.
+                    show_once: false,
                 });
                 continue;
             }
@@ -1703,6 +1715,7 @@ impl Session {
                     branch,
                     call: call.call,
                     result: Err(refused),
+                    show_once: false,
                 });
                 continue;
             }
@@ -1711,12 +1724,14 @@ impl Session {
                     let def = Arc::clone(def);
                     let tx = self.tx.clone();
                     self.in_flight.fetch_add(1, Ordering::SeqCst);
+                    let show_once = def.show_once;
                     thread::spawn(move || {
                         let result = guard_size((def.handler)(call.args));
                         let _ = tx.send(LoopMsg::ToolDone {
                             branch,
                             call: call.call,
                             result,
+                            show_once,
                         });
                         let _ = tx.send(LoopMsg::WorkerDone);
                     });
@@ -1726,6 +1741,7 @@ impl Session {
                         branch,
                         call: call.call,
                         result: Err(format!("unknown tool `{}`", call.name)),
+                        show_once: false,
                     });
                 }
             }
@@ -1804,6 +1820,7 @@ impl Session {
                 result: Err(format!(
                     "spawn() refused: agent nesting depth would exceed the limit ({limit})"
                 )),
+                show_once: false,
             });
             return Ok(());
         }
@@ -1846,6 +1863,7 @@ impl Session {
             branch: parent,
             call,
             result: Ok(serde_json::json!({ "agent": child_id.as_u64() })),
+            show_once: false,
         });
         Ok(())
     }
@@ -1882,6 +1900,7 @@ impl Session {
             branch: parent,
             call,
             result: Ok(serde_json::json!({ "agent": fork.as_u64() })),
+            show_once: false,
         });
         Ok(())
     }
@@ -1911,6 +1930,7 @@ impl Session {
                         branch: sender,
                         call: send,
                         result: Ok(serde_json::json!({ "post": serde_json::Value::Null })),
+                        show_once: false,
                     });
                 }
                 return Ok(());
@@ -1925,6 +1945,7 @@ impl Session {
                 branch: sender,
                 call: send,
                 result: Err(format!("#{} is not a branch in this log", branch.as_u64())),
+                show_once: false,
             });
             return Ok(());
         }
@@ -1937,6 +1958,7 @@ impl Session {
                 branch: sender,
                 call: send,
                 result: Ok(serde_json::json!({ "post": post.map(|p| p.as_u64()) })),
+                show_once: false,
             });
         }
         Ok(())
@@ -2059,7 +2081,13 @@ impl Session {
         // could ever advance it.
         self.step_branch(
             branch,
-            StepInput::ToolResults(vec![ToolResult { call, result }]),
+            StepInput::ToolResults(vec![ToolResult {
+                call,
+                result,
+                // An answer is already a row of its own; it is not a
+                // tool result whose shape a menu line failed to carry.
+                show_once: false,
+            }]),
         )
     }
 
@@ -2118,6 +2146,7 @@ impl Session {
                     branch: asker,
                     call: send,
                     result: guard_size(Ok(value)),
+                    show_once: false,
                 });
             }
             // The user asked. They have no branch and no program, so
@@ -2481,6 +2510,7 @@ mod tests {
             example: None,
             returns: None,
             handler: Box::new(handler),
+            show_once: false,
         }
     }
 

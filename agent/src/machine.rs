@@ -509,6 +509,12 @@ pub struct ToolResult {
     pub call: EventId,
     /// `Err` rejects the program-side promise with the message.
     pub result: Result<serde_json::Value, String>,
+    /// The tool's `show_once` (`ToolDef`), carried here because the
+    /// core has no registry — the host looks it up where it dispatches
+    /// and this is the only channel back. A `Render { Peeked }` is
+    /// appended beside the `Result`, so the value is in front of the
+    /// next reply and gone from the one after.
+    pub show_once: bool,
 }
 
 #[derive(Debug)]
@@ -2043,6 +2049,7 @@ impl Runner {
             let tr = ToolResult {
                 call: tr.call,
                 result: tr.result.as_ref().map(&with_id).map_err(|e| e.clone()),
+                show_once: tr.show_once,
             };
             let outcome = match &tr.result {
                 Ok(v) => Outcome::Delivered(v.clone()),
@@ -2055,6 +2062,26 @@ impl Runner {
                     outcome,
                 },
             )?;
+            // **A result the tool says is worth one look.** Appended as
+            // an ordinary `Render`, which is what makes an explicit
+            // `keep` or `peek` later in the same program simply win:
+            // `last_renders` takes the newest one on a row, so the
+            // model is never fighting the harness for a decision, it is
+            // overriding a default. A failure shows nothing — the
+            // rejection is already the program's to catch, and the row
+            // carries the message.
+            if tr.show_once
+                && let Ok(value) = &tr.result
+            {
+                tree.append(
+                    &mut self.spine,
+                    EventPayload::Render {
+                        of: tr.call,
+                        mode: crate::types::RenderMode::Peeked,
+                        value: value.clone(),
+                    },
+                )?;
+            }
 
             // A `tell()`'s `Result` is a delivery receipt, not a value
             // anyone asked for — `expects_reply: false` already says so
@@ -7064,6 +7091,7 @@ mod tests {
                 StepInput::ToolResults(vec![ToolResult {
                     call: id,
                     result: Ok(json!("DATA")),
+                    show_once: false,
                 }]),
             )
             .unwrap();
@@ -8238,6 +8266,7 @@ mod tests {
                 StepInput::ToolResults(vec![ToolResult {
                     call: yb,
                     result: Ok(json!("Y")),
+                    show_once: false,
                 }]),
             )
             .unwrap();
@@ -8248,6 +8277,7 @@ mod tests {
                 StepInput::ToolResults(vec![ToolResult {
                     call: xa,
                     result: Ok(json!("X")),
+                    show_once: false,
                 }]),
             )
             .unwrap();
@@ -9620,6 +9650,58 @@ mod tests {
             !c.document().contains("You printed the bytes of"),
             "a count is not a payload: {}",
             c.document()
+        );
+    }
+
+    /// **A result its tool marks `show_once` is peeked without being
+    /// asked, and an explicit `keep` or `peek` overrides it.**
+    ///
+    /// The override is not a special case: the harness appends an
+    /// ordinary `Render`, and `last_renders` takes the newest one on a
+    /// row. So a program that says `keep(w)` is not fighting a default,
+    /// it is writing after it — the same rule that already decides
+    /// `keep` against `peek` and both against `remove`.
+    ///
+    /// Why any of it: across every run logged to 2026-09-24, no model
+    /// ever asked to see a `replace_file` result — 0 of 3 calls, against
+    /// 34 shows on `read_file`. Its row says `ok, {version, diff, id},
+    /// 341 bytes`, which reports that something changed and never what,
+    /// and the shipped `04-many` exemplar only ever tests `w.diff ?
+    /// "changed" : "NO CHANGE"`. That is how a diff which dropped every
+    /// `+` line went unnoticed (f1cc555).
+    #[test]
+    fn a_show_once_result_is_peeked_unless_the_program_says_otherwise() {
+        let seen = |c: &Conversation| {
+            c.tree()
+                .path_events(c.runner().spine.leaf_id)
+                .iter()
+                .filter_map(|e| match &e.payload {
+                    EventPayload::Render { of, mode, .. } => Some((of.as_u64(), *mode)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // Left alone, the harness peeks it.
+        let mut c = Conversation::new();
+        c.answers("replace_file", serde_json::json!({ "version": "v2", "diff": "@@\n+a" }));
+        c.reply("```js\nawait tools.replace_file(\"a\", \"x\", \"v1\");\n```\n");
+        assert_eq!(
+            seen(&c),
+            vec![(4, crate::types::RenderMode::Peeked)],
+            "the tool asked for one look and got it"
+        );
+        assert!(c.document().contains("@@"), "and it is in front of the reply");
+
+        // A program that wants it kept says so, and wins by being later.
+        let mut c = Conversation::new();
+        c.answers("replace_file", serde_json::json!({ "version": "v2", "diff": "@@\n+a" }));
+        c.reply("```js\nconst w = await tools.replace_file(\"a\", \"x\", \"v1\");\nhistory.keep(w);\n```\n");
+        let r = seen(&c);
+        assert_eq!(
+            r.last(),
+            Some(&(4, crate::types::RenderMode::Kept)),
+            "the explicit keep is the newest word on the row: {r:?}"
         );
     }
 

@@ -35,6 +35,7 @@ pub fn demo_registry() -> ToolRegistry {
         guidelines: Vec::new(),
         example: None,
         returns: None,
+        show_once: false,
         handler: Box::new(|args| Ok(args.get(0).cloned().unwrap_or(serde_json::Value::Null))),
     });
     registry
