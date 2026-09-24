@@ -76,7 +76,7 @@ pub fn outline_def() -> ToolDef {
         returns: Some(
             "{ items: Array<{ name: string; kind: \"function\" | \"class\" | \
              \"struct\" | \"enum\" | \"trait\" | \"impl\" | \"module\" | \"const\" | \"static\" | \
-             \"type\" | \"macro\" | \"interface\" | \"variable\"; start_line: number; \
+             \"type\" | \"macro\" | \"interface\" | \"field\" | \"variable\"; start_line: number; \
              end_line: number; signature?: string; attributes?: string[]; doc?: string; \
              parent?: string }> }"
                 .into(),
@@ -230,24 +230,47 @@ fn leading_context(node: &Node, source: &str) -> (Vec<String>, Option<String>) {
 /// `filter(i => i.kind === "function")` would silently skip one
 /// language's methods and no other's. `parent` carries what
 /// `"method"` used to say, and carries it in every language.
+/// **A declaration without a body is the same concept as one with**,
+/// and the grammars give it a different node kind: a trait's required
+/// `fn sig(&self);` is a `function_signature_item` where its optional
+/// `fn deflt(&self) {}` is a `function_item`. Reporting the second as
+/// `"function"` and the first as `"function_signature_item"` would say
+/// the part of a trait that *is* the interface is a different species
+/// from the part that merely shows — and a program filtering for
+/// `"function"` would get the defaults and miss the contract.
 fn readable_kind(kind: &str) -> &str {
     match kind {
         "function_item"
         | "function_declaration"
         | "function_definition"
         | "method_definition"
-        | "generator_function_declaration" => "function",
+        | "generator_function_declaration"
+        // Bodiless: a required trait method or an `extern` block's
+        // `fn foo();` in Rust, an interface member, an abstract method
+        // or a `declare function` in TypeScript.
+        | "function_signature_item"
+        | "function_signature"
+        | "method_signature"
+        | "abstract_method_signature" => "function",
         "class_declaration" | "class_definition" | "abstract_class_declaration" => "class",
         "struct_item" => "struct",
         "enum_item" | "enum_declaration" => "enum",
         "trait_item" => "trait",
         "impl_item" => "impl",
-        "mod_item" => "module",
+        // A TypeScript `namespace`/`module` body holds definitions and
+        // scopes their names, which is what `mod` means here.
+        "mod_item" | "internal_module" => "module",
         "const_item" => "const",
         "static_item" => "static",
-        "type_item" | "type_alias_declaration" => "type",
+        // `type A;` in a trait and `type A = u32;` outside it are the
+        // same declaration with and without an answer.
+        "type_item" | "type_alias_declaration" | "associated_type" => "type",
         "macro_definition" => "macro",
         "interface_declaration" => "interface",
+        // Named slots on a type rather than free bindings: an
+        // interface's `a: number`, a class's `f = 1`. Not `"variable"` —
+        // a variable is something you can read on its own.
+        "property_signature" | "public_field_definition" | "field_definition" => "field",
         "lexical_declaration" | "variable_declaration" => "variable",
         // A grammar kind with no word yet keeps its own, so a new
         // language degrades to the old behaviour rather than to a lie.
@@ -257,6 +280,9 @@ fn readable_kind(kind: &str) -> &str {
 
 /// One entry for a definition node, or `None` when it has no name.
 fn entry_for(node: &Node, source: &str, lang: &str, parent: Option<&str>) -> Option<OutlineEntry> {
+    if is_loop_binding(node) {
+        return None;
+    }
     let name = find_name(node, source)?;
     let (attributes, doc) = leading_context(node, source);
     Some(OutlineEntry {
@@ -269,6 +295,20 @@ fn entry_for(node: &Node, source: &str, lang: &str, parent: Option<&str>) -> Opt
         doc,
         parent: parent.map(str::to_owned),
     })
+}
+
+/// The `const x` in `for (const x of xs)`, which is a loop's own
+/// bookkeeping and not something a reader outlines a file to find.
+///
+/// It only became reachable when `find_name` learned to look inside a
+/// `variable_declarator`: before that a declaration at file level
+/// produced no entry at all, so the loop head was excluded by the same
+/// accident that excluded every `const`.
+fn is_loop_binding(node: &Node) -> bool {
+    matches!(node.kind(), "lexical_declaration" | "variable_declaration")
+        && node
+            .parent()
+            .is_some_and(|p| p.kind().starts_with("for_") || p.kind() == "for_statement")
 }
 
 fn collect_definitions(node: Node, source: &str, lang: &str) -> Vec<OutlineEntry> {
@@ -349,13 +389,38 @@ fn is_container_node(kind: &str, lang: &str) -> bool {
     match lang {
         "rust" => matches!(kind, "mod_item" | "impl_item" | "trait_item"),
         "python" => matches!(kind, "class_definition"),
-        "javascript" | "typescript" => {
-            matches!(kind, "class_declaration" | "abstract_class_declaration")
-        }
+        "javascript" => matches!(kind, "class_declaration"),
+        // An `interface` holds declarations and names them, which is
+        // the whole of what it is; not descending into it left the one
+        // construct in the language that is *only* a list of members
+        // reported as a single line. A `namespace` body is a scope, so
+        // its contents used to surface at file level with no `parent` —
+        // which is the ambiguity `parent` was added to remove.
+        "typescript" => matches!(
+            kind,
+            "class_declaration"
+                | "abstract_class_declaration"
+                | "interface_declaration"
+                | "internal_module"
+        ),
         _ => false,
     }
 }
 
+/// **A declaration a reader would look for, whether or not it has a
+/// body.** The bodiless half was missing everywhere it exists, and it
+/// is the half of a trait or an interface that is actually the
+/// contract: `trait T { fn sig(&self); fn deflt(&self) {} type A; }`
+/// listed `deflt` — because it has a `{}` and is therefore a
+/// `function_item` — and omitted `sig` and `A`, so the optional part
+/// showed and the required part did not. `extern "C" { fn foo(); }` was
+/// empty for the same reason, and in TypeScript an `interface`'s
+/// members, an `abstract` method and `declare function g();` were all
+/// invisible.
+///
+/// Python is the one language with nothing to add here: a bodiless
+/// `def` does not exist, `def m(self): ...` has a block, and a
+/// `Protocol` method is an ordinary `function_definition`.
 fn is_definition_node(kind: &str, lang: &str) -> bool {
     match lang {
         "rust" => matches!(
@@ -370,6 +435,10 @@ fn is_definition_node(kind: &str, lang: &str) -> bool {
                 | "static_item"
                 | "type_item"
                 | "macro_definition"
+                // Bodiless: a trait's required methods, and everything
+                // inside `extern "C" { … }`.
+                | "function_signature_item"
+                | "associated_type"
         ),
         "javascript" => matches!(
             kind,
@@ -377,6 +446,7 @@ fn is_definition_node(kind: &str, lang: &str) -> bool {
                 | "generator_function_declaration"
                 | "class_declaration"
                 | "method_definition"
+                | "field_definition"
                 | "lexical_declaration"
                 | "variable_declaration"
         ),
@@ -386,12 +456,21 @@ fn is_definition_node(kind: &str, lang: &str) -> bool {
                 | "generator_function_declaration"
                 | "class_declaration"
                 | "method_definition"
+                | "field_definition"
                 | "lexical_declaration"
                 | "variable_declaration"
                 | "interface_declaration"
                 | "type_alias_declaration"
                 | "enum_declaration"
                 | "abstract_class_declaration"
+                | "internal_module"
+                // Bodiless: interface members, `abstract` members, and
+                // the `function` half of a `declare function g();`.
+                | "method_signature"
+                | "property_signature"
+                | "abstract_method_signature"
+                | "public_field_definition"
+                | "function_signature"
         ),
         "python" => matches!(kind, "function_definition" | "class_definition"),
         _ => false,
@@ -409,11 +488,28 @@ fn find_name(node: &Node, source: &str) -> Option<String> {
     // Fallback: look for an identifier child without a field name
     for i in 0..node.named_child_count() {
         let child = node.named_child(i)?;
+        // **A `const` at file level named nothing, so it appeared
+        // nowhere.** `lexical_declaration` has no `name` field — the
+        // name is a level down, on its `variable_declarator` — and no
+        // branch here descended, so `find_name` returned `None` and the
+        // entry was dropped. `"variable"` was in the declared `kind`
+        // union the whole time with nothing able to produce it, and an
+        // outline of a module of exported constants came back empty.
+        if child.kind() == "variable_declarator" {
+            return find_name(&child, source);
+        }
         if child.child_count() == 0 && child.kind() == "identifier" {
             return Some(child.utf8_text(source.as_bytes()).ok()?.to_string());
         }
+        // `private_property_identifier` is here because a class field
+        // is a definition now and `#count = 0` is one: without it the
+        // private half of a class is the half that silently vanishes,
+        // which is the failure this whole walk exists to end.
         if child.child_count() == 0
-            && (child.kind() == "property_identifier" || child.kind() == "type_identifier")
+            && matches!(
+                child.kind(),
+                "property_identifier" | "type_identifier" | "private_property_identifier"
+            )
         {
             return Some(child.utf8_text(source.as_bytes()).ok()?.to_string());
         }
@@ -653,32 +749,65 @@ mod tests {
             assert!(kinds.contains(&want), "missing {want} in {kinds:?}");
         }
 
-        // And every word the declaration promises is one this produces.
-        let declared = outline_def().returns.unwrap();
+        // Which words the declaration may use at all is
+        // `the_declared_kinds_are_exactly_the_kinds_produced`.
         assert!(
-            !declared.contains("\"method\""),
+            !outline_def().returns.unwrap().contains("\"method\""),
             "a method is a `function` here, in every language — see readable_kind"
         );
-        for word in [
-            "function",
-            "class",
-            "struct",
-            "enum",
-            "trait",
-            "impl",
-            "module",
-            "const",
-            "static",
-            "type",
-            "macro",
-            "interface",
-            "variable",
+    }
+
+    /// **The declared vocabulary and the produced one are the same
+    /// set, checked in both directions.**
+    ///
+    /// A word the declaration names that nothing emits is worse than no
+    /// word: `"method"` sat in this union unreachable for as long as
+    /// nothing descended into a class, so a program could filter on it
+    /// forever and get an empty array rather than an error — the
+    /// failure mode that emptied `helpers.py`. The other direction
+    /// catches a grammar kind falling through `readable_kind`'s
+    /// `other => other` arm, which ships the model a raw tree-sitter
+    /// name it was never told about.
+    #[test]
+    fn the_declared_kinds_are_exactly_the_kinds_produced() {
+        let returns = outline_def().returns.unwrap();
+        let union = {
+            let after = returns.split_once("kind: ").expect("a `kind:` field").1;
+            after.split_once(';').expect("the field ends").0.to_owned()
+        };
+        let declared: std::collections::BTreeSet<String> = union
+            .split('|')
+            .map(|w| w.trim().trim_matches('"').to_owned())
+            .collect();
+
+        // Every kind this can report, from one file per language that
+        // uses each construct once.
+        let mut produced: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for (ext, src) in [
+            (
+                "rs",
+                "fn f() {}\nstruct S;\nenum E { A }\ntrait T { fn s(&self); type A; }\n\
+                 impl S {}\nmod m {}\nconst C: u32 = 1;\nstatic X: u32 = 1;\n\
+                 type Y = u32;\nmacro_rules! mac { () => {} }\n",
+            ),
+            (
+                "ts",
+                "interface I { a: number; m(): void }\nclass C { f = 1 }\n\
+                 namespace N { const v = 1; }\n",
+            ),
         ] {
-            assert!(
-                declared.contains(&format!("\"{word}\"")),
-                "the declaration does not name `{word}`"
-            );
+            let (_dir, path) = temp_path_with_ext(ext);
+            std::fs::write(&path, src).unwrap();
+            let result = call_handler(&outline_def(), json!([path.to_str().unwrap()])).unwrap();
+            for e in result["items"].as_array().unwrap() {
+                produced.insert(e["kind"].as_str().unwrap().to_owned());
+            }
         }
+
+        assert_eq!(
+            declared, produced,
+            "the declared kinds and the produced kinds have drifted apart"
+        );
     }
 
     #[test]
@@ -833,6 +962,128 @@ mod tests {
                 .map(|e| e["name"].as_str().unwrap())
                 .collect();
             assert_eq!(names, vec!["outer"], "{ext}");
+        }
+    }
+
+    /// **The half of a trait that is the contract was the half that
+    /// was missing.** Probing
+    /// `trait T { fn sig(&self); fn deflt(&self) {} type A; const C: u32 = 1; }`
+    /// gave `T`, `deflt` and `C` — and not `sig`, not `A`. A method
+    /// showed *because it had a body*: `fn deflt(&self) {}` is a
+    /// `function_item` where `fn sig(&self);` is a
+    /// `function_signature_item`, and only the first was a definition.
+    /// So a trait's optional part was listed and its required part,
+    /// which is the part anyone outlining the file wants, was not.
+    ///
+    /// `extern "C" { fn foo(); }` was empty for the same reason.
+    #[test]
+    fn a_declaration_without_a_body_is_still_a_declaration() {
+        let (_dir, path) = temp_path_with_ext("rs");
+        std::fs::write(
+            &path,
+            "trait T {\n\
+             \x20   fn sig(&self);\n\
+             \x20   fn deflt(&self) {}\n\
+             \x20   type A;\n\
+             \x20   const C: u32 = 1;\n\
+             }\n\
+             unsafe extern \"C\" {\n\
+             \x20   fn foo();\n\
+             }\n",
+        )
+        .unwrap();
+        let result = call_handler(&outline_def(), json!([path.to_str().unwrap()])).unwrap();
+        let arr = result["items"].as_array().unwrap();
+        let find = |n: &str| {
+            arr.iter()
+                .find(|e| e["name"] == n)
+                .unwrap_or_else(|| panic!("no `{n}` in {arr:#?}"))
+        };
+
+        // The required method and the default are the same species.
+        assert_eq!(find("sig")["kind"], "function");
+        assert_eq!(find("sig")["parent"], "T");
+        assert_eq!(find("deflt")["kind"], find("sig")["kind"]);
+        // `type A;` and `type A = u32;` likewise.
+        assert_eq!(find("A")["kind"], "type");
+        assert_eq!(find("A")["parent"], "T");
+        assert_eq!(find("C")["kind"], "const");
+        // An `extern` block is not a scope, so its contents sit where
+        // the block does.
+        assert_eq!(find("foo")["kind"], "function");
+        assert!(find("foo").get("parent").is_none(), "{:?}", find("foo"));
+    }
+
+    /// The same hole in TypeScript, which has four shapes of it: an
+    /// `interface`'s members, an `abstract` method, a class field and
+    /// `declare function`. An `interface` is the one construct in the
+    /// language that is *only* a list of members, and it was reported
+    /// as a single line.
+    #[test]
+    fn typescript_declarations_without_bodies_are_listed() {
+        let (_dir, path) = temp_path_with_ext("ts");
+        std::fs::write(
+            &path,
+            "interface I {\n\
+             \x20   a: number;\n\
+             \x20   m(): void;\n\
+             }\n\
+             abstract class C {\n\
+             \x20   abstract am(): void;\n\
+             \x20   f: number = 1;\n\
+             }\n\
+             declare function g(): void;\n\
+             namespace N {\n\
+             \x20   export function h() {}\n\
+             }\n",
+        )
+        .unwrap();
+        let result = call_handler(&outline_def(), json!([path.to_str().unwrap()])).unwrap();
+        let arr = result["items"].as_array().unwrap();
+        let find = |n: &str| {
+            arr.iter()
+                .find(|e| e["name"] == n)
+                .unwrap_or_else(|| panic!("no `{n}` in {arr:#?}"))
+        };
+
+        assert_eq!(find("I")["kind"], "interface");
+        assert_eq!(find("m")["kind"], "function");
+        assert_eq!(find("m")["parent"], "I");
+        assert_eq!(find("a")["kind"], "field");
+        assert_eq!(find("a")["parent"], "I");
+        assert_eq!(find("am")["kind"], "function");
+        assert_eq!(find("am")["parent"], "C");
+        assert_eq!(find("f")["kind"], "field");
+        assert_eq!(find("g")["kind"], "function");
+        // A namespace is a scope, so what it holds says so — these used
+        // to surface at file level with no `parent` at all, which is
+        // the ambiguity `parent` exists to remove.
+        assert_eq!(find("N")["kind"], "module");
+        assert_eq!(find("h")["parent"], "N");
+    }
+
+    /// **`"variable"` was declared and unreachable**, which the
+    /// kind-parity test is what found. `lexical_declaration` carries no
+    /// `name` field — the name is a level down on its
+    /// `variable_declarator` — so `find_name` returned `None` and the
+    /// entry was dropped: a JavaScript module of exported constants
+    /// outlined to nothing at all.
+    #[test]
+    fn a_const_at_file_level_is_in_the_outline() {
+        for ext in ["js", "ts"] {
+            let (_dir, path) = temp_path_with_ext(ext);
+            std::fs::write(
+                &path,
+                "const LIMIT = 10;\nlet cursor = 0;\nfor (const row of rows) { use(row); }\n",
+            )
+            .unwrap();
+            let result = call_handler(&outline_def(), json!([path.to_str().unwrap()])).unwrap();
+            let arr = result["items"].as_array().unwrap();
+            let names: Vec<&str> = arr.iter().map(|e| e["name"].as_str().unwrap()).collect();
+            assert!(names.contains(&"LIMIT"), "{ext}: {arr:#?}");
+            assert!(names.contains(&"cursor"), "{ext}: {arr:#?}");
+            // A loop's own binding is bookkeeping, not a definition.
+            assert!(!names.contains(&"row"), "{ext}: {arr:#?}");
         }
     }
 
