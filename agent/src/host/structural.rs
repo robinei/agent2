@@ -526,6 +526,21 @@ mod tests {
         (dir, path)
     }
 
+
+    #[test]
+    fn zz_probe() {
+        let src = std::fs::read_to_string("src/compaction.rs").unwrap();
+        let r = run_outline(&src, "rust").unwrap();
+        let arr = r["items"].as_array().unwrap();
+        eprintln!("PROBE count={}", arr.len());
+        for e in arr { eprintln!("PROBE {} {} {}", e["kind"], e["name"], e["start_line"]); }
+        let r2 = run_outline("struct S;\nimpl S { fn m(&self){} }\nmod tests { fn t(){} }\n", "rust").unwrap();
+        eprintln!("PROBE2 {}", r2);
+        let r3 = run_outline("class A:\n    def m(self):\n        pass\n", "python").unwrap();
+        eprintln!("PROBE3 {}", r3);
+        let r4 = run_outline("class A { m() {} }\n", "javascript").unwrap();
+        eprintln!("PROBE4 {}", r4);
+    }
     #[test]
     fn outline_rust_lists_definitions() {
         let (_dir, path) = temp_path_with_ext("rs");
