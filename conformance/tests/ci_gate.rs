@@ -7,6 +7,19 @@ use conformance::runner::{TestOutcome, run_tests};
 /// on any diff. This is `#[ignore]`-d because the full test262 sweep (50k files)
 /// is too heavy for `cargo test`; CI runs it explicitly:
 ///     cargo test -p conformance -- --ignored --nocapture
+///
+/// **A diff of a dozen entries is not yet a signal.** The sweep is not
+/// reproducible: two runs of the *same binary* on 2026-09-24 gave
+/// 8,273 and 8,263 passes, and their regression lists differed by 19
+/// entries. Every one of those was annex-B block-scoped function
+/// hoisting (`annexB/language/{function,global}-code/*-existing-*fn-*`)
+/// plus a couple of `language/statements/function` neighbours — the
+/// same family each time, flipping in both directions.
+///
+/// So read a diff by *family* before believing it: a change confined
+/// to those paths is the known noise, and anything outside them is
+/// real. Judging a change by the pass count alone will attribute ±10
+/// tests to whatever was edited last.
 #[test]
 #[ignore]
 fn expectations_match_committed() {
