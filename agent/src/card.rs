@@ -1111,11 +1111,21 @@ mod tests {
     /// "What crosses from this reply to the next" lists every way a
     /// value reaches the next reply. Measured 2026-09-24 against a
     /// frozen document (`lab/readverb`), n=20 per arm, deleting one
-    /// thing at a time from the shipped card:
+    /// thing at a time.
+    ///
+    /// **The baseline is the card of 2026-09-23, not this one.** A
+    /// capture replays the card snapshotted in the log's `Agent` event,
+    /// so it is the card that run was actually sent — two commits back
+    /// from here, before the `console.log` rewrite and before
+    /// `history.remove` left. The arms are all derived from that one
+    /// baseline by deletion, so the comparisons below hold; the
+    /// absolute rates are that card's, and calling them "as shipped"
+    /// is how a stale capture quietly becomes a claim about code it
+    /// never saw.
     ///
     /// ```text
     ///                           shows   notes  prints
-    ///   as shipped               90%      0%     45%
+    ///   baseline (2026-09-23)    90%      0%     45%
     ///   − this paragraph         75%     30%     60%
     ///   − the 05-keep exemplar   65%      5%     70%
     ///   − both                   45%     15%     65%
