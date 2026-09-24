@@ -118,6 +118,34 @@ pub fn var(name: &str) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
+/// The key, read from the file `AGENT2_API_KEY_FILE` names.
+///
+/// **A path is not a secret.** Without this the only way in is an
+/// environment variable, so starting a session means putting the key
+/// itself on a command line or into a shell — in front of whoever is
+/// reading over your shoulder, into the shell's history, and into the
+/// process table. Naming a file instead keeps it on disk, where its
+/// permissions already say who may read it, and leaves nothing to
+/// clean up afterwards. `curl --netrc` and `ssh -i` have the same
+/// shape for the same reason.
+///
+/// Trailing whitespace goes: a key file written by an editor almost
+/// always ends in a newline, and a newline in an `Authorization`
+/// header fails as a puzzling 401 rather than as "your key has a
+/// newline in it".
+fn key_file() -> Option<String> {
+    let path = var("API_KEY_FILE")?;
+    match std::fs::read_to_string(&path) {
+        Ok(text) => Some(text.trim().to_owned()).filter(|k| !k.is_empty()),
+        // Silent would be wrong — a misspelt path would read as "no
+        // key set" and send you looking at the wrong thing.
+        Err(e) => {
+            eprintln!("AGENT2_API_KEY_FILE={path}: {e}");
+            None
+        }
+    }
+}
+
 /// **Is this endpoint on this machine?** Used for one thing only: an
 /// endpoint that cannot bill has no reason to demand a credential, and
 /// requiring one would make the free default unusable without a
@@ -158,7 +186,7 @@ impl Config {
         // key.** Asked for after the explicit key, so an env var still
         // wins — which is what lets one of these endpoints be reached
         // with a pasted token when debugging.
-        let api_key = match var("API_KEY") {
+        let api_key = match var("API_KEY").or_else(|| key_file()) {
             Some(key) => key,
             None if is_local(&base_url) => "local".to_owned(),
             None if base_url.contains("chatgpt.com/backend-api") => {
