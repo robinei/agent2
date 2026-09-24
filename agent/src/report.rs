@@ -235,6 +235,8 @@ pub struct ConditionReport {
     /// [`CompletionReport::copied_rows`], and [`copied_note`] for why
     /// this is on both shapes.
     pub copied_rows: Vec<(u64, u64)>,
+    /// Calls whose bytes this run printed — see [`printed_rows`].
+    pub printed_rows: Vec<u64>,
 }
 
 impl ConditionReport {
@@ -260,6 +262,7 @@ impl ConditionReport {
         sections.extend(render_rows(&rows));
         sections.extend(render_console(&self.console, self.console_id));
         sections.extend(copied_note(&self.copied_rows));
+        sections.extend(printed_note(&self.printed_rows));
         sections.join("\n\n")
     }
 }
@@ -410,6 +413,8 @@ pub struct CompletionReport {
     /// Exact byte equality only, and only for strings big enough to
     /// matter, so there is nothing to be wrong about.
     pub copied_rows: Vec<(u64, u64)>,
+    /// Calls whose bytes this run printed — see [`printed_rows`].
+    pub printed_rows: Vec<u64>,
     /// Bytes of the longest `bash` command this run issued, when it was
     /// long enough to be a script rather than a pipeline. Zero
     /// otherwise. See `host::tools`'s command ceiling for why this is a
@@ -463,7 +468,13 @@ impl CompletionReport {
             ));
         }
 
-        if let Some(note) = copied_note(&self.copied_rows) {
+        for note in [
+            printed_note(&self.printed_rows),
+            copied_note(&self.copied_rows),
+        ]
+        .into_iter()
+        .flatten()
+        {
             out.push_str("\n\n");
             out.push_str(&note);
         }
@@ -1226,6 +1237,30 @@ pub fn derive_report(tree: &Tree, leaf: EventId, outcome: EventId, budget: usize
 /// — so the one report it would have helped was the one shape it did
 /// not appear on. The same mistake as `CellFailed` hiding the work a
 /// reply had already done, one field over.
+/// The "you printed a result" half of `### worth knowing`.
+///
+/// **The same advice as [`copied_note`], and deliberately not the same
+/// words.** A note at least keeps the bytes fetchable under an id;
+/// printing them buys a clipped tail of something the record already
+/// holds whole, and the next reply has to read it again to get at it.
+/// So this one names what was lost, not just what it cost.
+fn printed_note(sources: &[u64]) -> Option<String> {
+    if sources.is_empty() {
+        return None;
+    }
+    let list = sources
+        .iter()
+        .map(|s| format!("`[{s}]`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!(
+        "You printed the bytes of {list}. The console is a trace of what a program did, kept as \
+         a tail and fetchable under no id of its own — so those bytes are now in front of you \
+         once, clipped, and still have to be read from {list} to be used. `history.keep(id)` \
+         shows a result from here on and `history.peek(id)` for one reply, both without a copy."
+    ))
+}
+
 fn copied_note(rows: &[(u64, u64)]) -> Option<String> {
     if rows.is_empty() {
         return None;
@@ -1273,15 +1308,77 @@ const COPY_MIN_BYTES: usize = 400;
 /// about: either those bytes are on the log twice or they are not. The
 /// earliest matching result wins, because that is the one whose id the
 /// model should have kept.
-fn copied_rows(h: &Handback<'_>) -> Vec<(u64, u64)> {
-    fn strings(v: &serde_json::Value, out: &mut Vec<String>) {
-        match v {
-            serde_json::Value::String(s) if s.len() >= COPY_MIN_BYTES => out.push(s.clone()),
-            serde_json::Value::Array(xs) => xs.iter().for_each(|x| strings(x, out)),
-            serde_json::Value::Object(m) => m.values().for_each(|x| strings(x, out)),
-            _ => {}
+/// Calls whose delivered bytes this run **printed** — the same mistake
+/// as [`copied_rows`], on the channel it moved to.
+///
+/// **Measured, after two card wordings failed to shift it.** On the
+/// card of 2026-09-24, 9 of 60 first replies to a reading task still
+/// wrote `console.log(f.content)`; 8 more printed counts and branches,
+/// which is what the channel is for. Saying it a third way in the card
+/// was not the next thing to try — the report already tells a program
+/// when it copied a row's bytes into a note, and said nothing when it
+/// printed them instead, so the one advisory that fires on this
+/// mistake was blind to where the mistake had gone.
+///
+/// A console line **containing** a delivered string, not equal to it:
+/// what a program writes is `console.log("DESIGN:\n" + f.content)`, and
+/// an equality test sees nothing wrong with that.
+fn printed_rows(h: &Handback<'_>) -> Vec<u64> {
+    let mut delivered: Vec<(String, u64)> = Vec::new();
+    for ev in h.path.iter() {
+        if let EventPayload::Result {
+            call,
+            outcome: crate::types::Outcome::Delivered(v),
+        } = &ev.payload
+        {
+            let mut found = Vec::new();
+            result_strings(v, &mut found);
+            for text in found {
+                delivered.push((text, call.as_u64()));
+            }
         }
     }
+    let mut out: Vec<u64> = Vec::new();
+    if delivered.is_empty() {
+        return out;
+    }
+    // **The console is stored as lines, and a printed payload is not
+    // one line.** `console.log(f.content)` becomes sixty rows of
+    // `h.console`, so a per-line containment test finds nothing —
+    // which is what the first version of this did, on the very shape
+    // it was written for. The run's output is one blob for this
+    // question.
+    let printed = h.console.join("\n");
+    if printed.len() < COPY_MIN_BYTES {
+        return out;
+    }
+    for (text, call) in &delivered {
+        // **Trimmed, because the console is stored line by line.** A
+        // `stdout` ends in a newline; splitting it into lines and
+        // joining them back drops that last one, so an untrimmed
+        // containment test misses by exactly one byte — on every
+        // command output there is, which is most of what gets printed.
+        let text = text.trim_end();
+        if text.len() >= COPY_MIN_BYTES && printed.contains(text) && !out.contains(call) {
+            out.push(*call);
+        }
+    }
+    out
+}
+
+/// Strings in a delivered result big enough to be worth not copying.
+/// Shared by [`copied_rows`] and [`printed_rows`] so the two advisories
+/// cannot disagree about what counts as a payload.
+fn result_strings(v: &serde_json::Value, out: &mut Vec<String>) {
+    match v {
+        serde_json::Value::String(s) if s.len() >= COPY_MIN_BYTES => out.push(s.clone()),
+        serde_json::Value::Array(xs) => xs.iter().for_each(|x| result_strings(x, out)),
+        serde_json::Value::Object(m) => m.values().for_each(|x| result_strings(x, out)),
+        _ => {}
+    }
+}
+
+fn copied_rows(h: &Handback<'_>) -> Vec<(u64, u64)> {
     // Everything a result on this branch has already delivered, keyed
     // by the bytes and valued by the *call* id — which is the id a row
     // advertises and a program reuses. A map rather than a scan: this
@@ -1296,7 +1393,7 @@ fn copied_rows(h: &Handback<'_>) -> Vec<(u64, u64)> {
         } = &ev.payload
         {
             let mut found = Vec::new();
-            strings(v, &mut found);
+            result_strings(v, &mut found);
             for s in found {
                 // The earliest delivery of these bytes is the id the
                 // program should have kept.
@@ -1310,7 +1407,7 @@ fn copied_rows(h: &Handback<'_>) -> Vec<(u64, u64)> {
             continue;
         };
         let mut mine = Vec::new();
-        strings(value, &mut mine);
+        result_strings(value, &mut mine);
         // **Every source, not the first.** A note holding four files
         // holds four results, and naming one of them understates what
         // it cost — seen on `sweep-8` at HEAD, where `[18]` carried
@@ -1347,6 +1444,7 @@ fn render_handback(h: &Handback<'_>, budget: usize) -> String {
             console_id: h.console_id,
             new_artifacts: menu_since(h, h.previous_outcome),
             copied_rows: copied_rows(h),
+            printed_rows: printed_rows(h),
             long_bash: h.path[h.turn_at + 1..=h.outcome_at]
                 .iter()
                 .filter_map(|e| match &e.payload {
@@ -1410,6 +1508,7 @@ fn render_handback(h: &Handback<'_>, budget: usize) -> String {
                 console_id: h.console_id,
                 artifacts,
                 copied_rows: copied_rows(h),
+                printed_rows: printed_rows(h),
             }
             .render()
         }
@@ -1427,6 +1526,7 @@ fn render_handback(h: &Handback<'_>, budget: usize) -> String {
             console_id: h.console_id,
             artifacts: menu_since(h, h.previous_outcome),
             copied_rows: copied_rows(h),
+            printed_rows: printed_rows(h),
         }
         .render(),
     }
@@ -2880,6 +2980,7 @@ mod tests {
         let report = ConditionReport {
             heading: RUN_HEADING,
             copied_rows: Vec::new(),
+            printed_rows: Vec::new(),
             what: "w".repeat(10_000),
             whence: Whence::Stack(vec!["<root>".into()]),
             console: Vec::new(),
@@ -2914,6 +3015,7 @@ mod tests {
             failed_calls: 0,
             long_bash: 0,
             copied_rows: Vec::new(),
+            printed_rows: Vec::new(),
         }
         .render();
         assert!(rendered.contains(&long), "the row is not clipped");
@@ -3008,6 +3110,7 @@ mod tests {
         let report = ConditionReport {
             heading: RUN_HEADING,
             copied_rows: Vec::new(),
+            printed_rows: Vec::new(),
             what: "boom".into(),
             whence: Whence::Stack(vec!["<root>".into()]),
             console: Vec::new(),
@@ -3032,6 +3135,7 @@ mod tests {
         let report = ConditionReport {
             heading: RUN_HEADING,
             copied_rows: Vec::new(),
+            printed_rows: Vec::new(),
             what: "boom".into(),
             whence: Whence::Stack(vec!["<root>".into()]),
             console: Vec::new(),
@@ -3082,6 +3186,7 @@ mod tests {
             failed_calls: 0,
             long_bash: 0,
             copied_rows: Vec::new(),
+            printed_rows: Vec::new(),
         }
         .render()
     }
@@ -3197,6 +3302,7 @@ mod tests {
             failed_calls: 0,
             long_bash: 0,
             copied_rows: Vec::new(),
+            printed_rows: Vec::new(),
         }
         .render();
         assert_eq!(rendered, format!("{RUN_HEADING}\n\nIt completed."));

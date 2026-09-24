@@ -9554,6 +9554,49 @@ mod tests {
         assert!(tail.contains("34734"), "with the numbers it fired on");
     }
 
+    /// **Printing a result's bytes is told about, the way copying them
+    /// into a note has been.**
+    ///
+    /// Measured on the card of 2026-09-24: 9 of 60 first replies to a
+    /// reading task wrote `console.log(f.content)`, and two wordings
+    /// failed to shift them — a closing consequence and a flat ban
+    /// naming the syntax performed identically, 9/60 against 11/60,
+    /// p=0.81. The report was the channel that had never said anything
+    /// about it: `copied_note` fires when a run copies a row's bytes
+    /// into a note, and was blind to the run printing them instead.
+    ///
+    /// Containment, not equality — a program writes `console.log("X:\n"
+    /// + f.content)`, and an equality test sees nothing wrong with it.
+    #[test]
+    fn printing_a_results_bytes_is_named_in_the_report() {
+        let mut c = Conversation::new();
+        let body = "warning: unused\n".repeat(60);
+        c.answers("bash", serde_json::json!({ "status": 0, "stdout": body }));
+        c.reply("```js\nconst r = await tools.bash(\"build\");\nconsole.log(\"out:\\n\" + r.stdout);\n```\n");
+
+        let doc = c.document();
+        assert!(
+            doc.contains("You printed the bytes of"),
+            "the report says so: {doc}"
+        );
+        assert!(
+            doc.contains("history.keep(id)") && doc.contains("history.peek(id)"),
+            "and names what to do instead"
+        );
+
+        // A trace of what happened is the channel's job and draws
+        // nothing — otherwise the advisory would fire on every loop
+        // the card asks for.
+        let mut c = Conversation::new();
+        c.answers("bash", serde_json::json!({ "status": 0, "stdout": body }));
+        c.reply("```js\nconst r = await tools.bash(\"build\");\nconsole.log(\"lines:\", r.stdout.split(\"\\n\").length);\n```\n");
+        assert!(
+            !c.document().contains("You printed the bytes of"),
+            "a count is not a payload: {}",
+            c.document()
+        );
+    }
+
     /// **A stray fence is not a message.**
     ///
     /// A ` ``` ` the model opened and shut with no cell in it parses as
