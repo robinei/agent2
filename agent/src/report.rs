@@ -61,7 +61,7 @@ pub const STACK_MAX_FRAMES: usize = 8;
 /// 200 with a 4 KB budget means bytes bind first for anything that
 /// reads like code (~40 bytes a line), and the line cap only catches a
 /// chatty loop printing something very short very often.
-pub const CONSOLE_TAIL_LINES: usize = 200;
+pub const CONSOLE_TAIL_PRINTS: usize = 200;
 /// Lines a logged `Console` keeps. It is a **diagnostic stream, not
 /// data** — a chatty loop can write megabytes — so it is capped with an
 /// explicit truncation marker, and the program's own `return` is the
@@ -607,7 +607,7 @@ fn render_console(lines: &[String], event: Option<u64>) -> Option<String> {
         return None;
     }
     // Newest-first until the budget runs out, then back into order.
-    let mut start = lines.len().saturating_sub(CONSOLE_TAIL_LINES);
+    let mut start = lines.len().saturating_sub(CONSOLE_TAIL_PRINTS);
     let mut used = 0usize;
     for (i, line) in lines.iter().enumerate().skip(start).rev() {
         used += line.len() + 1;
@@ -641,7 +641,7 @@ fn render_console(lines: &[String], event: Option<u64>) -> Option<String> {
         "### it printed\n".to_owned()
     } else {
         let mut out = format!(
-            "### it printed\nThe last {} of {} lines",
+            "### it printed\nThe last {} of {} prints",
             shown.len(),
             lines.len()
         );
@@ -2934,8 +2934,8 @@ mod tests {
         ];
         let rendered = render_console(&huge, Some(4)).expect("lines present");
         assert!(
-            rendered.contains("The last 1 of 3 lines"),
-            "the newest line is kept: {rendered}"
+            rendered.contains("The last 1 of 3 prints"),
+            "the newest print is kept: {rendered}"
         );
         assert!(
             rendered.contains("xxxx"),
@@ -2958,7 +2958,7 @@ mod tests {
         let fat: Vec<String> = (0..10).map(|i| format!("{i}{}", "z".repeat(line))).collect();
         let rendered = render_console(&fat, Some(7)).expect("lines present");
         assert!(
-            rendered.contains("of 10 lines; `history.fetch(7)` for all of them"),
+            rendered.contains("of 10 prints; `history.fetch(7)` for all of them"),
             "a clip names the id to fetch: {rendered}"
         );
         assert!(
@@ -3353,7 +3353,7 @@ mod tests {
             .collect();
         let rendered = render_console(&long, Some(9)).expect("many lines");
         assert!(
-            rendered.contains("of 400 lines"),
+            rendered.contains("of 400 prints"),
             "a real clip counts: {rendered}"
         );
         assert!(
