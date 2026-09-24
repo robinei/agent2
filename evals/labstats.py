@@ -37,6 +37,16 @@ from itertools import combinations
 # reasoning bytes did not.
 FENCE = re.compile(r"```(?:js|javascript|ts|typescript)\b")
 
+# A `console.log` whose argument carries a result's bytes rather than a
+# fact about them: a whole `.content`/`.stdout`, a big slice of one, or
+# an extracted window. `.length` on the same field is a fact, not bytes.
+DUMP = re.compile(
+    r"console\.log\([^\n]{0,160}?"
+    r"(?:\.(?:content|stdout|stderr)\b(?!\s*\.length)"
+    r"|\.slice\(\s*0\s*,\s*\d{3,}"
+    r"|\baround\(|\bgrab\()"
+)
+
 
 def load(path):
     rows = []
@@ -67,6 +77,13 @@ def metrics(r):
         # the run that is clipped to a tail and cannot be fetched. A
         # reply that reads by printing has the same shape on every other
         # metric here and is doing the expensive thing.
+        # **A payload printed, not a trace.** `prints` counts calls and
+        # cannot tell `console.log(f.content)` from `console.log(p,
+        # "changed")` — one is reading by printing, the other is what
+        # the channel is for. Measured on 2026-09-24, the split was 9
+        # replies dumping against 8 tracing, and every card wording
+        # aimed at the first moved neither.
+        "dumps": len(DUMP.findall(src)),
         "shows": len(re.findall(r"history\.(?:keep|peek)\(", src)),
         "notes": len(re.findall(r"history\.note\(", src)),
         "prints": len(re.findall(r"console\.log\(", src)),
@@ -144,6 +161,7 @@ def main(paths):
         print(f"{p}: n={len(ok)}{note}")
 
     keys = [
+        "dumps",
         "shows",
         "notes",
         "prints",
@@ -173,7 +191,7 @@ def main(paths):
         # hardcoded to `drafts` for as long as drafting was the only
         # question anyone brought here.
         na, nb = len(arms[a]), len(arms[b])
-        for k in ("shows", "notes", "prints", "drafts"):
+        for k in ("dumps", "shows", "notes", "prints", "drafts"):
             xa = sum(1 for r in arms[a] if r[k] > 0)
             xb = sum(1 for r in arms[b] if r[k] > 0)
             print(

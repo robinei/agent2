@@ -1107,21 +1107,31 @@ mod tests {
 
     /// **No worked example prints a result's payload.**
     ///
-    /// The card bans it in as many words — "it is not how you read
-    /// anything" — and for as long as that ban has existed the only
-    /// `console.log` in any exemplar was `console.log(`${p}\n${w.diff}`)`,
-    /// printing a field of `replace_file`'s result. A rule contradicted
-    /// by the example beside it loses: that is the one thing this
-    /// week's measurements said clearly (p=0.0057), and it is the
-    /// likeliest reason two sharper wordings of the ban moved nothing
-    /// (9/60 against 11/60, p=0.81).
+    /// `.content`, `.stdout`, `.stderr` — a result's own bytes. **Not
+    /// `.diff`**, and that distinction is the whole correction to why
+    /// this test exists.
     ///
-    /// What the exemplar logs now is what the console is *for* — which
-    /// of twenty files changed, one line each — and it guards a real
-    /// failure while it is at it: `replace_file` reports "nothing
-    /// changed" by omitting `diff`, and a `sweep-40` run wrote bytes
-    /// identical to disk and told the person it had deleted 24 helpers
-    /// that were all still there.
+    /// It was written believing the one `console.log` in any exemplar
+    /// violated the card's ban: `04-many` logged
+    /// `console.log(`${p}\n${w.diff}`)`, and a rule contradicted by the
+    /// example beside it loses (p=0.0057). But a `diff` is what the
+    /// tool computed about a write, not the file — compliant by the
+    /// definition on this very line — so there was no contradiction,
+    /// and replacing it changed nothing: `dumps` 9/60 against 9/60,
+    /// p=1.0000, identical to the sample.
+    ///
+    /// The exemplar was still worth changing, on other grounds. What it
+    /// logs now guards a documented failure: `replace_file` reports
+    /// "nothing changed" by *omitting* `diff`, and a `sweep-40` run
+    /// wrote bytes identical to disk and told the person it had deleted
+    /// 24 helpers that were all still there. `NO CHANGE` in that trace
+    /// is that run.
+    ///
+    /// **So the residual is not reachable by the document.** Three
+    /// changes have now missed it — a closing consequence, a flat ban
+    /// naming the syntax, and the exemplar — while 9 of 60 first
+    /// replies go on printing a whole file. The report advisory is the
+    /// remaining lever and it fires a turn too late to test here.
     #[test]
     fn no_exemplar_prints_a_results_payload() {
         for ex in &exemplars() {
