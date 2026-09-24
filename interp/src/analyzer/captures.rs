@@ -2,7 +2,8 @@ use std::collections::{HashMap, HashSet};
 
 use crate::vm::SlotKind;
 
-use super::scope::{FuncScope, SlotInfo};
+use super::NameRes;
+use super::scope::{FuncScope, Lex, SlotInfo};
 
 /// How an identifier reference resolves to a frame slot.
 #[derive(Copy, Clone, Debug)]
@@ -64,6 +65,7 @@ pub(crate) fn resolve_captures(scopes: &mut [FuncScope]) {
             continue;
         }
         let self_name = scopes[i].self_name.clone();
+        let def_blocks = scopes[i].def_blocks.clone();
         let frees: Vec<String> = scopes[i].free_vars.iter().cloned().collect();
         for fv in frees {
             if self_name.as_deref() == Some(fv.as_str()) {
@@ -81,11 +83,12 @@ pub(crate) fn resolve_captures(scopes: &mut [FuncScope]) {
                 }
                 continue;
             }
-            // Don't propagate a name the parent resolves: a slot (`names`) is
-            // captured below; a const (`const_names`) resolves to a value here.
-            if !scopes[parent].names.contains_key(&fv)
-                && !scopes[parent].const_names.contains_key(&fv)
-            {
+            // Don't propagate a name the parent binds *at this function's
+            // definition site*: a slot is captured below, a const resolves to
+            // a value here. A name the parent declares only in some sibling
+            // block is not bound here at all, and has to keep travelling — it
+            // may belong to an outer function, or to no one (a global).
+            if !scopes[parent].binds(&fv, &def_blocks) {
                 scopes[parent].free_vars.insert(fv);
             }
         }
@@ -129,26 +132,57 @@ pub(crate) fn resolve_captures(scopes: &mut [FuncScope]) {
             continue;
         }
         let self_name = scopes[i].self_name.clone();
+        let def_blocks = scopes[i].def_blocks.clone();
         let frees: Vec<String> = scopes[i].free_vars.iter().cloned().collect();
         for fv in frees {
             if self_name.as_deref() == Some(fv.as_str()) {
                 continue;
             }
             let parent_nparams = scopes[parent].params.len() as u32;
-            // Const resolution (nearest-first): the parent's own const, or a const
-            // the parent itself resolved to (transitive capture-of-a-const). Such a
-            // free var becomes a const ref, never a capture.
-            if let Some(value) = scopes[parent]
-                .const_names
-                .get(&fv)
-                .or_else(|| scopes[parent].const_by_name.get(&fv))
-                .cloned()
-            {
+            // What the parent binds this name to, as seen from where this
+            // function was written. A binding visible there settles the
+            // question by itself: consulting the name-keyed `const_names`
+            // first, as this used to, would hand `{const s=1; …} {let s=4;
+            // () => s}` the literal `1` even though the closure sits in the
+            // block that declared `s` as a slot.
+            let lex = scopes[parent].visible_at(&fv, &def_blocks);
+            // Const resolution (nearest-first): a visible literal const, a
+            // visible slot that turned out to be a constant function (Phase F
+            // registers those by slot as well as by name), or — when the
+            // parent's blocks say nothing — the parent's own const, or a const
+            // the parent itself resolved to (transitive capture-of-a-const).
+            // Such a free var becomes a const ref, never a capture.
+            let as_const = match &lex {
+                Lex::Found(NameRes::Const(value)) => Some(value.clone()),
+                Lex::Found(NameRes::Slot { slot, .. }) => {
+                    scopes[parent].const_fn_slots.get(slot).cloned()
+                }
+                Lex::NotVisible | Lex::Unknown => scopes[parent]
+                    .const_names
+                    .get(&fv)
+                    .or_else(|| scopes[parent].const_by_name.get(&fv))
+                    .cloned(),
+            };
+            if let Some(value) = as_const {
                 scopes[i].const_by_name.insert(fv, value);
                 continue;
             }
-            let (parent_abs, is_const) = if let Some(info) = scopes[parent].names.get(&fv).copied()
-            {
+            let own_slot = match &lex {
+                Lex::Found(NameRes::Slot { slot, is_const }) => Some(SlotInfo {
+                    slot: *slot,
+                    is_const: *is_const,
+                }),
+                Lex::Found(NameRes::Const(_)) => unreachable!("handled as a const above"),
+                // `<this>` and anything else reified after the walk never
+                // passed through a block, so fall back to the name table.
+                Lex::Unknown => scopes[parent].names.get(&fv).copied(),
+                // Declared here, but not where this function was written — so
+                // it is not this function's binding. Phase A propagated the
+                // name upward; it can only resolve to one of the parent's own
+                // upvals now.
+                Lex::NotVisible => None,
+            };
+            let (parent_abs, is_const) = if let Some(info) = own_slot {
                 scopes[parent].captured.insert(info.slot);
                 (
                     super::scope::frame_abs(info.slot, parent_nparams, scopes[parent].upval_count),

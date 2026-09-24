@@ -3,7 +3,8 @@ use std::collections::HashSet;
 use indexmap::{IndexMap, IndexSet};
 use oxc_ast::ast;
 
-use super::scope::FuncScope;
+use super::NameRes;
+use super::scope::{FuncScope, Lex};
 
 /// A compile-time constant value bound by a `const x = <literal>` declaration.
 /// Such bindings are *not* runtime variables: they occupy no frame slot, are
@@ -116,9 +117,9 @@ pub(crate) fn resolve_const_functions(
         let Some(name) = const_fn_binding_name(s) else {
             continue;
         };
-        if let Some(info) = scopes[s.parent].names.get(name)
-            && !scopes[s.parent].reassigned.contains(&info.slot)
-            && info.slot >= scopes[s.parent].params.len() as u32
+        if let Some(slot) = binding_slot(&scopes[s.parent], name, &s.def_blocks)
+            && !scopes[s.parent].reassigned.contains(&slot)
+            && slot >= scopes[s.parent].params.len() as u32
         {
             const_fns.insert(id);
         }
@@ -181,6 +182,17 @@ pub(crate) fn resolve_const_functions(
     const_fns
 }
 
+/// The own-slot the enclosing scope binds `name` to, as seen from a function
+/// written at `def_blocks`. Falls back to the name table for names that never
+/// passed through a block scope (see `FuncScope::visible_at`).
+fn binding_slot(parent: &FuncScope, name: &str, def_blocks: &[u32]) -> Option<u32> {
+    match parent.visible_at(name, def_blocks) {
+        Lex::Found(NameRes::Slot { slot, .. }) => Some(slot),
+        Lex::Found(NameRes::Const(_)) | Lex::NotVisible => None,
+        Lex::Unknown => parent.names.get(name).map(|i| i.slot),
+    }
+}
+
 /// The external binding name of a constant-function candidate: a declaration's
 /// own name, or a function expression's `const NAME = …` binding. (A named
 /// function expression's `self_name` is its *internal* recursion name, distinct
@@ -239,6 +251,24 @@ fn compact_const_fn_slots(scopes: &mut [FuncScope]) {
             }
             None => false,
         });
+        // `block_decls` holds the same slots, one entry per declaration, so it
+        // is renumbered the same way. A const function's slot is gone for
+        // good: dropping its entry is what makes `visible_at` report the name
+        // as undeclared, so capture resolution falls back to `const_names` and
+        // resolves it to the `Fn` value rather than to a reclaimed slot.
+        for decls in s.block_decls.values_mut() {
+            decls.retain_mut(|(_, res)| match res {
+                NameRes::Slot { slot, .. } => match remap(*slot) {
+                    Some(n) => {
+                        *slot = n;
+                        true
+                    }
+                    None => false,
+                },
+                NameRes::Const(_) => true,
+            });
+        }
+        s.block_decls.retain(|_, decls| !decls.is_empty());
         s.binding_spans = std::mem::take(&mut s.binding_spans)
             .into_iter()
             .filter_map(|(span, slot, is_const)| remap(slot).map(|n| (span, n, is_const)))
@@ -280,7 +310,7 @@ pub(crate) fn register_const_fns(scopes: &mut [FuncScope], const_fns: &HashSet<u
             arity: scopes[sf].declared_arity(),
             js_length: scopes[sf].js_length(),
         };
-        let slot = scopes[parent].names.get(&name).map(|i| i.slot);
+        let slot = binding_slot(&scopes[parent], &name, &scopes[sf].def_blocks);
         scopes[parent]
             .const_names
             .entry(name)

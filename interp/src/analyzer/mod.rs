@@ -33,8 +33,34 @@ pub(crate) enum NameRes {
     Const(ConstValue),
 }
 
+/// One lexical block: the names it declares, plus an id unique within the
+/// analysis unit.
+///
+/// **The id is what makes capture resolution lexical.** Capture resolution
+/// runs after the walk — it has to, because a closure may name a binding
+/// declared later in the same block (`const a = () => b(); const b = …`) —
+/// and until now it resolved a nested function's free name through
+/// `FuncScope::names`, which keeps one entry per *name per function*. Two
+/// sibling blocks declaring `s` are two bindings with two slots, but only the
+/// first reached `names`, so every closure in either block captured the first
+/// one. Tagging each declaration with the block that made it, and each nested
+/// function with the blocks open where it was written, tells them apart
+/// without giving up after-the-walk resolution (see `FuncScope::block_decls`).
+#[derive(Debug, Clone)]
+pub(crate) struct BlockScope {
+    pub(crate) id: u32,
+    pub(crate) names: IndexMap<String, NameRes>,
+}
+
 /// The lexical block-scope stack threaded through analysis: innermost scope last.
-pub(crate) type BlockScopes = Vec<IndexMap<String, NameRes>>;
+pub(crate) type BlockScopes = Vec<BlockScope>;
+
+/// The ids of the blocks open at this point, outermost first — the "definition
+/// site" recorded on every nested function scope, against which the enclosing
+/// function's declarations are tested for visibility.
+pub(crate) fn block_path(block_scopes: &BlockScopes) -> Vec<u32> {
+    block_scopes.iter().map(|b| b.id).collect()
+}
 
 /// Output of the analysis pass: the resolved `ProgramAnalysis`, the next free
 /// label id (codegen continues the same allocation), and semantic diagnostics.
@@ -48,6 +74,7 @@ pub(crate) struct Analysis {
 pub(crate) fn analyze(program: &ast::Program) -> Analysis {
     let mut analyzer = Analyzer {
         next_label: 0,
+        next_block: 0,
         diagnostics: Vec::new(),
         loop_depth: 0,
         current_super: None,
@@ -64,6 +91,12 @@ pub(crate) fn analyze(program: &ast::Program) -> Analysis {
 /// handed off via `Analysis::next_label`) and collected diagnostics.
 pub(super) struct Analyzer {
     pub(super) next_label: u32,
+    /// Block-id allocator. Ids are unique across the whole analysis unit,
+    /// including across incremental fragments — a reused id would let a
+    /// nested function from an earlier fragment "see" a later fragment's
+    /// block, so `IncrementalAnalyzer` carries this counter the way it
+    /// carries `next_label`.
+    pub(super) next_block: u32,
     pub(super) diagnostics: Vec<Diagnostic>,
     /// Lexical loop-nesting depth at the current walk position (reset to 0 when
     /// entering a nested function body). A `let`/`const` declared while this is
@@ -85,6 +118,16 @@ impl Analyzer {
         let id = self.next_label;
         self.next_label += 1;
         id
+    }
+
+    /// Open a fresh lexical block with a unique id.
+    pub(super) fn new_block(&mut self) -> BlockScope {
+        let id = self.next_block;
+        self.next_block += 1;
+        BlockScope {
+            id,
+            names: IndexMap::new(),
+        }
     }
 
     /// Record a semantic diagnostic from the analyzer. `span` here is a
@@ -158,7 +201,7 @@ impl Analyzer {
             None,
             false,
         );
-        let mut block_scopes: BlockScopes = vec![IndexMap::new()];
+        let mut block_scopes: BlockScopes = vec![self.new_block()];
         let mut next_slot = 0u32;
 
         self.analyze_hoist(&program.body, &mut scope, &mut block_scopes, &mut next_slot);

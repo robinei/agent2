@@ -8,6 +8,8 @@ use oxc_ast::ast;
 
 use super::Analyzer;
 use super::BlockScopes;
+use super::NameRes;
+use super::block_path;
 use super::const_fns::ConstValue;
 
 // ── Analysis structures (Phase 3: functions / closures) ─────────────
@@ -64,8 +66,27 @@ pub(crate) struct FuncScope {
     /// Own-slot indices are 0-based within own locals (excluding upvals).
     /// Only the *first* occurrence of a shadowed name is kept; per-reference
     /// resolution uses `local_refs`/`binding_spans` (keyed by span), so this
-    /// table is consulted only by capture resolution.
+    /// table is consulted only by capture resolution — as the *fallback* to
+    /// `block_decls`, for the handful of names that never pass through a
+    /// block scope (`<this>`, reified after the walk).
     pub(super) names: IndexMap<String, SlotInfo>,
+    /// Every binding declared in this scope, grouped by name, each tagged with
+    /// the lexical block that declared it. Unlike `names` this keeps *all* the
+    /// declarations of a name, which is what capture resolution needs: a
+    /// nested function's free `s` must resolve to the `s` visible at the
+    /// function's definition site, not to whichever `s` the walk met first.
+    ///
+    /// Two sibling blocks each declaring `s` used to give both their closures
+    /// the first block's binding — `{const s=1; f.push(()=>s)} {const s=4;
+    /// f.push(()=>s)}` evaluated to `1,1`. So did a block shadowing a param,
+    /// and two `for (let i …)` loops in a row. All of them are one name with
+    /// more than one declaration in a single function scope.
+    pub(super) block_decls: HashMap<String, Vec<(u32, NameRes)>>,
+    /// The blocks open in the *enclosing* function where this function was
+    /// written, outermost first. Capture resolution tests the parent's
+    /// `block_decls` against this path. Empty for the root, which has no
+    /// enclosing function to be written in.
+    pub(super) def_blocks: Vec<u32>,
     /// Which own-local slot indices are captured by nested functions (→ Boxed,
     /// unless also `loop_declared`, in which case → per-iteration `fresh_owns`).
     pub(super) captured: HashSet<u32>,
@@ -168,7 +189,66 @@ pub(crate) struct SlotInfo {
     pub(crate) is_const: bool,
 }
 
+/// What the *enclosing* function's declarations say about a free name, judged
+/// from the definition site of the nested function that named it.
+#[derive(Debug)]
+pub(super) enum Lex {
+    /// Declared here, and visible from that definition site.
+    Found(NameRes),
+    /// Declared here, but only in blocks that were already closed (or not yet
+    /// opened) where the nested function was written — a sibling block's
+    /// binding. Lexically this name is *not* bound by this function, so
+    /// resolution has to keep looking outward.
+    NotVisible,
+    /// This function never declared the name in any block. Includes the names
+    /// that bypass block scopes entirely (`<this>`, reified after the walk),
+    /// so the caller falls back to the name-keyed tables.
+    Unknown,
+}
+
 impl FuncScope {
+    /// Record one binding of `name`, made in block `block`. Repeated `var`
+    /// declarations in the same block name the same slot, so they collapse;
+    /// two declarations in *different* blocks are kept apart, which is the
+    /// whole point.
+    pub(super) fn declare_in_block(&mut self, name: &str, block: u32, res: NameRes) {
+        let decls = self.block_decls.entry(name.to_string()).or_default();
+        if decls.iter().any(|(b, _)| *b == block) {
+            return;
+        }
+        decls.push((block, res));
+    }
+
+    /// Resolve `name` as seen from a nested function defined with `def_blocks`
+    /// open, innermost block first.
+    pub(super) fn visible_at(&self, name: &str, def_blocks: &[u32]) -> Lex {
+        let Some(decls) = self.block_decls.get(name) else {
+            return Lex::Unknown;
+        };
+        for block in def_blocks.iter().rev() {
+            if let Some((_, res)) = decls.iter().find(|(b, _)| b == block) {
+                return Lex::Found(res.clone());
+            }
+        }
+        Lex::NotVisible
+    }
+
+    /// Whether this function binds `name` for a nested function defined at
+    /// `def_blocks` — the test capture propagation uses to decide whether a
+    /// free variable stops here or keeps travelling up the scope tree.
+    ///
+    /// `NotVisible` still consults `const_names`, which is where constant
+    /// *functions* are registered after the walk (by name, with no block of
+    /// their own); without that a mutually recursive pair would stop being
+    /// resolvable the moment one of them was declared inside a block.
+    pub(super) fn binds(&self, name: &str, def_blocks: &[u32]) -> bool {
+        match self.visible_at(name, def_blocks) {
+            Lex::Found(_) => true,
+            Lex::NotVisible => self.const_names.contains_key(name),
+            Lex::Unknown => self.names.contains_key(name) || self.const_names.contains_key(name),
+        }
+    }
+
     /// Whether this function's body ever names **itself** — directly, or
     /// from a nested scope that propagated the name up here.
     ///
@@ -206,6 +286,8 @@ impl FuncScope {
             binding_name: None,
             is_declaration,
             names: IndexMap::new(),
+            block_decls: HashMap::new(),
+            def_blocks: Vec::new(),
             captured: HashSet::new(),
             reassigned: HashSet::new(),
             loop_declared: HashSet::new(),
@@ -331,6 +413,7 @@ impl Analyzer {
         func: &ast::Function,
         is_declaration: bool,
         inherit_super: bool,
+        def_blocks: &[u32],
         scopes: &mut Vec<FuncScope>,
     ) -> usize {
         let label = self.new_label();
@@ -346,6 +429,7 @@ impl Analyzer {
             is_declaration,
         );
         scope.is_async = func.r#async;
+        scope.def_blocks = def_blocks.to_vec();
         if func.params.rest.is_some() {
             scope.uses_arguments = true;
         }
@@ -363,6 +447,7 @@ impl Analyzer {
     pub(super) fn build_arrow_scope(
         &mut self,
         arrow: &ast::ArrowFunctionExpression,
+        def_blocks: &[u32],
         scopes: &mut Vec<FuncScope>,
     ) -> usize {
         let label = self.new_label();
@@ -378,6 +463,7 @@ impl Analyzer {
         );
         scope.is_arrow = true;
         scope.is_async = arrow.r#async;
+        scope.def_blocks = def_blocks.to_vec();
         if arrow.params.rest.is_some() {
             scope.uses_arguments = true;
         }
@@ -440,7 +526,9 @@ impl Analyzer {
             }
         }
         // The constructor (explicit, or synthetic with just the field inits).
-        let ctor_scope = self.build_constructor_scope(class, ctor, &field_inits, scopes);
+        let def_blocks = block_path(block_scopes);
+        let ctor_scope =
+            self.build_constructor_scope(class, ctor, &field_inits, &def_blocks, scopes);
         scope.children.push(ctor_scope);
         // Each non-constructor method is an ordinary (non-arrow) function scope,
         // but keeps the class's `super` context (`inherit_super = true`).
@@ -448,7 +536,7 @@ impl Analyzer {
             if let ast::ClassElement::MethodDefinition(m) = el
                 && m.kind != ast::MethodDefinitionKind::Constructor
             {
-                let child = self.build_function_scope(&m.value, false, true, scopes);
+                let child = self.build_function_scope(&m.value, false, true, &def_blocks, scopes);
                 scope.children.push(child);
             }
         }
@@ -468,6 +556,7 @@ impl Analyzer {
         class: &ast::Class,
         ctor: Option<&ast::Function>,
         field_inits: &[&ast::Expression],
+        def_blocks: &[u32],
         scopes: &mut Vec<FuncScope>,
     ) -> usize {
         let label = self.new_label();
@@ -483,6 +572,7 @@ impl Analyzer {
                     None,
                     false,
                 );
+                scope.def_blocks = def_blocks.to_vec();
                 if func.params.rest.is_some() {
                     scope.uses_arguments = true;
                 }
@@ -507,6 +597,7 @@ impl Analyzer {
                     None,
                     false,
                 );
+                scope.def_blocks = def_blocks.to_vec();
                 self.analyze_function_body(&mut scope, None, &[], field_inits, scopes);
                 self.push_scope(scope, scopes)
             }

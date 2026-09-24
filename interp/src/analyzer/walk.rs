@@ -1,7 +1,7 @@
-use indexmap::IndexMap;
 use oxc_ast::ast;
 
 use super::Analyzer;
+use super::block_path;
 use super::const_fns::{ConstValue, literal_const_value};
 use super::scope::{FuncScope, ParamInfo, SlotInfo};
 use super::{BlockScopes, NameRes};
@@ -199,7 +199,8 @@ impl Analyzer {
             }
             ast::Statement::FunctionDeclaration(f) => {
                 // Name already hoisted; build the function's scope.
-                let child = self.build_function_scope(f, true, false, scopes);
+                let child =
+                    self.build_function_scope(f, true, false, &block_path(block_scopes), scopes);
                 scope.children.push(child);
             }
             ast::Statement::ClassDeclaration(c) => {
@@ -222,7 +223,7 @@ impl Analyzer {
                 self.build_class_scopes(c, scope, block_scopes, scopes);
             }
             ast::Statement::BlockStatement(block) => {
-                block_scopes.push(IndexMap::new());
+                block_scopes.push(self.new_block());
                 self.analyze_stmts(&block.body, scope, block_scopes, next_slot, scopes);
                 block_scopes.pop();
             }
@@ -248,6 +249,17 @@ impl Analyzer {
             ast::Statement::ForStatement(s) => {
                 // The head declaration and body are all per-iteration: a `let`
                 // declared in the head (`for (let i …)`) is loop-declared too.
+                //
+                // **The head gets its own block**, like for-of/for-in already
+                // had. Without one, `for (let i …)` declared `i` in the
+                // enclosing block, so two loops in a row put two `i`s in one
+                // block and the closures of the second captured the first
+                // loop's binding: `for(let i=0;i<2;i++) f.push(()=>i);
+                // for(let i=10;i<12;i++) f.push(()=>i)` gave `0,1,2,2` — the
+                // `2,2` being the first loop's cell read after it finished.
+                // The head binding also used to outlive the loop — `for (let
+                // i …) {} typeof i` answered `"number"` — and now does not.
+                block_scopes.push(self.new_block());
                 self.loop_depth += 1;
                 if let Some(init) = &s.init {
                     match init {
@@ -269,6 +281,7 @@ impl Analyzer {
                 }
                 self.analyze_stmt(&s.body, scope, block_scopes, next_slot, scopes);
                 self.loop_depth -= 1;
+                block_scopes.pop();
             }
             ast::Statement::ExpressionStatement(es) => {
                 self.analyze_expr(&es.expression, scope, block_scopes, scopes);
@@ -287,7 +300,7 @@ impl Analyzer {
             // not leak past the loop.
             ast::Statement::ForOfStatement(s) => {
                 self.analyze_expr(&s.right, scope, block_scopes, scopes);
-                block_scopes.push(IndexMap::new());
+                block_scopes.push(self.new_block());
                 self.loop_depth += 1;
                 self.analyze_for_head(&s.left, scope, block_scopes, next_slot, scopes);
                 self.analyze_stmt(&s.body, scope, block_scopes, next_slot, scopes);
@@ -296,7 +309,7 @@ impl Analyzer {
             }
             ast::Statement::ForInStatement(s) => {
                 self.analyze_expr(&s.right, scope, block_scopes, scopes);
-                block_scopes.push(IndexMap::new());
+                block_scopes.push(self.new_block());
                 self.loop_depth += 1;
                 self.analyze_for_head(&s.left, scope, block_scopes, next_slot, scopes);
                 self.analyze_stmt(&s.body, scope, block_scopes, next_slot, scopes);
@@ -309,7 +322,7 @@ impl Analyzer {
             // targeting is handled in codegen (break-only context for the switch).
             ast::Statement::SwitchStatement(s) => {
                 self.analyze_expr(&s.discriminant, scope, block_scopes, scopes);
-                block_scopes.push(IndexMap::new());
+                block_scopes.push(self.new_block());
                 for case in &s.cases {
                     if let Some(test) = &case.test {
                         self.analyze_expr(test, scope, block_scopes, scopes);
@@ -328,11 +341,11 @@ impl Analyzer {
             // block-scoped to the catch body and declared like a `let` (a
             // destructuring pattern declares its leaves the same way).
             ast::Statement::TryStatement(t) => {
-                block_scopes.push(IndexMap::new());
+                block_scopes.push(self.new_block());
                 self.analyze_stmts(&t.block.body, scope, block_scopes, next_slot, scopes);
                 block_scopes.pop();
                 if let Some(h) = &t.handler {
-                    block_scopes.push(IndexMap::new());
+                    block_scopes.push(self.new_block());
                     if let Some(param) = &h.param {
                         self.analyze_declare_pattern(
                             &param.pattern,
@@ -352,7 +365,7 @@ impl Analyzer {
                 // A finalizer is a compile error in codegen, but walk it so
                 // diagnostics aggregate sensibly.
                 if let Some(f) = &t.finalizer {
-                    block_scopes.push(IndexMap::new());
+                    block_scopes.push(self.new_block());
                     self.analyze_stmts(&f.body, scope, block_scopes, next_slot, scopes);
                     block_scopes.pop();
                 }
@@ -448,10 +461,14 @@ impl Analyzer {
         scope: &mut FuncScope,
         block_scopes: &mut BlockScopes,
     ) {
-        block_scopes
+        let block = block_scopes
             .last_mut()
-            .expect("a block scope is always open")
+            .expect("a block scope is always open");
+        block
+            .names
             .insert(name.to_string(), NameRes::Const(value.clone()));
+        let block_id = block.id;
+        scope.declare_in_block(name, block_id, NameRes::Const(value.clone()));
         scope.const_names.entry(name.to_string()).or_insert(value);
     }
 
@@ -514,18 +531,20 @@ impl Analyzer {
             return 0;
         }
         let slot = if ctx.is_var {
-            if let Some(NameRes::Slot { slot, .. }) = ctx.block_scopes[0].get(name) {
+            if let Some(NameRes::Slot { slot, .. }) = ctx.block_scopes[0].names.get(name) {
                 *slot
             } else {
                 let slot = *ctx.next_slot;
                 *ctx.next_slot += 1;
-                ctx.block_scopes[0].insert(
-                    name.to_string(),
-                    NameRes::Slot {
-                        slot,
-                        is_const: false,
-                    },
-                );
+                let res = NameRes::Slot {
+                    slot,
+                    is_const: false,
+                };
+                ctx.block_scopes[0]
+                    .names
+                    .insert(name.to_string(), res.clone());
+                ctx.scope
+                    .declare_in_block(name, ctx.block_scopes[0].id, res);
                 ctx.scope.names.entry(name.to_string()).or_insert(SlotInfo {
                     slot,
                     is_const: false,
@@ -535,16 +554,17 @@ impl Analyzer {
         } else {
             let slot = *ctx.next_slot;
             *ctx.next_slot += 1;
-            ctx.block_scopes
+            let block = ctx
+                .block_scopes
                 .last_mut()
-                .expect("a block scope is always open")
-                .insert(
-                    name.to_string(),
-                    NameRes::Slot {
-                        slot,
-                        is_const: ctx.is_const,
-                    },
-                );
+                .expect("a block scope is always open");
+            let res = NameRes::Slot {
+                slot,
+                is_const: ctx.is_const,
+            };
+            block.names.insert(name.to_string(), res.clone());
+            let block_id = block.id;
+            ctx.scope.declare_in_block(name, block_id, res);
             ctx.scope.names.entry(name.to_string()).or_insert(SlotInfo {
                 slot,
                 is_const: ctx.is_const,
@@ -696,11 +716,12 @@ impl Analyzer {
                 self.analyze_chain_element(&chain.expression, scope, block_scopes, scopes);
             }
             ast::Expression::FunctionExpression(f) => {
-                let child = self.build_function_scope(f, false, false, scopes);
+                let child =
+                    self.build_function_scope(f, false, false, &block_path(block_scopes), scopes);
                 scope.children.push(child);
             }
             ast::Expression::ArrowFunctionExpression(a) => {
-                let child = self.build_arrow_scope(a, scopes);
+                let child = self.build_arrow_scope(a, &block_path(block_scopes), scopes);
                 scope.children.push(child);
             }
             ast::Expression::ClassExpression(c) => {
@@ -946,7 +967,10 @@ impl Analyzer {
         name: &str,
         block_scopes: &BlockScopes,
     ) -> Option<NameRes> {
-        block_scopes.iter().rev().find_map(|s| s.get(name).cloned())
+        block_scopes
+            .iter()
+            .rev()
+            .find_map(|s| s.names.get(name).cloned())
     }
 
     /// Shared body of `build_function_scope` / `build_arrow_scope`: seed the
@@ -959,29 +983,38 @@ impl Analyzer {
         field_inits: &[&ast::Expression],
         scopes: &mut Vec<FuncScope>,
     ) {
-        let mut block_scopes: BlockScopes = vec![IndexMap::new()];
+        let mut block_scopes: BlockScopes = vec![self.new_block()];
         let mut next_slot = scope.params.len() as u32;
         // A nested function is a fresh frame: its bindings are not per-iteration
         // with respect to any loop enclosing the *definition*. Reset loop depth
         // for the whole body walk (including pattern-param bindings, which must
         // not be marked loop-declared) and restore it afterwards.
         let saved_loop_depth = std::mem::replace(&mut self.loop_depth, 0);
-        for (i, p) in scope.params.iter().enumerate() {
-            if p.name.is_empty() {
+        let param_names: Vec<(u32, String)> = scope
+            .params
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (i as u32, p.name.clone()))
+            .collect();
+        for (i, name) in param_names {
+            if name.is_empty() {
                 // Destructuring param: anonymous slot, bindings declared below.
                 continue;
             }
-            block_scopes[0].insert(
-                p.name.clone(),
-                NameRes::Slot {
-                    slot: i as u32,
-                    is_const: false,
-                },
-            );
+            let res = NameRes::Slot {
+                slot: i,
+                is_const: false,
+            };
+            block_scopes[0].names.insert(name.clone(), res.clone());
+            // Params are declared in the body's base block, like a `var`: a
+            // block that redeclares the name shadows them, and a closure
+            // written inside that block must capture the shadowing binding —
+            // `((a) => { { let a = 5; return () => a; } })(1)` returned 1.
+            scope.declare_in_block(&name, block_scopes[0].id, res);
             scope.names.insert(
-                p.name.clone(),
+                name,
                 SlotInfo {
-                    slot: i as u32,
+                    slot: i,
                     is_const: false,
                 },
             );

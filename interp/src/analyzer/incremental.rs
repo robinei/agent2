@@ -53,6 +53,11 @@ pub(crate) struct IncrementalAnalyzer {
     /// Label allocator, shared with codegen the way the one-shot path shares
     /// it via `Analysis::next_label`.
     next_label: u32,
+    /// Block-id allocator, carried across fragments for the same reason the
+    /// label one is: block ids have to stay unique for the whole unit, or a
+    /// nested function walked in an earlier fragment would find a later
+    /// fragment's block in its definition path and capture the wrong binding.
+    next_block: u32,
 }
 
 /// One fragment's analysis result.
@@ -70,6 +75,7 @@ impl IncrementalAnalyzer {
     pub(crate) fn new() -> Self {
         let mut analyzer = Analyzer {
             next_label: 0,
+            next_block: 0,
             diagnostics: Vec::new(),
             loop_depth: 0,
             current_super: None,
@@ -77,6 +83,7 @@ impl IncrementalAnalyzer {
         // The root's label, allocated first exactly as `analyze_top_level`
         // does, so label numbering matches the one-shot path.
         let label = analyzer.new_label();
+        let root_block = analyzer.new_block();
         let mut root = FuncScope::new(
             usize::MAX,
             label,
@@ -89,9 +96,10 @@ impl IncrementalAnalyzer {
         root.id = ROOT;
         Self {
             pristine: vec![root],
-            block_scopes: vec![IndexMap::new()],
+            block_scopes: vec![root_block],
             next_slot: 0,
             next_label: analyzer.next_label,
+            next_block: analyzer.next_block,
         }
     }
 
@@ -104,6 +112,7 @@ impl IncrementalAnalyzer {
     pub(crate) fn feed(&mut self, program: &ast::Program) -> FragmentAnalysis {
         let mut analyzer = Analyzer {
             next_label: self.next_label,
+            next_block: self.next_block,
             diagnostics: Vec::new(),
             loop_depth: 0,
             current_super: None,
@@ -154,6 +163,7 @@ impl IncrementalAnalyzer {
         }
 
         self.next_label = analyzer.next_label;
+        self.next_block = analyzer.next_block;
         let mut diagnostics = analyzer.diagnostics;
         diagnostics.extend(self.redeclarations(&before));
 
@@ -276,7 +286,8 @@ fn top_level_bindings(block_scopes: &BlockScopes) -> IndexMap<String, NameRes> {
     block_scopes
         .first()
         .map(|top| {
-            top.iter()
+            top.names
+                .iter()
                 .map(|(name, res)| (name.clone(), res.clone()))
                 .collect()
         })
