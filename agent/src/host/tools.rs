@@ -499,7 +499,7 @@ fn atomic_write(path: &Path, content: &str) -> Result<(), String> {
 fn read_file_def() -> ToolDef {
     ToolDef {
         name: "read_file".into(),
-        description: "Read a UTF-8 text file. The text lands on the record, not in front of you: `history.peek(f)` puts it in front of the next reply only, `history.keep(f)` from here on, and neither is needed if this program is the one doing the reading. `version` is a content hash — hand it to `replace_file` so the write fails if the file moved under you. `from`/`to` are 1-based inclusive lines."
+        description: "Read a UTF-8 text file. The text lands on the record, not in front of you. `version` is a content hash — hand it to `replace_file` so the write fails if the file moved under you. `from`/`to` are 1-based inclusive lines."
             .into(),
         input_schema: json!({
             "type": "array",
@@ -512,6 +512,7 @@ fn read_file_def() -> ToolDef {
             "maxItems": 3
         }),
         guidelines: vec![
+            "**If you will read this yourself — not just compute on it — you must `history.peek(r)` in this same reply, or `history.keep(r)` to have it from here on.** Nothing else shows it to you: the result is a variable, and printing it back is replaced by the id of the row it repeats.".into(),
             "Read files with this, not with `cat` or `sed` through bash. The `version` it hands back is what makes a later write atomic; a file read any other way has to be read again before you can safely write it."
                 .into(),
             "Hold onto `version` and hand it to `replace_file`, so a write fails rather than clobbering a file that moved.".into(),
@@ -729,6 +730,7 @@ fn bash_def() -> ToolDef {
             "maxItems": 1
         }),
         guidelines: vec![
+            "**If you will read this yourself — not just compute on it — you must `history.peek(r)` in this same reply, or `history.keep(r)` to have it from here on.** Nothing else shows it to you: the result is a variable, and printing it back is replaced by the id of the row it repeats.".into(),
             "Read `status` before `stdout`. A command that ran and failed writes nothing, and nothing reads as \"found no problems\".".into(),
             "Ask once for everything it will answer at once: change all the candidates, run it once, and read which ones it names back. A per-item loop is the fallback.".into(),
             "Prefer looping in the program rather than in the command: the values stay in variables you can use in the next call and return at the end, and a mistake stops at a line instead of somewhere inside a heredoc. When a script really is the right tool — a parser, something with no JS equivalent — write the script.".into(),
