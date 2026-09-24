@@ -222,10 +222,26 @@ pub fn script_of(tree: &Tree, leaf: EventId) -> Result<Script, String> {
 
 /// Whether a reply writes an event id as a literal argument to one of
 /// the verbs that takes one.
+///
+/// **Both spellings of each**, because a program may write either: the
+/// compiler lowers `history.fetch` to the settle verb `fetch_history`,
+/// and a hand-written program can name the settle verb directly.
+///
+/// `keep` and `peek` were missing until 2026-09-24, and they take an id
+/// like the rest — a live run that day wrote
+/// `history.peek(6, (r) => …)` off the menu. The cost of the omission
+/// is not cosmetic: this flag decides whether a divergence is charged
+/// to the harness (`Drifted`) or excused as the run having named an id
+/// (`NamesIds`), so a run that kept or peeked by number and then
+/// diverged was scored as a regression it did not cause.
 fn names_an_id(reply: &str) -> bool {
-    const VERBS: [&str; 6] = [
+    const VERBS: [&str; 10] = [
         "history.fetch(",
         "fetch_history(",
+        "history.keep(",
+        "keep_history(",
+        "history.peek(",
+        "peek_history(",
         "history.remove(",
         "remove_history(",
         "history.replace(",
@@ -501,6 +517,37 @@ pub fn replay_file(path: &std::path::Path) -> Result<Verdict, String> {
 
 #[cfg(test)]
 mod tests {
+    /// **Every verb that takes an id is watched, in both spellings.**
+    /// `keep` and `peek` were not, and this flag is what keeps a
+    /// divergence from being charged to the harness — see
+    /// `names_an_id`.
+    #[test]
+    fn a_literal_id_is_noticed_whichever_verb_and_spelling_names_it() {
+        for verb in [
+            "history.fetch",
+            "fetch_history",
+            "history.keep",
+            "keep_history",
+            "history.peek",
+            "peek_history",
+            "history.remove",
+            "remove_history",
+            "history.replace",
+            "replace_history",
+        ] {
+            assert!(
+                super::names_an_id(&format!("```js\n{verb}(6);\n```")),
+                "{verb} takes an id and naming one literally must be noticed"
+            );
+        }
+        // A value in hand is not a literal id, and must not be read as
+        // one — that is the ordinary case and excusing it would hide
+        // every real divergence behind it.
+        for ok in ["history.keep(f)", "history.peek(f.id)", "history.fetch(row)"] {
+            assert!(!super::names_an_id(&format!("```js\n{ok};\n```")), "{ok}");
+        }
+    }
+
     use super::*;
 
     /// **A run replays to itself.** Build one through the harness, read
