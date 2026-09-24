@@ -967,11 +967,33 @@ impl Conversation {
                             }
                         }
                     }
-                    StepOutput::Spawns(ids) | StepOutput::Forks(ids) => {
+                    // **A real branch, because a handle has to name
+                    // one.** These used to settle with
+                    // `{"agent": <the call's own id>}`, which is not an
+                    // agent or a branch — so `ask(fork(), …)` was
+                    // refused with exactly that message and no test
+                    // could reach the shape. `resolve_address` looks
+                    // the handle up in the tree and wants a `Fork` or
+                    // an `Agent` event there; nothing needs a `Runner`
+                    // unless the child is to run a program of its own,
+                    // which nothing here does — its replies are
+                    // scripted with `answer`.
+                    StepOutput::Spawns(ids) => {
                         for id in ids {
+                            let agent = self.open_agent(id);
                             results.push(ToolResult {
                                 call: id,
-                                result: Ok(json!({ "agent": id.as_u64() })),
+                                result: Ok(json!({ "agent": agent.as_u64() })),
+                                show_once: false,
+                            });
+                        }
+                    }
+                    StepOutput::Forks(ids) => {
+                        for id in ids {
+                            let fork = self.open_fork(id);
+                            results.push(ToolResult {
+                                call: id,
+                                result: Ok(json!({ "agent": fork.as_u64() })),
                                 show_once: false,
                             });
                         }
@@ -999,6 +1021,36 @@ impl Conversation {
 
     /// `Some(expects_reply)` for a logged `Send`, `None` for anything
     /// else.
+    /// Root a forked branch at its call site, as the host does: the
+    /// same agent, a divergent branch carrying the caller's history.
+    fn open_fork(&mut self, call: EventId) -> EventId {
+        let name = match self.tree.events.get(&call).map(|e| &e.payload) {
+            Some(EventPayload::Call(Call::Fork { name, .. })) => name.clone(),
+            _ => None,
+        };
+        let mut spine = self.tree.fork(call).expect("fork the caller's spine");
+        self.tree
+            .append(&mut spine, EventPayload::Fork { name })
+            .expect("a Fork event at the new branch's root")
+    }
+
+    /// Root a spawned agent at its call site. The charter and name come
+    /// off the logged `Call::Spawn`, the same way the host reads them,
+    /// so the branch a test addresses is the one the program asked for.
+    fn open_agent(&mut self, call: EventId) -> EventId {
+        let (name, charter) = match self.tree.events.get(&call).map(|e| &e.payload) {
+            Some(EventPayload::Call(Call::Spawn { name, charter, .. })) => {
+                (name.clone(), charter.clone())
+            }
+            _ => (None, String::new()),
+        };
+        let spine = self
+            .tree
+            .start_agent(Some(call), name, charter, None, "SYSTEM", Vec::new())
+            .expect("an Agent event at the child's root");
+        spine.leaf_id
+    }
+
     fn send_shape(&self, id: EventId) -> Option<bool> {
         match self.tree.events.get(&id).map(|e| &e.payload) {
             Some(EventPayload::Call(Call::Send { expects_reply, .. })) => Some(*expects_reply),
