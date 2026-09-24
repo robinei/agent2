@@ -4226,7 +4226,15 @@ mod tests {
         // clones. Sent through two clones, the `Shutdown` can be seen
         // first: `on_msg` sets `done`, `pump_one` stops, `ListLeaves`
         // is never processed and there is no `Leaves` event to find.
-        // Measured at roughly one suite run in twenty before this.
+        //
+        // **A provable defect, and an unproven cure.** The suite failed
+        // 3 times in 40 runs before and 1 in 55 after, which is
+        // p=0.31 — no demonstrated change in rate. The race is real
+        // (`handle()` clones, `mpsc` orders per sender, `pump_one`
+        // stops on `done`) and worth closing whether or not it was what
+        // those failures were; the one after the fix was never
+        // identified, because three loops captured the summary line and
+        // not the failing test's name.
         let h = session.handle();
         h.send(SessionCommand::ListLeaves);
         h.send(SessionCommand::Shutdown);

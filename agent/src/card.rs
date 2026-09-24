@@ -1187,10 +1187,21 @@ mod tests {
     /// about. Right paragraph, wrong reason, and the reason is what
     /// the next person would have edited against.
     ///
-    /// **The `console.log` block is the larger effect of the two**, and
-    /// it too was shipped on a hunch. Isolated on the current card at
-    /// n=60, reverting it alone moves `shows` 95% -> 82% (p=0.0434) and
-    /// `prints` 28% -> 47% (p=0.0588). Two attempts to improve it both
+    /// **The `console.log` block does nothing, pooled.** On *this*
+    /// task, reverting it alone moved `shows` 95% -> 82% (p=0.0434) and
+    /// `prints` 28% -> 47% (p=0.0588), and it was called the largest
+    /// card effect of the week on that basis. Run against three more
+    /// task shapes — a rename-and-check, a search, a read-and-explain —
+    /// it is null at n=150 per arm: dumps 18% against 15% (p=0.53),
+    /// prints 43% against 47% (p=0.49). Its sign flips: on the edit
+    /// task the paragraph *raises* dumping, 7% to 30% (p=0.042).
+    ///
+    /// **So every number above is this prompt's, not the card's.** A
+    /// held-still document removes path variance, which is what makes
+    /// its p-values mean anything, and replaces it with one task's
+    /// idiosyncrasy, which nothing inside the document can reveal. The
+    /// baselines alone should have been the warning: `shows` is 95%
+    /// here and 20% on a search, `drafts` 5% here and 80% on an edit. Two attempts to improve it both
     /// failed: leading `note` with its distinguishing jobs was null,
     /// and replacing "Loop over two hundred items here, not above" with
     /// a *justification* — that a bounded tail is cheaper than rows —
