@@ -21,7 +21,7 @@ This program wrote files but didn't check them. Don't report success unverified 
 
 ## RIGHT NOW
 
-### peeked — here for this reply only
+### peeked — read these in this reply; they are gone from the next
 
 - `[107]` `replace_file("CONF.json", "{ \"retries\": 5 }\n", "v1")` → ok, {version, diff, id}, 58 bytes
   ```text

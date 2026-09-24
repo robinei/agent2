@@ -4854,7 +4854,14 @@ impl Runner {
         if rows.is_empty() {
             return Vec::new();
         }
-        let mut out = vec!["### peeked — here for this reply only\n".to_owned()];
+        // **Imperative, because an unread peek is bytes paid for
+        // nothing.** These are here for one request and then gone, so
+        // there is no "later" to defer them to — a reply that does not
+        // use them has spent the tokens and must peek again to get
+        // them back. The old header stated the lifetime and left the
+        // consequence to be worked out.
+        let mut out =
+            vec!["### peeked — read these in this reply; they are gone from the next\n".to_owned()];
         out.extend(rows);
         out.push(String::new());
         out
@@ -10060,7 +10067,7 @@ mod tests {
         assert!(now.contains("KEPT-VALUE"), "the keep is inline: {now}");
         assert!(now.contains("PEEKED-VALUE"), "the peek is in the tail");
         assert!(
-            now.contains("### peeked — here for this reply only"),
+            now.contains("### peeked — read these in this reply"),
             "and the block says what it is: {now}"
         );
 

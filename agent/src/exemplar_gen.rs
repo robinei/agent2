@@ -430,7 +430,7 @@ mod tests {
             "### rows it added",
             "### it printed",
             "## RIGHT NOW",
-            "### peeked — here for this reply only",
+            "### peeked — read these in this reply",
             "## MESSAGES",
             "noted:",
             "you told user:",

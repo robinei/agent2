@@ -27,7 +27,7 @@ src/one.rs changed
 
 ## RIGHT NOW
 
-### peeked — here for this reply only
+### peeked — read these in this reply; they are gone from the next
 
 - `[47]` `replace_file("PATH", "// one\nNEW\nfn thing() {}\n", "v1")` → ok, {version, diff, id}, 57 bytes
   ```text

@@ -17,7 +17,7 @@ It completed.
 
 ## RIGHT NOW
 
-### peeked — here for this reply only
+### peeked — read these in this reply; they are gone from the next
 
 - `[87]` `bash("CHECK 2>&1")` → ok, {status, stdout, stderr, id}, 105 bytes
   ```text
