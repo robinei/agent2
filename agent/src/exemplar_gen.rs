@@ -62,7 +62,11 @@ pub(crate) const SERIES: &[Step] = &[
     // No one speaks: the reply before it noted what it found, and this
     // one acts on it. The turn that carries no message at all is the
     // commonest turn there is and no example used to show one.
-    Step { stem: "04-many", said: None, answers: &[] },
+    Step {
+        stem: "04-many",
+        said: None,
+        answers: &[],
+    },
     Step {
         stem: "03-ask",
         said: Some("this setting looks stale — can you sort it out?"),
@@ -74,7 +78,11 @@ pub(crate) const SERIES: &[Step] = &[
         answers: &[],
     },
     // The reply that reads what the one before it kept, and acts.
-    Step { stem: "09-act", said: None, answers: &[] },
+    Step {
+        stem: "09-act",
+        said: None,
+        answers: &[],
+    },
     Step {
         stem: "06-fork",
         said: Some("three services started timing out last night — what do they have in common?"),
@@ -88,7 +96,11 @@ pub(crate) const SERIES: &[Step] = &[
     Step {
         stem: "07-supervise",
         said: Some("run the integration suite for every package and tell me which ones fail"),
-        answers: &["nothing failed", "2 failed: timeout in pool_test", "nothing failed"],
+        answers: &[
+            "nothing failed",
+            "2 failed: timeout in pool_test",
+            "nothing failed",
+        ],
     },
 ];
 
@@ -193,7 +205,10 @@ fn unanswered_ask(c: &Conversation) -> Option<EventId> {
         .filter(|e| {
             matches!(
                 &e.payload,
-                EventPayload::Call(Call::Send { expects_reply: true, .. })
+                EventPayload::Call(Call::Send {
+                    expects_reply: true,
+                    ..
+                })
             ) && !settled.contains(&e.id)
         })
         .map(|e| e.id)
@@ -234,10 +249,15 @@ pub(crate) fn generate(js_of: impl Fn(&str) -> String) -> Vec<Exemplar> {
         }
         c.reply(&js);
         for reply in step.answers {
-            let Some(open) = unanswered_ask(&c) else { break };
+            let Some(open) = unanswered_ask(&c) else {
+                break;
+            };
             c.answer(open, serde_json::json!(reply));
         }
-        out.push(Exemplar { user, assistant: assistant_turn(&c) });
+        out.push(Exemplar {
+            user,
+            assistant: assistant_turn(&c),
+        });
     }
     out
 }
@@ -424,7 +444,10 @@ mod tests {
 
         // A reply that names a row it was shown, which is the thing a
         // single-turn example can never demonstrate.
-        let act = &made[SERIES.iter().position(|s| s.stem == "09-act").expect("09-act")];
+        let act = &made[SERIES
+            .iter()
+            .position(|s| s.stem == "09-act")
+            .expect("09-act")];
         assert!(
             act.user.contains("read_file(\"CONF.json\")"),
             "the turn before it was shown that row: {}",
@@ -435,7 +458,9 @@ mod tests {
         // the series ends on a reply — so a trap there would otherwise
         // be invisible.
         assert_eq!(
-            made.iter().filter(|e| e.user.contains("It completed.")).count(),
+            made.iter()
+                .filter(|e| e.user.contains("It completed."))
+                .count(),
             SERIES.len() - 1,
             "every reply but the last is reported as having completed"
         );
@@ -445,8 +470,6 @@ mod tests {
         );
     }
 }
-
-
 
 #[cfg(test)]
 mod owes_probe {
@@ -458,10 +481,16 @@ mod owes_probe {
         c.answers("bash", serde_json::json!({ "status": 0, "stdout": "x\n" }));
         c.user_says("do the thing");
         c.reply("```js\nawait tools.bash(\"x\");\n```\n");
-        println!("PROBE after a completed program, no finish: status={:?}", c.status());
+        println!(
+            "PROBE after a completed program, no finish: status={:?}",
+            c.status()
+        );
         let mut c2 = Conversation::new();
         c2.user_says("do the thing");
         c2.reply("just some prose, no block\n");
-        println!("PROBE after a prose-only reply:            status={:?}", c2.status());
+        println!(
+            "PROBE after a prose-only reply:            status={:?}",
+            c2.status()
+        );
     }
 }

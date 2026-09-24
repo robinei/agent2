@@ -424,8 +424,8 @@ impl Conversation {
     /// `Runner::new_root_without_exemplars`.
     pub fn for_exemplar_generation(charter: &str, card: &str) -> Self {
         let mut tree = Tree::new(None);
-        let runner = Runner::new_root_without_exemplars(&mut tree, charter, card)
-            .expect("a root runner");
+        let runner =
+            Runner::new_root_without_exemplars(&mut tree, charter, card).expect("a root runner");
         Self::around(tree, runner)
     }
 

@@ -11,12 +11,12 @@ mod lab;
 // Fixtures and scripted end-to-end runs: test-only, and compiled only
 // for `cargo test` now that no binary path reaches them.
 #[cfg(test)]
+mod exemplar_gen;
+#[cfg(test)]
 mod replay;
 mod score;
 #[cfg(test)]
 mod scripted;
-#[cfg(test)]
-mod exemplar_gen;
 #[cfg(test)]
 mod testkit;
 mod transcript;

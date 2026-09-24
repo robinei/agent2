@@ -1268,12 +1268,6 @@ pub fn derive_report(tree: &Tree, leaf: EventId, outcome: EventId, budget: usize
     text
 }
 
-
-
-
-
-
-
 fn render_handback(h: &Handback<'_>, budget: usize) -> String {
     let _ = budget;
     let EventPayload::Handback {

@@ -154,7 +154,6 @@ mod line_split_tests {
         assert_eq!(console(r#"console.log("a\n\nb");"#), vec!["a\n\nb"]);
     }
 
-
     /// What the cap produces, in bytes — the next bound out
     /// (`report::CONSOLE_SECTION_MAX_BYTES`) is the same number, so
     /// whether a capped print fits inside it or blows it by one is the
@@ -162,10 +161,7 @@ mod line_split_tests {
     /// fence.
     #[test]
     fn a_capped_print_fits_the_report_section_exactly() {
-        let out = console(&format!(
-            r#"console.log("{}");"#,
-            "z".repeat(40 * 1024)
-        ));
+        let out = console(&format!(r#"console.log("{}");"#, "z".repeat(40 * 1024)));
         assert_eq!(out.len(), 1);
         assert_eq!(
             out[0].len(),

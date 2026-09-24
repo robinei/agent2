@@ -514,7 +514,10 @@ fn annotate_history_calls(
         // stripped from a reply before it is logged or compiled
         // (`strip_annotations`), so the annotation never reaches a
         // parser and does not have to survive one.
-        let snipped = format!("{FENCE_OPEN}{ARROW} snipped - history[{}]{FENCE_CLOSE}", c.row);
+        let snipped = format!(
+            "{FENCE_OPEN}{ARROW} snipped - history[{}]{FENCE_CLOSE}",
+            c.row
+        );
         let marked = format!(" {FENCE_OPEN}{ARROW} history[{}]{FENCE_CLOSE}", c.row);
         if c.literal && snipped.len() < c.end - c.start {
             // Keep the callee, so the call still reads as a call:
@@ -644,7 +647,10 @@ fn is_bare_marker(line: &str) -> bool {
     else {
         return false;
     };
-    match rest.strip_suffix(FENCE_CLOSE).and_then(|r| r.strip_suffix(']')) {
+    match rest
+        .strip_suffix(FENCE_CLOSE)
+        .and_then(|r| r.strip_suffix(']'))
+    {
         Some(digits) => !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()),
         None => false,
     }
@@ -1926,7 +1932,10 @@ mod tests {
         // which is what the model was prompted with) / assistant(the
         // decision it wrote back) / user(both returns).
         assert_eq!(conv.len(), 5, "{doc:?}");
-        assert_eq!(conv[1].content, "【↓ history[4]】\n```js\nraise('x');\n```\n");
+        assert_eq!(
+            conv[1].content,
+            "【↓ history[4]】\n```js\nraise('x');\n```\n"
+        );
         assert_eq!(
             conv[3].content,
             "【↓ history[8]】\n```js\nhistory.note(resume(1));\n```\n"
@@ -2129,7 +2138,9 @@ mod tests {
         // A marker with something under it is an ordinary paragraph
         // that happens to start with one — the pass fixes its id and
         // the prose is kept.
-        assert!(!is_only_an_imitated_marker("【↓ history[7]】\nNow the file."));
+        assert!(!is_only_an_imitated_marker(
+            "【↓ history[7]】\nNow the file."
+        ));
         // And prose that merely mentions a row is not a marker at all.
         assert!(!is_only_an_imitated_marker("see history[9] for it"));
         assert!(!is_only_an_imitated_marker("Now the file."));

@@ -2095,7 +2095,8 @@ mod tests {
         assert_eq!(ex.len(), 9, "nine, and each earns its place");
 
         assert!(
-            with("Edit.replaceOnce").contains("finish()") && with("Edit.replaceOnce").contains("tell("),
+            with("Edit.replaceOnce").contains("finish()")
+                && with("Edit.replaceOnce").contains("tell("),
             "the first ends a finished task, and says the answer on its way out: {}",
             with("Edit.replaceOnce")
         );
@@ -2103,7 +2104,8 @@ mod tests {
         // exemplar demonstrates is handing a finding on to the next
         // reply and *not* ending the task.
         assert!(
-            with("mentions_old_host").contains("history.note") && !with("mentions_old_host").contains("finish("),
+            with("mentions_old_host").contains("history.note")
+                && !with("mentions_old_host").contains("finish("),
             "the second hands on and does not stop: {}",
             with("mentions_old_host")
         );
@@ -2183,7 +2185,8 @@ mod tests {
             with("spawn(")
         );
         assert!(
-            with("Edit.replaceAll").contains("console.log") && !with("Edit.replaceAll").contains("history.note"),
+            with("Edit.replaceAll").contains("console.log")
+                && !with("Edit.replaceAll").contains("history.note"),
             "the loop prints per item rather than appending: {}",
             with("Edit.replaceAll")
         );
@@ -2195,7 +2198,8 @@ mod tests {
         // model almost never reaches for. It carries both in one
         // program: enumerate, read in parallel, edit each, verify once.
         assert!(
-            with("Edit.replaceAll").contains("Promise.all") && with("Edit.replaceAll").contains("for ("),
+            with("Edit.replaceAll").contains("Promise.all")
+                && with("Edit.replaceAll").contains("for ("),
             "the fourth does many at once: {}",
             with("Edit.replaceAll")
         );
@@ -2209,7 +2213,8 @@ mod tests {
         // 10 KB card and the only place the model sees the work done
         // rather than described, so one of them does the work.
         assert!(
-            with("Edit.replaceOnce").contains("replace_file") && with("Edit.replaceOnce").contains("bash"),
+            with("Edit.replaceOnce").contains("replace_file")
+                && with("Edit.replaceOnce").contains("bash"),
             "the first edits and then runs the thing that would fail: {}",
             with("Edit.replaceOnce")
         );
@@ -2439,14 +2444,16 @@ mod tests {
         // The first finishes a task it actually changed, and checks the
         // change by running the thing that would fail.
         assert!(
-            with("Edit.replaceOnce").contains("finish(") && with("Edit.replaceOnce").contains("tools.replace_file"),
+            with("Edit.replaceOnce").contains("finish(")
+                && with("Edit.replaceOnce").contains("tools.replace_file"),
             "the first changes something and finishes: {}",
             with("Edit.replaceOnce")
         );
         // The second hands on without stopping — which is now `append`,
         // there being no `return`.
         assert!(
-            with("mentions_old_host").contains("history.note") && !with("mentions_old_host").contains("finish("),
+            with("mentions_old_host").contains("history.note")
+                && !with("mentions_old_host").contains("finish("),
             "the second hands on and does not stop: {}",
             with("mentions_old_host")
         );
@@ -2480,8 +2487,12 @@ mod tests {
         let cells = crate::notebook::split_cells(&with("Edit.replaceAll"));
         assert!(cells.len() >= 2, "the fourth spans two cells");
         assert!(
-            cells[0].slice(&with("Edit.replaceAll")).contains("const hits")
-                && cells[1].slice(&with("Edit.replaceAll")).contains("hits.length"),
+            cells[0]
+                .slice(&with("Edit.replaceAll"))
+                .contains("const hits")
+                && cells[1]
+                    .slice(&with("Edit.replaceAll"))
+                    .contains("hits.length"),
             "the fourth binds in one cell and reads it in the next"
         );
         // The fifth keeps two rows rather than one fat value, so a later

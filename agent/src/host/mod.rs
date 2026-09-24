@@ -155,7 +155,6 @@ pub(crate) fn context_tokens() -> Option<usize> {
         .and_then(provider::context_window)
 }
 
-
 /// Tokens held back from the context for the reply itself.
 ///
 /// The document is the *prompt*; the completion has to fit after it.

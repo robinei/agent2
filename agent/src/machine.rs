@@ -3799,12 +3799,7 @@ impl Runner {
             &format!("console event follows #{}", outcome.as_u64()),
         );
         substitute_printed_rows(&mut printed, tree, self.spine.leaf_id);
-        tree.append(
-            &mut self.spine,
-            EventPayload::Console {
-                lines: printed,
-            },
-        )?;
+        tree.append(&mut self.spine, EventPayload::Console { lines: printed })?;
 
         self.note_status(run.program_id, ProgramStatus::Completed);
         self.last_vm = Some(run.vm);
@@ -4001,12 +3996,7 @@ impl Runner {
             &format!("console event follows #{}", outcome.as_u64()),
         );
         substitute_printed_rows(&mut printed, tree, self.spine.leaf_id);
-        tree.append(
-            &mut self.spine,
-            EventPayload::Console {
-                lines: printed,
-            },
-        )?;
+        tree.append(&mut self.spine, EventPayload::Console { lines: printed })?;
         // A handover is the exception to everything below: it does ask,
         // here, through the ordinary door. Its `Handover` disposition
         // opens no scope, so the rolling document *does* show the report
@@ -5423,7 +5413,9 @@ fn substitute_within(
 fn reference_to(row: EventId, bytes: usize) -> String {
     let id = row.as_u64();
     let (open, close) = (crate::document::FENCE_OPEN, crate::document::FENCE_CLOSE);
-    format!("{open}← the {bytes} bytes already on [{id}]; history.keep({id}) shows them here{close}")
+    format!(
+        "{open}← the {bytes} bytes already on [{id}]; history.keep({id}) shows them here{close}"
+    )
 }
 
 /// The search itself, over any sequence of rows — separated from the
@@ -6574,7 +6566,6 @@ fn asker_of(tree: &Tree, question: EventId) -> Option<Author> {
 
 #[cfg(test)]
 mod tests {
-
 
     use super::*;
     use crate::testkit::{Conversation, Ending, Invariant};
@@ -8362,7 +8353,11 @@ mod tests {
             // examples are rendered turns and one of them notes
             // something, so a scan over every message finds *its* row
             // first and this compares an example against itself.
-            let text: String = doc.conversation().iter().map(|m| m.content.as_str()).collect();
+            let text: String = doc
+                .conversation()
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect();
             let at = text.find("noted: ").expect("a note row");
             text[at..].lines().next().unwrap().to_owned()
         };
@@ -8994,7 +8989,11 @@ mod tests {
         // The cap belongs to the tests that are *about* clipping. What
         // this fixture needs is the document's true size.
         let rendered = |tree: &Tree, state: &Runner| {
-            crate::compaction::rendered_size(&crate::document::render(tree, &state.spine, TEST_BUDGET))
+            crate::compaction::rendered_size(&crate::document::render(
+                tree,
+                &state.spine,
+                TEST_BUDGET,
+            ))
         };
         let preamble = rendered(&tree, &state);
         let mut size = preamble;
@@ -9190,11 +9189,7 @@ mod tests {
         let fired = settled
             .into_iter()
             .find(|o| matches!(o, StepOutput::LlmRequest(_)))
-            .or_else(|| {
-                state
-                    .compaction_if_needed(&mut tree, budget, 0.25)
-                    .unwrap()
-            })
+            .or_else(|| state.compaction_if_needed(&mut tree, budget, 0.25).unwrap())
             .expect("the document is over budget, so compaction fires");
         let StepOutput::LlmRequest(request) = fired else {
             panic!("compaction asks for a completion: {fired:?}");
@@ -9842,8 +9837,7 @@ mod tests {
         // `peek`, so its own `### peeked` block is rendered there for
         // good and says nothing about this branch's.
         assert!(
-            !after[after.find(crate::document::REAL_HEADING).unwrap_or(0)..]
-                .contains("### peeked"),
+            !after[after.find(crate::document::REAL_HEADING).unwrap_or(0)..].contains("### peeked"),
             "and its block went too"
         );
     }
@@ -10180,7 +10174,10 @@ mod tests {
     fn printing_a_row_back_stores_a_reference_to_it() {
         let body = "warning: unused\n".repeat(60);
         let mut c = Conversation::new();
-        c.answers("bash", serde_json::json!({ "status": 0, "stdout": body.clone() }));
+        c.answers(
+            "bash",
+            serde_json::json!({ "status": 0, "stdout": body.clone() }),
+        );
         c.user_says("go");
         c.reply(
             "```js\nconst r = await tools.bash(\"build\");\n\
@@ -10235,7 +10232,6 @@ mod tests {
             c.document()
         );
     }
-
 
     /// **A note that copies a row stores a reference to it instead.**
     /// `note` is for what a reply worked out; `keep` is for bytes it was
@@ -10320,7 +10316,10 @@ mod tests {
         let v = noted(&c);
         assert_eq!(v["finding"], "it stalls at batch 7", "the finding is kept");
         assert!(
-            v["dump"].as_str().unwrap().starts_with(crate::document::FENCE_OPEN),
+            v["dump"]
+                .as_str()
+                .unwrap()
+                .starts_with(crate::document::FENCE_OPEN),
             "the copy is not"
         );
 
@@ -10386,7 +10385,7 @@ mod tests {
         );
     }
 
-/// The search's own edges, away from the handler.
+    /// The search's own edges, away from the handler.
     ///
     /// **A shared run is not a repeat.** The first version asked only
     /// whether a long stretch appeared on both sides, which is true of
@@ -10847,7 +10846,6 @@ mod tests {
             "and not again"
         );
     }
-
 
     /// **A `finish()` that said nothing is not honoured**, and the next
     /// request says why. The pairing used to be the verb's arity —
@@ -11625,8 +11623,9 @@ mod tests {
     /// doubled marker is the example it imitates next turn.
     #[test]
     fn a_block_marker_the_model_wrote_is_replaced() {
-        let rows =
-            notebook_conversation("【↓ history[999]】\nReading it first.\n\n```js\nlet n = 1;\n```\n");
+        let rows = notebook_conversation(
+            "【↓ history[999]】\nReading it first.\n\n```js\nlet n = 1;\n```\n",
+        );
         let assistant: Vec<&String> = rows
             .iter()
             .filter(|(r, _)| *r == crate::document::ChatRole::Assistant)
