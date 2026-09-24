@@ -5221,6 +5221,16 @@ fn args_as_json(vm: &VM, call: &InvokeCall) -> Result<Vec<serde_json::Value>, St
 /// innocent coincidence (117).
 const NOTE_COPY_MIN_BYTES: usize = 512;
 
+/// How much of both sides a shared run has to cover before it counts
+/// as one carrying the other, rather than one quoting from it.
+///
+/// Ninety, because the two things being told apart are not close: a
+/// repeat is the row and nothing else, while a selection is a slice,
+/// a filter, or a handful of lines out of hundreds. What sits between
+/// them — a print that is most of a row but not all of it — is rare,
+/// and costs bytes rather than correctness when it is let through.
+const COPY_IS_A_REPEAT_PERCENT: usize = 90;
+
 /// Block size for the search below. Any run of `2 * BLOCK - 1` bytes
 /// shared between the note and a row contains a whole block-aligned
 /// slice of the note, so indexing the note by aligned blocks and
@@ -5398,8 +5408,31 @@ fn copy_of<'v>(
                     continue;
                 };
                 for row in &theirs {
-                    if let Some(at) = row.find(block) {
-                        return Some((call, overlap_len(s, row, at, block)));
+                    let Some(at) = row.find(block) else { continue };
+                    let shared = overlap_len(s, row, at, block);
+                    // **A reference can only stand in for a repeat, not
+                    // for a selection.** `← the N bytes already on [17]`
+                    // is a true account of what was written only if what
+                    // was written *was* that row. A slice of it is the
+                    // reply choosing what to look at — which is what the
+                    // console is for — and a reference loses which slice
+                    // it chose, so it replaces a fact with a falsehood.
+                    //
+                    // Live on 2026-09-24, against a 5,346-byte grep the
+                    // run had on a row: printing the whole thing was
+                    // replaced, correctly; then `slice(0, 4000)` was
+                    // replaced, and then the lines matching
+                    // `/index|char|byte/` were too — 14% of the row,
+                    // arrived at by a filter, which is the exact use the
+                    // card asks for. The reply lost its way of looking
+                    // at anything and spent three turns rediscovering
+                    // that `keep` exists. A shared run is not a repeat;
+                    // the test is whether each is nearly all of the
+                    // other.
+                    if shared * 100 >= s.len() * COPY_IS_A_REPEAT_PERCENT
+                        && shared * 100 >= row.len() * COPY_IS_A_REPEAT_PERCENT
+                    {
+                        return Some((call, shared));
                     }
                 }
             }
@@ -6467,6 +6500,7 @@ fn asker_of(tree: &Tree, question: EventId) -> Option<Author> {
 
 #[cfg(test)]
 mod tests {
+
 
     use super::*;
     use crate::testkit::{Conversation, Ending, Invariant};
@@ -10279,17 +10313,34 @@ mod tests {
         );
     }
 
-    /// The search's own edges, away from the handler.
+/// The search's own edges, away from the handler.
+    ///
+    /// **A shared run is not a repeat.** The first version asked only
+    /// whether a long stretch appeared on both sides, which is true of
+    /// a slice and of a filter's output as much as of a copy — and a
+    /// reference cannot stand in for those, because it loses which
+    /// slice was chosen. Live on 2026-09-24 that ate a
+    /// `slice(0, 4000)` and then a set of filtered lines, leaving the
+    /// reply no way to look at anything and three turns spent
+    /// rediscovering `keep`.
     #[test]
     fn the_copy_search_reads_provenance_and_not_length() {
         let row = serde_json::json!({ "stdout": "abcdefgh".repeat(200) });
         let rows = || std::iter::once((EventId::new(7), &row));
 
-        // A slice of the row, over the threshold: a copy.
+        // The row, carried whole: a copy, and the only shape that is.
+        let whole = "abcdefgh".repeat(200);
+        let (found, bytes) = copy_of(&[whole.as_str()], rows()).expect("a repeat");
+        assert_eq!((found.as_u64(), bytes), (7, whole.len()));
+
+        // Three quarters of it: a slice, which is the reply choosing
+        // what to look at. Leave it alone — this is the one that cost a
+        // live session its task.
         let lifted = "abcdefgh".repeat(150);
-        assert_eq!(
-            copy_of(&[lifted.as_str()], rows()).map(|(r, _)| r.as_u64()),
-            Some(7)
+        assert!(lifted.len() >= NOTE_COPY_MIN_BYTES, "over the threshold");
+        assert!(
+            copy_of(&[lifted.as_str()], rows()).is_none(),
+            "a slice is a selection, not a repeat"
         );
 
         // The same bytes, under the threshold: quoting is not copying.
@@ -10301,11 +10352,10 @@ mod tests {
         let own = "the parser drops the last field when it is empty. ".repeat(40);
         assert!(copy_of(&[own.as_str()], rows()).is_none());
 
-        // The reported number is the run they actually share, not the
-        // length of whatever string it sat in.
+        // A row's bytes buried in something mostly its own: the reply
+        // wrote around them, so they are part of what it said.
         let padded = format!("{}{}", "z".repeat(4000), "abcdefgh".repeat(100));
-        let (_, bytes) = copy_of(&[padded.as_str()], rows()).expect("found");
-        assert_eq!(bytes, 800, "the shared run, not the 4,800-byte string");
+        assert!(copy_of(&[padded.as_str()], rows()).is_none());
     }
 
     /// **A result its tool marks `show_once` is peeked without being
