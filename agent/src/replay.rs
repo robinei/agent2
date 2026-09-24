@@ -543,7 +543,11 @@ mod tests {
         // A value in hand is not a literal id, and must not be read as
         // one — that is the ordinary case and excusing it would hide
         // every real divergence behind it.
-        for ok in ["history.keep(f)", "history.peek(f.id)", "history.fetch(row)"] {
+        for ok in [
+            "history.keep(f)",
+            "history.peek(f.id)",
+            "history.fetch(row)",
+        ] {
             assert!(!super::names_an_id(&format!("```js\n{ok};\n```")), "{ok}");
         }
     }

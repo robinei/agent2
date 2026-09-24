@@ -165,7 +165,7 @@ fn for_of_array() {
 #[test]
 fn for_of_string_chars() {
     match testutil::run_val("let r = \"\"; for (const c of \"abc\") r = c + r; return r;") {
-        Value::String(s) => assert_eq!(s.as_str(), "cba"),
+        Value::String(s) => assert!(s.eq_str("cba")),
         other => panic!("not a string: {other:?}"),
     }
 }

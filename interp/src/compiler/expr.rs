@@ -3,7 +3,7 @@ use oxc_span::GetSpan;
 
 use crate::builtin::Builtin;
 use crate::span::Span;
-use crate::vm::{Instr, RcStr, Value};
+use crate::vm::{Instr, JsString, Value};
 
 impl super::Compiler {
     /// Every expression leaves exactly one value on the stack (the
@@ -216,7 +216,7 @@ impl super::Compiler {
             },
         }
         self.emit(
-            Instr::ObjNew(vec![RcStr::from("name"), RcStr::from("message")].into()),
+            Instr::ObjNew(vec![JsString::from("name"), JsString::from("message")].into()),
             span,
         );
     }

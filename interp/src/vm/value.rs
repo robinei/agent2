@@ -2,7 +2,7 @@ use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 
 use crate::builtin::Builtin;
-pub use crate::rc_str::RcStr;
+pub use crate::js_string::JsString;
 
 pub(crate) use super::BoundFn;
 pub(crate) use super::RcRegExp;
@@ -10,7 +10,7 @@ use super::instr;
 use super::instr::CodeAddr;
 use super::instr::{BufferPtr, DataViewPtr, MapPtr, SetPtr, TypedArrayPtr};
 
-/// Not `Copy`: the `String` variant owns an `RcStr` whose clone must bump a
+/// Not `Copy`: the `String` variant owns an `JsString` whose clone must bump a
 /// refcount and whose drop must release one. Every other variant is a trivial
 /// bit-copy, so `clone()` on a non-string value is as cheap as the old `Copy`.
 #[derive(Clone, Debug, PartialEq)]
@@ -47,7 +47,7 @@ pub enum Value {
     /// and objects — which are `Ptr` into `heap` and compare by reference
     /// identity — strings are primitives and are reclaimed when the last
     /// reference drops (the heap itself never reclaims).
-    String(RcStr),
+    String(JsString),
     Array(instr::ArrayPtr),
     Object(instr::ObjectPtr),
     /// Internal indirection for a captured *by-reference* binding: indexes the
@@ -249,7 +249,7 @@ impl Value {
             // NegInt is always negative (i64::MIN..=-1), hence never zero.
             Value::NegInt(_) => true,
             // Empty string is falsy; any other string is truthy.
-            Value::String(s) => !s.as_str().is_empty(),
+            Value::String(s) => !s.as_units().is_empty(),
             // All arrays/objects/closures/functions/promises are truthy.
             Value::Array(_)
             | Value::Object(_)
@@ -282,7 +282,7 @@ impl Value {
             Value::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
             Value::Null => Some(0.0),
             Value::Undefined => Some(f64::NAN),
-            Value::String(s) => Some(js_str_to_number(s)),
+            Value::String(s) => Some(js_str_to_number(s.as_units())),
             Value::Array(_)
             | Value::Object(_)
             | Value::Closure { .. }
@@ -358,7 +358,7 @@ impl Value {
             }
             // Builtins compare by identity, like Fn.
             (Value::Builtin(a), Value::Builtin(b)) => a == b,
-            // Strings are primitives: equal by *content*. `RcStr`'s `==` short-
+            // Strings are primitives: equal by *content*. `JsString`'s `==` short-
             // circuits on pointer identity, so comparing shared/interned strings
             // (e.g. two clones of one literal) is O(1).
             (Value::String(a), Value::String(b)) => a == b,
@@ -415,8 +415,8 @@ impl Value {
             (Bool(b), _) => Value::Float(if *b { 1.0 } else { 0.0 }).loose_equal(other),
             (_, Bool(b)) => self.loose_equal(&Value::Float(if *b { 1.0 } else { 0.0 })),
             // Number vs string (either order): coerce the string with ToNumber.
-            (l, String(s)) if l.is_number() => l.num_loose_eq_str(s),
-            (String(s), r) if r.is_number() => r.num_loose_eq_str(s),
+            (l, String(s)) if l.is_number() => l.num_loose_eq_str(s.as_units()),
+            (String(s), r) if r.is_number() => r.num_loose_eq_str(s.as_units()),
             // No further coercion: same-type primitives and heap-vs-heap defer
             // to the strict structural comparison.
             _ => self.strict_equal(other),
@@ -465,17 +465,17 @@ impl Value {
         matches!(self, Value::Float(_) | Value::PosInt(_) | Value::NegInt(_))
     }
 
-    pub(crate) fn num_loose_eq_str(&self, s: &str) -> bool {
+    pub(crate) fn num_loose_eq_str(&self, s: &[u16]) -> bool {
         match self.as_f64() {
             Some(a) => a == js_str_to_number(s),
             None => false,
         }
     }
 
-    /// Byte length of a string value, if it is one.
-    pub(crate) fn str_byte_len(&self) -> Option<usize> {
+    /// Code-unit length of a string value, if it is one.
+    pub(crate) fn str_unit_len(&self) -> Option<usize> {
         match self {
-            Value::String(s) => Some(s.len()),
+            Value::String(s) => Some(s.as_units().len()),
             _ => None,
         }
     }
@@ -541,11 +541,17 @@ pub(crate) fn float_is_int(n: f64) -> bool {
 /// otherwise parses as f64 — yielding NaN (which is never equal to anything)
 /// when unparseable. Diverges from spec ToNumber on a few literal forms it
 /// would accept (hex `0x…`, etc.), which don't arise from tool/JSON data here.
-pub(crate) fn js_str_to_number(s: &str) -> f64 {
-    let t = s.trim();
+pub(crate) fn js_str_to_number(units: &[u16]) -> f64 {
+    let (a, b) = crate::units::trim_range(units);
+    let t = &units[a..b];
     if t.is_empty() {
-        0.0
-    } else {
-        t.parse::<f64>().unwrap_or(f64::NAN)
+        return 0.0;
     }
+    // Every form `parse::<f64>` accepts is ASCII, so anything wider is NaN
+    // without going near the parser — and the narrowing below is exact.
+    if !t.iter().all(|&u| u < 0x80) {
+        return f64::NAN;
+    }
+    let s: String = t.iter().map(|&u| u as u8 as char).collect();
+    s.parse::<f64>().unwrap_or(f64::NAN)
 }

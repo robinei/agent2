@@ -2517,7 +2517,11 @@ mod tests {
         };
         let ages = std::collections::HashMap::from([(7, 11), (9, 2), (11, 0)]);
         let rows = heaviest_rows(&doc, &ages, 5);
-        assert_eq!(rows.first().map(|r| r.0), Some(7), "biggest first: {rows:?}");
+        assert_eq!(
+            rows.first().map(|r| r.0),
+            Some(7),
+            "biggest first: {rows:?}"
+        );
         assert!(rows[0].1 > 4000, "it carries the block's bytes: {rows:?}");
 
         let line = heaviest_line(&rows);
@@ -2760,7 +2764,13 @@ mod tests {
     /// was more than half of a 7,668-byte conversation.
     #[test]
     fn the_compaction_directive_says_how_much_is_actually_yours() {
-        let with = compaction_message(35_552, 42_000, crate::types::Measure::Bytes, Some(27_797), "");
+        let with = compaction_message(
+            35_552,
+            42_000,
+            crate::types::Measure::Bytes,
+            Some(27_797),
+            "",
+        );
         assert!(with.contains("27797 is the card"), "{with}");
         assert!(
             with.contains("conversation itself is 7755"),
@@ -2955,7 +2965,9 @@ mod tests {
         // document budget — a test that silently stops testing is worse
         // than one that breaks.
         let line = CONSOLE_SECTION_MAX_BYTES / 8;
-        let fat: Vec<String> = (0..10).map(|i| format!("{i}{}", "z".repeat(line))).collect();
+        let fat: Vec<String> = (0..10)
+            .map(|i| format!("{i}{}", "z".repeat(line)))
+            .collect();
         let rendered = render_console(&fat, Some(7)).expect("lines present");
         assert!(
             rendered.contains("of 10 lines; `history.fetch(7)` for all of them"),
@@ -3425,10 +3437,7 @@ mod tests {
         // the only promise the menu makes is `history.fetch(id)`.
         let few: Vec<&Artifact> = refs[..3].to_vec();
         let out = render_row_list("### rows", &few).unwrap();
-        assert!(
-            out.contains("and 2 the same before it: [10] [11]"),
-            "{out}"
-        );
+        assert!(out.contains("and 2 the same before it: [10] [11]"), "{out}");
     }
 
     /// **Two calls that merely *look* the same are two rows.** The

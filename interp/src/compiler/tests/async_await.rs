@@ -34,7 +34,7 @@ fn fanout_via_map_single_yield() {
     // Resolve in REVERSE order: resolution order must not matter.
     for call in calls.iter().rev() {
         let arg = match &call.args[0] {
-            Value::String(s) => s.as_str().to_owned(),
+            Value::String(s) => s.to_string(),
             other => panic!("expected string arg, got {other:?}"),
         };
         vm.resolve_promise(call.promise, Value::String(format!("got:{arg}").into()))
@@ -195,7 +195,7 @@ fn unawaited_calls_reported_in_done() {
     match vm.step(u64::MAX).unwrap() {
         StepResult::Done { value, unstarted } => {
             assert_eq!(value, Value::PosInt(1));
-            let args: Vec<&str> = unstarted.iter().map(|c| str_arg(&c.args[0])).collect();
+            let args: Vec<String> = unstarted.iter().map(|c| str_arg(&c.args[0])).collect();
             assert_eq!(args, ["step1", "step2"]);
         }
         other => panic!("expected Done, got {other:?}"),
@@ -942,9 +942,9 @@ fn expect_done_json(vm: &mut VM) -> serde_json::Value {
     }
 }
 
-fn str_arg(v: &Value) -> &str {
+fn str_arg(v: &Value) -> String {
     match v {
-        Value::String(s) => s.as_str(),
+        Value::String(s) => s.to_string(),
         other => panic!("expected string arg, got {other:?}"),
     }
 }

@@ -1,6 +1,6 @@
 use crate::builtin::Args;
-use crate::rc_str::keys;
-use crate::vm::{ErrorKind, RcStr, VM, VMError, Value};
+use crate::js_string::keys;
+use crate::vm::{ErrorKind, JsString, VM, VMError, Value};
 use smallvec::SmallVec;
 use thin_vec::ThinVec;
 
@@ -65,7 +65,7 @@ pub fn array_from(vm: &mut VM, args: Args) -> Result<Value, VMError> {
             let n = (len as usize).min(10_000_000);
             let mut out: ThinVec<Value> = ThinVec::with_capacity(n);
             for i in 0..n {
-                let key = crate::rc_str::RcStr::from(i.to_string());
+                let key = crate::js_string::JsString::from(i.to_string());
                 let v = obj.map.get(&key).cloned().unwrap_or(Value::Undefined);
                 out.push(v);
             }
@@ -81,10 +81,8 @@ pub fn array_from(vm: &mut VM, args: Args) -> Result<Value, VMError> {
         Value::Set(_) => super::set_values(vm, args),
         Value::Map(_) => super::map_entries(vm, args),
         Value::String(s) => {
-            let chars: ThinVec<Value> = s
-                .as_str()
-                .chars()
-                .map(|c| Value::String(crate::rc_str::RcStr::from(c.to_string())))
+            let chars: ThinVec<Value> = crate::units::code_points(s.as_units())
+                .map(|cp| Value::String(JsString::from_units(cp)))
                 .collect();
             Ok(vm.alloc_array(chars))
         }
@@ -171,24 +169,24 @@ pub fn array_unshift(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 pub fn array_join(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let arr_ptr = args.array_receiver(vm)?;
     let sep = match args.get(vm, 1) {
-        Value::Undefined => RcStr::from(","),
+        Value::Undefined => JsString::from(","),
         v => vm.to_js_string(v, 0),
     };
     let arr = vm
         .arrays
         .get(arr_ptr as usize)
         .ok_or_else(|| vm.fail(ErrorKind::TypeError, "type error"))?;
-    let mut joined = String::new();
+    let mut joined: Vec<u16> = Vec::new();
     for (i, v) in arr.iter().enumerate() {
         if i > 0 {
-            joined.push_str(sep.as_str());
+            joined.extend_from_slice(sep.as_units());
         }
         // JS: null/undefined elements contribute the empty string.
         if !matches!(v, Value::Null | Value::Undefined) {
-            joined.push_str(vm.to_js_string(v, 0).as_str());
+            joined.extend_from_slice(vm.to_js_string(v, 0).as_units());
         }
     }
-    Ok(Value::String(RcStr::from(joined)))
+    Ok(Value::String(JsString::from_units(&joined)))
 }
 
 /// `arr.reverse()` → reverses in-place, returns the receiver.
@@ -596,7 +594,7 @@ mod tests {
             Instr::CallBuiltin(Builtin::ArrayJoin, 1),
         ]);
         match &out[0] {
-            Value::String(s) => assert_eq!(s.as_str(), "1,2"),
+            Value::String(s) => assert!(s.eq_str("1,2")),
             other => panic!("expected string, got {other:?}"),
         }
     }
@@ -611,7 +609,7 @@ mod tests {
             Instr::CallBuiltin(Builtin::ArrayJoin, 2),
         ]);
         match &out[0] {
-            Value::String(s) => assert_eq!(s.as_str(), "1 - 2"),
+            Value::String(s) => assert!(s.eq_str("1 - 2")),
             other => panic!("expected string, got {other:?}"),
         }
     }

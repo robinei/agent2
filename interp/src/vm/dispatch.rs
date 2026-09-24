@@ -1,6 +1,6 @@
 use super::*;
 use crate::builtin::{Builtin, BuiltinKind};
-use crate::rc_str::keys;
+use crate::js_string::keys;
 use smallvec::SmallVec;
 
 /// How much of a string rejection survives into the error a program's
@@ -82,7 +82,7 @@ impl VM {
             Value::Object(p) => match self.objects.get(*p as usize) {
                 Some(o) => {
                     let n = o.map.len();
-                    let shown: Vec<&str> = o.map.keys().take(4).map(|k| k.as_str()).collect();
+                    let shown: Vec<String> = o.map.keys().take(4).map(|k| k.to_string()).collect();
                     let more = if n > shown.len() { ", …" } else { "" };
                     let keys = if shown.is_empty() {
                         String::new()
@@ -142,7 +142,7 @@ impl VM {
                     ErrorKind::TypeError,
                     format!(
                         "cannot read property '{}' on {}{}",
-                        name.as_str(),
+                        name,
                         receiver.type_name(),
                         await_hint(receiver)
                     ),
@@ -154,14 +154,17 @@ impl VM {
                     ErrorKind::ValueError,
                     format!(
                         "cannot read property '{}' on {}",
-                        name.as_str(),
+                        name,
                         receiver.type_name()
                     ),
                 ));
             }
             Value::Promise(_) => {
                 let name = self.to_js_string(key, 0);
-                return Err(self.fail(ErrorKind::TypeError, promise_property_error(name.as_str())));
+                return Err(self.fail(
+                    ErrorKind::TypeError,
+                    promise_property_error(&name.to_utf8_lossy()),
+                ));
             }
             _ => {}
         }
@@ -215,41 +218,19 @@ impl VM {
                     return Ok(arr.get(idx).cloned().unwrap_or(Value::Undefined));
                 }
                 Value::String(s) => {
-                    let s = s.as_str();
-                    if idx >= s.len() {
+                    // **One code unit, and no way to land between two.** This
+                    // used to read a UTF-8 byte offset and raise a
+                    // ValueError, with a paragraph of advice, whenever the
+                    // offset fell inside a multi-byte character — which
+                    // `for (let i = 0; i < s.length; i++) s[i]` did on the
+                    // first character over 0x7F. Seen live on 2026-09-24,
+                    // walking a Rust file full of em dashes. There is no such
+                    // position any more: every index names a unit.
+                    let u = s.as_units();
+                    if idx >= u.len() {
                         return Ok(Value::Undefined);
                     }
-                    if !s.is_char_boundary(idx) {
-                        // Strings here index by UTF-8 byte offset, not code point
-                        // (see the module doc on string indexing) — landing
-                        // mid-codepoint is the price of that, surfaced rather
-                        // than silently coerced.
-                        //
-                        // **It says what to do instead**, because there is
-                        // exactly one way to arrive here and the writer of
-                        // the program cannot be expected to know it. A
-                        // reader of text walks it one index at a time, and
-                        // told that `.length` counts bytes will write
-                        // `for (let i = 0; i < s.length; i++) s[i]` —
-                        // correct-looking, self-consistent, and certain to
-                        // land here on the first character over 0x7F. Seen
-                        // live on 2026-09-24, walking a Rust file full of
-                        // em dashes.
-                        return Err(self.fail(
-                            ErrorKind::ValueError,
-                            format!(
-                                "cannot index string at byte offset {idx}: falls inside a \
-                                 multi-byte UTF-8 character. `.length` and every index here \
-                                 count UTF-8 bytes, so stepping one at a time lands inside a \
-                                 character on any text that is not pure ASCII. To walk \
-                                 characters, `for (const ch of s)`. To find something, \
-                                 `s.indexOf(…)` and `s.slice(…)`, whose offsets are always \
-                                 on a boundary."
-                            ),
-                        ));
-                    }
-                    let ch = s[idx..].chars().next().unwrap();
-                    return Ok(Value::String(RcStr::from(ch.to_string())));
+                    return Ok(Value::String(JsString::from_units(&u[idx..][..1])));
                 }
                 // Integer key on a non-array, non-string, non-Object:
                 // TypeError (cannot index into <type>). Object falls
@@ -277,7 +258,7 @@ impl VM {
     /// bags, and proto-chain walk for a `&str` field. Called after the
     /// integer-key fast path above (which lives in `get_property` so
     /// array-index reads inline to exactly today's code).
-    fn named_get_property(&mut self, receiver: &Value, field: &RcStr) -> Result<Value, VMError> {
+    fn named_get_property(&mut self, receiver: &Value, field: &JsString) -> Result<Value, VMError> {
         match receiver {
             Value::Null | Value::Undefined | Value::Promise(_) | Value::Upval(_) => {
                 unreachable!("handled before named_get_property")
@@ -291,12 +272,12 @@ impl VM {
                 let v = crate::match_wide!(field => {
                     "source" => Value::String(r.pattern.clone()),
                     "flags" => Value::String(r.flags.clone()),
-                    "global" => Value::Bool(r.flags.contains('g')),
-                    "ignoreCase" => Value::Bool(r.flags.contains('i')),
-                    "multiline" => Value::Bool(r.flags.contains('m')),
-                    "dotAll" => Value::Bool(r.flags.contains('s')),
-                    "unicode" => Value::Bool(r.flags.contains('u')),
-                    "sticky" => Value::Bool(r.flags.contains('y')),
+                    "global" => Value::Bool(r.has_flag(b'g')),
+                    "ignoreCase" => Value::Bool(r.has_flag(b'i')),
+                    "multiline" => Value::Bool(r.has_flag(b'm')),
+                    "dotAll" => Value::Bool(r.has_flag(b's')),
+                    "unicode" => Value::Bool(r.has_flag(b'u')),
+                    "sticky" => Value::Bool(r.has_flag(b'y')),
                     "lastIndex" => Value::PosInt(r.last_index.get() as u64),
                     _ => Value::Undefined,
                 });
@@ -311,12 +292,12 @@ impl VM {
                 if field.eq_str("prototype") {
                     return Ok(Value::Object(self.resolve_prototype(*ptr)?));
                 }
-                if field.eq_str("name") || field.eq_str(keys::LENGTH) {
+                if field.eq_str("name") || field.eq_str("length") {
                     let c = self.closures.get(*ptr as usize).ok_or_else(|| {
                         self.fail_not_resumable(ErrorKind::TypeError, "bad closure pointer")
                     })?;
                     if field.eq_str("name") {
-                        return Ok(Value::String(RcStr::from("")));
+                        return Ok(Value::String(JsString::from("")));
                     }
                     return Ok(Value::Float(c.arity as f64));
                 }
@@ -338,8 +319,8 @@ impl VM {
                     if field.eq_str("prototype") {
                         return Ok(Value::Object(self.prototype_for(tag)?));
                     } else if field.eq_str("name") {
-                        return Ok(Value::String(RcStr::from(b.meta().name)));
-                    } else if field.eq_str(keys::LENGTH) {
+                        return Ok(Value::String(JsString::from(b.meta().name)));
+                    } else if field.eq_str("length") {
                         let meta = b.meta();
                         let n = match meta.kind {
                             crate::builtin::BuiltinKind::Method => meta.min_args.saturating_sub(1),
@@ -363,7 +344,7 @@ impl VM {
 
             // ── Array: `length` virtual rung → Array proto ───────
             Value::Array(_) => {
-                if field.eq_str(keys::LENGTH) {
+                if field.eq_str("length") {
                     let len = match receiver {
                         Value::Array(p) => {
                             self.arrays.get(*p as usize).map(|a| a.len()).unwrap_or(0)
@@ -377,7 +358,7 @@ impl VM {
 
             // ── Map: `size` virtual rung → Map proto ────────────
             Value::Map(_) => {
-                if field.eq_str(keys::SIZE) {
+                if field.eq_str("size") {
                     let sz = match receiver {
                         Value::Map(p) => self.maps.get(*p as usize).map(|m| m.len()).unwrap_or(0),
                         _ => unreachable!(),
@@ -389,7 +370,7 @@ impl VM {
 
             // ── Set: `size` virtual rung → Set proto ────────────
             Value::Set(_) => {
-                if field.eq_str(keys::SIZE) {
+                if field.eq_str("size") {
                     let sz = match receiver {
                         Value::Set(p) => self.sets.get(*p as usize).map(|s| s.len()).unwrap_or(0),
                         _ => unreachable!(),
@@ -458,7 +439,7 @@ impl VM {
     fn type_proto_lookup(
         &mut self,
         tag: crate::vm::instr::TypeTag,
-        field: &RcStr,
+        field: &JsString,
         receiver: &Value,
     ) -> Result<Value, VMError> {
         let proto = self.prototype_for(tag)?;
@@ -476,7 +457,7 @@ impl VM {
     /// matched rung, `None` to fall through to the proto chain.
     fn typed_array_virtual(
         &self,
-        field: &RcStr,
+        field: &JsString,
         receiver: &Value,
     ) -> Option<Result<Value, VMError>> {
         let ptr = match receiver {
@@ -497,7 +478,11 @@ impl VM {
     /// Resolve DataView virtual properties (byteLength, byteOffset,
     /// buffer). Returns `Some(Value)` for a matched rung, `None` to fall
     /// through to the proto chain.
-    fn data_view_virtual(&self, field: &RcStr, receiver: &Value) -> Option<Result<Value, VMError>> {
+    fn data_view_virtual(
+        &self,
+        field: &JsString,
+        receiver: &Value,
+    ) -> Option<Result<Value, VMError>> {
         let ptr = match receiver {
             Value::DataView(p) => *p,
             _ => return None,
@@ -655,7 +640,7 @@ impl VM {
     fn named_set_property(
         &mut self,
         receiver: &Value,
-        field: &RcStr,
+        field: &JsString,
         val: Value,
         mode: SetMode,
     ) -> Result<Value, VMError> {
@@ -727,7 +712,7 @@ impl VM {
 
             // ── RegExp: lastIndex is writable ────────────────────
             Value::RegExp(r) => {
-                if field == "lastIndex" {
+                if field.eq_str("lastIndex") {
                     let n = val.to_number().unwrap_or(0.0);
                     let n = if n.is_finite() && n >= 0.0 {
                         n as usize
@@ -859,12 +844,12 @@ impl VM {
             _ => return Ok(None),
         };
         // `name` is a builtin's `&'static str`, and a property key is an
-        // `RcStr`; building one here costs a short allocation. It sits on the
+        // `JsString`; building one here costs a short allocation. It sits on the
         // path that was already going to walk a prototype chain, and only for
         // a builtin method called on an `Object` receiver — not on the
         // `CallBuiltin` fast path, which is the case this whole helper exists
         // to keep fast.
-        let val = self.resolve_proto_chain(obj_ptr, &RcStr::from(name))?;
+        let val = self.resolve_proto_chain(obj_ptr, &JsString::from(name))?;
         Ok(if matches!(val, Value::Undefined) {
             None
         } else {
@@ -881,7 +866,7 @@ impl VM {
     /// an empty list. Returns `None` for any other receiver — the builtins turn
     /// that into the same `TypeError` they already raise for non-objects.
     /// (Collections/primitives are non-extensible, so they have no user bag.)
-    pub(crate) fn own_enumerable_props(&self, value: &Value) -> Option<Vec<(RcStr, Value)>> {
+    pub(crate) fn own_enumerable_props(&self, value: &Value) -> Option<Vec<(JsString, Value)>> {
         match value {
             Value::Object(p) => self
                 .objects
@@ -902,7 +887,7 @@ impl VM {
     /// `Object.hasOwn` and `obj.hasOwnProperty`. Mirrors `own_enumerable_props`'s
     /// receiver handling (Object `map` or function `props` bag); `None` for a
     /// receiver the reflection builtins reject.
-    pub(crate) fn own_prop_contains(&self, value: &Value, key: &RcStr) -> Option<bool> {
+    pub(crate) fn own_prop_contains(&self, value: &Value, key: &JsString) -> Option<bool> {
         match value {
             Value::Object(p) => self
                 .objects
@@ -2025,14 +2010,18 @@ impl VM {
                     let result = if lhs.is_string() || rhs.is_string() {
                         // Pre-size the buffer when both operands are strings (the
                         // common concat path), saving incremental growth.
-                        let cap = match (lhs.str_byte_len(), rhs.str_byte_len()) {
+                        let cap = match (lhs.str_unit_len(), rhs.str_unit_len()) {
                             (Some(a), Some(b)) => a + b,
                             _ => 0,
                         };
-                        let mut s = String::with_capacity(cap);
-                        self.write_js_string(&lhs, 0, &mut s);
-                        self.write_js_string(&rhs, 0, &mut s);
-                        Value::String(RcStr::from(s))
+                        // **Units, so the common case stays a memcpy.**
+                        // Narrowing both sides to UTF-8 and re-widening the
+                        // result would make `a + b` on two strings two
+                        // transcodes where it is two `extend_from_slice`s.
+                        let mut s: Vec<u16> = Vec::with_capacity(cap);
+                        self.write_js_units(&lhs, 0, &mut s);
+                        self.write_js_units(&rhs, 0, &mut s);
+                        Value::String(JsString::from_units(&s))
                     } else {
                         match (lhs.to_number(), rhs.to_number()) {
                             (Some(a), Some(b)) => Value::Float(a + b),
@@ -2161,7 +2150,7 @@ impl VM {
                     let mut obj = IndexMap::new();
                     // Left-to-right: field 0's value is the deepest (first
                     // pushed), so values line up with fields in order. `field`
-                    // clones are refcount bumps on the interned `RcStr` key.
+                    // clones are refcount bumps on the interned `JsString` key.
                     for (field, val) in fields.iter().zip(vals) {
                         obj.insert(field.clone(), val);
                     }
@@ -2308,7 +2297,7 @@ impl VM {
                                     VMError::fail_at(ip, ErrorKind::TypeError, "bad object pointer")
                                 })?
                                 .map
-                                .shift_remove(field.as_str())
+                                .shift_remove(&field)
                                 .is_some()
                         }
                         Value::Closure { ptr, .. } => {
@@ -2324,7 +2313,7 @@ impl VM {
                                 }
                             };
                             if let Some(ref mut bag) = c.props {
-                                bag.shift_remove(field.as_str()).is_some()
+                                bag.shift_remove(&field).is_some()
                             } else {
                                 false
                             }
@@ -2365,7 +2354,7 @@ impl VM {
                     match src {
                         Value::Null | Value::Undefined => {}
                         Value::Object(src_ptr) => {
-                            let entries: SmallVec<[(RcStr, Value); 8]> = self
+                            let entries: SmallVec<[(JsString, Value); 8]> = self
                                 .objects
                                 .get(src_ptr as usize)
                                 .ok_or_else(|| {
@@ -2479,10 +2468,8 @@ impl VM {
                         // `[..."abc"]` — a string is iterable too, by
                         // code point.
                         Value::String(ref s) => {
-                            let elts: ThinVec<Value> = s
-                                .as_str()
-                                .chars()
-                                .map(|c| Value::String(RcStr::from(c.to_string().as_str())))
+                            let elts: ThinVec<Value> = crate::units::code_points(s.as_units())
+                                .map(|cp| Value::String(JsString::from_units(cp)))
                                 .collect();
                             let arr = self.arrays.get_mut(arr_ptr as usize).ok_or_else(|| {
                                 VMError::fail_at(ip, ErrorKind::TypeError, "bad array pointer")
@@ -2526,7 +2513,7 @@ impl VM {
                             let elts: ThinVec<Value> = (0..n.min(10_000_000))
                                 .map(|i| {
                                     obj.map
-                                        .get(&RcStr::from(i.to_string().as_str()))
+                                        .get(&JsString::from(i.to_string().as_str()))
                                         .cloned()
                                         .unwrap_or(Value::Undefined)
                                 })
@@ -2596,7 +2583,7 @@ impl VM {
                     // `TypeError` — for-of lowering relies on that (it iterates
                     // only array/string, via `idx < ArrLength`).
                     let result = match val {
-                        Value::String(s) => Value::Float(s.len() as f64),
+                        Value::String(s) => Value::Float(s.as_units().len() as f64),
                         Value::Array(p) => Value::Float(
                             self.arrays
                                 .get(p as usize)
@@ -2744,7 +2731,7 @@ impl VM {
                     // and continue executing. The host sees the accumulated
                     // outbox only when an `Await` blocks on a pending promise,
                     // so fan-out composes across arbitrary control flow.
-                    let name = name.as_str().to_owned();
+                    let name = name.to_string();
                     let n = *nargs as usize;
                     if n > self.stack.len() {
                         return Err(self.fail(ErrorKind::StackUnderflow, "stack underflow"));
@@ -2777,7 +2764,7 @@ impl VM {
                     // not the promise: this call is known to settle at
                     // dispatch, so there is nothing for the program to
                     // wait on (`Instr::Notify`'s own doc).
-                    let name = name.as_str().to_owned();
+                    let name = name.to_string();
                     let n = *nargs as usize;
                     if n > self.stack.len() {
                         return Err(self.fail(ErrorKind::StackUnderflow, "stack underflow"));
@@ -2817,7 +2804,7 @@ impl VM {
                     // stranded: a `Settle` always gets answered, and the
                     // next `Await` (or the program's completion) drains
                     // the outbox as it always did.
-                    let name = name.as_str().to_owned();
+                    let name = name.to_string();
                     let n = *nargs as usize;
                     if n > self.stack.len() {
                         return Err(self.fail(ErrorKind::StackUnderflow, "stack underflow"));
@@ -2932,9 +2919,9 @@ impl VM {
                             // still gets the type-and-preview form.
                             let msg = match errval {
                                 Value::String(s) => {
-                                    let s = s.as_str();
+                                    let s = s.to_string();
                                     if s.len() <= REJECTION_MESSAGE_MAX_BYTES {
-                                        s.to_owned()
+                                        s
                                     } else {
                                         let mut end = REJECTION_MESSAGE_MAX_BYTES;
                                         while !s.is_char_boundary(end) {
@@ -2966,7 +2953,7 @@ impl VM {
                                         .and_then(|o| o.map.get(keys::MESSAGE).cloned())
                                         .unwrap_or(Value::Undefined);
                                     let text = match &m {
-                                        Value::String(s) => s.as_str().to_owned(),
+                                        Value::String(s) => s.to_string(),
                                         _ => String::new(),
                                     };
                                     let mut end = text.len().min(REJECTION_MESSAGE_MAX_BYTES);
@@ -3043,7 +3030,7 @@ impl VM {
                     // calling step() again (or using VM::resume_raise).
                     self.ip += 1;
                     return Ok(StepResult::Raise {
-                        condition: condition.as_str().to_owned(),
+                        condition: condition.to_string(),
                         payload,
                     });
                 }

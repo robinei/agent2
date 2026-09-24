@@ -144,20 +144,25 @@ fn shift_out_of_range_reports_the_amount() {
     );
 }
 
+/// **There is no mid-character index left to report.**
+///
+/// This test used to assert the opposite: `"é"[1]` raised
+/// `cannot index string at byte offset 1: falls inside a multi-byte UTF-8
+/// character`, with a paragraph of advice, because an index was a UTF-8 byte
+/// offset and `"é"` was two of them. Under code units `"é"` is one unit, so
+/// index 1 is simply past the end — `undefined`, as JS says — and the error
+/// branch it was guarding is gone with the offsets that made it possible.
 #[test]
-fn string_mid_codepoint_index_reports_the_offset() {
-    // Strings index by UTF-8 byte offset here (see the module doc on
-    // string indexing); "é" is 2 bytes, so byte 1 lands inside it.
-    let err = testutil::run_runtime_err("return \"\u{e9}\"[1];");
-    assert_eq!(err.kind, crate::vm::ErrorKind::ValueError);
-    // The offset is the point of this test; the remedy that follows it
-    // belongs to `tests/string_is_walked_by_character.rs`, which is
-    // also where the three readings of a character are held together.
-    assert!(
-        err.message
-            .starts_with("cannot index string at byte offset 1: falls inside a multi-byte"),
-        "{}",
-        err.message
+fn string_index_past_the_end_is_undefined() {
+    assert_eq!(eval("\"\u{e9}\".length"), Value::Float(1.0));
+    assert_eq!(eval("\"\u{e9}\"[1]"), Value::Undefined);
+    assert_eq!(eval("\"\u{e9}\"[0]"), Value::String("\u{e9}".into()));
+    // The astral case, where an index *can* land between the halves of a
+    // character: it reads one code unit, exactly as JS does.
+    assert_eq!(eval("\"\u{1F600}\".length"), Value::Float(2.0));
+    assert_eq!(
+        eval("\"\u{1F600}\"[0] + \"\u{1F600}\"[1] === \"\u{1F600}\""),
+        Value::Bool(true)
     );
 }
 

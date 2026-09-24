@@ -4,7 +4,7 @@ mod tests;
 pub mod value;
 
 // Re-exports so external paths (`crate::vm::Value` etc.) are unchanged.
-pub use crate::rc_str::RcStr;
+pub use crate::js_string::JsString;
 pub use instr::{
     ArrayPtr, BufferPtr, CellIndex, ClosurePtr, CodeAddr, DataViewEntry, DataViewPtr, FieldName,
     GlobalId, Instr, LocalIndex, MapPtr, ObjectPtr, PromisePtr, SetMode, SetPtr, SlotKind,
@@ -142,11 +142,15 @@ The remaining intentional divergences from JS — deferred or accepted, NOT bugs
   • Function arity is strict: reading an argument past those passed is an error,
     not `undefined`. The compiler is expected to pass exact arity (no implicit
     `arguments`, default, or rest-param holes).
-  • Strings are UTF-8 byte sequences: `.length` and all index/offset string ops
-    count/use UTF-8 *bytes*, not UTF-16 code units (`"é".length` is 2 here, 1 in
-    JS; "😀" is 4 here, 2 in JS). ASCII text is identical. Slicing at a
-    mid-codepoint byte offset errors rather than coercing to a codepoint
-    boundary.
+  • Strings are UTF-16 code units, as JS's are: `.length` and every index and
+    offset counts a code unit, so `"é".length` is 1 and `"😀".length` is 2 —
+    and a lone surrogate (`"\uD800"`) is a value a program can hold. **This
+    bullet said the opposite until 2026-09-24**, and the byte model was a
+    deliberate choice; it was reversed because it was silently manufacturing
+    wrong answers (`"aéb".slice(0, 2)` was `"a"`) rather than loud ones. See
+    `docs/30_STRINGS.md` and `js_string.rs`. What is still divergent: an unpaired
+    surrogate has no UTF-8 form, so it becomes U+FFFD on the way out to JSON —
+    `isWellFormed()`/`toWellFormed()` let a program ask before that happens.
   • Bitwise ops (`& | ^ << >> >>> ~`) operate on full i64, not JS's 32-bit
     ToInt32 semantics. Shift counts must be 0..63 (JS masks to 0..31).
     `>>>` is an unsigned (zero-fill) right shift on 64-bit values.
@@ -248,11 +252,27 @@ const MAX_JSON_DEPTH: usize = 128;
 /// object identity.
 #[derive(Debug)]
 pub struct RegExpData {
-    pub pattern: RcStr,
-    pub flags: RcStr,
+    pub pattern: JsString,
+    pub flags: JsString,
     pub compiled: regress::Regex,
-    /// `lastIndex`: where the next `/g` `exec`/`test` resumes (bytes).
+    /// `lastIndex`: where the next `/g` `exec`/`test` resumes (code units).
     pub last_index: std::cell::Cell<usize>,
+}
+
+impl RegExpData {
+    /// Whether the flag letter `c` (ASCII) is set.
+    pub fn has_flag(&self, c: u8) -> bool {
+        debug_assert!(c.is_ascii());
+        self.flags.as_units().contains(&(c as u16))
+    }
+
+    /// Whether matching runs in Unicode mode — the `u` flag, or `v`, which
+    /// implies it. **This is the one bit that picks the input type**:
+    /// regress's `Utf16Input` pairs surrogates and `Ucs2Input` does not,
+    /// which is exactly the difference the flag names.
+    pub fn unicode(&self) -> bool {
+        self.has_flag(b'u') || self.has_flag(b'v')
+    }
 }
 
 /// Reference-counted handle to a [`RegExpData`]. `Clone` is a refcount bump.
@@ -681,7 +701,7 @@ pub struct Closure {
     pub upvals: ThinVec<Value>,
     pub prototype: Option<ObjectPtr>,
     pub arity: u16,
-    pub props: Option<Box<IndexMap<RcStr, Value>>>,
+    pub props: Option<Box<IndexMap<JsString, Value>>>,
 }
 
 /// A bound function value produced by `f.bind(thisArg, ...args)` — the only
@@ -690,7 +710,7 @@ pub struct Closure {
 /// The `Rc` graph is acyclic by construction — `BoundFn` has no interior
 /// mutability and references heap aggregates only by arena index (a `u32`),
 /// never by a strong `Rc`. The `bound_args` vector is fixed at bind time, and
-/// any `Rc`-bearing element (`RcStr`/`RcRegExp`/another `Bound`) is itself
+/// any `Rc`-bearing element (`JsString`/`RcRegExp`/another `Bound`) is itself
 /// immutable and pre-existing, so no element can close a cycle back to this
 /// `BoundFn`. (`ThinVec` keeps the common `f.bind(obj)` case — empty
 /// `bound_args` — to a single pointer, no heap alloc.)

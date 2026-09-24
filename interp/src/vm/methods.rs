@@ -1,5 +1,5 @@
 use super::*;
-use crate::rc_str::keys;
+use crate::js_string::keys;
 
 use crate::compiler::{ConstVal, namespace_constants};
 use crate::diag::Diagnostic;
@@ -300,12 +300,12 @@ impl VM {
     pub(super) fn error_to_thrown(&mut self, e: &VMError) -> Value {
         let mut obj = IndexMap::new();
         obj.insert(
-            RcStr::from("name"),
-            Value::String(RcStr::from(format!("{:?}", e.kind).as_str())),
+            JsString::from("name"),
+            Value::String(JsString::from(format!("{:?}", e.kind).as_str())),
         );
         obj.insert(
-            RcStr::from("message"),
-            Value::String(RcStr::from(self.render_error(e).as_str())),
+            JsString::from("message"),
+            Value::String(JsString::from(self.render_error(e).as_str())),
         );
         self.alloc_object(obj)
     }
@@ -314,8 +314,14 @@ impl VM {
     /// rejects with (the scheduler-side mirror of the `Await` cycle check).
     fn cycle_error_value(&mut self, msg: &str) -> Value {
         let mut obj = IndexMap::new();
-        obj.insert(RcStr::from("name"), Value::String(RcStr::from("TypeError")));
-        obj.insert(RcStr::from("message"), Value::String(RcStr::from(msg)));
+        obj.insert(
+            JsString::from("name"),
+            Value::String(JsString::from("TypeError")),
+        );
+        obj.insert(
+            JsString::from("message"),
+            Value::String(JsString::from(msg)),
+        );
         self.alloc_object(obj)
     }
 
@@ -328,7 +334,7 @@ impl VM {
             && let (Some(Value::String(name)), Some(Value::String(msg))) =
                 (obj.map.get(keys::NAME), obj.map.get(keys::MESSAGE))
         {
-            return format!("uncaught {}: {}", name.as_str(), msg.as_str());
+            return format!("uncaught {name}: {msg}");
         }
         // **A thrown string is a message, not a value being previewed.**
         // This used to go through `preview`, which cuts a string at 40
@@ -353,7 +359,7 @@ impl VM {
         // does. The `{name, message}` branch above is not truncated at
         // all; this is the same treatment for the same kind of text.
         if let Value::String(s) = value {
-            let s = s.as_str();
+            let s = &s.to_utf8_lossy();
             if s.len() <= UNCAUGHT_MESSAGE_MAX_BYTES {
                 return format!("uncaught exception: \"{}\"", s.escape_debug());
             }
@@ -394,7 +400,7 @@ impl VM {
     pub fn preview(&self, v: &Value) -> String {
         match v {
             Value::String(s) => {
-                let s = s.as_str();
+                let s = &s.to_utf8_lossy();
                 if s.len() <= 42 {
                     format!("\"{}\"", s.escape_debug())
                 } else {
@@ -416,7 +422,7 @@ impl VM {
             }
             Value::Object(p) => {
                 if let Some(obj) = self.objects.get(*p as usize) {
-                    let mut keys: Vec<&str> = obj.map.keys().map(|k| k.as_str()).collect();
+                    let mut keys: Vec<String> = obj.map.keys().map(|k| k.to_string()).collect();
                     keys.sort();
                     if keys.len() <= 4 {
                         format!("{{object with keys {}}}", keys.join(", "))
@@ -428,7 +434,7 @@ impl VM {
                 }
             }
             Value::RegExp(r) => {
-                format!("/{}/{}", r.pattern.as_str(), r.flags.as_str())
+                format!("/{}/{}", r.pattern, r.flags)
             }
             other => other.type_name().to_string(),
         }
@@ -584,14 +590,14 @@ impl VM {
     fn seed_const_object(
         &mut self,
         json: serde_json::Value,
-    ) -> Result<IndexMap<RcStr, Value>, VMError> {
+    ) -> Result<IndexMap<JsString, Value>, VMError> {
         let serde_json::Value::Object(map) = json else {
             return Ok(IndexMap::new());
         };
         let mut entries = IndexMap::with_capacity(map.len());
         for (k, v) in &map {
             let sv = self.json_to_stack_value(v, 0)?;
-            entries.insert(RcStr::from(k.as_str()), sv);
+            entries.insert(JsString::from(k.as_str()), sv);
         }
         Ok(entries)
     }
@@ -1178,10 +1184,10 @@ impl VM {
         format!("{line}:{col}")
     }
 
-    /// Push a string value onto the stack. Strings live inline as `RcStr`, not
+    /// Push a string value onto the stack. Strings live inline as `JsString`, not
     /// in `heap`, so this is just a stack push (no heap slot, no growth). The
     /// builtin/string-producing counterpart to `alloc_array`/`alloc_object`.
-    pub(crate) fn push_str_value(&mut self, s: impl Into<RcStr>) {
+    pub(crate) fn push_str_value(&mut self, s: impl Into<JsString>) {
         self.stack.push(Value::String(s.into()));
     }
 
@@ -1195,8 +1201,12 @@ impl VM {
     /// Shared by the `RegExp` constructor handler (`regexp_ctor`) and
     /// `construct_builtin` (the `new RegExp(…)` path). Validates flags and
     /// compiles via `regress`; an invalid pattern or flags → `ValueError`.
-    pub(crate) fn alloc_regexp(&mut self, pattern: RcStr, flags: RcStr) -> Result<Value, VMError> {
-        let flags_str = flags.as_str();
+    pub(crate) fn alloc_regexp(
+        &mut self,
+        pattern: JsString,
+        flags: JsString,
+    ) -> Result<Value, VMError> {
+        let flags_str = flags.to_utf8_lossy();
         for c in flags_str.chars() {
             if !matches!(c, 'g' | 'i' | 'm' | 's' | 'u' | 'y' | 'd' | 'v') {
                 return Err(self.fail(
@@ -1205,15 +1215,16 @@ impl VM {
                 ));
             }
         }
-        let compiled = match regress::Regex::with_flags(pattern.as_str(), flags_str) {
-            Ok(re) => re,
-            Err(e) => {
-                return Err(self.fail(
-                    ErrorKind::ValueError,
-                    format!("invalid regular expression: {e}"),
-                ));
-            }
-        };
+        let compiled =
+            match regress::Regex::with_flags(&pattern.to_utf8_lossy(), flags_str.as_str()) {
+                Ok(re) => re,
+                Err(e) => {
+                    return Err(self.fail(
+                        ErrorKind::ValueError,
+                        format!("invalid regular expression: {e}"),
+                    ));
+                }
+            };
         let rx_data = RegExpData {
             pattern,
             flags,
@@ -1257,7 +1268,7 @@ impl VM {
     pub(crate) fn resolve_proto_chain(
         &self,
         obj_ptr: ObjectPtr,
-        field: &RcStr,
+        field: &JsString,
     ) -> Result<Value, VMError> {
         const MAX_PROTO_DEPTH: u32 = 100;
         let mut cur = obj_ptr;
@@ -1600,7 +1611,7 @@ impl VM {
         // Compile-time constants (Math.PI, Math.E) folded into the map.
         for &(ns, member, val) in namespace_constants() {
             if ns == ns_name {
-                let key = RcStr::from(member);
+                let key = JsString::from(member);
                 let v = match val {
                     ConstVal::Float(f) => Value::Float(f),
                     ConstVal::PosInt(n) => Value::PosInt(n),
@@ -1614,7 +1625,7 @@ impl VM {
         // registry appears here with no second edit.
         for (ns, member, b) in crate::builtin::Builtin::namespace_statics() {
             if ns == ns_name {
-                map.insert(RcStr::from(member), Value::Builtin(b));
+                map.insert(JsString::from(member), Value::Builtin(b));
             }
         }
         self.objects[ptr as usize].map = map;
@@ -1641,25 +1652,29 @@ impl VM {
     /// (`undefined`, `NaN`, `Infinity`) resolve to their literal values;
     /// everything else raises a `ReferenceError` whose message includes the
     /// name — preserving the name-level signal in the failure histogram.
-    pub fn resolve_name(&mut self, name: &str) -> Result<Value, VMError> {
+    pub fn resolve_name(&mut self, name: &JsString) -> Result<Value, VMError> {
         if let Some(b) = crate::builtin::Builtin::for_constructor(name) {
             return Ok(Value::Builtin(b));
         }
-        match name {
+        // error constructors: used by test262 for typeof checks, instanceof,
+        // and error-type comparison. The compiler's `new` path handles
+        // construction; here we provide a callable identity so
+        // `typeof TypeError` returns "function".
+        crate::match_wide!(name => {
             "undefined" => Ok(Value::Undefined),
             "NaN" => Ok(Value::Float(f64::NAN)),
             "Infinity" => Ok(Value::Float(f64::INFINITY)),
-            // error constructors: used by test262 for typeof checks,
-            // instanceof, and error-type comparison.  The compiler's `new`
-            // path handles construction; here we provide a callable identity
-            // so `typeof TypeError` returns "function".
-            "Error" | "TypeError" | "ReferenceError" | "SyntaxError" | "RangeError"
-            | "EvalError" => Ok(Value::Builtin(crate::builtin::Builtin::FunctionCtor)),
+            "Error" => Ok(Value::Builtin(crate::builtin::Builtin::FunctionCtor)),
+            "TypeError" => Ok(Value::Builtin(crate::builtin::Builtin::FunctionCtor)),
+            "ReferenceError" => Ok(Value::Builtin(crate::builtin::Builtin::FunctionCtor)),
+            "SyntaxError" => Ok(Value::Builtin(crate::builtin::Builtin::FunctionCtor)),
+            "RangeError" => Ok(Value::Builtin(crate::builtin::Builtin::FunctionCtor)),
+            "EvalError" => Ok(Value::Builtin(crate::builtin::Builtin::FunctionCtor)),
             _ => Err(self.fail(
                 crate::vm::ErrorKind::ReferenceError,
                 format!("{name} is not defined"),
             )),
-        }
+        })
     }
 
     /// Materialize the element sequence of a value this dialect treats as
@@ -1681,7 +1696,7 @@ impl VM {
     ///   `"abc"` yields three one-character strings). Note this is *not*
     ///   the dialect's usual "strings are UTF-8 bytes" indexing rule —
     ///   walking raw byte offsets would split multi-byte characters into
-    ///   fragments that are not valid `RcStr`s on their own, so member-
+    ///   fragments that are not valid `JsString`s on their own, so member-
     ///   ship in the resulting `Set`/`Map` would be nonsensical for
     ///   anything outside ASCII. `chars()` is the one sane reading of
     ///   "iterate a string" here; ASCII input (the tested case) is
@@ -1711,9 +1726,8 @@ impl VM {
                 Ok(Some(arr.iter().cloned().collect()))
             }
             Value::String(s) => Ok(Some(
-                s.as_str()
-                    .chars()
-                    .map(|c| Value::String(RcStr::from(c.to_string())))
+                crate::units::code_points(s.as_units())
+                    .map(|cp| Value::String(JsString::from_units(cp)))
                     .collect(),
             )),
             Value::Set(p) => {
@@ -1930,7 +1944,7 @@ impl VM {
             Value::PosInt(u) => buf.push_str(&u.to_string()),
             Value::NegInt(i) => buf.push_str(&i.to_string()),
             Value::Float(n) => buf.push_str(&js_number_to_string(*n)),
-            Value::String(s) => buf.push_str(s.as_str()),
+            Value::String(s) => buf.push_str(&s.to_utf8_lossy()),
             Value::Closure { .. } | Value::Builtin(_) | Value::Bound(_) => {
                 buf.push_str("function () { [native code] }");
             }
@@ -1955,11 +1969,9 @@ impl VM {
             Value::Promise(_) => buf.push_str("[object Promise]"),
             Value::RegExp(r) => {
                 buf.push('/');
-                buf.push_str(r.pattern.as_str());
+                buf.push_str(&r.pattern.to_utf8_lossy());
                 buf.push('/');
-                if !r.flags.as_str().is_empty() {
-                    buf.push_str(r.flags.as_str());
-                }
+                buf.push_str(&r.flags.to_utf8_lossy());
             }
             Value::Map(_) => buf.push_str("[object Map]"),
             Value::Set(_) => buf.push_str("[object Set]"),
@@ -1967,16 +1979,57 @@ impl VM {
     }
 
     /// JS `String(x)` / `ToString`. Delegates to [`write_js_string`], assembling
-    /// in a growable `String` and freezing to an immutable `RcStr` once.
-    pub(crate) fn to_js_string(&self, val: &Value, depth: usize) -> RcStr {
-        // Fast path: an existing string is already an `RcStr` — share it (a
-        // refcount bump) instead of copying its bytes through a fresh buffer.
+    /// in a growable `String` and freezing to an immutable `JsString` once.
+    pub(crate) fn to_js_string(&self, val: &Value, depth: usize) -> JsString {
+        // Fast path: an existing string is already an `JsString` — share it (a
+        // refcount bump) instead of copying its units through a fresh buffer.
         if let Value::String(s) = val {
             return s.clone();
         }
-        let mut out = String::new();
-        self.write_js_string(val, depth, &mut out);
-        RcStr::from(out)
+        let mut out: Vec<u16> = Vec::new();
+        self.write_js_units(val, depth, &mut out);
+        JsString::from_units(&out)
+    }
+
+    /// `write_js_string`, but appending code units.
+    ///
+    /// **The string cases memcpy and everything else is formatted then
+    /// widened.** Every leaf but a string, a regexp source and an array
+    /// element renders as ASCII (`"undefined"`, a number, `[object Object]`),
+    /// so the widening is a byte-to-unit map over a handful of characters.
+    /// Routing the string cases through UTF-8 instead would put a transcode
+    /// on both sides of every `+`.
+    pub(super) fn write_js_units(&self, val: &Value, depth: usize, buf: &mut Vec<u16>) {
+        if depth > MAX_JSON_DEPTH {
+            return;
+        }
+        match val {
+            Value::String(s) => buf.extend_from_slice(s.as_units()),
+            Value::Array(p) => {
+                if let Some(arr) = self.arrays.get(*p as usize) {
+                    for (i, v) in arr.iter().enumerate() {
+                        if i > 0 {
+                            buf.push(b',' as u16);
+                        }
+                        match v {
+                            Value::Null | Value::Undefined => {}
+                            _ => self.write_js_units(v, depth + 1, buf),
+                        }
+                    }
+                }
+            }
+            Value::RegExp(r) => {
+                buf.push(b'/' as u16);
+                buf.extend_from_slice(r.pattern.as_units());
+                buf.push(b'/' as u16);
+                buf.extend_from_slice(r.flags.as_units());
+            }
+            other => {
+                let mut tmp = String::new();
+                self.write_js_string(other, depth, &mut tmp);
+                buf.extend(crate::units::from_str(&tmp));
+            }
+        }
     }
 
     pub(super) fn peek(&self) -> Result<&Value, VMError> {
@@ -2000,7 +2053,7 @@ impl VM {
     }
 
     /// Pop a value and require it to be a String; return it (a refcount bump).
-    pub(super) fn pop_string(&mut self) -> Result<RcStr, VMError> {
+    pub(super) fn pop_string(&mut self) -> Result<JsString, VMError> {
         match self
             .stack
             .pop()
@@ -2015,17 +2068,17 @@ impl VM {
     /// to `val` (not the VM), so — unlike when strings lived in the heap — the
     /// caller may freely mutate the VM while it is live. Use for read-only
     /// builtins that push a scalar result without cloning the string.
-    pub(crate) fn str_from<'a>(&self, val: &'a Value) -> Result<&'a str, VMError> {
+    pub(crate) fn str_from<'a>(&self, val: &'a Value) -> Result<&'a [u16], VMError> {
         match val {
-            Value::String(s) => Ok(s.as_str()),
+            Value::String(s) => Ok(s.as_units()),
             _ => Err(self.fail(ErrorKind::TypeError, "type error")),
         }
     }
 
-    /// Extract an owned `RcStr` from an already-popped string value — a refcount
+    /// Extract an owned `JsString` from an already-popped string value — a refcount
     /// bump, sharing the same allocation. The clone sibling of `str_from`; use
     /// it when the builtin must retain the string past a borrow of the VM.
-    pub(crate) fn string_from(&self, val: &Value) -> Result<RcStr, VMError> {
+    pub(crate) fn string_from(&self, val: &Value) -> Result<JsString, VMError> {
         self.string_arg(val, None)
     }
 
@@ -2042,7 +2095,7 @@ impl VM {
     /// `as_non_neg_usize` in `builtin/edit.rs` had it right all along,
     /// one line further down the same call: `"start must be a
     /// non-negative integer, got 2.5"`.
-    pub(crate) fn string_arg(&self, val: &Value, label: Option<&str>) -> Result<RcStr, VMError> {
+    pub(crate) fn string_arg(&self, val: &Value, label: Option<&str>) -> Result<JsString, VMError> {
         match val {
             Value::String(s) => Ok(s.clone()),
             other => Err(self.fail(
@@ -2124,7 +2177,13 @@ impl VM {
                     }
                 }
             }
-            Value::String(s) => serde_json::Value::String(s.as_str().to_owned()),
+            // **The crossing, and the one place the loss happens.** An
+            // unpaired surrogate is a value the program was entitled to
+            // produce and JSON has no representation for it; erroring here
+            // would make this fallible on legitimate data and turn a display
+            // problem into a crashed run. `to_utf8_lossy` is the single
+            // function that decides, so the loss is countable.
+            Value::String(s) => serde_json::Value::String(s.to_utf8_lossy()),
             Value::Array(p) => {
                 let arr = self
                     .arrays
@@ -2165,10 +2224,7 @@ impl VM {
                     if matches!(v, Value::Undefined) {
                         continue;
                     }
-                    map.insert(
-                        k.as_str().to_owned(),
-                        self.stack_value_to_json(v, depth + 1)?,
-                    );
+                    map.insert(k.to_string(), self.stack_value_to_json(v, depth + 1)?);
                 }
                 serde_json::Value::Object(map)
             }
@@ -2234,7 +2290,7 @@ impl VM {
                     Value::Float(n.as_f64().unwrap_or(0.0))
                 }
             }
-            serde_json::Value::String(s) => Value::String(RcStr::from(s.as_str())),
+            serde_json::Value::String(s) => Value::String(JsString::from(s.as_str())),
             serde_json::Value::Array(arr) => {
                 let vals: ThinVec<Value> = arr
                     .iter()
@@ -2246,7 +2302,7 @@ impl VM {
                 let mut map = IndexMap::new();
                 for (k, v) in obj {
                     map.insert(
-                        RcStr::from(k.as_str()),
+                        JsString::from(k.as_str()),
                         self.json_to_stack_value(v, depth + 1)?,
                     );
                 }

@@ -152,7 +152,11 @@ fn line_for(tree: &Tree, path: &[&Event], event: &Event) -> Option<String> {
             )
         }
         EventPayload::Compacted { of, text } => {
-            let how = if text.is_some() { "replaced" } else { "removed" };
+            let how = if text.is_some() {
+                "replaced"
+            } else {
+                "removed"
+            };
             format!("#{id}    ✂ #{} {how}", of.as_u64())
         }
         // **Finishing and handing on are one ending with a flag on

@@ -140,7 +140,8 @@ impl super::Compiler {
                                         return self.error(
                                             span,
                                             "`history.keep`/`history.peek` need their prelude \
-                                             helper, which was not compiled".to_owned(),
+                                             helper, which was not compiled"
+                                                .to_owned(),
                                         );
                                     };
                                     let k = self.intern_string(method);
@@ -150,8 +151,7 @@ impl super::Compiler {
                                     return;
                                 }
                                 _ => {
-                                    let known =
-                                        "note, fetch, keep, peek, remove and replace";
+                                    let known = "note, fetch, keep, peek, remove and replace";
                                     return self.error(
                                         span,
                                         format!("`history.{method}` is not a thing — history has {known}"),
@@ -229,7 +229,7 @@ impl super::Compiler {
         {
             self.emit(Instr::LoadThis, span);
             self.emit_super_class_ref(s.span.into());
-            self.emit(Instr::ObjGet(crate::vm::RcStr::from("prototype")), span);
+            self.emit(Instr::ObjGet(crate::vm::JsString::from("prototype")), span);
             self.emit(Instr::ObjGet(m.property.name.as_str().into()), span);
             self.compile_call_args_array(&call.arguments, span);
             self.emit(Instr::CallSpread(true), span);
@@ -690,8 +690,7 @@ impl super::Compiler {
                 self.emit(Instr::Notify(name.into(), argv.len() as u32), span);
             }
             "spawn" | "fork" | "list_agents" | "fetch_history" | "answer" | "note_history"
-            | "keep_history" | "peek_history"
-            | "remove_history" | "replace_history" => {
+            | "keep_history" | "peek_history" | "remove_history" | "replace_history" => {
                 // **The settle-at-dispatch verbs.** None of these leaves
                 // the frame that called it: the host answers each from
                 // the log or the tree it already has — `fetch_history`
@@ -800,8 +799,8 @@ impl super::Compiler {
                 self.emit(
                     Instr::ObjNew(
                         vec![
-                            crate::vm::RcStr::from("__decision"),
-                            crate::vm::RcStr::from("value"),
+                            crate::vm::JsString::from("__decision"),
+                            crate::vm::JsString::from("value"),
                         ]
                         .into(),
                     ),
@@ -823,7 +822,7 @@ impl super::Compiler {
                 let tag = self.intern_string("abandon");
                 self.emit(Instr::PushStr(tag), span);
                 self.emit(
-                    Instr::ObjNew(vec![crate::vm::RcStr::from("__decision")].into()),
+                    Instr::ObjNew(vec![crate::vm::JsString::from("__decision")].into()),
                     span,
                 );
             }
@@ -852,8 +851,8 @@ impl super::Compiler {
                 self.emit(
                     Instr::ObjNew(
                         vec![
-                            crate::vm::RcStr::from("name"),
-                            crate::vm::RcStr::from("message"),
+                            crate::vm::JsString::from("name"),
+                            crate::vm::JsString::from("message"),
                         ]
                         .into(),
                     ),
@@ -1037,7 +1036,7 @@ impl super::Compiler {
     ) {
         self.emit(Instr::LoadThis, span); // receiver = the instance
         self.emit_super_class_ref(super_span); // parent constructor
-        self.emit(Instr::ObjGet(crate::vm::RcStr::from("prototype")), span); // Parent.prototype
+        self.emit(Instr::ObjGet(crate::vm::JsString::from("prototype")), span); // Parent.prototype
         self.emit(Instr::ObjGet(method.into()), span); // Parent.prototype.m (chain walk)
         self.compile_args(argv);
         self.emit(Instr::CallDyn(argv.len() as u32, true), span);

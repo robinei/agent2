@@ -2273,14 +2273,8 @@ mod tests {
                 },
             )
             .unwrap();
-            tree.append(
-                &mut spine,
-                EventPayload::Compacted {
-                    of: program,
-                    text,
-                },
-            )
-            .unwrap();
+            tree.append(&mut spine, EventPayload::Compacted { of: program, text })
+                .unwrap();
             render(&tree, &spine, 64 * 1024)
         };
 

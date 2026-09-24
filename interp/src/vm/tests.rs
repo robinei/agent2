@@ -18,7 +18,7 @@ fn run(code: Vec<Instr>) -> Vec<Value> {
 /// Build a `PushStr` for a string literal — terse sugar for the many tests
 /// that push string operands inline.
 fn ps(val: &str) -> Instr {
-    Instr::PushStr(RcStr::from(val))
+    Instr::PushStr(JsString::from(val))
 }
 
 /// Run code to the first effect (Pending/Raise), returning the StepResult.
@@ -78,7 +78,7 @@ fn s(addr: u32) -> Value {
 }
 /// A string value (strings are inline now, not heap pointers).
 fn str_v(val: &str) -> Value {
-    Value::String(RcStr::from(val))
+    Value::String(JsString::from(val))
 }
 /// `n` plain (unboxed) local slots, for `EnterFrame`.
 fn plain(n: usize) -> Vec<SlotKind> {
@@ -383,7 +383,7 @@ fn add_strings() {
 /// ArrJoin).
 fn run_last_str(code: Vec<Instr>) -> String {
     match run(code).last() {
-        Some(Value::String(s)) => s.as_str().to_owned(),
+        Some(Value::String(s)) => s.to_string(),
         other => panic!("expected a string result, got {other:?}"),
     }
 }
@@ -2102,7 +2102,7 @@ fn int_indices_and_bitops() {
 
 /// Run a representative hot-loop workload and record the allocation count.
 /// Each iteration does Math.abs + a string concat `s += "x"`. String
-/// literals ride inline in `PushStr` as `RcStr` (each push is a refcount
+/// literals ride inline in `PushStr` as `JsString` (each push is a refcount
 /// bump, zero per-iteration literal allocation); only the concat allocates.
 #[test]
 fn alloc_baseline_hot_loop() {
@@ -2140,15 +2140,15 @@ fn alloc_breakdown() {
     use crate::alloc_counter;
 
     // 1. How many allocs to materialize one string value? One: the single
-    //    `RcStr` block (header + bytes).
+    //    `JsString` block (header + bytes).
     alloc_counter::reset();
-    let _s = Value::String(RcStr::from("x"));
+    let _s = Value::String(JsString::from("x"));
     let per_string = alloc_counter::count();
-    eprintln!("  RcStr::from: {per_string}");
+    eprintln!("  JsString::from: {per_string}");
 
     // 2. How many allocs for to_js_string on a string value? Zero — the fast
-    //    path clones the existing `RcStr` (a refcount bump).
-    let v = Value::String(RcStr::from("hello"));
+    //    path clones the existing `JsString` (a refcount bump).
+    let v = Value::String(JsString::from("hello"));
     let vm = VM::new(vec![]);
     alloc_counter::reset();
     let _ = vm.to_js_string(&v, 0);
@@ -2244,19 +2244,15 @@ fn alloc_breakdown() {
 
 // ── string edge cases ───────────────────────────────────────────
 
+/// Was `string_mid_codepoint_index_errors`, asserting a `ValueError` for
+/// `"é"[1]`. There is no such position now: `"é"` is one code unit, so index
+/// 1 is past the end and reads `undefined`.
 #[test]
-fn string_mid_codepoint_index_errors() {
-    // Indexing into the middle of a multi-byte UTF-8 codepoint is a
-    // ValueError (not a panic).
-    let mut vm = VM::new(vec![
-        PushStr("é".into()), // 2-byte UTF-8
-        PushPosInt(1),       // middle of codepoint
-        IndexGet,
-    ]);
-    match vm.step(u64::MAX) {
-        Err(e) if e.kind == ErrorKind::ValueError => {} // expected
-        other => panic!("expected ValueError, got {other:?}"),
-    }
+fn string_index_past_the_end_is_undefined() {
+    let out = run(vec![PushStr("é".into()), PushPosInt(1), IndexGet]);
+    assert_eq!(out, vec![Value::Undefined]);
+    let out = run(vec![PushStr("é".into()), PushPosInt(0), IndexGet]);
+    assert_eq!(out, vec![Value::String("é".into())]);
 }
 
 #[test]
@@ -2332,15 +2328,17 @@ fn arr_index_negative_errors() {
     }
 }
 
-// ── UTF-8 string length (JS divergence) ─────────────────────────
+// ── string length is UTF-16 code units, as JS says ──────────────
 
+/// Was `string_utf8_length`, asserting 2 for `"é"` and 4 for `"😀"` — the
+/// byte counts. `.length` is a code-unit count now, which is the answer every
+/// reference the reader or the model will consult already gives.
 #[test]
-fn string_utf8_length() {
-    // String `.length` returns byte count, not char count.
-    // "é" is 2 bytes in UTF-8.
-    assert_eq!(run(vec![ps("é"), GetLength]), vec![Value::Float(2.0)]);
-    // "😀" is 4 bytes.
-    assert_eq!(run(vec![ps("😀"), GetLength]), vec![Value::Float(4.0)]);
+fn string_length_counts_code_units() {
+    assert_eq!(run(vec![ps("é"), GetLength]), vec![Value::Float(1.0)]);
+    // An astral character is a surrogate pair: two units, and JS agrees.
+    assert_eq!(run(vec![ps("😀"), GetLength]), vec![Value::Float(2.0)]);
+    assert_eq!(run(vec![ps("aéb"), GetLength]), vec![Value::Float(3.0)]);
 }
 
 // ── NaN in Math.min/max (JS divergence) ─────────────────────────
@@ -2472,7 +2470,7 @@ fn stack_value_to_json_depth_limit() {
         vm.objects.push(ObjData {
             proto: None,
             map: [(
-                RcStr::from("x"),
+                JsString::from("x"),
                 std::mem::replace(&mut innermost, Value::Null),
             )]
             .into_iter()
@@ -2968,7 +2966,7 @@ fn cyclic_value_serialization_errors() {
     let mut vm = VM::new(vec![]);
     vm.objects.push(ObjData {
         proto: None,
-        map: [(RcStr::from("me"), Value::Object(0))]
+        map: [(JsString::from("me"), Value::Object(0))]
             .into_iter()
             .collect(),
         ..Default::default()
@@ -2987,13 +2985,13 @@ fn proto_chain_own_hit() {
     // An own property is resolved immediately, without walking the chain.
     let mut vm = VM::new(vec![]);
     let mut map = IndexMap::new();
-    map.insert(RcStr::from("x"), Value::PosInt(42));
+    map.insert(JsString::from("x"), Value::PosInt(42));
     vm.objects.push(ObjData {
         proto: None,
         map,
         ..Default::default()
     });
-    let val = vm.resolve_proto_chain(0, &RcStr::from("x")).unwrap();
+    let val = vm.resolve_proto_chain(0, &JsString::from("x")).unwrap();
     assert_eq!(val, Value::PosInt(42));
 }
 
@@ -3003,7 +3001,7 @@ fn proto_chain_proto_hit() {
     let mut vm = VM::new(vec![]);
     // Parent (proto): has "x"
     let mut parent = IndexMap::new();
-    parent.insert(RcStr::from("x"), Value::PosInt(99));
+    parent.insert(JsString::from("x"), Value::PosInt(99));
     let parent_ptr = 0u32;
     vm.objects.push(ObjData {
         proto: None,
@@ -3012,13 +3010,13 @@ fn proto_chain_proto_hit() {
     });
     // Child: has no "x", but proto links to parent
     let mut child = IndexMap::new();
-    child.insert(RcStr::from("y"), Value::PosInt(1));
+    child.insert(JsString::from("y"), Value::PosInt(1));
     vm.objects.push(ObjData {
         proto: Some(parent_ptr),
         map: child,
         ..Default::default()
     });
-    let val = vm.resolve_proto_chain(1, &RcStr::from("x")).unwrap();
+    let val = vm.resolve_proto_chain(1, &JsString::from("x")).unwrap();
     assert_eq!(val, Value::PosInt(99));
 }
 
@@ -3031,7 +3029,7 @@ fn proto_chain_miss() {
         map: IndexMap::new(),
         ..Default::default()
     });
-    let val = vm.resolve_proto_chain(0, &RcStr::from("nope")).unwrap();
+    let val = vm.resolve_proto_chain(0, &JsString::from("nope")).unwrap();
     assert_eq!(val, Value::Undefined);
 }
 
@@ -3045,7 +3043,9 @@ fn proto_chain_none_short_circuit() {
         map: IndexMap::new(),
         ..Default::default()
     });
-    let val = vm.resolve_proto_chain(0, &RcStr::from("missing")).unwrap();
+    let val = vm
+        .resolve_proto_chain(0, &JsString::from("missing"))
+        .unwrap();
     assert_eq!(val, Value::Undefined);
 }
 
@@ -3055,7 +3055,7 @@ fn proto_chain_own_shadows_proto() {
     let mut vm = VM::new(vec![]);
     // Parent: x = 1
     let mut parent = IndexMap::new();
-    parent.insert(RcStr::from("x"), Value::PosInt(1));
+    parent.insert(JsString::from("x"), Value::PosInt(1));
     vm.objects.push(ObjData {
         proto: None,
         map: parent,
@@ -3063,13 +3063,13 @@ fn proto_chain_own_shadows_proto() {
     });
     // Child: x = 2, proto = parent
     let mut child = IndexMap::new();
-    child.insert(RcStr::from("x"), Value::PosInt(2));
+    child.insert(JsString::from("x"), Value::PosInt(2));
     vm.objects.push(ObjData {
         proto: Some(0),
         map: child,
         ..Default::default()
     });
-    let val = vm.resolve_proto_chain(1, &RcStr::from("x")).unwrap();
+    let val = vm.resolve_proto_chain(1, &JsString::from("x")).unwrap();
     assert_eq!(val, Value::PosInt(2), "own must shadow proto");
 }
 
@@ -3079,13 +3079,13 @@ fn proto_chain_self_referential_no_hang() {
     // VM must not hang or overflow.
     let mut vm = VM::new(vec![]);
     let mut map = IndexMap::new();
-    map.insert(RcStr::from("self"), Value::PosInt(1));
+    map.insert(JsString::from("self"), Value::PosInt(1));
     vm.objects.push(ObjData {
         proto: Some(0), // points to itself
         map,
         ..Default::default()
     });
-    let val = vm.resolve_proto_chain(0, &RcStr::from("nope")).unwrap();
+    let val = vm.resolve_proto_chain(0, &JsString::from("nope")).unwrap();
     assert_eq!(val, Value::Undefined);
 }
 
@@ -3095,7 +3095,7 @@ fn obj_has_walks_proto_chain() {
     let mut vm = VM::new(vec![]);
     // Parent: has "a"
     let mut parent = IndexMap::new();
-    parent.insert(RcStr::from("a"), Value::PosInt(1));
+    parent.insert(JsString::from("a"), Value::PosInt(1));
     vm.objects.push(ObjData {
         proto: None,
         map: parent,
@@ -3107,7 +3107,7 @@ fn obj_has_walks_proto_chain() {
         map: IndexMap::new(),
         ..Default::default()
     });
-    let val = vm.resolve_proto_chain(1, &RcStr::from("a")).unwrap();
+    let val = vm.resolve_proto_chain(1, &JsString::from("a")).unwrap();
     assert_eq!(val, Value::PosInt(1), "proto-chain hit via resolve");
 }
 
@@ -3123,7 +3123,7 @@ fn obj_has_own_vs_proto() {
     // Build heap by hand
     vm.objects.clear();
     let mut parent = IndexMap::new();
-    parent.insert(RcStr::from("a"), Value::PosInt(1));
+    parent.insert(JsString::from("a"), Value::PosInt(1));
     vm.objects.push(ObjData {
         proto: None,
         map: parent,
@@ -3153,17 +3153,17 @@ fn obj_set_only_affects_own() {
     let mut vm = VM::new(vec![
         PushObject(1), // child
         PushPosInt(99),
-        ObjSet(RcStr::from("a"), SetMode::New),
+        ObjSet(JsString::from("a"), SetMode::New),
         // Now read child's "a" — should be 99 (own)
         PushObject(1),
-        ObjGet(RcStr::from("a")),
+        ObjGet(JsString::from("a")),
         // Next, read parent's "a" — should still be 1 (unchanged)
         PushObject(0),
-        ObjGet(RcStr::from("a")),
+        ObjGet(JsString::from("a")),
     ]);
     vm.objects.clear();
     let mut parent = IndexMap::new();
-    parent.insert(RcStr::from("a"), Value::PosInt(1));
+    parent.insert(JsString::from("a"), Value::PosInt(1));
     vm.objects.push(ObjData {
         proto: None,
         map: parent,
@@ -3199,7 +3199,7 @@ fn obj_delete_only_affects_own() {
     ]);
     vm.objects.clear();
     let mut parent = IndexMap::new();
-    parent.insert(RcStr::from("a"), Value::PosInt(1));
+    parent.insert(JsString::from("a"), Value::PosInt(1));
     vm.objects.push(ObjData {
         proto: None,
         map: parent,
@@ -3237,7 +3237,7 @@ fn obj_extend_reads_proto() {
         PushObject(2), // child with proto parent
         ObjExtend,     // → pops src and target, extends, pushes target back
         // Target is now on stack; read its "own_only" property
-        ObjGet(RcStr::from("own_only")),
+        ObjGet(JsString::from("own_only")),
     ]);
     vm.objects.clear();
     // Target
@@ -3248,7 +3248,7 @@ fn obj_extend_reads_proto() {
     }); // 0
     // Parent
     let mut parent = IndexMap::new();
-    parent.insert(RcStr::from("proto_only"), Value::PosInt(1));
+    parent.insert(JsString::from("proto_only"), Value::PosInt(1));
     vm.objects.push(ObjData {
         proto: None,
         map: parent,
@@ -3256,7 +3256,7 @@ fn obj_extend_reads_proto() {
     }); // 1: parent
     // Child: own "own_only", proto = parent
     let mut child = IndexMap::new();
-    child.insert(RcStr::from("own_only"), Value::PosInt(2));
+    child.insert(JsString::from("own_only"), Value::PosInt(2));
     vm.objects.push(ObjData {
         proto: Some(1),
         map: child,
@@ -3345,7 +3345,7 @@ fn objset_on_frozen_prototype_is_typeerror() {
     let proto = vm.prototype_for(TypeTag::Array).unwrap();
     vm.stack.push(Value::Object(proto));
     vm.stack.push(Value::PosInt(1));
-    vm.code = vec![Instr::ObjSet(RcStr::from("x"), SetMode::New)];
+    vm.code = vec![Instr::ObjSet(JsString::from("x"), SetMode::New)];
     vm.ip = 0;
     let err = vm.step(u64::MAX).unwrap_err();
     assert_eq!(err.kind, ErrorKind::TypeError);
@@ -3359,7 +3359,7 @@ fn objdelete_on_frozen_prototype_is_typeerror() {
     let mut vm = VM::new(vec![]);
     let proto = vm.prototype_for(TypeTag::Object).unwrap();
     vm.stack.push(Value::Object(proto));
-    vm.stack.push(Value::String(RcStr::from("x")));
+    vm.stack.push(Value::String(JsString::from("x")));
     vm.code = vec![Instr::ObjDelete];
     vm.ip = 0;
     let err = vm.step(u64::MAX).unwrap_err();
@@ -3397,7 +3397,7 @@ fn prototype_has_no_json_form() {
 fn frozen_ordinary_object_serializes() {
     let mut vm = VM::new(vec![]);
     let mut map = IndexMap::new();
-    map.insert(RcStr::from("x"), Value::PosInt(1));
+    map.insert(JsString::from("x"), Value::PosInt(1));
     let ptr = vm.objects.len() as ObjectPtr;
     vm.objects.push(ObjData {
         proto: None,
@@ -3429,31 +3429,31 @@ fn prototype_ptr_lazy() {
 fn constructors_are_callable_functions() {
     assert_eq!(
         testutil::eval("typeof Array"),
-        Value::String(RcStr::from("function"))
+        Value::String(JsString::from("function"))
     );
     assert_eq!(
         testutil::eval("typeof Map"),
-        Value::String(RcStr::from("function"))
+        Value::String(JsString::from("function"))
     );
     assert_eq!(
         testutil::eval("typeof Object"),
-        Value::String(RcStr::from("function"))
+        Value::String(JsString::from("function"))
     );
     assert_eq!(
         testutil::eval("typeof RegExp"),
-        Value::String(RcStr::from("function"))
+        Value::String(JsString::from("function"))
     );
     assert_eq!(
         testutil::eval("typeof Number"),
-        Value::String(RcStr::from("function"))
+        Value::String(JsString::from("function"))
     );
     assert_eq!(
         testutil::eval("typeof String"),
-        Value::String(RcStr::from("function"))
+        Value::String(JsString::from("function"))
     );
     assert_eq!(
         testutil::eval("typeof Boolean"),
-        Value::String(RcStr::from("function"))
+        Value::String(JsString::from("function"))
     );
 }
 
@@ -3558,11 +3558,11 @@ fn set_without_new_throws() {
 fn namespaces_are_non_callable_objects() {
     assert_eq!(
         testutil::eval("typeof Math"),
-        Value::String(RcStr::from("object"))
+        Value::String(JsString::from("object"))
     );
     assert_eq!(
         testutil::eval("typeof JSON"),
-        Value::String(RcStr::from("object"))
+        Value::String(JsString::from("object"))
     );
 }
 
@@ -3634,7 +3634,7 @@ fn for_in_array_throws_no_method_names_leak() {
                 // If it completes (future fix), it must show no method names.
                 assert_eq!(
                     value,
-                    Value::String(RcStr::from("none")),
+                    Value::String(JsString::from("none")),
                     "for-in over [] must not enumerate method names"
                 );
                 return;
@@ -4061,7 +4061,7 @@ fn primitive_method_call_no_boxing() {
 fn function_constructor_value() {
     assert_eq!(
         testutil::eval("typeof Function"),
-        Value::String(RcStr::from("function"))
+        Value::String(JsString::from("function"))
     );
     // `Function.prototype` is the frozen Function prototype object.
     let v = testutil::eval("Function.prototype");

@@ -6,7 +6,7 @@ use oxc_span::GetSpan;
 use crate::analyzer::frame_abs;
 use crate::builtin::Builtin;
 use crate::span::Span;
-use crate::vm::{Instr, LocalIndex, RcStr, SetMode, SlotKind};
+use crate::vm::{Instr, JsString, LocalIndex, SetMode, SlotKind};
 
 impl super::Compiler {
     /// Hoist the function declarations written directly in this function
@@ -246,7 +246,7 @@ impl super::Compiler {
         scope_id: usize,
         body_stmts: &[ast::Statement],
         params: Option<&ast::FormalParameters>,
-        field_inits: &[(RcStr, Option<&ast::Expression>)],
+        field_inits: &[(JsString, Option<&ast::Expression>)],
         span: Span,
         is_expression_body: bool,
         defer_fields_after_super: bool,
@@ -496,7 +496,11 @@ impl super::Compiler {
     /// Emit a class constructor's instance-field initializers: `this.<name> =
     /// <init>` for each, in declaration order. `ObjSet` leaves the value, so it
     /// is discarded. A field with no initializer stores `undefined`.
-    fn emit_field_inits(&mut self, field_inits: &[(RcStr, Option<&ast::Expression>)], span: Span) {
+    fn emit_field_inits(
+        &mut self,
+        field_inits: &[(JsString, Option<&ast::Expression>)],
+        span: Span,
+    ) {
         for (name, init) in field_inits {
             self.emit(Instr::LoadThis, span);
             match init {

@@ -2,8 +2,8 @@ use indexmap::IndexMap;
 
 use crate::builtin::Args;
 use crate::builtin::regexp::try_reg_exp;
-use crate::rc_str::keys;
-use crate::vm::{ErrorKind, RcStr, VM, VMError, Value};
+use crate::js_string::keys;
+use crate::vm::{ErrorKind, JsString, VM, VMError, Value};
 
 // ── Edit.replaceOnce ──────────────────────────────────────────────────────────
 
@@ -21,7 +21,7 @@ use crate::vm::{ErrorKind, RcStr, VM, VMError, Value};
 /// never had one. What is left is an ordinary mistake — the wrong
 /// variable, or the object a tool returned instead of the string
 /// inside it — and both are worth naming precisely.
-fn edit_text(vm: &mut VM, args: &Args, who: &str) -> Result<RcStr, VMError> {
+fn edit_text(vm: &mut VM, args: &Args, who: &str) -> Result<String, VMError> {
     let v = args.get(vm, 0).clone();
     if matches!(v, Value::Undefined) {
         let msg = format!(
@@ -69,7 +69,52 @@ fn edit_text(vm: &mut VM, args: &Args, who: &str) -> Result<RcStr, VMError> {
         }
     }
     // Anything else wrong: say which argument and what arrived.
-    vm.string_arg(&v, Some("text"))
+    //
+    // **The receiver narrows here and the 1,500 lines below stay on UTF-8.**
+    // `Edit.*` is built on byte offsets throughout — `lines_of`,
+    // `brace_range_from`, `enclosing_pair`, the comment/string scanners that
+    // walk `as_bytes()`. Rewriting all of it over code units would be ~500
+    // lines of risk for text that is ASCII in every observed run. Instead the
+    // conversion happens at the two edges where an offset is *visible to the
+    // program* — `unit_to_byte` on the way in, `byte_to_unit` on the way out —
+    // and for ASCII both are the identity.
+    Ok(vm.string_arg(&v, Some("text"))?.to_utf8_lossy())
+}
+
+/// A code-unit offset as a byte offset into `text`.
+///
+/// **The `Edit.*` boundary, one of two.** An index a program computed with
+/// `indexOf` counts code units; the body below counts bytes. Identity for
+/// ASCII, which is what this operates on in every observed run. An offset
+/// that falls between the halves of a surrogate pair resolves to the start of
+/// that character — there is no byte there to point at.
+fn unit_to_byte(text: &str, target: usize) -> usize {
+    if text.is_ascii() {
+        return target.min(text.len());
+    }
+    let mut units = 0;
+    for (b, c) in text.char_indices() {
+        if units >= target {
+            return b;
+        }
+        units += c.len_utf16();
+    }
+    text.len()
+}
+
+/// A byte offset as a code-unit offset into `text`. See [`unit_to_byte`].
+fn byte_to_unit(text: &str, target: usize) -> usize {
+    if text.is_ascii() {
+        return target.min(text.len());
+    }
+    let mut units = 0;
+    for (b, c) in text.char_indices() {
+        if b >= target {
+            return units;
+        }
+        units += c.len_utf16();
+    }
+    units
 }
 
 /// `Edit.replaceOnce(text, old, new)` → string.
@@ -237,7 +282,7 @@ fn match_count_error(what: &str, n: usize, needle: &str, lines: &[usize]) -> Str
 pub fn edit_replace_once(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let text_s = edit_text(vm, &args, "replaceOnce")?;
     let text = text_s.as_str();
-    let replacement = vm.to_js_string(args.get(vm, 2), 0);
+    let replacement = vm.to_js_string(args.get(vm, 2), 0).to_utf8_lossy();
     let old_val = args.get(vm, 1);
 
     if let Some(rx) = try_reg_exp(vm, old_val) {
@@ -253,9 +298,9 @@ pub fn edit_replace_once(vm: &mut VM, args: Args) -> Result<Value, VMError> {
         out.push_str(&text[..m.range.start]);
         out.push_str(replacement.as_str());
         out.push_str(&text[m.range.end..]);
-        Ok(Value::String(RcStr::from(out)))
+        Ok(Value::String(JsString::from(out)))
     } else {
-        let old_s = vm.to_js_string(old_val, 0);
+        let old_s = vm.to_js_string(old_val, 0).to_utf8_lossy();
         let old = old_s.as_str();
         if old.is_empty() {
             return Err(vm.fail(
@@ -280,7 +325,7 @@ pub fn edit_replace_once(vm: &mut VM, args: Args) -> Result<Value, VMError> {
         out.push_str(&text[..pos]);
         out.push_str(replacement.as_str());
         out.push_str(&text[pos + old.len()..]);
-        Ok(Value::String(RcStr::from(out)))
+        Ok(Value::String(JsString::from(out)))
     }
 }
 
@@ -300,7 +345,7 @@ pub fn edit_replace_once(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 pub fn edit_replace_all(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let text_s = edit_text(vm, &args, "replaceAll")?;
     let text = text_s.as_str();
-    let replacement = vm.to_js_string(args.get(vm, 2), 0);
+    let replacement = vm.to_js_string(args.get(vm, 2), 0).to_utf8_lossy();
     let old_val = args.get(vm, 1);
 
     if let Some(rx) = try_reg_exp(vm, old_val) {
@@ -312,10 +357,10 @@ pub fn edit_replace_all(vm: &mut VM, args: Args) -> Result<Value, VMError> {
             last = m.range.end;
         }
         out.push_str(&text[last..]);
-        return Ok(Value::String(RcStr::from(out.as_str())));
+        return Ok(Value::String(JsString::from(out.as_str())));
     }
 
-    let old_s = vm.to_js_string(old_val, 0);
+    let old_s = vm.to_js_string(old_val, 0).to_utf8_lossy();
     let old = old_s.as_str();
     if old.is_empty() {
         return Err(vm.fail(
@@ -339,7 +384,7 @@ pub fn edit_replace_all(vm: &mut VM, args: Args) -> Result<Value, VMError> {
         last = pos + old.len();
     }
     out.push_str(&text[last..]);
-    Ok(Value::String(RcStr::from(out.as_str())))
+    Ok(Value::String(JsString::from(out.as_str())))
 }
 
 // ── Edit.count ────────────────────────────────────────────────────────────────
@@ -351,16 +396,23 @@ pub fn edit_count(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let needle = args.get(vm, 1);
 
     let count = if let Some(rx) = try_reg_exp(vm, needle) {
-        rx.compiled.find_iter(text).count() as u64
+        crate::builtin::regexp::find_all(rx, text).len() as u64
     } else {
         let needle_s = vm.to_js_string(needle, 0);
-        if needle_s.is_empty() {
+        let needle_u = needle_s.as_units();
+        if needle_u.is_empty() {
             return Err(vm.fail(
                 ErrorKind::ValueError,
                 "count: empty needle is not supported",
             ));
         }
-        text.match_indices(needle_s.as_str()).count() as u64
+        let mut n = 0u64;
+        let mut at = 0;
+        while let Some(i) = crate::units::find(text, needle_u, at) {
+            n += 1;
+            at = i + needle_u.len();
+        }
+        n
     };
     Ok(Value::PosInt(count))
 }
@@ -374,22 +426,24 @@ pub fn edit_count(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 pub fn edit_extract_block(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let text_s = edit_text(vm, &args, "extractBlock")?;
     let text = text_s.as_str();
-    let head = as_non_neg_usize(vm, args.get(vm, 1), "headIndex")?;
-    if head >= text.len() {
+    let head_unit = as_non_neg_usize(vm, args.get(vm, 1), "headIndex")?;
+    let text_units = byte_to_unit(text, text.len());
+    if head_unit >= text_units {
         return Err(vm.fail(
             ErrorKind::ValueError,
-            format!("headIndex {head} is past end of text (len {})", text.len()),
+            format!("headIndex {head_unit} is past end of text (len {text_units})"),
         ));
     }
+    let head = unit_to_byte(text, head_unit);
     let open = text[head..].find('{').map(|i| head + i).ok_or_else(|| {
         vm.fail(
             ErrorKind::ValueError,
-            format!("no opening brace found at or after byte index {head}"),
+            format!("no opening brace found at or after index {head_unit}"),
         )
     })?;
     let close =
         balance_to(text, open, '{', '}').map_err(|msg| vm.fail(ErrorKind::ValueError, msg))?;
-    build_range_obj(vm, open, close)
+    build_range_obj(vm, text, open, close)
 }
 
 // ── Edit.extractByIndent ──────────────────────────────────────────────────────
@@ -439,7 +493,7 @@ pub fn edit_extract_by_indent(vm: &mut VM, args: Args) -> Result<Value, VMError>
         i += 1;
     }
 
-    build_range_obj(vm, start, end)
+    build_range_obj(vm, text, start, end)
 }
 
 fn indent_width(line: &str) -> usize {
@@ -461,19 +515,21 @@ fn is_blank_line(line: &str) -> bool {
 pub fn edit_extract_enclosing(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let text_s = edit_text(vm, &args, "extractEnclosing")?;
     let text = text_s.as_str();
-    let idx = as_non_neg_usize(vm, args.get(vm, 1), "index")?;
+    let idx_unit = as_non_neg_usize(vm, args.get(vm, 1), "index")?;
 
     let open = args.get(vm, 2);
     let close_val = args.get(vm, 3);
     let open_ch = char_from_val(vm, open, "open")?;
     let close_ch = char_from_val(vm, close_val, "close")?;
 
-    if idx >= text.len() {
+    let text_units = byte_to_unit(text, text.len());
+    if idx_unit >= text_units {
         return Err(vm.fail(
             ErrorKind::ValueError,
-            format!("index {idx} is past end of text (len {})", text.len()),
+            format!("index {idx_unit} is past end of text (len {text_units})"),
         ));
     }
+    let idx = unit_to_byte(text, idx_unit);
 
     let pairs = balanced_pairs(text, open_ch, close_ch);
     let best = pairs
@@ -484,13 +540,13 @@ pub fn edit_extract_enclosing(vm: &mut VM, args: Args) -> Result<Value, VMError>
             vm.fail(
                 ErrorKind::ValueError,
                 format!(
-                    "no enclosing `{open_ch}`…`{close_ch}` pair around byte index {idx}{}",
+                    "no enclosing `{open_ch}`…`{close_ch}` pair around index {idx_unit}{}",
                     block_hint(text, idx, open_ch, close_ch)
                 ),
             )
         })?;
 
-    build_range_obj(vm, best.0, best.1)
+    build_range_obj(vm, text, best.0, best.1)
 }
 
 /// The sentence that names `extractBlock`, when the index the caller
@@ -531,16 +587,27 @@ fn char_from_val(vm: &VM, val: &Value, label: &str) -> Result<char, VMError> {
     let s = vm
         .str_from(val)
         .map_err(|_| vm.fail(ErrorKind::ValueError, format!("{label} must be a string")))?;
-    if s.len() != 1 {
+    // One *code point*: `open`/`close` are delimiters like `(` or `{`, and a
+    // surrogate pair is one character even though it is two units.
+    let mut cps = crate::units::code_points(s);
+    let first = cps.next();
+    if first.is_none() || cps.next().is_some() {
         return Err(vm.fail(
             ErrorKind::ValueError,
             format!(
                 "{label} must be a single character, got {len} chars",
-                len = s.len()
+                len = crate::units::code_points(s).count()
             ),
         ));
     }
-    Ok(s.chars().next().unwrap())
+    let (cp, _) = crate::units::code_point_at(first.expect("checked above"), 0)
+        .expect("a code point slice is non-empty");
+    char::from_u32(cp).ok_or_else(|| {
+        vm.fail(
+            ErrorKind::ValueError,
+            format!("{label} must be a character, not an unpaired surrogate"),
+        )
+    })
 }
 
 // ── brace / delimiter helpers ─────────────────────────────────────────────────
@@ -584,7 +651,7 @@ fn balance_to(text: &str, open_pos: usize, open_ch: char, close_ch: char) -> Res
     }
 
     Err(format!(
-        "unbalanced `{open_ch}`…`{close_ch}` starting at byte index {open_pos}"
+        "unbalanced `{open_ch}`…`{close_ch}` starting at index {open_pos}"
     ))
 }
 
@@ -679,7 +746,7 @@ pub fn edit_replace_lines(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let text = text_s.as_str();
     let start = as_non_neg_usize(vm, args.get(vm, 1), "start")?;
     let end = as_non_neg_usize(vm, args.get(vm, 2), "end")?;
-    let new_text = vm.to_js_string(args.get(vm, 3), 0);
+    let new_text = vm.to_js_string(args.get(vm, 3), 0).to_utf8_lossy();
 
     if start < 1 || end < 1 || start > end {
         return Err(vm.fail(ErrorKind::ValueError, format!(
@@ -702,7 +769,7 @@ pub fn edit_replace_lines(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     out.push_str(&text[..prefix_len]);
     out.push_str(new_text.as_str());
     out.push_str(&text[suffix_start..]);
-    Ok(Value::String(RcStr::from(out)))
+    Ok(Value::String(JsString::from(out)))
 }
 
 // ── Edit.insertAt ─────────────────────────────────────────────────────────────
@@ -715,7 +782,7 @@ pub fn edit_insert_at(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let text_s = edit_text(vm, &args, "insertAt")?;
     let text = text_s.as_str();
     let line_no = as_non_neg_usize(vm, args.get(vm, 1), "lineNo")?;
-    let new_text = vm.to_js_string(args.get(vm, 2), 0);
+    let new_text = vm.to_js_string(args.get(vm, 2), 0).to_utf8_lossy();
 
     if line_no < 1 {
         return Err(vm.fail(ErrorKind::ValueError, "insertAt: lineNo must be >= 1"));
@@ -743,7 +810,7 @@ pub fn edit_insert_at(vm: &mut VM, args: Args) -> Result<Value, VMError> {
             out.push('\n');
         }
         out.push_str(new_text.as_str());
-        return Ok(Value::String(RcStr::from(out)));
+        return Ok(Value::String(JsString::from(out)));
     }
 
     let insert_pos: usize = lines[..(line_no - 1)].iter().map(|l| l.len()).sum();
@@ -751,7 +818,7 @@ pub fn edit_insert_at(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     out.push_str(&text[..insert_pos]);
     out.push_str(new_text.as_str());
     out.push_str(&text[insert_pos..]);
-    Ok(Value::String(RcStr::from(out)))
+    Ok(Value::String(JsString::from(out)))
 }
 
 // ── Edit.applyEdits ───────────────────────────────────────────────────────────
@@ -768,7 +835,7 @@ pub fn edit_apply_edits(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let edits_val = args.get(vm, 1);
     let edits = parse_edits(vm, edits_val)?;
 
-    let mut spans: Vec<(usize, usize, usize, &RcStr)> = Vec::new();
+    let mut spans: Vec<(usize, usize, usize, &String)> = Vec::new();
     // (edit_idx, match_start, match_end_excl, replacement)
 
     for (i, (old_s, new_s)) in edits.iter().enumerate() {
@@ -794,7 +861,7 @@ pub fn edit_apply_edits(vm: &mut VM, args: Args) -> Result<Value, VMError> {
                 ),
             ));
         }
-        if let Some(why) = doubles_indentation(text, matches[0], old, new_s.as_str()) {
+        if let Some(why) = doubles_indentation(text, matches[0], old, new_s) {
             return Err(vm.fail(
                 ErrorKind::ValueError,
                 format!("applyEdits edit[{i}]: {why}").as_str(),
@@ -825,15 +892,17 @@ pub fn edit_apply_edits(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     // Apply right-to-left (already sorted descending).
     let mut result = String::from(text);
     for (_, start, end, replacement) in &spans {
-        let r = replacement.as_str();
-        result.replace_range(*start..*end, r);
+        result.replace_range(*start..*end, replacement);
     }
 
-    Ok(Value::String(RcStr::from(result)))
+    Ok(Value::String(JsString::from(result)))
 }
 
 /// Parse the edits arg: an array of `{ old, new }` objects.
-fn parse_edits<'a>(vm: &'a VM, val: &'a Value) -> Result<Vec<(RcStr, RcStr)>, VMError> {
+///
+/// Narrowed to UTF-8 here, like the receiver: `applyEdits` matches and splices
+/// against `text`, which is a `String` from `edit_text`.
+fn parse_edits<'a>(vm: &'a VM, val: &'a Value) -> Result<Vec<(String, String)>, VMError> {
     let arr_ptr = match val {
         Value::Array(p) => *p as usize,
         _ => {
@@ -870,7 +939,7 @@ fn parse_edits<'a>(vm: &'a VM, val: &'a Value) -> Result<Vec<(RcStr, RcStr)>, VM
             .map
             .get(keys::OLD)
             .and_then(|v| match v {
-                Value::String(s) => Some(s.clone()),
+                Value::String(s) => Some(s.to_utf8_lossy()),
                 _ => None,
             })
             .ok_or_else(|| {
@@ -883,7 +952,7 @@ fn parse_edits<'a>(vm: &'a VM, val: &'a Value) -> Result<Vec<(RcStr, RcStr)>, VM
             .map
             .get(keys::NEW)
             .and_then(|v| match v {
-                Value::String(s) => Some(s.clone()),
+                Value::String(s) => Some(s.to_utf8_lossy()),
                 _ => None,
             })
             .ok_or_else(|| {
@@ -899,10 +968,19 @@ fn parse_edits<'a>(vm: &'a VM, val: &'a Value) -> Result<Vec<(RcStr, RcStr)>, VM
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
-fn build_range_obj(vm: &mut VM, start: usize, end: usize) -> Result<Value, VMError> {
+/// `{ start, end }` — the other `Edit.*` boundary. `start` and `end` arrive
+/// as byte offsets from the body and leave as the code-unit offsets the
+/// program's own `indexOf`/`slice` speak.
+fn build_range_obj(vm: &mut VM, text: &str, start: usize, end: usize) -> Result<Value, VMError> {
     let mut obj = IndexMap::new();
-    obj.insert(RcStr::from("start"), Value::PosInt(start as u64));
-    obj.insert(RcStr::from("end"), Value::PosInt(end as u64));
+    obj.insert(
+        JsString::from("start"),
+        Value::PosInt(byte_to_unit(text, start) as u64),
+    );
+    obj.insert(
+        JsString::from("end"),
+        Value::PosInt(byte_to_unit(text, end) as u64),
+    );
     Ok(vm.alloc_object(obj))
 }
 

@@ -36,7 +36,7 @@ pub fn value_to_string(vm: &mut VM, args: Args) -> Result<Value, VMError> {
         }
         let radix = r as u32;
         let n = recv.as_f64().unwrap_or(0.0);
-        return Ok(Value::String(crate::vm::RcStr::from(
+        return Ok(Value::String(crate::vm::JsString::from(
             number_to_radix_string(n, radix),
         )));
     }

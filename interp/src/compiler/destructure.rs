@@ -3,7 +3,7 @@ use oxc_span::GetSpan;
 
 use crate::builtin::Builtin;
 use crate::span::Span;
-use crate::vm::{Instr, LocalIndex, RcStr};
+use crate::vm::{Instr, JsString, LocalIndex};
 
 impl super::Compiler {
     /// Apply a destructuring/parameter default to the value on top of the stack:
@@ -50,7 +50,7 @@ impl super::Compiler {
                 return;
             }
         };
-        self.emit(Instr::ObjGet(RcStr::from(name.as_str())), span);
+        self.emit(Instr::ObjGet(JsString::from(name.as_str())), span);
     }
 
     /// Push a pattern property's key as a string *value* (used to exclude
@@ -81,7 +81,7 @@ impl super::Compiler {
                 return;
             }
         };
-        self.emit(Instr::PushStr(RcStr::from(name.as_str())), span);
+        self.emit(Instr::PushStr(JsString::from(name.as_str())), span);
     }
 
     /// Object-rest plumbing: with `[src, rest, src, key]` on the stack (key a

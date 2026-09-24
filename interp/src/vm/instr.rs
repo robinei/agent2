@@ -1,5 +1,5 @@
 use crate::builtin::Builtin;
-use crate::rc_str::RcStr;
+use crate::js_string::JsString;
 use thin_vec::ThinVec;
 
 pub type CodeAddr = u32;
@@ -31,7 +31,7 @@ pub type CellIndex = u32;
 /// immutable string: cloning a key (`ObjNew`/`ObjSet`) or pushing a literal
 /// (`PushStr`) is a refcount bump, and identical interned names share one
 /// allocation.
-pub type FieldName = RcStr;
+pub type FieldName = JsString;
 
 /// Storage class for a local slot declared by `EnterFrame`. A `Plain` slot is an
 /// ordinary stack local; a `Boxed` slot is captured by reference, so it is
@@ -297,7 +297,7 @@ pub enum Instr {
     PushPosInt(u64),                   // () -> num
     PushNegInt(i64),                   // () -> num
     PushFloat(f64),                    // () -> num
-    PushStr(RcStr),                    // () -> str
+    PushStr(JsString),                 // () -> str
     PushArray(ArrayPtr),               // () -> arr
     PushObject(ObjectPtr),             // () -> obj
     PushFn(CodeAddr, ClosurePtr, u16), // () -> fn ; const-fn canonical push (u16 = JS arity for fn.length)
@@ -315,12 +315,12 @@ pub enum Instr {
     /// cheap to compare. The VM checks the builtin registry, error-constructor
     /// set, and hardcoded globals; everything else resolves to a `ReferenceError`.
     /// () -> any
-    PushName(RcStr),
+    PushName(JsString),
     /// Like `PushName` but returns `Undefined` instead of throwing for unknown
     /// names. Used exclusively for `typeof <undeclared-identifier>` where JS
     /// specifies that the result must be `"undefined"` (no ReferenceError).
     /// () -> any
-    PushNameSoft(RcStr),
+    PushNameSoft(JsString),
 
     Pop(usize),
 
@@ -538,7 +538,7 @@ pub enum Instr {
     /// awaits a still-pending promise (`Await` → `StepResult::Pending`), so
     /// fan-out composes across arbitrary control flow, not just adjacent
     /// instructions.
-    Invoke(RcStr, ArgCount), // any, ... -> promise
+    Invoke(JsString, ArgCount), // any, ... -> promise
 
     /// EFFECT: starts the named call exactly like `Invoke` — same outbox
     /// entry, same host-visible `InvokeCall` — but pushes `undefined`
@@ -565,7 +565,7 @@ pub enum Instr {
     /// The right way out is a `tell` that never enters the outbox at
     /// all, which is a change to how the host hears about it, not to
     /// this instruction.
-    Notify(RcStr, ArgCount), // any, ... -> undefined
+    Notify(JsString, ArgCount), // any, ... -> undefined
 
     /// EFFECT: performs the named call **now**, in this frame. Pops N
     /// arguments (push order: arg 0 deepest), advances `ip` past itself,
@@ -600,7 +600,7 @@ pub enum Instr {
     /// other), and `step()` meanwhile reports `Pending` with an empty
     /// batch. What the instruction promises is only that the frame is
     /// still standing when the answer lands.
-    Settle(RcStr, ArgCount), // any, ... -> any
+    Settle(JsString, ArgCount), // any, ... -> any
 
     /// Second half of an **async** function's prologue, emitted right after
     /// `EnterFrame` (and before any code that can throw — a param default,
@@ -650,7 +650,7 @@ pub enum Instr {
     /// and even rewriting the program preserving already written variables with execution starting at arbitrary point.
     /// NOT catchable by `try`: conditions are addressed to the LLM, and a
     /// program must not be able to swallow them (6_LANGUAGE Part B).
-    Raise(RcStr, ArgCount), // (payload?) -> result
+    Raise(JsString, ArgCount), // (payload?) -> result
     /// `finish()` — **a flag, not an ending**: the task is finished, so
     /// the branch should not be prompted again once this program ends.
     /// Nothing about control flow changes; the instructions after it

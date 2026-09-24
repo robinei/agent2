@@ -126,9 +126,7 @@ pub enum EventPayload {
     /// waits to be spoken to. Retrying is a policy decision with a
     /// loop in it — a provider that is down stays down — and belongs
     /// with the autonomous-progress work, not here.
-    RequestFailed {
-        message: String,
-    },
+    RequestFailed { message: String },
 
     /// **The conversation is full and a compaction was asked for**
     /// (28). Parent: the owning agent's spine. Renders to chat: no — the

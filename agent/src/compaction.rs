@@ -296,14 +296,7 @@ pub fn floor_size(tree: &Tree, spine: &Spine, budget: usize) -> usize {
         .path_events(spine.leaf_id)
         .iter()
         .filter(|e| renders_a_line(&e.payload))
-        .map(|e| {
-            (
-                e.id,
-                crate::tree::CompactedView {
-                    text: None,
-                },
-            )
-        })
+        .map(|e| (e.id, crate::tree::CompactedView { text: None }))
         .collect();
     let leaf = spine.leaf_id;
     let Some(agent) = tree.enclosing_agent(leaf) else {
@@ -634,7 +627,11 @@ mod tests {
         };
 
         let (tree, spine, call, ret) = build();
-        let ids: Vec<EventId> = tree.path_events(spine.leaf_id).iter().map(|e| e.id).collect();
+        let ids: Vec<EventId> = tree
+            .path_events(spine.leaf_id)
+            .iter()
+            .map(|e| e.id)
+            .collect();
         let sweep = compact(
             &tree,
             &spine,
@@ -697,7 +694,11 @@ mod tests {
         .unwrap();
         tree.append(&mut spine, EventPayload::Restart).unwrap();
 
-        let ids: Vec<EventId> = tree.path_events(spine.leaf_id).iter().map(|e| e.id).collect();
+        let ids: Vec<EventId> = tree
+            .path_events(spine.leaf_id)
+            .iter()
+            .map(|e| e.id)
+            .collect();
         let sweep = compact(
             &tree,
             &spine,

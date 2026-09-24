@@ -1,5 +1,5 @@
 use crate::builtin::Args;
-use crate::vm::{ErrorKind, RcStr, VM, VMError, Value};
+use crate::vm::{ErrorKind, JsString, VM, VMError, Value};
 
 // ── JSON static implementations ──────────────────────────────────────────────
 
@@ -28,6 +28,7 @@ pub fn json_parse(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     // is parsing something that was never JSON — a command's output, a
     // file, an object that was already a value — and one look at the
     // first characters settles which.
+    let s = s.to_utf8_lossy();
     let json: serde_json::Value = serde_json::from_str(&s).map_err(|e| {
         let head: String = s.chars().take(60).collect();
         let more = if s.chars().nth(60).is_some() {
@@ -83,7 +84,7 @@ pub fn json_stringify(vm: &mut VM, args: Args) -> Result<Value, VMError> {
                 let n = n.trunc().clamp(0.0, 10.0) as usize;
                 " ".repeat(n)
             }
-            Value::String(s) => s.chars().take(10).collect(),
+            Value::String(s) => s.to_utf8_lossy().chars().take(10).collect(),
             other => {
                 let what = vm.describe_operand(&other.clone());
                 return Err(vm.fail(
@@ -106,10 +107,10 @@ pub fn json_stringify(vm: &mut VM, args: Args) -> Result<Value, VMError> {
                 format!("this value cannot be written as JSON: {e}").as_str(),
             )
         })?;
-        Ok(Value::String(RcStr::from(s)))
+        Ok(Value::String(JsString::from(s)))
     } else {
         let s = pretty_print_json(&json, &indent);
-        Ok(Value::String(RcStr::from(s)))
+        Ok(Value::String(JsString::from(s)))
     }
 }
 
@@ -256,7 +257,7 @@ mod tests {
             Instr::CallBuiltin(Builtin::JSONStringify, 1),
         ]);
         match &out[0] {
-            Value::String(s) => assert_eq!(s.as_str(), "3.5"),
+            Value::String(s) => assert!(s.eq_str("3.5")),
             other => panic!("expected string, got {other:?}"),
         }
     }
@@ -269,7 +270,7 @@ mod tests {
         let v = testutil::run_val("return JSON.stringify({a:1}, null, 2);");
         match v {
             Value::String(s) => {
-                assert_eq!(s.as_str(), "{\n  \"a\": 1\n}");
+                assert!(s.eq_str("{\n  \"a\": 1\n}"));
             }
             other => panic!("expected string, got {other:?}"),
         }
@@ -280,7 +281,7 @@ mod tests {
         // No space → compact, unchanged from today.
         let v = testutil::run_val("return JSON.stringify({a:1});");
         match v {
-            Value::String(s) => assert_eq!(s.as_str(), "{\"a\":1}"),
+            Value::String(s) => assert!(s.eq_str("{\"a\":1}")),
             other => panic!("expected string, got {other:?}"),
         }
     }
@@ -322,7 +323,7 @@ mod tests {
         // the eval's outline.items call cares about are covered together.
         let v = testutil::run_val("return JSON.stringify([1, undefined, 3]);");
         match v {
-            Value::String(s) => assert_eq!(s.as_str(), "[1,null,3]"),
+            Value::String(s) => assert!(s.eq_str("[1,null,3]")),
             other => panic!("expected string, got {other:?}"),
         }
     }
@@ -333,7 +334,7 @@ mod tests {
         // here for the same reason.
         let v = testutil::run_val("return JSON.stringify({a: 1, b: undefined, c: 3});");
         match v {
-            Value::String(s) => assert_eq!(s.as_str(), "{\"a\":1,\"c\":3}"),
+            Value::String(s) => assert!(s.eq_str("{\"a\":1,\"c\":3}")),
             other => panic!("expected string, got {other:?}"),
         }
     }

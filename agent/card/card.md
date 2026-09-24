@@ -195,12 +195,11 @@ declare namespace Edit {
 
 **`await` works at the top level of a block**, and is the only way to settle a promise. `tools.*` below are this session's capabilities and are all async; of everything above, only `ask` and `choose` are — the two that wait on somebody.
 
-## Three places this dialect answers differently
+## Two places this dialect answers differently
 
 Everything else that differs stops the block and says what to write instead, so it is not listed here.
 
 | you write | you get | |
 |---|---|---|
-| `"aéb".length` | `4` | strings count UTF-8 bytes, not characters, so walk one with `for (const ch of s)` rather than an index |
 | `1 < "2"` | `false` | `<` `>` `<=` `>=` do not coerce across types, so a number parsed out of a tool's output is a string until you write `Number(x)` |
 | `e instanceof Error` | `false` | a caught error is a plain `{ name, message }`, so branch on `e.name` |

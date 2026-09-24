@@ -128,7 +128,7 @@ fn compound_assignment() {
         testutil::num(8.0)
     );
     match testutil::run_val("let s = \"a\"; s += \"b\"; return s;") {
-        Value::String(s) => assert_eq!(s.as_str(), "ab"),
+        Value::String(s) => assert!(s.eq_str("ab")),
         other => panic!("not a string: {other:?}"),
     }
     assert_eq!(

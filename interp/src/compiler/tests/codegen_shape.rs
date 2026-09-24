@@ -6,7 +6,7 @@
 use super::*;
 use crate::builtin::Builtin;
 use crate::compiler::compile;
-use crate::rc_str::RcStr;
+use crate::js_string::JsString;
 use crate::testutil;
 use crate::vm::{Instr, SlotKind, VM, Value};
 
@@ -47,7 +47,7 @@ fn peephole_folds_not_into_branch() {
     // And it still behaves correctly: `c` is true, so the body is skipped.
     let vm = run_program(prog);
     let o = &vm.objects[0];
-    assert_eq!(o.map.get(&RcStr::from("x")), None, "body must not run");
+    assert_eq!(o.map.get(&JsString::from("x")), None, "body must not run");
 }
 
 #[test]
@@ -57,7 +57,7 @@ fn peephole_not_fold_preserves_semantics_when_taken() {
     assert!(!prog.code.iter().any(|i| matches!(i, Instr::Not)));
     let vm = run_program(prog);
     let o = &vm.objects[0];
-    assert_eq!(o.map.get(&RcStr::from("x")), Some(&Value::PosInt(1)));
+    assert_eq!(o.map.get(&JsString::from("x")), Some(&Value::PosInt(1)));
 }
 
 #[test]
@@ -76,7 +76,7 @@ fn simplify_cfg_eliminates_dead_code_after_return() {
     );
     let vm = run_program(prog);
     let o = &vm.objects[0];
-    assert_eq!(o.map.get(&RcStr::from("r")), Some(&Value::PosInt(1)));
+    assert_eq!(o.map.get(&JsString::from("r")), Some(&Value::PosInt(1)));
 }
 
 #[test]
@@ -96,7 +96,7 @@ fn simplify_cfg_preserves_loop_semantics() {
     let vm = run_program(prog);
     // 0+1+2 + 4+5+6 = 18 (3 skipped, break at 7).
     let o = &vm.objects[0];
-    assert_eq!(o.map.get(&RcStr::from("sum")), Some(&Value::Float(18.0)));
+    assert_eq!(o.map.get(&JsString::from("sum")), Some(&Value::Float(18.0)));
 }
 
 #[test]
@@ -113,7 +113,7 @@ fn peephole_double_negation_compiles_to_tobool() {
     // `input.c` is undefined here → `!!undefined` is `false`.
     let vm = run_program(prog);
     let o = &vm.objects[0];
-    assert_eq!(o.map.get(&RcStr::from("b")), Some(&Value::Bool(false)));
+    assert_eq!(o.map.get(&JsString::from("b")), Some(&Value::Bool(false)));
 }
 
 #[test]
@@ -219,8 +219,8 @@ fn const_branch_folds_dead_arm() {
     );
     let vm = run_program(prog);
     let o = &vm.objects[0];
-    assert_eq!(o.map.get(&RcStr::from("x")), None);
-    assert_eq!(o.map.get(&RcStr::from("y")), Some(&Value::PosInt(2)));
+    assert_eq!(o.map.get(&JsString::from("x")), None);
+    assert_eq!(o.map.get(&JsString::from("y")), Some(&Value::PosInt(2)));
 }
 
 #[test]
@@ -473,7 +473,7 @@ fn reassigned_function_is_not_a_constant() {
     let vm = run_program(prog);
     assert_eq!(input_val(&vm, "a"), Value::PosInt(1));
     match input_val(&vm, "b") {
-        Value::String(s) => assert_eq!(s.as_str(), "number"),
+        Value::String(s) => assert!(s.eq_str("number")),
         other => panic!("expected string, got {other:?}"),
     }
 }
@@ -583,7 +583,7 @@ fn for_program_seeds_input_at_heap0() {
     let state = serde_json::json!({ "count": 7 });
     let vm = VM::for_program(prog, state).unwrap();
     let o = &vm.objects[0];
-    assert_eq!(o.map.get(&RcStr::from("count")), Some(&Value::PosInt(7)));
+    assert_eq!(o.map.get(&JsString::from("count")), Some(&Value::PosInt(7)));
 }
 
 // ── effects lowering ──────────────────────────────────────────────

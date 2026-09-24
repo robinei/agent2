@@ -18,7 +18,7 @@ use oxc_span::SourceType;
 use crate::analyzer::{self, ProgramAnalysis};
 use crate::diag::Diagnostic;
 use crate::span::Span;
-use crate::vm::RcStr;
+use crate::vm::JsString;
 use crate::vm::{Instr, Value};
 
 mod analysis;
@@ -332,10 +332,10 @@ pub(crate) struct Compiler {
     /// `analysis.scopes`). Consulted only for static-call resolution of
     /// directly-named callees (`find_callee_label`/`function_arity`/…).
     current_scope: usize,
-    /// Interned string literals: identical contents share one `RcStr`
+    /// Interned string literals: identical contents share one `JsString`
     /// allocation, which each `PushStr` then clones (a refcount bump). Stored as
-    /// a set keyed by the string itself (via `RcStr: Borrow<str>`).
-    interned: HashSet<RcStr>,
+    /// a set keyed by the string itself (via `JsString: Borrow<str>`).
+    interned: HashSet<JsString>,
     /// Constant-propagation environment for the current function frame: a slot
     /// holding a `const` bound to a compile-time constant maps to the literal
     /// push that reproduces it, so references emit the literal instead of a
@@ -536,5 +536,3 @@ mod count_statements_tests {
         assert_eq!(count_statements("let ("), 0);
     }
 }
-
-

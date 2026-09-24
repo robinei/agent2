@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::diag::{DiagKind, Diagnostic};
 use crate::span::Span;
-use crate::vm::{Instr, RcStr};
+use crate::vm::{Instr, JsString};
 
 impl super::Compiler {
     pub(super) fn new() -> Self {
@@ -37,15 +37,18 @@ impl super::Compiler {
         self.spans.push(span);
     }
 
-    /// Intern a string literal, returning a shared `RcStr`. Deduplicated by
+    /// Intern a string literal, returning a shared `JsString`. Deduplicated by
     /// content — identical literals across the program share one allocation, so
     /// the embedded `PushStr` operands (and the values they push at runtime) are
     /// all clones of the same block.
-    pub(super) fn intern_string(&mut self, s: &str) -> RcStr {
-        if let Some(existing) = self.interned.get(s) {
+    pub(super) fn intern_string(&mut self, s: &str) -> JsString {
+        // The set is keyed by `JsString`, which borrows as `[u16]`, so the
+        // probe widens first. Compile-time only, and once per distinct
+        // literal.
+        if let Some(existing) = self.interned.get(&crate::units::from_str(s)[..]) {
             return existing.clone();
         }
-        let rc = RcStr::from(s);
+        let rc = JsString::from(s);
         self.interned.insert(rc.clone());
         rc
     }

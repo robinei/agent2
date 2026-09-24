@@ -2907,11 +2907,21 @@ mod tests {
         assert_eq!(
             kinds(session.tree(), root_leaf(&session)),
             [
-                "Agent", "Post", "Reply", "Part",
+                "Agent",
+                "Post",
+                "Reply",
+                "Part",
                 // Calls are logged at dispatch, their results at
                 // landing; the reply ends where the text stopped, which
                 // here is after its one cell had already dispatched.
-                "Call", "Call", "ReplyEnd", "Result", "Result", "Note", "Handback", "Console",
+                "Call",
+                "Call",
+                "ReplyEnd",
+                "Result",
+                "Result",
+                "Note",
+                "Handback",
+                "Console",
                 // The script is spent: the next request fails, and the
                 // branch records that rather than going quiet.
                 "RequestFailed",
@@ -3083,10 +3093,7 @@ mod tests {
         // The program still saw its own await order — and it reaches the
         // next reply as the row it appended, not as a return value.
         let texts = tool_texts(&session);
-        assert!(
-            texts[0].contains(r#"noted: ["slow","fast"]"#),
-            "{texts:?}"
-        );
+        assert!(texts[0].contains(r#"noted: ["slow","fast"]"#), "{texts:?}");
     }
 
     /// The artifact menu a suspended `raise` hands the handler names
@@ -4349,7 +4356,9 @@ mod tests {
         // event logged, so its id — the new branch's id — is #8.
         h.send(SessionCommand::Fork {
             from: EventId::new(2),
-            name: Some("retry".into()), text: None });
+            name: Some("retry".into()),
+            text: None,
+        });
         let fork = EventId::new(8);
         h.send(SessionCommand::UserTurn {
             branch: fork,
@@ -4515,7 +4524,9 @@ mod tests {
         });
         h.send(SessionCommand::Fork {
             from: EventId::new(2),
-            name: None, text: None });
+            name: None,
+            text: None,
+        });
         h.send(SessionCommand::Resume(EventId::new(2)));
         for _ in 0..8 {
             session.pump_one();
@@ -4690,7 +4701,14 @@ mod tests {
         );
         let kinds = kinds(session.tree(), root_leaf(&session));
         assert!(
-            kinds.ends_with(&["Part", "Note", "ReplyEnd", "Handback", "Console", "RequestFailed"]),
+            kinds.ends_with(&[
+                "Part",
+                "Note",
+                "ReplyEnd",
+                "Handback",
+                "Console",
+                "RequestFailed"
+            ]),
             "the rewrite ran to completion and the branch went idle: {kinds:?}"
         );
         assert!(session.quiet());
@@ -6062,8 +6080,17 @@ mod tests {
         assert_eq!(
             kinds(tree, child_leaf),
             [
-                "Agent", "Post", "Reply", "Part", "Call", "ReplyEnd", "Result", "Answer", "Note",
-                "Handback", "Console",
+                "Agent",
+                "Post",
+                "Reply",
+                "Part",
+                "Call",
+                "ReplyEnd",
+                "Result",
+                "Answer",
+                "Note",
+                "Handback",
+                "Console",
                 // The script is spent; the failed request is recorded.
                 "RequestFailed",
             ],
@@ -6131,10 +6158,14 @@ mod tests {
         // events logged: #8 and #9.
         h.send(SessionCommand::Fork {
             from: EventId::new(2),
-            name: Some("A".into()), text: None });
+            name: Some("A".into()),
+            text: None,
+        });
         h.send(SessionCommand::Fork {
             from: EventId::new(2),
-            name: Some("B".into()), text: None });
+            name: Some("B".into()),
+            text: None,
+        });
         let (a, b) = (EventId::new(8), EventId::new(9));
         h.send(SessionCommand::UserTurn {
             branch: a,
@@ -6196,7 +6227,9 @@ mod tests {
         let h = session.handle();
         h.send(SessionCommand::Fork {
             from: EventId::new(2),
-            name: None, text: None });
+            name: None,
+            text: None,
+        });
         h.send(SessionCommand::Shutdown);
         let mut session = drain(session);
         let fork = EventId::new(8);
@@ -6241,7 +6274,9 @@ mod tests {
         let h = session.handle();
         h.send(SessionCommand::Fork {
             from: EventId::new(7),
-            name: None, text: None });
+            name: None,
+            text: None,
+        });
         h.send(SessionCommand::Shutdown);
         let session = drain(session);
 
@@ -6511,7 +6546,9 @@ mod tests {
         let at = session.state(branch).unwrap().spine.leaf_id;
         h.send(SessionCommand::Fork {
             from: at,
-            name: Some("explore".into()), text: None });
+            name: Some("explore".into()),
+            text: None,
+        });
         while session.pump_one() {}
         let fork = live_branches(&session)
             .into_iter()
@@ -6817,8 +6854,16 @@ mod tests {
         assert_eq!(
             kinds(tree, leaf),
             [
-                "Agent", "Post", "Reply", "Part", "Note", "Call", "ReplyEnd", "Handback",
-                "Console", "Result",
+                "Agent",
+                "Post",
+                "Reply",
+                "Part",
+                "Note",
+                "Call",
+                "ReplyEnd",
+                "Handback",
+                "Console",
+                "Result",
                 // The script is spent; the failed request is recorded.
                 "RequestFailed"
             ]
@@ -7192,7 +7237,14 @@ mod tests {
         assert_eq!(
             kinds(session.tree(), worker.spine.leaf_id),
             [
-                "Agent", "Post", "Reply", "Part", "Answer", "ReplyEnd", "Handback", "Console",
+                "Agent",
+                "Post",
+                "Reply",
+                "Part",
+                "Answer",
+                "ReplyEnd",
+                "Handback",
+                "Console",
                 // The script is spent; the failed request is recorded.
                 "RequestFailed"
             ],
@@ -7382,8 +7434,10 @@ mod tests {
             &mut root,
             EventPayload::Part {
                 reply: EventId::new(1),
-                part: crate::types::Part::Cell("await tools.send_email(); history.note(await ask(\"user\", \"which one?\"));"
-                    .into()),
+                part: crate::types::Part::Cell(
+                    "await tools.send_email(); history.note(await ask(\"user\", \"which one?\"));"
+                        .into(),
+                ),
             },
         )
         .unwrap();
