@@ -1188,7 +1188,37 @@ pub(crate) fn render_with_lookup(
                                 // turn.
                                 None if is_only_an_imitated_marker(t) => {}
                                 None => {
-                                    blocks.push((text.len(), ev.id.as_u64()));
+                                    // **A part that renders as nothing
+                                    // asks for no marker.** A marker's
+                                    // whole promise is "read *that*
+                                    // back with `history.fetch`", and a
+                                    // prose segment of one newline has
+                                    // nothing to read. Worse, it does
+                                    // not merely add noise: the markers
+                                    // are inserted back-to-front and
+                                    // each absorbs an imitated one
+                                    // above it — a pass that cannot
+                                    // tell our own freshly-written
+                                    // marker from a copied one, because
+                                    // by then they are the same bytes.
+                                    // So the blank part's marker ate
+                                    // the *next* block's, and the label
+                                    // directly above a block named the
+                                    // whitespace instead.
+                                    //
+                                    // Live on 2026-09-24: a reply
+                                    // opened with a blank prose part,
+                                    // the block below it came back
+                                    // labelled with the blank's id, and
+                                    // the model fetched what it was
+                                    // told to — getting a newline, and
+                                    // trapping on `.stdout` of it. The
+                                    // bytes stay on the log and `fetch`
+                                    // still answers; what goes is an
+                                    // invitation to read nothing.
+                                    if !t.trim().is_empty() {
+                                        blocks.push((text.len(), ev.id.as_u64()));
+                                    }
                                     part_spans.push((sent_len, t.len(), text.len()));
                                     text.push_str(t);
                                 }
@@ -1505,6 +1535,65 @@ mod tests {
     use super::*;
 
     use crate::testkit::Conversation;
+
+    /// **A blank prose segment must not take the next block's
+    /// marker.** Live on 2026-09-24: a reply opened with a prose part
+    /// whose whole content was `"\n"`, and the turn came back as
+    ///
+    /// ```text
+    /// 【↓ history[67]】
+    /// ```js
+    /// const where = await tools.bash("find . -name card.md …");
+    /// ```
+    /// ```
+    ///
+    /// — where 67 is the blank prose and the block is 68. The model
+    /// read the label directly above the block, fetched 67, got a
+    /// newline, and trapped on `.stdout` of it. It was not guessing;
+    /// it was believing us.
+    ///
+    /// The markers go in back-to-front, and each insertion absorbs an
+    /// imitated marker above it — a pass that cannot tell the
+    /// harness's own freshly-written marker from one the model copied,
+    /// because by then they are the same bytes. A part that renders as
+    /// nothing has nothing to name, so it no longer asks for a marker
+    /// and cannot eat its neighbour's.
+    #[test]
+    fn a_blank_prose_part_does_not_take_the_block_s_marker() {
+        let mut c = Conversation::new();
+        c.answers("bash", serde_json::json!({ "status": 0, "stdout": "ok\n" }));
+        c.user_says("go");
+        // A reply that opens with a blank line before its block — the
+        // shape the notebook splits into an empty prose piece.
+        c.reply("\n```js\nawait tools.bash(\"find .\");\n```\n");
+        let doc = c.document();
+        let live = &doc[doc.find(super::REAL_HEADING).unwrap_or(0)..];
+
+        let block_id = c
+            .tree()
+            .path_events(c.runner().spine.leaf_id)
+            .iter()
+            .find_map(|e| match &e.payload {
+                EventPayload::Part {
+                    part: Part::Cell(_),
+                    ..
+                } => Some(e.id.as_u64()),
+                _ => None,
+            })
+            .expect("the block is on the log");
+
+        let marker = live
+            .lines()
+            .zip(live.lines().skip(1))
+            .find(|(_, next)| next.starts_with("```js"))
+            .map(|(m, _)| m.to_owned())
+            .expect("a marker sits above the block");
+        assert_eq!(
+            marker,
+            format!("{FENCE_OPEN}{BLOCK_ARROW} history[{block_id}]{FENCE_CLOSE}"),
+            "the marker above a block names that block: {live}"
+        );
+    }
 
     /// **The examples say what they are; this says where they end.**
     /// Four sessions that are not the model's own sit directly above
