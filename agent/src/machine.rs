@@ -293,6 +293,30 @@ const WORK_UNDER_WAY_CALL: &str =
 const SILENT_FINISH: &str = "- Your last finish() said nothing to anybody, so it was not \
      honoured. tell() the answer, then finish().";
 
+/// **How a reply says it is finished without running anything.**
+///
+/// `finish()` is a function, so saying "the task is done" required
+/// opening a ```js block — which means a reply that has concluded in
+/// words has to write a program whose only purpose is to say it is not
+/// writing programs any more. Measured across 382 kept runs: of the
+/// thirteen times the stopped-short prod fired, twelve bought a reply
+/// that was `done();` and nothing else.
+///
+/// So the ending is a mark in the prose instead. U+220E, end of proof:
+/// it already means *this is concluded*, and across 280 model-written
+/// parts from the kept sessions it appears zero times — the same test
+/// that chose `【`/`】`, which it must not be confused with. Those are
+/// the harness writing in the model's turn; this is the model writing
+/// to the harness, and the only token that goes that way.
+pub(crate) const FINISH_MARK: &str = "∎";
+
+/// Sent when a reply ran nothing, said something, and did not mark
+/// itself finished — so the branch cannot tell a conclusion from a
+/// thought said aloud.
+const NOT_FINISHED_NOTICE: &str = "- Your last reply ran no program and did not end with ∎, so \
+     the task is still open. If it was the answer, say it again with ∎ at the end. If you were \
+     thinking aloud, that belongs in reasoning — carry on with the work.";
+
 /// **The reply-shape line**, for the request where someone has just
 /// asked something and the branch has no work of its own outstanding.
 ///
@@ -1626,10 +1650,19 @@ impl Runner {
         // and a tool call in a foreign syntax (4 runs in 4 on
         // qwen3.8-flash, one carrying the task's whole answer) are real
         // strandings, and both were measured as such.
-        if !self.nudge_when_nothing_ran {
-            return None;
-        }
-        (!last.answering).then(|| STOPPED_SHORT_NOTICE.to_owned())
+        // **The ending vocabulary, now that there is one.** The note
+        // above is right that prodding was the wrong fix: twelve of
+        // thirteen wakes bought a reply of `done();` and nothing else,
+        // because saying "I am finished" required opening a block and
+        // calling a function — so a reply that had concluded in words
+        // had no way to say so, and the prod asked it to spend a round
+        // trip on syntax.
+        //
+        // `FINISH_MARK` is that way. It costs a character at the end of
+        // the sentence the model was writing anyway, so the wake it
+        // earns is one the next reply can discharge without a program.
+        (!last.answering && !last.text.contains(FINISH_MARK))
+            .then(|| NOT_FINISHED_NOTICE.to_owned())
     }
 
     /// **Reconciliation's half of the trigger rule**: forget having shown
@@ -3724,7 +3757,16 @@ impl Runner {
             serde_json::Value::Null => None,
             v => Some(v.clone()),
         };
-        let rested = self.finished && self.said_something(tree);
+        // **Either ending counts.** `finish()` sets the VM's flag;
+        // `∎` in the prose says the same thing without a program, which
+        // is the only way a reply that concluded in words can say it.
+        // A reply that does both is not a contradiction — it is a
+        // program that finished and a sentence that said so.
+        let marked = self
+            .replies(tree)
+            .last()
+            .is_some_and(|r| r.text.contains(FINISH_MARK));
+        let rested = (self.finished || marked) && self.said_something(tree);
         let outcome = tree.append(
             &mut self.spine,
             EventPayload::Handback {
@@ -10662,50 +10704,43 @@ mod tests {
         assert!(state.is_idle());
     }
 
-    /// **A continuation that ran nothing did stop short** — nobody asked
-    /// it anything; it was carrying on its own work and ended without a
-    /// `finish(text)`. Off by default now, so the branch has to be asked
-    /// for it.
+    /// **A reply that ran nothing does not rest unless it says so.**
     ///
-    /// Kept because the measurement that turned it off is a *ratio*,
-    /// not a refutation: one rescue in thirteen. If that ratio is ever
-    /// worth having back, this is the test that says it still works.
-    /// **And by default it is not asked again.** Twelve of the thirteen
-    /// times this notice fired across 382 kept runs, the reply it woke
-    /// was `done();` — a model that had finished the work and had not
-    /// said so in the syntax that rests a branch. Those runs would have
-    /// rested with the task complete and passed anyway, so the prod
-    /// bought a round trip and changed nothing.
+    /// It used to rest on the strength of having spoken, which made a
+    /// conclusion and a thought said aloud the same event. Live on
+    /// 2026-09-24 a run ended on "I keep losing the bytes between
+    /// replies — `keep` puts them in front of me for the next one" —
+    /// working-notes, delivered to the person as the answer, and the
+    /// task closed on it.
     ///
-    /// The other two branches of `stopped_short` are untouched and have
-    /// their own measurements: an empty completion, and a tool call in
-    /// a syntax this harness does not read.
+    /// The prod that would have caught it was off, and rightly: of the
+    /// thirteen times it fired across 382 kept runs, twelve woke a
+    /// reply of `done();` and nothing else — the cost of asking a model
+    /// that had already concluded to say so in a syntax that needs a
+    /// program. `FINISH_MARK` is what that was missing, so the wake now
+    /// costs a character rather than a round trip.
     #[test]
-    fn a_continuation_that_ran_nothing_rests_by_default() {
-        let (mut tree, mut state) = setup_under();
-        user_post(&mut state, &mut tree, "go");
-        let out = state
-            .step(&mut tree, StepInput::LlmResponse(llm_program("let a = 1;")))
-            .unwrap();
-        drain(&mut state, &mut tree, out);
+    fn a_reply_that_ran_nothing_rests_only_when_it_says_it_is_finished() {
+        let ran_nothing = |text: &str| {
+            let mut c = Conversation::new();
+            c.user_says("go");
+            c.reply("```js\nlet a = 1;\n```\n");
+            c.reply(text);
+            c.status()
+        };
 
-        let out = state
-            .step(
-                &mut tree,
-                StepInput::LlmResponse(crate::host::scripted_markdown(
-                    "That is the lay of the land.\n",
-                )),
-            )
-            .unwrap();
-        let settled = drain(&mut state, &mut tree, out);
-        assert!(
-            !settled
-                .iter()
-                .any(|o| matches!(o, StepOutput::LlmRequest(_))),
-            "the branch rests: {settled:?}"
+        assert_eq!(
+            ran_nothing("I keep losing the bytes between replies.\n"),
+            "awaiting llm",
+            "a thought said aloud leaves the task open"
         );
-        assert!(!state.needs_prompt(&tree));
+        assert_eq!(
+            ran_nothing("The limit is 65536 bytes, and it can carry on. ∎\n"),
+            "idle",
+            "a conclusion that marks itself finished rests the branch"
+        );
     }
+
 
     /// **A `finish()` that said nothing is not honoured**, and the next
     /// request says why. The pairing used to be the verb's arity —

@@ -447,3 +447,21 @@ mod tests {
 }
 
 
+
+#[cfg(test)]
+mod owes_probe {
+    use crate::testkit::Conversation;
+
+    #[test]
+    fn does_a_completed_program_get_another_turn() {
+        let mut c = Conversation::new();
+        c.answers("bash", serde_json::json!({ "status": 0, "stdout": "x\n" }));
+        c.user_says("do the thing");
+        c.reply("```js\nawait tools.bash(\"x\");\n```\n");
+        println!("PROBE after a completed program, no finish: status={:?}", c.status());
+        let mut c2 = Conversation::new();
+        c2.user_says("do the thing");
+        c2.reply("just some prose, no block\n");
+        println!("PROBE after a prose-only reply:            status={:?}", c2.status());
+    }
+}
