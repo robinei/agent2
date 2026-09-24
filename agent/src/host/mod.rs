@@ -4221,8 +4221,15 @@ mod tests {
     #[test]
     fn list_leaves_projects_the_log() {
         let (session, rx) = open(tree_with_open_root(), vec![]);
-        session.handle().send(SessionCommand::ListLeaves);
-        session.handle().send(SessionCommand::Shutdown);
+        // **One handle for both, because `handle()` clones the
+        // sender** and `mpsc` orders messages per sender, not across
+        // clones. Sent through two clones, the `Shutdown` can be seen
+        // first: `on_msg` sets `done`, `pump_one` stops, `ListLeaves`
+        // is never processed and there is no `Leaves` event to find.
+        // Measured at roughly one suite run in twenty before this.
+        let h = session.handle();
+        h.send(SessionCommand::ListLeaves);
+        h.send(SessionCommand::Shutdown);
         let _ = drain(session);
 
         let leaves = last_leaves(&rx.try_iter().collect::<Vec<_>>());
@@ -6189,10 +6196,15 @@ mod tests {
     #[test]
     fn fork_line_renders() {
         let (session, _rx) = open(tree_with_answered_root(), vec![]);
-        session.handle().send(SessionCommand::Fork {
+        // One handle, for the reason in `list_leaves_projects_the_log`:
+        // two clones of the sender are not ordered against each other,
+        // and a `Shutdown` that overtakes stops the pump before the
+        // command it was meant to follow.
+        let h = session.handle();
+        h.send(SessionCommand::Fork {
             from: EventId::new(7),
             name: None, text: None });
-        session.handle().send(SessionCommand::Shutdown);
+        h.send(SessionCommand::Shutdown);
         let session = drain(session);
 
         let state = session.state(EventId::new(8)).unwrap();
