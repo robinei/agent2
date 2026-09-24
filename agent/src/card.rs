@@ -619,6 +619,76 @@ pub fn full_card(registry: &crate::host::ToolRegistry) -> String {
     )
 }
 
+/// The tool names a rendered system prompt declares, read back out of
+/// its own `declare namespace tools { … }` block.
+///
+/// Read back rather than taken from the registry on purpose: the check
+/// this feeds runs over a *document* — a log rendered by `agent capture`
+/// or `agent document`, possibly written by another process under
+/// another card — where the registry that produced it is long gone and
+/// the manifest is the only surviving statement of what the model was
+/// told it had.
+pub fn tools_declared_in(system: &str) -> std::collections::BTreeSet<String> {
+    let mut names = std::collections::BTreeSet::new();
+    let Some(body) = system.split_once("declare namespace tools {") else {
+        return names;
+    };
+    for line in body.1.lines() {
+        let trimmed = line.trim_start();
+        if line.starts_with('}') || line.starts_with("```") {
+            break;
+        }
+        if let Some(rest) = trimmed.strip_prefix("function ")
+            && let Some(name) = rest.split('(').next()
+            && !name.is_empty()
+        {
+            names.insert(name.to_owned());
+        }
+    }
+    names
+}
+
+/// Every `tools.X(` a worked example calls but the system prompt beside
+/// it does not declare.
+///
+/// **A document that contradicts itself is one the model stops to
+/// litigate.** Three eval documents were built here from scripted
+/// sessions, whose registry holds exactly one tool, so each shipped a
+/// manifest declaring only `tools.echo` in front of worked examples
+/// calling `tools.bash` and `tools.read_file`. The model spent
+/// thousands of reasoning tokens on the contradiction — "the tools
+/// available in this session are only `tools.echo`! ... So bash/read_file
+/// may not exist" — and the arm was not measuring what it was built to
+/// measure. Nothing said so; the mismatch is visible only by reading
+/// the rendered prompt, which is exactly the thing nobody reads until
+/// something has already gone wrong.
+///
+/// One direction only. The converse — every declared tool is
+/// demonstrated — is false by design and should stay false: there are
+/// more tools than exemplars, and an exemplar exists to teach a shape,
+/// not to tour the registry.
+pub fn undeclared_example_tools(system: &str, worked_examples: &[&str]) -> Vec<String> {
+    let declared = tools_declared_in(system);
+    let mut missing: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for text in worked_examples {
+        for (i, _) in text.match_indices("tools.") {
+            let name: String = text[i + "tools.".len()..]
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            // `tools.X` with no call after it is prose about the
+            // namespace, not a call this has to account for.
+            if name.is_empty() || !text[i + "tools.".len() + name.len()..].starts_with('(') {
+                continue;
+            }
+            if !declared.contains(&name) {
+                missing.insert(name);
+            }
+        }
+    }
+    missing.into_iter().collect()
+}
+
 /// Where the program will run, stated once.
 ///
 /// **Because we never told it.** The tool descriptions say "absolute or
@@ -1350,6 +1420,60 @@ mod tests {
                 "an exemplar calls history.{verb}, which the card does not declare"
             );
         }
+    }
+
+    /// **Every `tools.X(` a worked example calls is declared in the
+    /// manifest that ships with it.**
+    ///
+    /// The same shape as
+    /// [`every_history_verb_is_demonstrated_and_every_demonstration_is_declared`],
+    /// one namespace over, and it fails the same way: an example that
+    /// calls a tool the reader has not been given teaches a name that
+    /// does not resolve — except that here the reader can *see* it does
+    /// not resolve, and says so. Three eval documents built from
+    /// scripted sessions declared only `tools.echo` while their
+    /// examples called `tools.bash` and `tools.read_file`, and the
+    /// model spent thousands of reasoning tokens deciding which half of
+    /// its own prompt to believe.
+    ///
+    /// This half holds the *shipped* pairing — the embedded card's
+    /// exemplars against the real registry's manifest — which is the
+    /// one a renamed or withdrawn tool would break. The scripted
+    /// pairing cannot be caught from here, because no test builds it:
+    /// it is built by `agent capture` over a `--headless` log, and
+    /// [`crate::card::undeclared_example_tools`] is called there.
+    #[test]
+    fn every_tool_a_worked_example_calls_is_declared() {
+        let system = format!(
+            "{}{}",
+            card(),
+            tool_manifest(&crate::host::tools::real_registry(), true)
+        );
+        let exemplars = exemplars();
+        let assistants: Vec<&str> = exemplars.iter().map(|ex| ex.assistant.as_str()).collect();
+        let missing = undeclared_example_tools(&system, &assistants);
+        assert!(
+            missing.is_empty(),
+            "a worked example calls {missing:?}, which the manifest shipping with it \
+             does not declare — the example is what the model copies, and this one \
+             names a tool it will be told it does not have"
+        );
+
+        // The detector has to be able to see a call at all: a check
+        // that silently matches nothing passes forever.
+        let seen = {
+            let declared = tools_declared_in(&system);
+            assert!(
+                declared.contains("bash") && declared.contains("read_file"),
+                "the manifest parser found {declared:?}"
+            );
+            undeclared_example_tools(&card(), &assistants)
+        };
+        assert!(
+            seen.contains(&"bash".to_string()),
+            "with the manifest removed the same examples must come back unsatisfied, \
+             got {seen:?}"
+        );
     }
 
     #[test]

@@ -324,6 +324,12 @@ fn print_document(log: Option<&str>, at: Option<&String>) -> Result<(), String> 
         None => doc,
     };
 
+    // Printed, not refused: reading a broken prompt is how you find out
+    // it is broken, so `document` always shows it — and says so first,
+    // where it will be read before the 23 KB below it.
+    if let Some(why) = document_contradiction(&doc) {
+        eprintln!("warning: {why}");
+    }
     let total: usize = doc.messages.iter().map(|m| m.content.len()).sum();
     println!("{} messages, {total} bytes\n", doc.messages.len());
     for (i, m) in doc.messages.iter().enumerate() {
@@ -336,6 +342,47 @@ fn print_document(log: Option<&str>, at: Option<&String>) -> Result<(), String> 
         println!("{}\n", m.content);
     }
     Ok(())
+}
+
+/// The complaint a self-contradicting document deserves, or `None`.
+///
+/// **A document whose manifest and whose worked examples disagree is
+/// not measuring what it was built to measure.** Three eval documents
+/// here were captured from `agent session --headless` logs — the
+/// scripted M0 demo, whose registry holds exactly one tool — so each
+/// declared `tools.echo` and nothing else, in front of the card's
+/// examples calling `tools.bash` and `tools.read_file`. The model
+/// noticed, as it should: "the tools available in this session are only
+/// `tools.echo`! ... So bash/read_file may not exist". A day of arms was
+/// invalidated by a contradiction nothing in the harness was looking
+/// for, and which is visible only to someone reading 23 KB of prompt.
+///
+/// It is checked over the rendered document rather than at the registry
+/// because that is where the two halves finally meet: `full_card` sees
+/// the registry but the exemplars ride beside it on the `Agent` event,
+/// and a narrowed spawn (`spawn(..., { tools: [...] })`) reaches the
+/// same state legitimately at runtime. A capture is the point where it
+/// stops being a runtime fact and becomes an experiment.
+fn document_contradiction(doc: &document::Document) -> Option<String> {
+    let system = doc.messages.first()?;
+    let examples: Vec<&str> = doc.messages[1..doc.preamble]
+        .iter()
+        .filter(|m| matches!(m.role, document::ChatRole::Assistant))
+        .map(|m| m.content.as_str())
+        .collect();
+    let missing = card::undeclared_example_tools(&system.content, &examples);
+    if missing.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "this document's worked examples call {} — which its own tool manifest \
+         does not declare. A scripted (`agent session` without `--real`) or \
+         allowlist-narrowed session declares only the tools it holds, and the \
+         card's examples were written against the real registry; the model reads \
+         both and spends the turn deciding which to believe. Re-capture from a \
+         `--real` log, or narrow the exemplars to match.",
+        missing.join(", ")
+    ))
 }
 
 /// A tiny `--flag value` reader. Not worth a dependency: these two
@@ -387,6 +434,11 @@ fn capture_document(args: &[String]) -> Result<(), String> {
         Some(tail) => doc.with_tail(&tail),
         None => doc,
     };
+    // Refused, not warned: a capture is written to be measured, often
+    // in a batch whose stderr nobody reads until the numbers look odd.
+    if let Some(why) = document_contradiction(&doc) {
+        return Err(format!("refusing to capture #{}: {why}", leaf.as_u64()));
+    }
     let text = lab::write(&doc);
     match opt(args, "-o") {
         Some(out) => {
@@ -1120,5 +1172,73 @@ mod turn_target_tests {
         assert_eq!(turn_target(&tree, None, conversation), conversation);
         // An id that is not in the log falls back rather than panicking.
         assert_eq!(turn_target(&tree, Some(9999), conversation), conversation);
+    }
+}
+
+#[cfg(test)]
+mod document_contradiction_tests {
+    use super::*;
+    use document::{ChatMessage, ChatRole, Document};
+
+    fn msg(role: ChatRole, content: &str) -> ChatMessage {
+        ChatMessage {
+            role,
+            content: content.to_owned(),
+            call: None,
+            result_for: None,
+            thinking: None,
+        }
+    }
+
+    fn doc(system: &str, example: &str) -> Document {
+        let messages = vec![
+            msg(ChatRole::System, system),
+            msg(ChatRole::User, "a task"),
+            msg(ChatRole::Assistant, example),
+        ];
+        Document {
+            preamble: messages.len(),
+            messages,
+        }
+    }
+
+    /// **The scripted registry's document, which is the one that got
+    /// shipped.** `agent session` without `--real` is the M0 demo: one
+    /// tool, `echo`. Capturing from such a log produced three eval
+    /// documents whose manifest declared `tools.echo` and whose worked
+    /// examples called `tools.bash` and `tools.read_file`, and the
+    /// model spent the turn litigating which half to believe rather
+    /// than doing the task. Nothing in the harness was looking.
+    #[test]
+    fn a_scripted_registrys_document_is_refused() {
+        let scripted = "card prose\n\ndeclare namespace tools {\n  \
+                        function echo(v: unknown): Promise<unknown>;\n}\n";
+        let why = document_contradiction(&doc(scripted, "const r = await tools.bash('ls');"))
+            .expect("the contradiction is the whole point");
+        assert!(why.contains("bash"), "{why}");
+
+        // And the same document with the tool declared is fine — this
+        // must not fire on every capture, or it will be turned off.
+        let full = "card prose\n\ndeclare namespace tools {\n  \
+                    function echo(v: unknown): Promise<unknown>;\n  \
+                    function bash(cmd: string): Promise<unknown>;\n}\n";
+        assert!(
+            document_contradiction(&doc(full, "const r = await tools.bash('ls');")).is_none(),
+            "a declared tool must not be reported"
+        );
+    }
+
+    /// Only the preamble is examined. What the *conversation* called is
+    /// history, not a worked example, and a tool withdrawn mid-session
+    /// (or a branch narrowed after the fact) would otherwise make every
+    /// capture of a finished run unopenable.
+    #[test]
+    fn a_call_in_the_conversation_is_not_a_worked_example() {
+        let scripted = "card prose\n\ndeclare namespace tools {\n  \
+                        function echo(v: unknown): Promise<unknown>;\n}\n";
+        let mut d = doc(scripted, "await tools.echo(1);");
+        d.messages
+            .push(msg(ChatRole::Assistant, "await tools.bash('ls');"));
+        assert!(document_contradiction(&d).is_none(), "{:?}", d.messages);
     }
 }
