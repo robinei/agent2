@@ -1931,14 +1931,60 @@ mod tests {
         // Only the shipping half of each file: a `#[cfg(test)]` module
         // builds scripted programs whose text is input to the harness,
         // not output from it.
+        //
+        // **Every such module, not the file up to the first one.**
+        // This truncated at the first `#[cfg(test)]`, and `machine.rs`
+        // has one at line 487 of 11,324 — a `const TEST_BUDGET`, not
+        // the test module. So the guard read 4% of the file it names
+        // and called the other 96% checked. Both leaks found on
+        // 2026-09-24 sat in that blind 96%: `keep_history` in the
+        // keep/peek refusal and `note_history` in the one below it.
+        //
+        // Not every `#[cfg(test)]` opens a block — that const is one
+        // line ending in `;`, and skipping to the next `}` past it
+        // would swallow thousands of shipping lines, which is the same
+        // bug wearing the other hat. So: an item that opens a brace is
+        // skipped to its closing `}` in the first column (these are
+        // top-level items, so that brace is unambiguous); an item that
+        // ends in `;` is skipped alone.
+        let shipping = |f: &str| -> String {
+            let mut out = String::new();
+            let mut lines = f.lines().peekable();
+            while let Some(line) = lines.next() {
+                if line.trim_start() != "#[cfg(test)]" {
+                    out.push_str(line);
+                    out.push('\n');
+                    continue;
+                }
+                let Some(item) = lines.next() else { break };
+                if !item.contains('{') && item.trim_end().ends_with(';') {
+                    continue;
+                }
+                for rest in lines.by_ref() {
+                    if rest.starts_with('}') {
+                        break;
+                    }
+                }
+            }
+            out
+        };
         let harness: String = [include_str!("report.rs"), include_str!("machine.rs")]
             .iter()
-            .map(|f| match f.find("\n#[cfg(test)]") {
-                Some(at) => &f[..at],
-                None => f,
-            })
+            .map(|f| shipping(f))
             .collect::<Vec<_>>()
             .concat();
+        // **The scan proves it reached the far side of the file.**
+        // A guard that silently reads nothing passes forever; this one
+        // did, for months. These two strings ship from past the line
+        // the old scan stopped at, and are what it should have caught.
+        for deep in ["takes one row", "needs the value to carry over"] {
+            assert!(
+                harness.contains(deep),
+                "the scan stopped short of {deep:?} — it is reading less \
+                 of the harness than it claims, which is how the leaks \
+                 it is meant to catch got through"
+            );
+        }
         // Only what the model reads: quoted strings, not identifiers,
         // doc comments, or the constants the lowering is named by.
         let model_facing: Vec<&str> = harness

@@ -2904,7 +2904,11 @@ impl Runner {
                         // call should be handing over.
                         self.settle(Ok(serde_json::json!(row.as_u64())));
                     }
-                    None => self.settle_err("note_history(value) needs one argument"),
+                    None => self.settle_err(
+                        "history.note(value) needs the value to carry over: \
+                         `history.note(\"the parser drops the last field\")`, \
+                         or any value at all.",
+                    ),
                 }
                 Ok(true)
             }
