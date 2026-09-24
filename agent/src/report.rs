@@ -528,7 +528,7 @@ pub const PART_RUN_HEADING: &str = "## YOUR PROGRAM RAN, THEN A BLOCK DID NOT CO
 /// The fence grows past the longest backtick run inside, which is what
 /// CommonMark requires and what keeps a printed markdown file from
 /// closing the block early.
-fn fenced(body: &str, tag: &str) -> String {
+pub(crate) fn fenced(body: &str, tag: &str) -> String {
     // **No blank line before the closing fence.** A console entry is
     // one `console.log` call's output, not one line, and most end with
     // a newline of their own — so adding the fence's newline printed a

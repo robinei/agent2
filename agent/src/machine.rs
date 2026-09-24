@@ -5350,18 +5350,6 @@ fn args_as_json(vm: &VM, call: &InvokeCall) -> Result<Vec<serde_json::Value>, St
         })
         .collect()
 }
-/// The `Result` settling `call`, if one landed on this path.
-/// How much of a value has to be on a row already before a `note`
-/// carrying it is refused.
-///
-/// **Provenance is the test, not size.** The largest innocent note in
-/// the corpus was 3,421 bytes — the model's own written-up finding,
-/// matching nothing — and it is bigger than three of the five that
-/// were copies. This threshold exists only so that quoting an error
-/// line or two is never mistaken for a dump: it sits well under the
-/// smallest real copy measured (1,032 bytes) and well over the largest
-/// innocent coincidence (117).
-const NOTE_COPY_MIN_BYTES: usize = 512;
 
 /// How much of both sides a shared run has to cover before it counts
 /// as one carrying the other, rather than one quoting from it.
@@ -5379,7 +5367,25 @@ const COPY_IS_A_REPEAT_PERCENT: usize = 90;
 /// searching each one in the row finds every copy of 511 bytes or
 /// more. Alignment on the note's side costs nothing because the search
 /// in the row is unanchored — a copy that has been shifted by a
-/// prepended sentence is still found.
+/// prepended sentence is still found. A value shorter than one block
+/// is searched whole, which is the only way anything under 511 bytes
+/// is found at all.
+///
+/// **There used to be a size threshold on top of this, and it taught
+/// the wrong thing.** `NOTE_COPY_MIN_BYTES` was 512, on the reasoning
+/// that quoting an error line or two should never be mistaken for a
+/// dump. What it produced, seen in `live/t5`, is a harness that
+/// answers the same code two different ways: `console.log(r.stdout)`
+/// printed in full at 481 bytes (message [21]) and was replaced by a
+/// reference at 3,661 (message [23]). From inside the conversation
+/// that reads as arbitrary — and the small case is where "printing
+/// works" gets learnt, right before it stops working.
+///
+/// So a repeat is a repeat at any size. What keeps an innocent quote
+/// from being called one is [`COPY_IS_A_REPEAT_PERCENT`], which asks
+/// about provenance rather than length: the shared run has to be
+/// nearly all of *both* sides, so a line taken out of a row is a
+/// selection and only the whole row is a copy.
 const NOTE_COPY_BLOCK: usize = 256;
 
 /// Every string inside a value, whatever it is nested in.
@@ -5488,8 +5494,23 @@ fn substitute_within(
 ) -> usize {
     match value {
         serde_json::Value::String(s) => match copy_of(&[s.as_str()], rows.iter().copied()) {
+            // **The reference has to be smaller than what it replaces**,
+            // or it is not standing in for anything — it is the bigger
+            // of the two things it could have written.
+            //
+            // This is the floor the retired `NOTE_COPY_MIN_BYTES` was
+            // guessing at, derived instead of chosen: a reference runs
+            // about 140 bytes, so anything shorter is cheaper left
+            // alone. Without it a `tell` of an agent's four-byte status
+            // came back as `【snipped - history[20] holds these 4
+            // bytes…】` — thirty-five times the size, and the word the
+            // reply was actually about was gone.
             Some((row, bytes)) => {
-                *s = reference_to(row, bytes);
+                let reference = reference_to(row, bytes);
+                if reference.len() >= s.len() {
+                    return 0;
+                }
+                *s = reference;
                 1
             }
             None => 0,
@@ -5555,15 +5576,11 @@ fn copy_of<'v>(
     mine: &[&str],
     rows: impl Iterator<Item = (EventId, &'v serde_json::Value)>,
 ) -> Option<(EventId, usize)> {
-    // **The threshold is part of the search, not of its caller.** It
-    // decides what counts as a copy, so it belongs where that is
-    // decided — a caller that forgot it would quietly refuse a quoted
-    // error line.
-    let mine: Vec<&str> = mine
-        .iter()
-        .copied()
-        .filter(|s| s.len() >= NOTE_COPY_MIN_BYTES)
-        .collect();
+    // Empty strings only: a repeat is a repeat at any size, and what
+    // tells one from a quote is `COPY_IS_A_REPEAT_PERCENT` below, not
+    // a length. See `NOTE_COPY_BLOCK` for what the threshold that used
+    // to be here taught instead.
+    let mine: Vec<&str> = mine.iter().copied().filter(|s| !s.is_empty()).collect();
     if mine.is_empty() {
         return None;
     }
@@ -5571,10 +5588,18 @@ fn copy_of<'v>(
         let mut theirs: Vec<&str> = Vec::new();
         strings_within(v, &mut theirs);
         for s in &mine {
-            for block in s.as_bytes().chunks(NOTE_COPY_BLOCK) {
-                if block.len() < NOTE_COPY_BLOCK {
-                    break;
-                }
+            // A short value is one block: the aligned-chunk scheme
+            // needs a *whole* block to index by, so without this
+            // nothing under 256 bytes could ever match.
+            let blocks: Vec<&[u8]> = if s.len() <= NOTE_COPY_BLOCK {
+                vec![s.as_bytes()]
+            } else {
+                s.as_bytes()
+                    .chunks(NOTE_COPY_BLOCK)
+                    .filter(|b| b.len() == NOTE_COPY_BLOCK)
+                    .collect()
+            };
+            for block in blocks {
                 let Ok(block) = std::str::from_utf8(block) else {
                     // A block cut mid-character is skipped rather than
                     // widened: the next one along covers the same run.
@@ -5635,6 +5660,7 @@ fn overlap_len(mine: &str, row: &str, row_at: usize, block: &str) -> usize {
     c - a
 }
 
+/// The `Result` settling `call`, if one landed on this path.
 pub(crate) fn settlement_of<'e>(segment: &[&'e Event], call: EventId) -> Option<&'e Outcome> {
     segment.iter().find_map(|e| match &e.payload {
         EventPayload::Result { call: c, outcome } if *c == call => Some(outcome),
@@ -5926,8 +5952,22 @@ fn shown_body(verb: &str, id: EventId, value: &serde_json::Value) -> String {
         &note_text(value),
         crate::report::NOTE_ROW_MAX_BYTES,
     ));
+    // **Fenced, because this document is markdown and the value is
+    // not part of it.** Five kept file excerpts used to render as bare
+    // indented source, each running straight into the next row's
+    // bullet with no blank line and nothing saying where one ended
+    // (`live/t5`, message [29], 16,931 bytes of it). A fence is the
+    // markup that already means "content, not structure", it is what
+    // the model's own cells are delimited by, and `report::fenced`
+    // grows it past the longest backtick run inside so the value
+    // cannot close it early.
+    //
+    // `text`, not `js`: the card's rule is that a block fenced
+    // anything but `js` is quoted rather than run, and nothing here is
+    // ever meant to execute.
+    let fenced = crate::report::fenced(&body, "text");
     if !value.is_object() || body.len() <= SHOWN_HINT_MIN_BYTES {
-        return body;
+        return fenced;
     }
     // The longest string field is the one worth reading on its own —
     // `content` on a read, `stdout` on a command. A result with no
@@ -5940,8 +5980,10 @@ fn shown_body(verb: &str, id: EventId, value: &serde_json::Value) -> String {
     }) else {
         return body;
     };
+    // The advice sits outside the fence: it is the harness talking,
+    // and the fence holds what the row holds.
     format!(
-        "{body}\n… that is the whole result, as JSON. \
+        "{fenced}\n… that is the whole result, as JSON. \
          `history.{verb}({}, (v) => v.{field})` shows just that field.",
         id.as_u64()
     )
@@ -10102,17 +10144,22 @@ mod tests {
             "one row, one copy of the value: {doc}"
         );
         // And it is under the call's *menu row*, indented as part of
-        // it — not somewhere else that happens to hold those bytes.
+        // it and inside a fence — not somewhere else that happens to
+        // hold those bytes.
         let row = doc
             .lines()
             .position(|l| l.starts_with("- `[") && l.contains("echo(1)"))
             .expect("the call's row");
+        let after: Vec<&str> = doc.lines().skip(row + 1).take(3).collect();
         assert!(
-            doc.lines()
-                .nth(row + 1)
-                .is_some_and(|l| l.starts_with("  ") && l.contains("ECHOED")),
-            "the value is the indented line under the row: {doc}"
+            after[0].starts_with("  ```"),
+            "the value opens a fence of its own: {doc}"
         );
+        assert!(
+            after[1].starts_with("  ") && after[1].contains("ECHOED"),
+            "the value is the indented line inside it: {doc}"
+        );
+        assert!(after[2].starts_with("  ```"), "and the fence closes: {doc}");
     }
 
     /// **One result, one answer: the last `keep`/`peek` on it wins.**
@@ -10185,7 +10232,7 @@ mod tests {
             .expect("the call's row");
         assert!(
             doc.lines()
-                .nth(row + 1)
+                .nth(row + 2)
                 .is_some_and(|l| l.trim() == "ECHOED"),
             "the lambda saw the result, not the number 4: {doc}"
         );
@@ -10654,16 +10701,32 @@ mod tests {
         // what to look at. Leave it alone — this is the one that cost a
         // live session its task.
         let lifted = "abcdefgh".repeat(150);
-        assert!(lifted.len() >= NOTE_COPY_MIN_BYTES, "over the threshold");
         assert!(
             copy_of(&[lifted.as_str()], rows()).is_none(),
             "a slice is a selection, not a repeat"
         );
 
-        // The same bytes, under the threshold: quoting is not copying.
+        // A short quote out of the row, which the retired size
+        // threshold used to refuse and the ratio refuses anyway — it
+        // is 320 bytes of a 1,600-byte row, so it is not nearly all of
+        // both sides.
         let short = "abcdefgh".repeat(40);
-        assert!(short.len() < NOTE_COPY_MIN_BYTES);
         assert!(copy_of(&[short.as_str()], rows()).is_none());
+
+        // **A small row copied whole is still a copy.** This is what
+        // the retired size threshold refused, and refusing it is what
+        // let a reply learn that printing works — at 481 bytes it did,
+        // at 3,661 it did not (`live/t5`, messages [21] and [23]).
+        let small_text = "the config is at etc/app.toml and the port is 8080";
+        let small_row = serde_json::json!({ "stdout": small_text });
+        assert!(
+            copy_of(
+                &[small_text],
+                std::iter::once((EventId::new(9), &small_row))
+            )
+            .is_some(),
+            "a whole row repeated is a repeat at any size"
+        );
 
         // Long, and nothing to do with the row.
         let own = "the parser drops the last field when it is empty. ".repeat(40);

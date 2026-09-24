@@ -21,7 +21,9 @@ It completed.
 ### peeked — here for this reply only
 
 - `[11]` `replace_file("PATH", "// one\nNEW\nfn thing() {}\n", "v1")` → ok, {version, diff, id}, 57 bytes
+  ```text
   {"version":"v2","diff":"@@ -2 +2 @@\n-OLD\n+NEW","id":11}
+  ```
 
 - 6 rows, #6–#17. history.fetch(id) for any of them; a report lists only what is new.
 - No client is attached; an ask() stays open until someone answers it.
