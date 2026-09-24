@@ -1143,6 +1143,17 @@ mod tests {
     /// is the 52 KB-into-one-row failure the live runs were loudest
     /// about. Right paragraph, wrong reason, and the reason is what
     /// the next person would have edited against.
+    ///
+    /// **The `console.log` block is the larger effect of the two**, and
+    /// it too was shipped on a hunch. Isolated on the current card at
+    /// n=60, reverting it alone moves `shows` 95% -> 82% (p=0.0434) and
+    /// `prints` 28% -> 47% (p=0.0588). Two attempts to improve it both
+    /// failed: leading `note` with its distinguishing jobs was null,
+    /// and replacing "Loop over two hundred items here, not above" with
+    /// a *justification* — that a bounded tail is cheaper than rows —
+    /// took `prints` from 15% to 40%. Telling the model a channel is
+    /// cheap is an invitation to use it; the prohibition was doing the
+    /// work.
     #[test]
     fn the_index_of_channels_names_every_way_a_value_crosses() {
         let card = card();
