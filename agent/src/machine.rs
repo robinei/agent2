@@ -910,6 +910,11 @@ pub struct Runner {
     /// set wherever a run parks, because that is the one place the
     /// cause is in hand.
     pause_falsifies_the_rest: bool,
+    /// Harness annotations deleted from the reply being written, or
+    /// from the last one if none is. Kept on the runner rather than
+    /// read off the notebook because the tail that reports it is built
+    /// *after* the reply ends, by which time the notebook is gone.
+    annotations_stripped: usize,
     /// The reply this generation has produced so far, verbatim.
     ///
     /// **Kept here rather than read off the run**, because the run does
@@ -1233,6 +1238,7 @@ impl Runner {
             streaming_epoch: None,
             next_prompt_floor: Counted::Never,
             pause_falsifies_the_rest: false,
+            annotations_stripped: 0,
             streaming_reply: String::new(),
             pending_decision: None,
             reply_id: EventId::new(1),
@@ -4618,6 +4624,20 @@ impl Runner {
         if self.finish_ignored {
             lines.push(SILENT_FINISH.to_owned());
         }
+        // **Said once, where a per-request fact belongs.** The spans
+        // were deleted before the reply was logged or compiled, so
+        // nothing downstream has to cope with them — but a silent
+        // deletion teaches nothing, and the ids in what was deleted
+        // were guesses the model may still be reasoning from.
+        if self.annotations_stripped > 0 {
+            let n = self.annotations_stripped;
+            lines.push(format!(
+                "- {n} harness annotation{} removed from your last reply.                  `{}…{}` is this harness writing in your turn, added after it was                  logged; an id you write between them is a guess.",
+                if n == 1 { "" } else { "s" },
+                crate::document::FENCE_OPEN,
+                crate::document::FENCE_CLOSE,
+            ));
+        }
         if self.reply_shape_tail && self.answering_a_post(tree) {
             lines.push(REPLY_SHAPE_TAIL.to_owned());
         }
@@ -5825,6 +5845,8 @@ impl Runner {
             return Ok(());
         };
         let pieces = notebook.push_text(text);
+        let stripped = notebook.stripped();
+        self.annotations_stripped = stripped;
         self.log_parts(tree, &pieces)?;
         let Some(run) = self.run_mut() else {
             return Ok(());
@@ -6760,7 +6782,7 @@ mod tests {
         );
         assert!(
             c.document()
-                .contains(&format!("/* ← history[{}] */", r.row().id.as_u64())),
+                .contains(&format!("【← history[{}]】", r.row().id.as_u64())),
             "and the call points at the row it wrote: {}",
             c.document()
         );
@@ -6792,7 +6814,7 @@ mod tests {
             .content
             .clone();
         assert!(
-            program.contains("tell(/* ← snipped - history["),
+            program.contains("tell(【← snipped - history["),
             "the long literal tell became a reference: {program}"
         );
         assert!(
@@ -6800,7 +6822,7 @@ mod tests {
             "and its bytes are not in the document twice: {program}"
         );
         assert!(
-            program.contains("String(1)") && program.contains(") /* ← history["),
+            program.contains("String(1)") && program.contains(") 【← history["),
             "the computed one keeps its construction and takes a reference: {program}"
         );
         let all: String = doc
@@ -7837,15 +7859,33 @@ mod tests {
             "an empty conversation is not news: {early}"
         );
 
-        // Enough rows to pass the mark. Each is under the row bound, so
-        // all of them render and the document really is that big.
-        for i in 0..24 {
+        // **Grown until the line appears, not a fixed count.** This
+        // added exactly 24 rows, which landed in the band for as long
+        // as the fixed prefix was the size it was that day — and when
+        // the worked examples became rendered turns and took the
+        // preamble from ~29 KB to ~38 KB, 24 rows sailed past the
+        // readout and into the compaction directive, which is the tail
+        // saying something else entirely. The claim is about *when*
+        // the line starts appearing, so the test looks for the moment
+        // rather than assuming where it is.
+        //
+        // Each row is under the row bound, so all of them render and
+        // the document really is that big.
+        let mut full = String::new();
+        for i in 0..40 {
             c.reply(&format!(
                 "```js\nhistory.note(\"{}\");\n```\n",
                 format_args!("{i}{}", "z".repeat(1200))
             ));
+            full = c.runner().request_tail(c.tree()).unwrap_or_default();
+            if full.contains("% full") {
+                break;
+            }
+            assert!(
+                !full.contains("CONVERSATION IS FULL"),
+                "it went straight to the directive without ever reporting fullness: {full}"
+            );
         }
-        let full = c.runner().request_tail(c.tree()).unwrap_or_default();
         assert!(full.contains("% full"), "{full}");
         // **The advice is prospective, because that is the only verb
         // the card gives it.** It named `history.remove(id)` while the
@@ -8771,15 +8811,22 @@ mod tests {
     /// is for. Returning it puts the lifetime in the caller's hands
     /// without asking the caller to know any of this — the one shape
     /// that cannot fall behind as tests are added.
+
     fn crowded() -> (Tree, Runner, usize, std::sync::MutexGuard<'static, ()>) {
         let env = env_lock();
         let (mut tree, mut state) = setup();
+        // **Measured without a clip.** This rendered at `64 * 1024`,
+        // which stopped being a measurement the moment the fixed
+        // prefix grew: the loop below grows the document until it is
+        // three times the preamble, and a render capped below that
+        // figure can never report it. The worked examples going from
+        // task lines to rendered turns took the preamble from ~29 KB
+        // to ~38 KB and 3× stopped being reachable at all.
+        //
+        // The cap belongs to the tests that are *about* clipping. What
+        // this fixture needs is the document's true size.
         let rendered = |tree: &Tree, state: &Runner| {
-            crate::compaction::rendered_size(&crate::document::render(
-                tree,
-                &state.spine,
-                64 * 1024,
-            ))
+            crate::compaction::rendered_size(&crate::document::render(tree, &state.spine, TEST_BUDGET))
         };
         let preamble = rendered(&tree, &state);
         let mut size = preamble;
@@ -8958,10 +9005,28 @@ mod tests {
                 StepInput::LlmResponse(llm_program("tell(\"working\");")),
             )
             .unwrap();
-        drain(&mut state, &mut tree, out);
-        let fired = state
-            .compaction_if_needed(&mut tree, budget, 0.25)
-            .unwrap()
+        // **The request arrives from the step, and that is the real
+        // path.** The fixture builds a document three times its
+        // preamble, which now trips the session's own budget while the
+        // program runs — so the compaction is asked for there, logs a
+        // `Compaction`, and `compaction_outstanding` gates every later
+        // call from the log. Asking again by hand answered `None`, and
+        // this failed saying compaction did not fire at the moment it
+        // had. The preamble grew from ~10 KB to ~16 KB when the worked
+        // examples became rendered turns.
+        //
+        // Taking it from the step's own outputs is closer to a live
+        // run than the hand call ever was: nothing in production calls
+        // `compaction_if_needed` directly.
+        let settled = drain(&mut state, &mut tree, out);
+        let fired = settled
+            .into_iter()
+            .find(|o| matches!(o, StepOutput::LlmRequest(_)))
+            .or_else(|| {
+                state
+                    .compaction_if_needed(&mut tree, budget, 0.25)
+                    .unwrap()
+            })
             .expect("the document is over budget, so compaction fires");
         let StepOutput::LlmRequest(request) = fired else {
             panic!("compaction asks for a completion: {fired:?}");
@@ -9044,7 +9109,22 @@ mod tests {
             )
             .unwrap();
         drain(&mut state, &mut tree, out);
-        assert!(!state.compaction_requested, "the request is closed");
+        // **The commit closes the request it was answering.** Not
+        // "and no request is ever open again": this document is still
+        // over budget with one post gone, so asking a second time is
+        // correct and is what a live run does. The two are only
+        // distinguishable at the commit, which is what the floor below
+        // records — it goes `Stale` there and nowhere else.
+        //
+        // Asserting the flag after draining conflated them, and
+        // started failing when the preamble grew and one post stopped
+        // being enough to get under.
+        assert!(
+            tree.events
+                .values()
+                .any(|e| matches!(e.payload, EventPayload::Compacted { .. })),
+            "the batch committed"
+        );
         assert_eq!(
             state.next_prompt_floor,
             Counted::Stale,
@@ -11224,7 +11304,7 @@ mod tests {
     #[test]
     fn a_block_marker_the_model_wrote_is_replaced() {
         let rows =
-            notebook_conversation("↓ history[999]\nReading it first.\n\n```js\nlet n = 1;\n```\n");
+            notebook_conversation("【↓ history[999]】\nReading it first.\n\n```js\nlet n = 1;\n```\n");
         let assistant: Vec<&String> = rows
             .iter()
             .filter(|(r, _)| *r == crate::document::ChatRole::Assistant)
@@ -11233,7 +11313,7 @@ mod tests {
         let text = assistant[0];
         assert!(!text.contains("999"), "the invented id is gone: {text}");
         assert_eq!(
-            text.matches("↓ history[").count(),
+            text.matches("【↓ history[").count(),
             2,
             "one marker per block, not one per block plus a forgery: {text}"
         );
@@ -11294,14 +11374,14 @@ mod tests {
         // re-fencing, no reassembly, no normalisation.
         let stripped: String = assistant[0]
             .split_inclusive('\n')
-            .filter(|l| !l.starts_with("↓ history["))
+            .filter(|l| !l.starts_with("【↓ history["))
             .collect();
         assert_eq!(
             stripped, reply,
             "byte-identical to what the model generated, once the markers are lifted"
         );
         assert_eq!(
-            assistant[0].matches("↓ history[").count(),
+            assistant[0].matches("【↓ history[").count(),
             5,
             "one marker per block — three prose, two cells: {}",
             assistant[0]

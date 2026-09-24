@@ -295,15 +295,20 @@ mod tests {
         let update = std::env::var("UPDATE_EXEMPLARS").is_ok();
         let mut stale = Vec::new();
         for (step, ex) in SERIES.iter().zip(&made) {
-            let path = format!("card/exemplars/{}.txt", step.stem);
-            let want = std::fs::read_to_string(&path).unwrap_or_default();
-            if want == ex.user {
-                continue;
-            }
-            if update {
-                std::fs::write(&path, &ex.user).expect("write");
-            } else {
-                stale.push(step.stem);
+            // `.txt` is the report that arrived; `.turn` is the reply
+            // as the document renders it back — annotations and all,
+            // which is how the model's own turns reach it and how no
+            // worked example used to look.
+            for (ext, made) in [("txt", &ex.user), ("turn", &ex.assistant)] {
+                let path = format!("card/exemplars/{}.{ext}", step.stem);
+                if std::fs::read_to_string(&path).unwrap_or_default() == *made {
+                    continue;
+                }
+                if update {
+                    std::fs::write(&path, made).expect("write");
+                } else {
+                    stale.push(step.stem);
+                }
             }
         }
         assert!(

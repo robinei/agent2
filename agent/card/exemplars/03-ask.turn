@@ -1,0 +1,15 @@
+【↓ history[62]】
+Which way this should go is not mine to guess, and it is a closed choice — the answer is one of three things I can name.
+
+【↓ history[63]】
+```js
+const f = await tools.read_file("PATH");
+const pick = await choose(【← snipped - history[69]】);
+if (pick === "leave it") {
+  tell("left PATH alone.");
+} else {
+  await tools.replace_file("PATH", Edit.replaceOnce(f.content, "OLD", pick), f.version);
+  tell(`PATH says ${pick} now.`) 【← history[74]】;
+}
+finish();
+```

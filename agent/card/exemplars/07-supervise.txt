@@ -17,6 +17,7 @@ It completed.
 ## RIGHT NOW
 
 - 51 rows, #6–#159. history.fetch(id) for any of them; a report lists only what is new.
+- 50% full: 32985 bytes of 65536. Everything you keep is paid for again every turn; peek what you only need once.
 - No client is attached; an ask() stays open until someone answers it.
 - Your reply is markdown and reaches the person as written. Only a ```js block runs; ```text and unfenced code do nothing.
 - Thinking is for reasoning! Never draft code blocks! One-shot them in the reply.

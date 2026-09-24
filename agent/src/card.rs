@@ -51,7 +51,14 @@ pub fn embedded() -> Card {
         ($stem:literal) => {
             Exemplar {
                 user: include_str!(concat!("../card/exemplars/", $stem, ".txt")).to_owned(),
-                assistant: include_str!(concat!("../card/exemplars/", $stem, ".js")).to_owned(),
+                // **The rendered turn, not the source.** `.js` is what
+                // was written; `.turn` is how the document hands it
+                // back — carrying `【↓ history[N]】` above each block and
+                // `【← history[N]】` beside each call. Shipping the
+                // source made the examples the one place those never
+                // appear, while every real turn the model reads is
+                // covered in them.
+                assistant: include_str!(concat!("../card/exemplars/", $stem, ".turn")).to_owned(),
             }
         };
     }
@@ -153,23 +160,25 @@ fn the_card_teaches_the_markers_the_document_uses() {
     let card = &active().text;
     let down = crate::document::BLOCK_ARROW;
     let left = crate::document::ARROW.trim();
+    let (open, close) = (crate::document::FENCE_OPEN, crate::document::FENCE_CLOSE);
     assert!(
-        card.contains(&format!("`{down} history[")),
-        "the card shows the block marker as it renders: {down}"
+        card.contains(&format!("{open}{down} history[")),
+        "the card shows the block marker as it renders: {open}{down} history[N]{close}"
     );
     assert!(
-        card.contains(&format!("/* {left} history[")),
-        "and the call annotation as it renders: {left}"
+        card.contains(&format!("{open}{left} history[")),
+        "and the call annotation as it renders: {open}{left} history[N]{close}"
     );
-    // **The fact, not the phrasing.** This used to require the exact
-    // words "Every `↓` and `←`", so rewriting the sentence to say the
-    // same thing more plainly failed it. What has to be true is that
-    // one line names both markers and says whose they are.
+    // **The fence is the rule now, so the fence is what must be
+    // named.** It used to be the two arrows — and naming those was the
+    // best available, because they were all the model had to go on.
+    // A reply is cleaned of anything between the brackets before it is
+    // kept, so the brackets are the thing to recognise and the thing
+    // not to type.
     assert!(
-        card.lines().any(|l| {
-            l.contains(down) && l.contains(left) && l.contains("harness")
-        }),
-        "one line names both markers and attributes them to the harness"
+        card.lines()
+            .any(|l| l.contains(open) && l.contains(close) && l.contains("harness")),
+        "one line names the fence and says whose it is"
     );
 }
 
@@ -232,8 +241,13 @@ fn the_shipped_manifest_tells_the_truth_about_itself() {
 #[test]
 fn every_worked_example_compiles() {
     for ex in &active().exemplars {
-        let js: String = ex
-            .assistant
+        // Cleaned first, as `Notebook::push_text` cleans a reply: the
+        // examples ship as rendered turns, so a block carries
+        // `【← history[N]】` beside a call, which no compiler is ever
+        // handed.
+        let mut reply = ex.assistant.clone();
+        crate::notebook::strip_annotations_for_test(&mut reply);
+        let js: String = reply
             .split("```js")
             .skip(1)
             .filter_map(|rest| rest.split_once("```").map(|(code, _)| code.to_owned()))
@@ -1000,7 +1014,7 @@ mod tests {
         // `card()` shows up as a diff review must look at, not a byte
         // count that silently drifts. Comparing full text (not just a
         // hash) so the diff itself is legible in a failure message.
-        const EXPECTED_LEN: usize = 23086;
+        const EXPECTED_LEN: usize = 23258;
         assert_eq!(
             card().len(),
             EXPECTED_LEN,
@@ -1600,7 +1614,20 @@ mod tests {
 
     /// An exemplar's cells, in order, in one scope — what the notebook
     /// driver hands the compiler.
+    /// The program inside a worked example's reply, **cleaned the way
+    /// the harness cleans one**.
+    ///
+    /// The examples ship as rendered turns, so their blocks carry
+    /// `【← history[N]】` beside a call — which is not JavaScript and is
+    /// not meant to be. A reply is stripped of everything between the
+    /// fences before it is logged or compiled
+    /// (`Notebook::push_text`), so anything asking whether an example
+    /// compiles has to strip it too. Doing otherwise would test a
+    /// string no compiler is ever handed.
     fn cells_of(reply: &str) -> String {
+        let mut reply = reply.to_owned();
+        crate::notebook::strip_annotations_for_test(&mut reply);
+        let reply = &reply;
         crate::notebook::split_cells(reply)
             .iter()
             .map(|c| c.slice(reply))
@@ -2262,9 +2289,18 @@ mod tests {
         // which a live model reached for unprompted — says the same
         // thing shorter. A measured guard is not the thing to move when
         // the code under it can be better instead.
+        // **900, because the turn now carries the harness's own
+        // annotations.** The guard is about the *program* — an example
+        // long enough to copy is one the model copies instead of
+        // writing — and what ships is the rendered turn, which adds a
+        // `【↓ history[N]】` above every block and prose segment and a
+        // `【← history[N]】` beside every logged call. Across the nine
+        // that is ~90 bytes an example of text the model did not
+        // write and cannot make shorter. The bound on the part that
+        // *is* the lesson has not moved.
         for e in &ex {
             assert!(
-                e.assistant.len() < 700,
+                e.assistant.len() < 900,
                 "an exemplar long enough to copy: {} bytes",
                 e.assistant.len()
             );

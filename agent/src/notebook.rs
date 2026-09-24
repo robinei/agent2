@@ -62,6 +62,8 @@ pub struct Notebook {
     base_blank: String,
     /// The completion so far.
     reply: String,
+    /// Harness annotations taken out of it — see [`strip_annotations`].
+    stripped: usize,
     stream: Stream,
     /// Pieces that are complete but not yet acted on, in source order.
     ///
@@ -105,6 +107,7 @@ impl Notebook {
             base,
             base_blank,
             reply: String::new(),
+            stripped: 0,
             stream: Stream::new(),
             queued: std::collections::VecDeque::new(),
             ended: false,
@@ -117,6 +120,7 @@ impl Notebook {
     pub fn push_text(&mut self, text: &str) -> Vec<Piece> {
         self.reply.push_str(text);
         self.drop_leaked_reasoning();
+        self.stripped += strip_annotations(&mut self.reply, self.stream.consumed());
         let pieces = self.stream.advance(&self.reply);
         self.queue(&pieces);
         pieces
@@ -145,6 +149,12 @@ impl Notebook {
     /// alone — a model quoting the tags, not a provider emitting one. See
     /// [`strip_leaked_reasoning`] for why the opener, and not the fence
     /// around it, is what tells those apart.
+    /// How many harness annotations have been taken out of this reply.
+    /// The request after it says so, once — see `Runner::request_tail`.
+    pub fn stripped(&self) -> usize {
+        self.stripped
+    }
+
     fn drop_leaked_reasoning(&mut self) {
         strip_leaked_reasoning(&mut self.reply, self.stream.consumed());
     }
@@ -539,6 +549,54 @@ const OPEN_THINK: &str = "<think>";
 /// closer is an artefact.
 ///
 /// Returns whether anything was dropped.
+/// Remove every harness annotation the model wrote back, returning how
+/// many went.
+///
+/// **The harness writes these; the model copying one is noise to be
+/// deleted, not a judgement to be made.** A reply comes back with its
+/// own past turns annotated — `【↓ history[12]】`, `【← history[40]】` —
+/// and a model that has just read a dozen of them sometimes writes one.
+/// The ids in it are guesses, and a guessed id is worse than no id: a
+/// later `history.fetch` follows it somewhere real and wrong.
+///
+/// Deleting the spans is only safe because the fence is exclusive.
+/// Across 221 model-written parts from the kept sessions, `【`/`】`
+/// appear in none — so anything between them came from here. The old
+/// bare markers could not be treated this way: telling a copied
+/// `/* ← history[40] */` from a `/* see history[9] for the listing */`
+/// the model meant is a judgement, and getting it wrong destroys what
+/// the model said.
+///
+/// **Never behind `consumed`**, for the reason `strip_leaked_reasoning`
+/// gives: a cell already dispatched has run and a prose segment already
+/// emitted has reached the person, so neither can be unsaid.
+///
+/// An unterminated `【` is left alone — the rest of the fence may still
+/// be arriving.
+/// [`strip_annotations`] from the start, for tests that need to say
+/// what a reply looks like once the harness has cleaned it.
+#[cfg(test)]
+pub(crate) fn strip_annotations_for_test(reply: &mut String) {
+    strip_annotations(reply, 0);
+}
+
+fn strip_annotations(reply: &mut String, consumed: usize) -> usize {
+    let mut removed = 0;
+    let mut from = consumed.min(reply.len());
+    while let Some(open) = reply[from..].find(crate::document::FENCE_OPEN) {
+        let open = from + open;
+        let after = open + crate::document::FENCE_OPEN.len();
+        let Some(close) = reply[after..].find(crate::document::FENCE_CLOSE) else {
+            break;
+        };
+        let end = after + close + crate::document::FENCE_CLOSE.len();
+        reply.replace_range(open..end, "");
+        removed += 1;
+        from = open;
+    }
+    removed
+}
+
 fn strip_leaked_reasoning(reply: &mut String, from: usize) -> bool {
     let Some(rel) = reply[from..].find(CLOSE_THINK) else {
         return false;

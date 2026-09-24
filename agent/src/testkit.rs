@@ -1236,7 +1236,19 @@ impl Conversation {
         !self.allowed.contains(&inv)
     }
 
-    fn check(&self, s: &Said, markdown: &str) {
+    fn check(&self, s: &Said, raw: &str) {
+        // **The reply as the log kept it.** A harness annotation the
+        // model copied back is deleted at ingress
+        // (`Notebook::push_text`), so every span the compiler recorded
+        // and every `Part` the log holds is an offset into the cleaned
+        // text. Checking them against the raw chunk fails exactly when
+        // the stripping worked, and reports it as a character-boundary
+        // bug rather than as what it is.
+        let markdown = &{
+            let mut m = raw.to_owned();
+            crate::notebook::strip_annotations_for_test(&mut m);
+            m
+        }[..];
         let events = self.scope(s.span.0);
         if self.enforced(Invariant::OneReply) {
             let replies = s
@@ -1683,8 +1695,8 @@ mod tests {
         let mut c = Conversation::new();
         c.user("go");
         let r = c.reply(
-            "↓ history[17]\nThe check is simple, so I will just run it.\n\n\
-             ↓ history[18]\n```js\ntell(\"ran it.\"); finish();\n```\n",
+            "【↓ history[17]】\nThe check is simple, so I will just run it.\n\n\
+             【↓ history[18]】\n```js\ntell(\"ran it.\"); finish();\n```\n",
         );
 
         assert_eq!(
@@ -1692,14 +1704,26 @@ mod tests {
             ["The check is simple, so I will just run it."],
             "the annotation is ours; the person reads the sentence"
         );
-        // And the log still has every byte — that is what makes the
-        // parts concatenate back to the reply, which the harness
-        // checks on every reply.
+        // **And the log does not have it either.** This used to assert
+        // the opposite — the bytes were kept and only the outgoing
+        // prose was cleaned — because the annotation was a bare
+        // `↓ history[17]` and deleting it from the record meant
+        // deciding whether the model had meant it. Between `【` and
+        // `】` there is nothing to decide, so the deletion happens once,
+        // at ingress, and the second door needs no guard of its own.
         assert!(
             c.fetch(r.parts[0])
                 .as_str()
-                .is_some_and(|t| t.contains("history[17]")),
-            "the part keeps what the model wrote"
+                .is_some_and(|t| !t.contains("history[17]")),
+            "the annotation is gone from the record, not merely from the reply"
+        );
+        // Said once, in the request after it, because an id the model
+        // wrote between the fences was a guess it may still be
+        // reasoning from.
+        assert!(
+            c.document().contains("harness annotation"),
+            "and the next request says what was taken out: {}",
+            c.document()
         );
     }
 

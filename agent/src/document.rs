@@ -500,13 +500,22 @@ fn annotate_history_calls(
                     Some(above) => (above, ""),
                     None => (at, lead),
                 };
-                out.replace_range(start..end, &format!("{lead}{BLOCK_ARROW} history[{row}]\n"));
+                out.replace_range(
+                    start..end,
+                    &format!("{lead}{FENCE_OPEN}{BLOCK_ARROW} history[{row}]{FENCE_CLOSE}\n"),
+                );
                 continue;
             }
             Edit::Call(c) => c,
         };
-        let snipped = format!("/*{ARROW} snipped - history[{}] */", c.row);
-        let marked = format!(" /*{ARROW} history[{}] */", c.row);
+        // **No comment syntax.** These used to be `/* … */` so a
+        // block stayed valid JavaScript if the model copied it back.
+        // It cannot copy one now: every span between the fences is
+        // stripped from a reply before it is logged or compiled
+        // (`strip_annotations`), so the annotation never reaches a
+        // parser and does not have to survive one.
+        let snipped = format!("{FENCE_OPEN}{ARROW} snipped - history[{}]{FENCE_CLOSE}", c.row);
+        let marked = format!(" {FENCE_OPEN}{ARROW} history[{}]{FENCE_CLOSE}", c.row);
         if c.literal && snipped.len() < c.end - c.start {
             // Keep the callee, so the call still reads as a call:
             // `const a = await ask(/* snipped - history[7] */)` has a
@@ -521,7 +530,7 @@ fn annotate_history_calls(
             // **Replace an imitated one, never sit beside it.** The
             // model reads these in its own turns and writes them back:
             // on a live run of 2026-09-19 it emitted
-            // `history.note(…); /* history[13] */` with four
+            // `history.note(…); 【history[13]】` with four
             // invented ids, and the pass below added the four real ones
             // beside them — so every line came back doubly annotated,
             // with a *wrong* id next to the true one that `fetch` would
@@ -551,6 +560,27 @@ fn annotate_history_calls(
 /// words that neither was written by the model.
 pub(crate) const BLOCK_ARROW: &str = "↓";
 
+/// The brackets every harness annotation is written between, and which
+/// nothing else in a reply ever uses.
+///
+/// **An exclusive fence replaces a judgement call.** The old markers
+/// were bare — `【↓ history[12]】`, `【← history[40]】` — so telling an
+/// annotation the model copied from one it wrote *meaning* something
+/// was a heuristic straddling a real ambiguity: `/* see history[9] for
+/// the listing */` is the model's own words and rewriting it would
+/// destroy what it said. Inside a fence the model never types, the
+/// question does not arise.
+///
+/// Measured over 221 model-written parts from the kept sessions:
+/// `↓`/`←` appear in 30% of reasoning blocks and about 1% of replies;
+/// `【`/`】` appear in none of them.
+///
+/// Everything the harness adds goes between these, so a reply can be
+/// cleaned by deleting the spans and nothing else — see
+/// `strip_annotations`.
+pub(crate) const FENCE_OPEN: &str = "【";
+pub(crate) const FENCE_CLOSE: &str = "】";
+
 /// The arrow every annotation carries, so it reads as something
 /// pointing *out* of the code at a row rather than as a comment
 /// somebody wrote in it.
@@ -559,7 +589,13 @@ pub(crate) const BLOCK_ARROW: &str = "↓";
 /// it would not reach for on its own says the same thing at the place
 /// the confusion happens, which prose in a system prompt 16 KB earlier
 /// evidently does not.
-pub(crate) const ARROW: &str = " ←";
+/// **No leading space.** It carried one for as long as it sat inside
+/// `/* … */`, where the space separated it from the opener. Between
+/// the fences it would render `【 ← history[30]】`, and the fence is
+/// the thing the model is being taught to recognise — a stray space
+/// after the bracket makes it a shape to squint at rather than a
+/// token.
+pub(crate) const ARROW: &str = "←";
 
 /// Drop the `↓ history[N]` lines the model copied out of its own
 /// document, from text that is about to reach a person.
@@ -572,10 +608,10 @@ pub(crate) const ARROW: &str = " ←";
 /// against `Qwen3.8-27B` on 2026-09-20 the person read:
 ///
 /// ```text
-/// ↓ history[17]
+/// 【↓ history[17]】
 /// The check is simple: no `old.example.com` anywhere in config.json…
 ///
-/// ↓ history[18]
+/// 【↓ history[18]】
 /// ```
 ///
 /// which is an annotation the harness wrote, quoted back at the person
@@ -602,12 +638,13 @@ pub(crate) fn strip_imitated_markers(text: &str) -> String {
 /// `↓ history[<digits>]`, and nothing else on the line.
 fn is_bare_marker(line: &str) -> bool {
     let Some(rest) = line
-        .strip_prefix(BLOCK_ARROW)
+        .strip_prefix(FENCE_OPEN)
+        .and_then(|r| r.strip_prefix(BLOCK_ARROW))
         .and_then(|r| r.strip_prefix(" history["))
     else {
         return false;
     };
-    match rest.strip_suffix(']') {
+    match rest.strip_suffix(FENCE_CLOSE).and_then(|r| r.strip_suffix(']')) {
         Some(digits) => !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()),
         None => false,
     }
@@ -623,18 +660,30 @@ fn imitated_block_marker(text: &str, at: usize) -> Option<usize> {
     let rest = text.get(at..)?;
     let lead = rest.len() - rest.trim_start_matches(['\n', ' ', '\t']).len();
     let body = &rest[lead..];
-    let digits = body.strip_prefix(BLOCK_ARROW)?.strip_prefix(" history[")?;
+    let digits = body
+        .strip_prefix(FENCE_OPEN)?
+        .strip_prefix(BLOCK_ARROW)?
+        .strip_prefix(" history[")?;
     let close = digits.find(']')?;
     if close == 0 || !digits[..close].bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
-    let after = &digits[close + 1..];
+    let after = digits[close + 1..].strip_prefix(FENCE_CLOSE)?;
     let line_end = after.find('\n').map(|i| i + 1).unwrap_or(after.len());
     // Anything else on that line means it was not a bare marker.
     if !after[..line_end].trim().is_empty() {
         return None;
     }
-    Some(at + lead + BLOCK_ARROW.len() + " history[".len() + close + 1 + line_end)
+    Some(
+        at + lead
+            + FENCE_OPEN.len()
+            + BLOCK_ARROW.len()
+            + " history[".len()
+            + close
+            + 1
+            + FENCE_CLOSE.len()
+            + line_end,
+    )
 }
 
 /// Whether a prose part says nothing except a marker the model copied.
@@ -648,8 +697,8 @@ fn imitated_block_marker(text: &str, at: usize) -> Option<usize> {
 /// marker:
 ///
 /// ```text
-/// ↓ history[38]
-/// ↓ history[39]
+/// 【↓ history[38]】
+/// 【↓ history[39]】
 /// ```js
 /// ```
 ///
@@ -668,11 +717,11 @@ fn imitated_block_marker(text: &str, at: usize) -> Option<usize> {
 /// different ids:
 ///
 /// ```text
-/// ↓ history[77]
+/// 【↓ history[77]】
 /// Let me get the full source with line numbers.
 ///
-/// ↓ history[78]
-/// ↓ history[78]
+/// 【↓ history[78]】
+/// 【↓ history[78]】
 /// ```js
 /// ```
 ///
@@ -699,28 +748,32 @@ fn is_only_an_imitated_marker(text: &str) -> bool {
 /// The span of an annotation the model wrote itself, immediately after
 /// `at` — so this pass can replace it rather than append beside it.
 ///
-/// **Only our exact shape**, optional arrow and all: a comment that
-/// merely mentions a row (`/* see history[9] for the listing */`) is
-/// something the model wrote *meaning* it, and rewriting that would
-/// destroy what it said.
+/// **A fence, not a judgement.** This used to look for our exact
+/// comment shape and reason about whether the model had meant it: a
+/// `/* see history[9] for the listing */` is the model's own words and
+/// rewriting it destroys what it said, so the match had to be narrow
+/// enough to miss that and wide enough to catch a copy. Between
+/// `【` and `】` there is nothing to decide — the model does not write
+/// those, and anything that does is ours coming back.
+///
+/// Replies no longer reach here carrying one: `Notebook::push_text`
+/// strips the spans before the text is logged or compiled. This stays
+/// for the sources that never went through it — a re-opened log
+/// written before the fence existed, a hand-built program — and
+/// because a render pass that appends beside an existing annotation
+/// produces two ids for one row, one of them wrong.
 fn imitated_annotation(text: &str, at: usize) -> Option<std::ops::Range<usize>> {
     let rest = text.get(at..)?;
     let lead = rest.len() - rest.trim_start_matches([' ', '\t', ';']).len();
     // The statement's own `;` is not the model's annotation and stays;
-    // the whitespace between it and the comment goes, or removing the
-    // comment leaves a trailing space behind.
+    // the whitespace between it and the fence goes, or removing the
+    // annotation leaves a trailing space behind.
     let keep = rest[..lead].rfind(';').map_or(0, |i| i + 1);
     let body = &rest[lead..];
-    if !body.starts_with("/*") {
-        return None;
-    }
-    let close = body.find("*/")? + 2;
-    let inner = body[2..close - 2].trim().trim_start_matches('←').trim();
-    let digits = inner
-        .strip_prefix("history[")
-        .and_then(|r| r.strip_suffix(']'))?;
-    (!digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()))
-        .then_some(at + keep..at + lead + close)
+    let inner = body.strip_prefix(FENCE_OPEN)?;
+    let close = inner.find(FENCE_CLOSE)?;
+    (!inner[..close].contains('\n'))
+        .then_some(at + keep..at + lead + FENCE_OPEN.len() + close + FENCE_CLOSE.len())
 }
 
 /// A replaced entry's line, `[id] … text`. `None` for a removed one,
@@ -1112,7 +1165,7 @@ pub(crate) fn render_with_lookup(
                             // nothing else.** The marker already names
                             // the row and already sits on its own line,
                             // so a shadow has somewhere to go that no
-                            // other row's does: `↓ history[12] … what
+                            // other row's does: `【↓ history[12]】 … what
                             // it did`. A removed one takes its marker
                             // with it and leaves the blocks either side
                             // adjacent, which is what removal means.
@@ -1120,7 +1173,7 @@ pub(crate) fn render_with_lookup(
                                 Some(shadow) => {
                                     if let Some(t) = shadow.text.as_deref() {
                                         text.push_str(&format!(
-                                            "{BLOCK_ARROW} history[{}] … {t}\n",
+                                            "{FENCE_OPEN}{BLOCK_ARROW} history[{}] … {t}{FENCE_CLOSE}\n",
                                             ev.id.as_u64()
                                         ));
                                     }
@@ -1638,7 +1691,7 @@ mod tests {
                 .map(|m| m.content.clone())
                 .expect("the reply renders");
             assert!(
-                assistant.starts_with("↓ history[4]\nLooking at the first of the two"),
+                assistant.starts_with("【↓ history[4]】\nLooking at the first of the two"),
                 "verbatim under its marker first: {assistant}"
             );
             assert!(assistant.contains(want), "and then the marker: {assistant}");
@@ -1682,7 +1735,7 @@ mod tests {
         assert_eq!(conv[1].role, ChatRole::Assistant);
         assert_eq!(
             conv[1].content,
-            "↓ history[4]\n```js\ntell('hi'); history.note(1);\n```\n"
+            "【↓ history[4]】\n```js\ntell('hi'); history.note(1);\n```\n"
         );
         assert_eq!(conv[2].role, ChatRole::User);
     }
@@ -1784,10 +1837,10 @@ mod tests {
         // which is what the model was prompted with) / assistant(the
         // decision it wrote back) / user(both returns).
         assert_eq!(conv.len(), 5, "{doc:?}");
-        assert_eq!(conv[1].content, "↓ history[4]\n```js\nraise('x');\n```\n");
+        assert_eq!(conv[1].content, "【↓ history[4]】\n```js\nraise('x');\n```\n");
         assert_eq!(
             conv[3].content,
-            "↓ history[8]\n```js\nhistory.note(resume(1));\n```\n"
+            "【↓ history[8]】\n```js\nhistory.note(resume(1));\n```\n"
         );
         assert!(
             !conv[2].content.is_empty(),
@@ -1927,11 +1980,11 @@ mod tests {
             .content
             .clone();
         assert!(
-            program.contains(&format!("tell(/* ← snipped - history[{}] */)", a.as_u64())),
+            program.contains(&format!("tell(【← snipped - history[{}]】)", a.as_u64())),
             "the long literal is replaced by its row: {program}"
         );
         assert!(
-            program.contains("tell(\"x \" + y) /* ← history["),
+            program.contains("tell(\"x \" + y) 【← history["),
             "the computed one keeps its construction and takes a reference: {program}"
         );
         assert!(
@@ -1945,7 +1998,7 @@ mod tests {
     /// **An annotation the model wrote itself is replaced, not joined.**
     ///
     /// It reads these in its own turns and writes them back. On a live
-    /// run of 2026-09-19 it emitted `history.note(…); /* history[13] */`
+    /// run of 2026-09-19 it emitted `history.note(…); 【history[13]】`
     /// with four invented ids, and the pass added the four real ones
     /// beside them: every line came back doubly annotated, with a wrong
     /// id next to the true one that `fetch` would follow somewhere
@@ -1959,15 +2012,15 @@ mod tests {
             literal: false,
         }];
         // The model's own guess, in our shape and with the wrong id.
-        let source = "history.note(arg); /* history[13] */\n";
+        let source = "history.note(arg); 【history[13]】\n";
         let out = annotate_history_calls(source, Some(&cuts), &[]);
-        assert_eq!(out, "history.note(arg) /* ← history[30] */;\n");
+        assert_eq!(out, "history.note(arg) 【← history[30]】;\n");
         assert!(!out.contains("13"), "the invented id is gone: {out}");
 
         // And the same once it has imitated the arrow too.
-        let source = "history.note(arg); /* ← history[13] */\n";
+        let source = "history.note(arg); 【← history[13]】\n";
         let out = annotate_history_calls(source, Some(&cuts), &[]);
-        assert_eq!(out, "history.note(arg) /* ← history[30] */;\n");
+        assert_eq!(out, "history.note(arg) 【← history[30]】;\n");
     }
 
     /// **A part that is nothing but a copied marker renders as
@@ -1982,12 +2035,12 @@ mod tests {
     /// annotation, in the model's own turn, as an example to imitate.
     #[test]
     fn a_part_that_is_only_a_copied_marker_is_not_shown() {
-        assert!(is_only_an_imitated_marker("\n↓ history[36]\n"));
-        assert!(is_only_an_imitated_marker("↓ history[7]"));
+        assert!(is_only_an_imitated_marker("\n【↓ history[36]】\n"));
+        assert!(is_only_an_imitated_marker("【↓ history[7]】"));
         // A marker with something under it is an ordinary paragraph
         // that happens to start with one — the pass fixes its id and
         // the prose is kept.
-        assert!(!is_only_an_imitated_marker("↓ history[7]\nNow the file."));
+        assert!(!is_only_an_imitated_marker("【↓ history[7]】\nNow the file."));
         // And prose that merely mentions a row is not a marker at all.
         assert!(!is_only_an_imitated_marker("see history[9] for it"));
         assert!(!is_only_an_imitated_marker("Now the file."));
@@ -2001,12 +2054,12 @@ mod tests {
     /// see. The turn carried both, usually with different ids.
     #[test]
     fn a_marker_the_model_wrote_above_the_block_is_absorbed() {
-        let source = "Let me look.\n\n↓ history[78]\n```js\nx();\n```\n";
+        let source = "Let me look.\n\n【↓ history[78]】\n```js\nx();\n```\n";
         let at = source.find("```js").unwrap();
         let out = annotate_history_calls(source, None, &[(at, 91)]);
-        assert_eq!(out.matches("↓ history[").count(), 1, "one marker: {out}");
+        assert_eq!(out.matches("【↓ history[").count(), 1, "one marker: {out}");
         assert!(
-            out.contains("↓ history[91]\n```js"),
+            out.contains("【↓ history[91]】\n```js"),
             "and it is ours: {out}"
         );
         assert!(!out.contains("78"), "the guess is gone: {out}");
@@ -2078,7 +2131,7 @@ mod tests {
         let source = "history.note(arg); /* see history[9] for the listing */\n";
         let out = annotate_history_calls(source, Some(&cuts), &[]);
         assert!(out.contains("see history[9] for the listing"), "{out}");
-        assert!(out.contains("/* ← history[30] */"), "{out}");
+        assert!(out.contains("【← history[30]】"), "{out}");
     }
 
     /// the reference, because the link from call to row is the point.
@@ -2116,7 +2169,7 @@ mod tests {
             .content
             .clone();
         assert!(
-            program.contains("tell(\"ok\") /* ← history["),
+            program.contains("tell(\"ok\") 【← history["),
             "text kept, reference added: {program}"
         );
     }
@@ -2246,7 +2299,7 @@ mod tests {
         let all: String = doc.messages.iter().map(|m| m.content.clone()).collect();
         assert!(
             all.contains(&format!(
-                "const a = await ask(/* ← snipped - history[{}] */)",
+                "const a = await ask(【← snipped - history[{}]】)",
                 q.as_u64()
             )),
             "{all}"
@@ -2423,7 +2476,7 @@ mod tests {
         assert_eq!(conv[1].role, ChatRole::Assistant);
         assert_eq!(
             conv[1].content,
-            "↓ history[4]\n```js\ntell('hi'); history.note(1);\n```\n"
+            "【↓ history[4]】\n```js\ntell('hi'); history.note(1);\n```\n"
         );
         assert_eq!(conv[2].role, ChatRole::User, "{conv:?}");
     }

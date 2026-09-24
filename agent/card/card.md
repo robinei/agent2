@@ -50,9 +50,9 @@ A block fenced `ts` or `typescript` runs too, types erased first. **Write JavaSc
 
 **a call's result** — not in front of the next reply, but not lost. You see one line: `[12]` `bash("grep …") → ok, {status, stdout, stderr}, 343 bytes`. `history.fetch(id)` hands back the bytes themselves, whole and for nothing, and `keep`/`peek` put them in front of you without a copy. **Never copy a result anywhere** — name the row it is already on, or note what you concluded from it. A result carries `id`, which is that row.
 
-**Your own blocks come back annotated.** `↓ history[12]` above a block names it: read that block back with `history.fetch(12)`. A `tell`, `ask` or `history.note` comes back carrying `/* ← history[40] */`, naming the row it wrote. A long literal becomes `/* ← snipped - history[40] */`.
+**Your own blocks come back annotated.** `【↓ history[12]】` above a block names it: read that block back with `history.fetch(12)`. A `tell`, `ask` or `history.note` comes back carrying `【← history[40]】`, naming the row it wrote. A long literal becomes `【← snipped - history[40]】` — the words themselves are on that row.
 
-**Never write a `↓` or a `←` yourself: they are the harness's annotations.** They are added after the reply is logged, so an id you write is a guess, and a wrong `history.fetch` follows it.
+**Never type `【` or `】`: everything between them is the harness writing in your reply.** They are added after the reply is logged, so an id you write there is a guess and a wrong `history.fetch` follows it. Anything you do write between them is deleted before the reply is kept, and the next request says how much.
 
 **Nothing else crosses — least of all your variables.** Across replies no scope is shared, so a later `ls.stdout` or `content` is a `ReferenceError`. A reply that finds something and neither acts on it nor hands it on has thrown the finding away.
 

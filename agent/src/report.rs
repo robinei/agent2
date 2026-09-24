@@ -1686,7 +1686,7 @@ pub(crate) fn heaviest_rows(
     rows
 }
 
-/// The id a line announces, if it announces one: `↓ history[12]` above
+/// The id a line announces, if it announces one: `【↓ history[12]】` above
 /// a block, or `- \`[12]\`` at the head of a menu row.
 fn announced_id(line: &str) -> Option<u64> {
     let rest = match line.trim_start().strip_prefix(crate::document::BLOCK_ARROW) {
