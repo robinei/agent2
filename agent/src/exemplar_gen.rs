@@ -251,8 +251,31 @@ fn last_user_turn(c: &Conversation) -> String {
         .iter()
         .rev()
         .find(|m| m.role == crate::document::ChatRole::User)
-        .map(|m| m.content.clone())
+        .map(|m| without_a_readout_of_someone_elses_budget(&m.content))
         .unwrap_or_default()
+}
+
+/// Drop the fullness line from a captured turn.
+///
+/// **An example must not state a number about the reader's own
+/// budget.** `## RIGHT NOW` carries live session state, and most of it
+/// reads as shape — "17 rows, #6–#69" is obviously that session's.
+/// The fullness line is not shape: it is a measurement of how much
+/// room *you* have left, and frozen into a worked example it is a
+/// measurement of somebody else's.
+///
+/// It shipped. `07-supervise` carried "51% full: 33443 bytes of 65536"
+/// into every prompt — and doubly wrong, because the generator runs
+/// with no model configured, so `context_tokens` was `None` and the
+/// measurement fell back to bytes. A live session against a model with
+/// a known window measures tokens against `max_document_tokens`: the
+/// same conversation reads "31360 tokens of 131072". So the number was
+/// false, the unit was false, and the limit was false.
+fn without_a_readout_of_someone_elses_budget(turn: &str) -> String {
+    turn.lines()
+        .filter(|l| !l.contains("% full:"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// The reply just logged, as the document renders it — annotations and
@@ -343,6 +366,25 @@ mod tests {
             .collect();
         let want: Vec<&str> = SERIES.iter().map(|s| s.stem).collect();
         assert_eq!(shipped, want, "shipped order must match the series");
+    }
+
+    /// **No example states how full anyone is.** `07-supervise`
+    /// shipped "51% full: 33443 bytes of 65536" — a number about a
+    /// session that is not the reader's, in the strongest position in
+    /// the prompt. It was wrong three ways over: the generator runs
+    /// with no model configured, so the measurement fell back to bytes
+    /// against the byte budget, where a live session against a known
+    /// window reports tokens against `max_document_tokens` — the same
+    /// conversation reads "31360 tokens of 131072".
+    #[test]
+    fn no_worked_example_reports_a_fullness() {
+        for ex in &from_shipped() {
+            assert!(
+                !ex.user.contains("% full:"),
+                "an example states a budget that is not the reader's: {}",
+                ex.user
+            );
+        }
     }
 
     /// **The snapshot has to contain the things it exists to pin.**
