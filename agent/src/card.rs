@@ -1948,8 +1948,19 @@ mod tests {
                 !t.starts_with("//") && !t.starts_with("///") && l.contains('"')
             })
             .collect();
+        // **Every verb whose two spellings differ, not just the one
+        // that was caught.** This list held `fetch_history` alone for
+        // months while `keep_history` leaked in the refusal a live run
+        // was handed on 2026-09-24 — told to fix `keep_history(result)`
+        // for a call it had spelled `history.keep(…)`. A guard that
+        // covers one of six is why the other five were invisible.
         for (stale, instead) in [
             ("fetch_history(", "history.fetch("),
+            ("note_history(", "history.note("),
+            ("keep_history(", "history.keep("),
+            ("peek_history(", "history.peek("),
+            ("remove_history(", "history.remove("),
+            ("replace_history(", "history.replace("),
             ("artifacts on this branch", "rows on this branch"),
         ] {
             let offenders: Vec<&&str> = model_facing
