@@ -306,10 +306,29 @@ pub(crate) const FINISH_MARK: &str = "∎";
 /// Sent when a reply ran nothing, said something, and did not mark
 /// itself finished — so the branch cannot tell a conclusion from a
 /// thought said aloud.
-const NOT_FINISHED_NOTICE: &str = "- Your last reply ran no program and did not end with ∎, so \
-     the task is still open. **If you reply once more with prose alone, that reply is your \
-     last** — this is asked once. If you are already done, reply with a single ∎ and nothing \
-     else. If you were thinking aloud, that belongs in reasoning: carry on with the work.";
+///
+/// **The durable half.** This is a `Post`: it goes on the log, and it
+/// is read on every request after this one, so every word of it has to
+/// stay true when it is a record of something the harness said three
+/// replies ago. "Your last reply ran no program" read from there is a
+/// true account of that moment. The escalation is not — *whether this
+/// is your last chance* is true of exactly one request — so it rides
+/// the tail instead, as [`PROSE_ONCE_MORE`], and the two arrive in the
+/// same request from the two places the harness keeps for them.
+const NOT_FINISHED_NOTICE: &str = "Your last reply ran no program and did not end with ∎, so \
+     the task is still open. If you were thinking aloud, that belongs in reasoning: carry on \
+     with the work. If you are already done, reply with a single ∎ and nothing else.";
+
+/// The volatile half of [`NOT_FINISHED_NOTICE`], for the one request
+/// that follows the first prose-only reply.
+///
+/// `stopped_short` is bounded at one retry: a second prose-only reply
+/// in a row rests the branch without another ask. That bound was
+/// silent, so a reply could spend its last turn thinking aloud and
+/// never know it had been the last. Said here, it costs one line of
+/// the request it is true of and nothing afterwards.
+const PROSE_ONCE_MORE: &str = "- Asked once: if your next reply is prose again with no ∎, it is \
+     your last and the task ends there, done or not.";
 
 /// Sent when a reply wrote `∎` and ran a program in the same breath.
 /// The mark was deleted before the reply was logged — see
@@ -1087,6 +1106,11 @@ pub struct Runner {
     /// was not rested. The next request's tail says so — see
     /// [`SILENT_FINISH`].
     finish_ignored: bool,
+    /// The request being built is the one retry `stopped_short` allows
+    /// after a prose-only reply, so the tail says it is the last — see
+    /// [`PROSE_ONCE_MORE`]. Set when that wake is logged and cleared by
+    /// the next reply's own outcome, so it is true of one request.
+    prose_once_more: bool,
     /// Runs suspended **beneath** the one currently in `phase`, each
     /// frozen exactly where it stopped, oldest first popped last (a
     /// stack) — see `Phase::Suspended`'s own doc for why this, and not
@@ -1249,6 +1273,7 @@ impl Runner {
             no_rehearsal_last: std::env::var("AGENT2_NO_REHEARSAL_LAST").map_or(true, |v| v != "0"),
             run_program: std::env::var("AGENT2_RUN_PROGRAM").is_ok_and(|v| v != "0"),
             finish_ignored: false,
+            prose_once_more: false,
             spine,
             agent,
             branch,
@@ -3842,6 +3867,10 @@ impl Runner {
         // told nobody anything is remembered instead, so the next
         // request's tail can say why the branch is still going.
         self.finish_ignored = self.finished && !rested;
+        // Cleared here, set below in `prompt_if_needed` if this very
+        // reply is what earns the warning — so the flag never outlives
+        // the request it describes.
+        self.prose_once_more = false;
         if rested {
             // Matches `suspend`'s own depth>0 branch precedent: `shown`
             // advances here, marking this outcome accounted-for so
@@ -4059,6 +4088,8 @@ impl Runner {
         // comes back here to decide whether to do it — which is a cycle
         // with no base case, and was one until the stack overflowed.
         if let Some(text) = self.stopped_short(tree) {
+            // The tail's half of this one — see `PROSE_ONCE_MORE`.
+            self.prose_once_more = text == NOT_FINISHED_NOTICE;
             tree.append(
                 &mut self.spine,
                 EventPayload::Post {
@@ -4681,6 +4712,9 @@ impl Runner {
         }
         if self.finish_ignored {
             lines.push(SILENT_FINISH.to_owned());
+        }
+        if self.prose_once_more {
+            lines.push(PROSE_ONCE_MORE.to_owned());
         }
         // **Said once, where a per-request fact belongs.** The spans
         // were deleted before the reply was logged or compiled, so
@@ -11048,6 +11082,55 @@ mod tests {
         user_post(&mut state, &mut tree, "what is a mutex?");
         let tail = state.request_tail(&tree).expect("a tail");
         assert!(!tail.contains("is a complete answer"), "{tail}");
+    }
+
+    /// **The one retry is said out loud, and only on the request it is
+    /// true of.**
+    ///
+    /// `stopped_short` rests the branch on a second prose-only reply
+    /// without asking again. That bound was silent, so a reply could
+    /// spend its last turn thinking aloud and never know it had been
+    /// the last. The warning is split by how long it stays true: what
+    /// happened goes on the log as a `Post`, *whether this is your last
+    /// chance* rides the tail, which is re-emitted at the new end each
+    /// request and never written into the history.
+    #[test]
+    fn the_last_chance_is_in_the_tail_and_what_happened_is_on_the_log() {
+        let mut c = Conversation::new();
+        c.user_says("go");
+        c.reply("```js\nlet a = 1;\n```\n");
+        c.reply("Next I will fix the config.\n");
+
+        let tail = c.runner().request_tail(c.tree()).expect("a tail");
+        assert!(
+            tail.contains("it is your last"),
+            "the escalation is in the tail: {tail}"
+        );
+        let doc = crate::document::render(c.tree(), &c.runner().spine, 64 * 1024);
+        let logged: String = doc
+            .conversation()
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect();
+        assert!(
+            logged.contains("ran no program and did not end with ∎"),
+            "and what happened is on the log, where it stays true"
+        );
+        assert!(
+            !logged.contains("it is your last"),
+            "the escalation is not, because a request later it is false: {logged}"
+        );
+
+        // A reply that runs something discharges it, and the next
+        // request does not still say a prose reply would be the last.
+        c.reply("```js\nlet b = 2;\n```\n");
+        assert!(
+            !c.runner()
+                .request_tail(c.tree())
+                .unwrap_or_default()
+                .contains("it is your last"),
+            "one request, then gone"
+        );
     }
 
     #[test]
