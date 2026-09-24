@@ -656,7 +656,7 @@ impl super::Compiler {
                     return;
                 }
                 let name = match &argv[0] {
-                    ast::Expression::StringLiteral(lit) => lit.value.as_str().into(),
+                    ast::Expression::StringLiteral(lit) => super::cook::string_literal(lit),
                     other => {
                         self.error(
                             other.span().into(),

@@ -37,9 +37,11 @@ impl super::Compiler {
             return;
         }
         let name = match key {
-            ast::PropertyKey::StaticIdentifier(id) => id.name.as_str().to_string(),
-            ast::PropertyKey::StringLiteral(s) => s.value.as_str().to_string(),
-            ast::PropertyKey::NumericLiteral(n) => super::number_key_to_string(n.value),
+            ast::PropertyKey::StaticIdentifier(id) => JsString::from(id.name.as_str()),
+            ast::PropertyKey::StringLiteral(s) => super::cook::string_literal(s),
+            ast::PropertyKey::NumericLiteral(n) => {
+                JsString::from(super::number_key_to_string(n.value).as_str())
+            }
             _ => {
                 if let Some(expr) = key.as_expression() {
                     self.compile_expr(expr);
@@ -50,7 +52,7 @@ impl super::Compiler {
                 return;
             }
         };
-        self.emit(Instr::ObjGet(JsString::from(name.as_str())), span);
+        self.emit(Instr::ObjGet(name), span);
     }
 
     /// Push a pattern property's key as a string *value* (used to exclude
@@ -68,9 +70,11 @@ impl super::Compiler {
             return;
         }
         let name = match key {
-            ast::PropertyKey::StaticIdentifier(id) => id.name.as_str().to_string(),
-            ast::PropertyKey::StringLiteral(s) => s.value.as_str().to_string(),
-            ast::PropertyKey::NumericLiteral(n) => super::number_key_to_string(n.value),
+            ast::PropertyKey::StaticIdentifier(id) => JsString::from(id.name.as_str()),
+            ast::PropertyKey::StringLiteral(s) => super::cook::string_literal(s),
+            ast::PropertyKey::NumericLiteral(n) => {
+                JsString::from(super::number_key_to_string(n.value).as_str())
+            }
             _ => {
                 if let Some(expr) = key.as_expression() {
                     self.compile_expr(expr);
@@ -81,7 +85,7 @@ impl super::Compiler {
                 return;
             }
         };
-        self.emit(Instr::PushStr(JsString::from(name.as_str())), span);
+        self.emit(Instr::PushStr(name), span);
     }
 
     /// Object-rest plumbing: with `[src, rest, src, key]` on the stack (key a

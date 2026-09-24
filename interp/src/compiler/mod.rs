@@ -26,6 +26,7 @@ mod assign;
 pub mod call;
 mod class;
 mod control_flow;
+pub(crate) mod cook;
 mod destructure;
 mod emit;
 mod expr;

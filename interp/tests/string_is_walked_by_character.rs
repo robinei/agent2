@@ -185,6 +185,68 @@ fn the_silent_divergences_are_gone() {
     );
 }
 
+/// **A lone surrogate can be written, and this is the point of the change.**
+///
+/// It is the one capability UTF-16 has that "UTF-8 with an `is_ascii` bit"
+/// does not, and without it the whole representation swap reduces to
+/// code-unit indexing — which the cheap option would have delivered for a
+/// fifth of the work. `docs/30_STRINGS.md` calls that the most important
+/// sentence in the plan. So this test is the answer to "was it worth doing".
+///
+/// `"\uD800"` compiled to *seven bytes* before: U+FFFD followed by the
+/// literal characters `d800`, because oxc's cooked value cannot hold a
+/// surrogate and encodes one in band. See `compiler/cook.rs`.
+#[test]
+fn a_source_literal_can_hold_a_lone_surrogate() {
+    assert_eq!(val(r#"return "\uD800".length;"#), 1); // was 7
+    assert_eq!(val(r#"return "\uD800".charCodeAt(0);"#), 55296);
+    assert_eq!(val(r#"return "\uDFFF".charCodeAt(0);"#), 57343);
+    // An explicit pair is one character, and two units.
+    assert_eq!(val(r#"return "\uD83D\uDE00".length;"#), 2);
+    assert_eq!(val(r#"return "\uD83D\uDE00" === "😀";"#), true);
+    // Split: it used to give ["\uFFFD","d","8","0","0"].
+    assert_eq!(val(r#"return "\uD800".split("").length;"#), 1);
+    // A lone surrogate and a genuine U+FFFD in the same literal — oxc encodes
+    // the second one as an escaped escape, so this is where a decoder that
+    // collapsed the two cases would be caught.
+    assert_eq!(val(r#"return "\uD800\uFFFD".length;"#), 2);
+    assert_eq!(val(r#"return "\uD800\uFFFD".charCodeAt(0);"#), 55296);
+    assert_eq!(val(r#"return "\uD800\uFFFD".charCodeAt(1);"#), 65533);
+    // Template literals cook through the same path.
+    assert_eq!(val(r#"return `a\uD800b`.length;"#), 3);
+    assert_eq!(val(r#"return `a\uD800b`.charCodeAt(1);"#), 55296);
+    assert_eq!(val(r#"return `x${1}\uD800`.length;"#), 3);
+    // And a program can tell: the mitigation for the U+FFFD policy at the
+    // JSON boundary is that it can ask before the crossing loses anything.
+    assert_eq!(val(r#"return "\uD800".isWellFormed();"#), false);
+    assert_eq!(val(r#"return "\uD83D\uDE00".isWellFormed();"#), true);
+    assert_eq!(
+        val(r#"return "\uD800".toWellFormed().charCodeAt(0);"#),
+        65533
+    );
+    // `fromCharCode` and a literal agree, which they could not before.
+    assert_eq!(
+        val(r#"return String.fromCharCode(0xD800) === "\uD800";"#),
+        true
+    );
+    // An object key can be one too — the key path cooks through `cook.rs` as
+    // well, and a key that decoded differently from the literal used to read
+    // it would be a hole nothing else would find.
+    assert_eq!(val(r#"const o = { "\uD800": 7 }; return o["\uD800"];"#), 7);
+    // **A `const` must propagate the literal, not oxc'''s encoding of it.**
+    // Constant propagation held the initializer as a `String`, which cannot
+    // carry a surrogate, so this answered 5 while the same literal written
+    // inline answered 1 — two spellings of one literal disagreeing, which is
+    // the shape this whole phase is about. Found by `unicode-back-reference`,
+    // a test262 file that had been green on mangled input.
+    assert_eq!(val(r#"const s = "\uD800"; return s.length;"#), 1);
+    assert_eq!(val(r#"const s = "\uD800"; return s === "\uD800";"#), true);
+    assert_eq!(
+        val(r#"const s = "foo\uD834bar"; return s.charCodeAt(3);"#),
+        55348
+    );
+}
+
 /// **Code-unit `Ord` is a fix, not a side effect.** JS defines `<` on strings
 /// as code-unit comparison; `str::cmp` compared code points, and the two
 /// disagree for exactly this pair.

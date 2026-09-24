@@ -20,7 +20,9 @@ impl super::Compiler {
                 _ => unreachable!(),
             },
             ast::Expression::StringLiteral(lit) => {
-                let s = self.intern_string(lit.value.as_str());
+                // Not `lit.value.as_str()`: a literal holding a lone surrogate
+                // reaches us as oxc's in-band encoding. See `cook.rs`.
+                let s = self.intern_units(&super::cook::string_literal_units(lit));
                 self.emit(Instr::PushStr(s), lit.span.into());
             }
             ast::Expression::BooleanLiteral(lit) => {

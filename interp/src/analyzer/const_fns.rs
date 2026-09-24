@@ -17,7 +17,14 @@ pub(crate) enum ConstValue {
     Null,
     Bool(bool),
     Num(f64),
-    Str(String),
+    /// **Code units, not a `String`.** A constant-propagated literal has to
+    /// reproduce the literal exactly, and a literal can hold a lone
+    /// surrogate, which no `String` can. Holding `s.value.to_string()` here
+    /// meant `const s = "\uD800"` propagated oxc's in-band encoding —
+    /// U+FFFD followed by `d800` — while the same literal written inline
+    /// compiled correctly. Found by a test262 RegExp test that had been
+    /// green on mangled input for as long as it had existed.
+    Str(Vec<u16>),
     /// A non-capturing, non-reassigned function: its value is a fixed code
     /// address (`Fn(label)`), so the binding is a compile-time constant — no
     /// slot, references emit `PushFn(label)`, calls are static `Call(label)`.
@@ -38,7 +45,9 @@ pub(crate) enum ConstValue {
 pub(crate) fn literal_const_value(expr: &ast::Expression) -> Option<ConstValue> {
     match expr {
         ast::Expression::NumericLiteral(n) => Some(ConstValue::Num(n.value)),
-        ast::Expression::StringLiteral(s) => Some(ConstValue::Str(s.value.to_string())),
+        ast::Expression::StringLiteral(s) => Some(ConstValue::Str(
+            crate::compiler::cook::string_literal_units(s),
+        )),
         ast::Expression::BooleanLiteral(b) => Some(ConstValue::Bool(b.value)),
         ast::Expression::NullLiteral(_) => Some(ConstValue::Null),
         ast::Expression::UnaryExpression(u) if u.operator == ast::UnaryOperator::UnaryNegation => {

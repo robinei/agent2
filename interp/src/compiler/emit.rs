@@ -42,13 +42,19 @@ impl super::Compiler {
     /// the embedded `PushStr` operands (and the values they push at runtime) are
     /// all clones of the same block.
     pub(super) fn intern_string(&mut self, s: &str) -> JsString {
-        // The set is keyed by `JsString`, which borrows as `[u16]`, so the
-        // probe widens first. Compile-time only, and once per distinct
-        // literal.
-        if let Some(existing) = self.interned.get(&crate::units::from_str(s)[..]) {
+        self.intern_units(&crate::units::from_str(s))
+    }
+
+    /// [`intern_string`](Self::intern_string) for content that is already code
+    /// units — which a source literal holding a lone surrogate has to be,
+    /// since no `&str` can carry one. The set is keyed by `JsString`, which
+    /// borrows as `[u16]`, so this is the primitive and the `&str` form widens
+    /// into it.
+    pub(super) fn intern_units(&mut self, units: &[u16]) -> JsString {
+        if let Some(existing) = self.interned.get(units) {
             return existing.clone();
         }
-        let rc = JsString::from(s);
+        let rc = JsString::from_units(units);
         self.interned.insert(rc.clone());
         rc
     }

@@ -234,7 +234,7 @@ impl super::Compiler {
         }
         match key {
             ast::PropertyKey::StaticIdentifier(id) => Some(JsString::from(id.name.as_str())),
-            ast::PropertyKey::StringLiteral(s) => Some(JsString::from(s.value.as_str())),
+            ast::PropertyKey::StringLiteral(s) => Some(super::cook::string_literal(s)),
             ast::PropertyKey::NumericLiteral(n) => Some(JsString::from(
                 super::number_key_to_string(n.value).as_str(),
             )),

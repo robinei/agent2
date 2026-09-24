@@ -85,7 +85,7 @@ impl super::Compiler {
         }
         match &p.key {
             ast::PropertyKey::StaticIdentifier(id) => Some(JsString::from(id.name.as_str())),
-            ast::PropertyKey::StringLiteral(s) => Some(JsString::from(s.value.as_str())),
+            ast::PropertyKey::StringLiteral(s) => Some(super::cook::string_literal(s)),
             ast::PropertyKey::NumericLiteral(num) => Some(JsString::from(
                 super::number_key_to_string(num.value).as_str(),
             )),
@@ -187,20 +187,12 @@ impl super::Compiler {
         // result = quasi0 + expr0 + quasi1 + expr1 + … . The accumulator starts
         // as a string (interned constant) and stays one, so every `Add` takes
         // the concat path and ToString-coerces each interpolated value, as JS does.
-        let quasi_str = |q: &ast::TemplateElement| {
-            q.value
-                .cooked
-                .as_ref()
-                .map(|s| s.as_str())
-                .unwrap_or_else(|| q.value.raw.as_str())
-                .to_string()
-        };
-        let q0 = self.intern_string(quasi_str(&tl.quasis[0]).as_str());
+        let q0 = self.intern_units(&super::cook::template_element_units(&tl.quasis[0]));
         self.emit(Instr::PushStr(q0), span);
         for (i, expr) in tl.expressions.iter().enumerate() {
             self.compile_expr(expr);
             self.emit(Instr::Add, span);
-            let qn = self.intern_string(quasi_str(&tl.quasis[i + 1]).as_str());
+            let qn = self.intern_units(&super::cook::template_element_units(&tl.quasis[i + 1]));
             self.emit(Instr::PushStr(qn), span);
             self.emit(Instr::Add, span);
         }
