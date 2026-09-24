@@ -117,6 +117,26 @@ pub(crate) fn resolve_const_functions(
         let Some(name) = const_fn_binding_name(s) else {
             continue;
         };
+        // **One name, one function — otherwise it is not a constant.** A name
+        // declared by two function declarations in the same scope holds a
+        // different function at different points of the run: the prologue
+        // stores each declaration's closure in source order, and an annex-B
+        // block-level declaration stores its closure again when the block is
+        // evaluated. `const_names` is keyed by *name* and holds one value per
+        // scope, so it cannot represent that — it can only record one of the
+        // competing functions and silently answer with it everywhere.
+        //
+        // That is what made `{ function f(){return 'inner'} } f(); function
+        // f(){return 'outer'}` return 'inner' in some processes and 'outer' in
+        // others (measured 2026-09-24: 5 and 7 of 12 runs): `register_const_fns`
+        // walks a `HashSet<usize>` whose iteration order is seeded per process,
+        // so whichever declaration it reached first claimed the name. Excluding
+        // the whole ambiguous name removes the choice rather than freezing an
+        // arbitrary winner; both declarations keep a real slot and a real
+        // store, and the run decides, as it must.
+        if redeclared_in_scope(scopes, s.parent, name) {
+            continue;
+        }
         if let Some(slot) = binding_slot(&scopes[s.parent], name, &s.def_blocks)
             && !scopes[s.parent].reassigned.contains(&slot)
             && slot >= scopes[s.parent].params.len() as u32
@@ -180,6 +200,19 @@ pub(crate) fn resolve_const_functions(
     register_const_fns(scopes, &const_fns);
     super::captures::resolve_captures(scopes);
     const_fns
+}
+
+/// Whether `scope` holds more than one function whose external binding is
+/// `name` — two `function name(){}` declarations, or a declaration and a
+/// `const name = function(){}` in a sibling block. Such a name has no single
+/// compile-time value (see the caller).
+fn redeclared_in_scope(scopes: &[FuncScope], scope: usize, name: &str) -> bool {
+    scopes[scope]
+        .children
+        .iter()
+        .filter(|&&c| const_fn_binding_name(&scopes[c]).map(String::as_str) == Some(name))
+        .count()
+        > 1
 }
 
 /// The own-slot the enclosing scope binds `name` to, as seen from a function
@@ -300,7 +333,14 @@ fn compact_const_fn_slots(scopes: &mut [FuncScope]) {
 /// a value, never a capture) and by slot in `const_fn_slots` (so a same-scope
 /// reference emits the literal). Run before `resolve_captures`.
 pub(crate) fn register_const_fns(scopes: &mut [FuncScope], const_fns: &HashSet<usize>) {
-    for &sf in const_fns {
+    // Ascending scope id is source order, and source order is the order the
+    // prologue stores these bindings in. It matters only if two entries ever
+    // land on the same key — which `redeclared_in_scope` is there to prevent —
+    // so walking the set in a fixed order is what keeps a future gap failing
+    // the same way in every process instead of once in every N.
+    let mut in_source_order: Vec<usize> = const_fns.iter().copied().collect();
+    in_source_order.sort_unstable();
+    for sf in in_source_order {
         let parent = scopes[sf].parent;
         let Some(name) = const_fn_binding_name(&scopes[sf]).cloned() else {
             continue;

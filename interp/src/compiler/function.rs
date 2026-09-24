@@ -9,78 +9,94 @@ use crate::span::Span;
 use crate::vm::{Instr, LocalIndex, RcStr, SetMode, SlotKind};
 
 impl super::Compiler {
-    /// Hoist function declarations in the current scope's prologue: emit each
-    /// declaration's binding value (`Fn`/closure) into its slot. Recurses
-    /// through blocks/conditionals/loops (function declarations hoist to the
-    /// enclosing function), but not into nested functions.
+    /// Hoist the function declarations written directly in this function
+    /// body's statement list: emit each one's binding value (`Fn`/closure)
+    /// into its slot, in source order, as part of the prologue.
+    ///
+    /// **A declaration nested in a block is not hoisted here.** It is an
+    /// annex-B block-level function declaration, and B.3.3.1/B.3.3.2 are
+    /// explicit that the var-scoped binding it synthesizes starts out
+    /// `undefined` and receives the function object only when the declaration
+    /// is *reached* — which is why `if (false) { function g(){} }` leaves `g`
+    /// undefined, and why the block in
+    ///
+    /// ```text
+    /// { function f(){ return 'inner' } }
+    /// f();
+    /// function f(){ return 'outer' }
+    /// ```
+    ///
+    /// wins over the outer declaration at the call: the outer one is stored at
+    /// frame entry, the block's one when the block runs, and the block runs
+    /// later. This walk used to recurse into blocks, conditionals, loops and
+    /// `try`, which put both stores in the prologue in *source* order and so
+    /// gave the answer backwards. `compile_stmt` now emits the store at the
+    /// declaration instead; `prologue_fn_decls` records the spans settled here
+    /// so it knows which declarations it still owes one.
     pub(super) fn hoist_function_decls(&mut self, stmts: &[ast::Statement]) {
         for stmt in stmts {
-            self.hoist_function_decl_in_stmt(stmt);
+            if let ast::Statement::FunctionDeclaration(f) = stmt {
+                self.prologue_fn_decls.insert(f.span.start);
+                self.emit_fn_decl_binding(f);
+            }
         }
     }
 
-    pub(super) fn hoist_function_decl_in_stmt(&mut self, stmt: &ast::Statement) {
-        match stmt {
-            ast::Statement::FunctionDeclaration(f) => {
-                let Some(scope_id) = self.scope_for_node(f.span.start) else {
-                    return;
-                };
-                let (label, captures, js_length) = {
-                    let analysis = self.analysis.as_ref().expect("analysis present");
-                    let child = &analysis.scopes[scope_id];
-                    (child.label, child.captures.clone(), child.js_length())
-                };
-                // A constant function (Phase F) has no live slot — its binding
-                // store is dead (references/calls go through its `Fn` constant).
-                if self.is_const_fn_scope(scope_id) {
-                    return;
-                }
-                if let Some(id) = &f.id
-                    && let Some(slot) = self.binding_slot(id.span.start)
-                {
-                    let span = f.span.into();
-                    self.emit(
-                        Instr::ClosureNew(
-                            label,
-                            js_length,
-                            captures.iter().map(|&c| c as LocalIndex).collect(),
-                        ),
-                        span,
-                    );
-                    self.emit(Instr::SetLocal(slot as LocalIndex), span);
-                }
-            }
-            ast::Statement::BlockStatement(b) => {
-                for s in &b.body {
-                    self.hoist_function_decl_in_stmt(s);
-                }
-            }
-            ast::Statement::IfStatement(s) => {
-                self.hoist_function_decl_in_stmt(&s.consequent);
-                if let Some(alt) = &s.alternate {
-                    self.hoist_function_decl_in_stmt(alt);
-                }
-            }
-            ast::Statement::WhileStatement(s) => self.hoist_function_decl_in_stmt(&s.body),
-            ast::Statement::DoWhileStatement(s) => self.hoist_function_decl_in_stmt(&s.body),
-            ast::Statement::ForStatement(s) => self.hoist_function_decl_in_stmt(&s.body),
-            ast::Statement::TryStatement(t) => {
-                for s in &t.block.body {
-                    self.hoist_function_decl_in_stmt(s);
-                }
-                if let Some(h) = &t.handler {
-                    for s in &h.body.body {
-                        self.hoist_function_decl_in_stmt(s);
-                    }
-                }
-                if let Some(f) = &t.finalizer {
-                    for s in &f.body {
-                        self.hoist_function_decl_in_stmt(s);
-                    }
-                }
-            }
-            _ => {}
+    /// Emit `<closure> → binding slot` for one function declaration. Nothing is
+    /// emitted for a constant function (Phase F): it has no live slot, and
+    /// references/calls go through its `Fn` constant.
+    pub(super) fn emit_fn_decl_binding(&mut self, f: &ast::Function) {
+        let Some(scope_id) = self.scope_for_node(f.span.start) else {
+            return;
+        };
+        if self.is_const_fn_scope(scope_id) {
+            return;
         }
+        let (label, captures, js_length) = {
+            let analysis = self.analysis.as_ref().expect("analysis present");
+            let child = &analysis.scopes[scope_id];
+            (child.label, child.captures.clone(), child.js_length())
+        };
+        if let Some(id) = &f.id
+            && let Some(slot) = self.binding_slot(id.span.start)
+        {
+            let span = f.span.into();
+            self.emit(
+                Instr::ClosureNew(
+                    label,
+                    js_length,
+                    captures.iter().map(|&c| c as LocalIndex).collect(),
+                ),
+                span,
+            );
+            self.emit(Instr::SetLocal(slot as LocalIndex), span);
+        }
+    }
+
+    /// The store owed to an annex-B block-level function declaration, emitted
+    /// where the declaration stands. A declaration the prologue already stored
+    /// gets nothing — storing it twice would be harmless but dead.
+    pub(super) fn emit_block_level_fn_binding(&mut self, f: &ast::Function) {
+        if self.prologue_fn_decls.contains(&f.span.start) {
+            return;
+        }
+        // **A formal parameter of the same name cancels annex B entirely.**
+        // B.3.3.1 gates the whole transformation — the synthesized `var` *and*
+        // the store at the declaration — on `parameterNames does not contain
+        // F`. So `(function (f) { switch (1) { case 1: function f(){} } })(123)`
+        // sees `f === 123` both before and after the switch (test262
+        // `annexB/language/function-code/switch-*-func-skip-param.js`). The
+        // param slot is the first `nparams` frame slots, which is what makes
+        // this a slot-number test.
+        if let Some(id) = &f.id
+            && let Some(slot) = self.binding_slot(id.span.start)
+        {
+            let analysis = self.analysis.as_ref().expect("analysis present");
+            if (slot as usize) < analysis.scopes[self.current_scope].params.len() {
+                return;
+            }
+        }
+        self.emit_fn_decl_binding(f);
     }
 
     /// Emit the body of a function declaration (its binding was already emitted

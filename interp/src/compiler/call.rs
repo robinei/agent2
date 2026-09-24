@@ -1314,16 +1314,39 @@ impl super::Compiler {
 
     /// Find the entry label of a function named `name` declared in the current
     /// scope. Returns `None` if not statically known.
+    ///
+    /// **A name has to name one function for the whole run, or the call goes
+    /// dynamic.** Two conditions disqualify it, and both used to be missed:
+    ///
+    /// * *More than one declaration of the name.* The prologue stores them in
+    ///   source order, so the binding holds the **last** one — `function
+    ///   f(){return 1} function f(){return 2}; f()` is 2 (test262
+    ///   `language/global-code/decl-func-dup.js`, `S13_A6_T2`, `S14_A5_T*`).
+    ///   Scanning for the first match called the wrong function; picking the
+    ///   last one instead would still be wrong the moment an annex-B block
+    ///   declaration re-stores the name mid-run. There is no static winner, so
+    ///   read the slot.
+    /// * *A block-level (annex B) declaration.* Its store happens where the
+    ///   declaration stands, not in the prologue, so before the block runs the
+    ///   binding is `undefined` — and `if (false) { function g(){} } g()` must
+    ///   throw rather than call `g`.
+    ///
+    /// Everything else — the ordinary case of one declaration written in the
+    /// body — still lowers to a static `Call`.
     pub(super) fn find_callee_label(&self, name: &str) -> Option<u32> {
         let analysis = self.analysis.as_ref().expect("analysis present");
         let scope = &analysis.scopes[self.current_scope];
+        let mut found: Option<u32> = None;
         for &child_id in &scope.children {
             let child = &analysis.scopes[child_id];
             if child.is_declaration && child.self_name.as_deref() == Some(name) {
-                return Some(child.label);
+                if found.is_some() || !self.prologue_fn_decls.contains(&child.node_span) {
+                    return None;
+                }
+                found = Some(child.label);
             }
         }
-        None
+        found
     }
 
     /// Get the declared parameter count of a function named `name` in the

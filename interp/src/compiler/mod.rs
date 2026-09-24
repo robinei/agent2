@@ -374,6 +374,14 @@ pub(crate) struct Compiler {
     /// harness's vocabulary and not the language's. Left `None` on the one-shot
     /// path, where top-level `return` is the program's own result.
     no_top_level_return: Option<String>,
+    /// Spans of the function declarations whose binding store was emitted in a
+    /// function prologue — i.e. the ones written *directly* in some function
+    /// body's statement list. Every other declaration is a block-level one
+    /// (annex B) whose store belongs at the point the declaration is reached,
+    /// so `compile_stmt` emits it there. Spans are unique across the program,
+    /// so one accumulating set serves every scope; a nested body's prologue
+    /// runs before its own statements, which is the only ordering this needs.
+    prologue_fn_decls: HashSet<u32>,
 }
 
 // ── impl blocks live in the sub-modules above ────────────────────────

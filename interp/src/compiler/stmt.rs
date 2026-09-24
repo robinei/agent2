@@ -139,8 +139,11 @@ impl super::Compiler {
 
             // ── Phase 3: functions / return ───────────────────────────
             ast::Statement::FunctionDeclaration(f) => {
-                // The binding was already hoisted in the prologue by
-                // `hoist_function_decls`. Now emit the function body.
+                // A declaration written directly in a function body had its
+                // binding emitted in that body's prologue by
+                // `hoist_function_decls`; a block-level (annex B) one is
+                // stored here, where it is reached. Then the body.
+                self.emit_block_level_fn_binding(f);
                 self.compile_function_decl_body(f);
             }
             ast::Statement::ReturnStatement(r) => {
