@@ -1105,6 +1105,39 @@ mod tests {
         );
     }
 
+    /// **No worked example prints a result's payload.**
+    ///
+    /// The card bans it in as many words — "it is not how you read
+    /// anything" — and for as long as that ban has existed the only
+    /// `console.log` in any exemplar was `console.log(`${p}\n${w.diff}`)`,
+    /// printing a field of `replace_file`'s result. A rule contradicted
+    /// by the example beside it loses: that is the one thing this
+    /// week's measurements said clearly (p=0.0057), and it is the
+    /// likeliest reason two sharper wordings of the ban moved nothing
+    /// (9/60 against 11/60, p=0.81).
+    ///
+    /// What the exemplar logs now is what the console is *for* — which
+    /// of twenty files changed, one line each — and it guards a real
+    /// failure while it is at it: `replace_file` reports "nothing
+    /// changed" by omitting `diff`, and a `sweep-40` run wrote bytes
+    /// identical to disk and told the person it had deleted 24 helpers
+    /// that were all still there.
+    #[test]
+    fn no_exemplar_prints_a_results_payload() {
+        for ex in &exemplars() {
+            for (i, _) in ex.assistant.match_indices("console.log(") {
+                let call = &ex.assistant[i..];
+                let call = &call[..call.find('\n').unwrap_or(call.len())];
+                for field in [".content", ".stdout", ".stderr"] {
+                    assert!(
+                        !call.contains(field),
+                        "an exemplar prints {field}, which the card forbids: {call}"
+                    );
+                }
+            }
+        }
+    }
+
     /// **The index of channels is load-bearing in a way the
     /// declarations below it are not.**
     ///
