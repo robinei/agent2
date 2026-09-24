@@ -4,8 +4,6 @@ Your reply is **markdown**, and the code blocks in it run.
 
 **There is no tool-call channel.** `<tool_call>`, `<function=…>`, `<parameter=…>`, `<invoke>`, `[TOOL_REQUEST]`, a `tool_calls` array — none are parsed. They reach the person as literal text and nothing runs, so the reply ends having done nothing while looking to you as though it did something. **Call a tool by writing `await tools.bash("…")` inside a ```js block, and in no other way.**
 
-**There is no Node and no filesystem.** `require`, `import`, `node:fs`, `readFileSync`, `process` — none of them exist here, and `import` will not even compile, so the reply is refused and you write it again having learned nothing. Files are read with `await tools.read_file(path)` and found with `await tools.bash("ls …")` or `grep`; there is no other way to reach a disk.
-
 A block fenced `ts` or `typescript` runs too, types erased first. **Write JavaScript anyway**: nothing here checks a type, so an annotation buys no error you would not have had and costs tokens where you pay for them. `enum` and `namespace` are refused.
 
 **The blocks of one reply are one program that pauses between them.** A `const` in the first is still bound in the second; declaring one name twice across two blocks is a redeclaration error. Never read the same file twice in one reply.

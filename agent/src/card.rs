@@ -887,7 +887,7 @@ mod tests {
         // `card()` shows up as a diff review must look at, not a byte
         // count that silently drifts. Comparing full text (not just a
         // hash) so the diff itself is legible in a failure message.
-        const EXPECTED_LEN: usize = 23208;
+        const EXPECTED_LEN: usize = 22829;
         assert_eq!(
             card().len(),
             EXPECTED_LEN,
@@ -1105,39 +1105,46 @@ mod tests {
         );
     }
 
-    /// **The card says there is no Node, because the model reaches for
-    /// one.**
+    /// **The Node paragraph was measured on a broken document, and is
+    /// gone.**
     ///
-    /// The largest effect measured against this card, and a pure
-    /// omission: `grep -niE "require|node|import|filesystem"` over
-    /// `card.md` returned nothing at all, while first replies wrote
-    /// `await import("node:fs")`, `require("fs")` and `readFileSync`
-    /// into the program itself — 48% of them, pooled over a
-    /// rename-and-check, a search and a read-and-explain. With one
-    /// paragraph saying the thing does not exist: **0%**, n=90 per arm,
-    /// p<0.00001, replicating independently on all three (p=0.0046,
-    /// p<0.0001, p<0.0001).
+    /// It was added at 48% -> 0%, p<0.00001, on three captures built
+    /// with the scripted LLM to save money. Those captures declare a
+    /// manifest of exactly one tool:
     ///
-    /// **Only `import` is refused at compile time.** `require(...)`,
-    /// `process.cwd()` and `readFileSync(...)` all compile and trap at
-    /// run time, which is why the paragraph scopes that clause to
-    /// `import` rather than claiming it of all five.
+    /// ```ts
+    /// declare namespace tools { function echo(arg0: unknown): Promise<unknown>; }
+    /// ```
     ///
-    /// The reading task that every other measurement this week used
-    /// shows 0/60 here, because it names both files and never has to
-    /// enumerate. The model reaches for a filesystem exactly when it
-    /// must *find* something, which is the case that prompt does not
-    /// contain.
+    /// beside worked examples calling `tools.bash` and
+    /// `tools.read_file`. The model said so itself, in reasoning I only
+    /// read afterwards: *"the tools available in this session are only
+    /// `tools.echo`! ... So bash/read_file may not exist."* It reached
+    /// for `node:fs` because it had been told it had no file tool — not
+    /// because the card was silent about Node.
+    ///
+    /// Re-run on captures taken from real sessions, with real
+    /// manifests: **0/90 without the paragraph, 1/90 with it**, p=1.0.
+    /// The problem it fixed does not exist. And the paragraph costs
+    /// something: drafting in the reasoning stream ran 19% with it
+    /// against 8% without, p=0.047, in the same direction on all three
+    /// tasks. Naming a thing at length appears to put it in mind.
+    ///
+    /// A null would not have been reason enough to remove it — a card
+    /// may hold what reasoning says belongs there. Evidence of harm is.
+    ///
+    /// Pinned as an absence because it is a plausible thing to re-add:
+    /// the reasoning for it ("say what does not exist") is sound, and
+    /// only a valid document shows that nobody asks.
     #[test]
-    fn the_card_says_there_is_no_node() {
+    fn the_card_does_not_name_node() {
         let card = card();
-        for word in ["require", "node:fs", "readFileSync", "no filesystem"] {
-            assert!(card.contains(word), "the card no longer rules out {word}");
+        for word in ["node:fs", "readFileSync", "require`"] {
+            assert!(
+                !card.contains(word),
+                "the card names {word} again — see this test's comment before keeping it"
+            );
         }
-        assert!(
-            card.contains("tools.read_file(path)"),
-            "and it must name what to use instead"
-        );
     }
 
     /// **No worked example prints a result's payload.**
