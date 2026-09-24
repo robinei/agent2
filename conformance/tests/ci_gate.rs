@@ -10,16 +10,43 @@ use conformance::runner::{TestOutcome, run_tests};
 #[test]
 #[ignore]
 fn expectations_match_committed() {
-    let expectations_path = Path::new("conformance/expectations.json");
+    // **Anchored at the workspace root, not at the working directory.**
+    // Cargo runs an integration test from its *package* directory, so
+    // every one of these paths resolved under `conformance/` and missed:
+    // `conformance/conformance/expectations.json`,
+    // `conformance/test262/test`. `Expectations::load` answers a missing
+    // file with an empty set rather than an error, and the walk of a
+    // missing directory yields nothing — so an empty run was compared
+    // against empty expectations, matched, and printed
+    // `expectations match: total=0`. This gate covers 53,658 files and
+    // was passing on none of them.
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("the conformance package sits in the workspace");
+    let expectations_path = root.join("conformance/expectations.json");
     let previous =
-        Expectations::load(expectations_path).expect("failed to load committed expectations");
+        Expectations::load(&expectations_path).expect("failed to load committed expectations");
+    // **A gate that ran nothing fails.** Both halves of the comparison
+    // go empty together when the corpus is absent, and empty matches
+    // empty — so the one thing this must never do is agree with
+    // itself about nothing. The submodule is either checked out or
+    // this is not a run.
+    assert!(
+        !previous.entries.is_empty(),
+        "no committed expectations at {}: nothing to gate against",
+        expectations_path.display()
+    );
 
     let stats = run_tests(
-        Path::new("test262/test"),
-        Path::new("conformance/harness"),
-        Path::new("test262/harness"),
+        &root.join("test262/test"),
+        &root.join("conformance/harness"),
+        &root.join("test262/harness"),
         None,
         Some(&previous),
+    );
+    assert!(
+        stats.total > 0,
+        "the test262 corpus is missing or empty — `git submodule update --init test262`"
     );
 
     let mut current = Expectations::default();
