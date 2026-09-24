@@ -5486,10 +5486,34 @@ fn substitute_printed_rows(lines: &mut [String], tree: &Tree, leaf: EventId) {
         })
         .collect();
     for line in lines.iter_mut() {
-        if let Some((row, bytes)) = copy_of(&[line.as_str()], rows.iter().copied()) {
-            *line = reference_to(row, bytes);
+        if let Some(reference) = reference_for(line, &rows) {
+            *line = reference;
         }
     }
+}
+
+/// The reference that should stand in for `text`, if one should.
+///
+/// **One place decides**, because there are two callers and they
+/// disagreed. The guard below lived only on the note path, so a
+/// *printed* row was replaced whatever the arithmetic: `live/t7`
+/// printed a 110-byte row back and got a 143-byte annotation for it,
+/// twice — the harness making the document bigger while saying it was
+/// standing in for something.
+fn reference_for(text: &str, rows: &[(EventId, &serde_json::Value)]) -> Option<String> {
+    let (row, bytes) = copy_of(&[text], rows.iter().copied())?;
+    let reference = reference_to(row, bytes);
+    // **The reference has to be smaller than what it replaces**, or it
+    // is not standing in for anything — it is the bigger of the two
+    // things it could have written.
+    //
+    // This is the floor the retired `NOTE_COPY_MIN_BYTES` was guessing
+    // at, derived instead of chosen: a reference runs about 140 bytes,
+    // so anything shorter is cheaper left alone. Without it a `tell` of
+    // an agent's four-byte status came back as `【snipped - history[20]
+    // holds these 4 bytes…】` — thirty-five times the size, with the
+    // word the reply was about gone.
+    (reference.len() < text.len()).then_some(reference)
 }
 
 /// Rewrite every copied string in `value`, returning how many were
@@ -5500,23 +5524,8 @@ fn substitute_within(
     rows: &[(EventId, &serde_json::Value)],
 ) -> usize {
     match value {
-        serde_json::Value::String(s) => match copy_of(&[s.as_str()], rows.iter().copied()) {
-            // **The reference has to be smaller than what it replaces**,
-            // or it is not standing in for anything — it is the bigger
-            // of the two things it could have written.
-            //
-            // This is the floor the retired `NOTE_COPY_MIN_BYTES` was
-            // guessing at, derived instead of chosen: a reference runs
-            // about 140 bytes, so anything shorter is cheaper left
-            // alone. Without it a `tell` of an agent's four-byte status
-            // came back as `【snipped - history[20] holds these 4
-            // bytes…】` — thirty-five times the size, and the word the
-            // reply was actually about was gone.
-            Some((row, bytes)) => {
-                let reference = reference_to(row, bytes);
-                if reference.len() >= s.len() {
-                    return 0;
-                }
+        serde_json::Value::String(s) => match reference_for(s, rows) {
+            Some(reference) => {
                 *s = reference;
                 1
             }
@@ -10525,6 +10534,40 @@ mod tests {
             "a count is not a payload: {}",
             c.document()
         );
+    }
+
+    /// **A reference that is bigger than what it replaces is not a
+    /// reference**, on either path.
+    ///
+    /// The guard lived only on the note path, so a printed row was
+    /// replaced whatever the arithmetic: `live/t7` printed a 110-byte
+    /// row back and got a 143-byte annotation, twice. One function
+    /// decides now, and this holds both callers to it.
+    #[test]
+    fn a_reference_bigger_than_the_bytes_it_replaces_is_not_written() {
+        let small = "interp dir: ./interp";
+        let rows = [(
+            EventId::new(9),
+            &serde_json::json!({ "stdout": small }) as &serde_json::Value,
+        )];
+        let row_refs: Vec<(EventId, &serde_json::Value)> =
+            rows.iter().map(|(a, b)| (*a, *b)).collect();
+        assert!(
+            copy_of(&[small], row_refs.iter().copied()).is_some(),
+            "the search still calls it a repeat — it is one"
+        );
+        assert!(
+            reference_for(small, &row_refs).is_none(),
+            "but a reference for it would be bigger than the bytes themselves"
+        );
+
+        // The printed path is the one that was missing it.
+        let mut lines = vec![small.to_owned()];
+        let mut c = Conversation::new();
+        c.user_says("go");
+        let _ = &mut c;
+        substitute_printed_rows(&mut lines, c.tree(), c.runner().spine.leaf_id);
+        assert_eq!(lines[0], small, "a print of it is left alone");
     }
 
     /// **A note that copies a row stores a reference to it instead.**
