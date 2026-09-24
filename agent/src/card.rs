@@ -298,7 +298,7 @@ fn the_dialect_table_says_what_the_interpreter_does() {
             Some((un(cells.first()?), un(cells.get(1)?)))
         })
         .collect();
-    assert_eq!(rows.len(), 3, "the table's rows parsed: {rows:?}");
+    assert_eq!(rows.len(), 2, "the table's rows parsed: {rows:?}");
 
     for (expr, expected) in rows {
         // `e` is the card's own word for a caught error, and one row is
@@ -340,7 +340,7 @@ fn every_promise_above_the_tools_is_named_as_one() {
         .split_once("## What you can call")
         .expect("the declaration block")
         .1
-        .split_once("## Three places")
+        .split_once("## Two places")
         .expect("and its end")
         .0;
     let promised: Vec<&str> = decls
@@ -1014,7 +1014,7 @@ mod tests {
         // `card()` shows up as a diff review must look at, not a byte
         // count that silently drifts. Comparing full text (not just a
         // hash) so the diff itself is legible in a failure message.
-        const EXPECTED_LEN: usize = 23849;
+        const EXPECTED_LEN: usize = 23716;
         assert_eq!(
             card().len(),
             EXPECTED_LEN,

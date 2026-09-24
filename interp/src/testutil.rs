@@ -160,7 +160,7 @@ pub fn eval(expr: &str) -> Value {
 /// Like [`eval`], but resolves the result to an owned `String`.
 pub fn eval_str(expr: &str) -> String {
     match run_val(&format!("return ({expr});")) {
-        Value::String(s) => s.as_str().to_owned(),
+        Value::String(s) => s.to_string(),
         other => panic!("not a string: {other:?}"),
     }
 }

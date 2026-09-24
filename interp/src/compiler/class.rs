@@ -3,11 +3,11 @@ use oxc_span::GetSpan;
 
 use crate::builtin::Builtin;
 use crate::span::Span;
-use crate::vm::{Instr, LocalIndex, RcStr, SetMode};
+use crate::vm::{Instr, JsString, LocalIndex, SetMode};
 
 /// One instance method to install on `C.prototype`.
 struct Method<'a> {
-    name: RcStr,
+    name: JsString,
     func: &'a ast::Function<'a>,
     /// Scope lookup key (`scope_by_span`) — the method function's start
     /// offset. Kept separate from `span` below.
@@ -77,7 +77,7 @@ impl super::Compiler {
         // fields, and instance methods. Rejected element kinds (static members,
         // getters/setters, computed/private keys, static blocks, …) error here.
         let mut ctor: Option<&ast::Function> = None;
-        let mut fields: Vec<(RcStr, Option<&ast::Expression>)> = Vec::new();
+        let mut fields: Vec<(JsString, Option<&ast::Expression>)> = Vec::new();
         let mut methods: Vec<Method> = Vec::new();
         for el in &class.body.body {
             match el {
@@ -177,7 +177,7 @@ impl super::Compiler {
         // ── install instance methods on `C.prototype` ────────────────────────
         if !methods.is_empty() {
             self.emit(Instr::Pick(0), span); // dup C
-            self.emit(Instr::ObjGet(RcStr::from("prototype")), span); // C.prototype (lazy-alloc)
+            self.emit(Instr::ObjGet(JsString::from("prototype")), span); // C.prototype (lazy-alloc)
             for m in &methods {
                 let Some(m_scope) = self.scope_for_node(m.key) else {
                     self.error(m.span, "internal error: class method not found in analysis");
@@ -212,9 +212,9 @@ impl super::Compiler {
         // the Step-8 `Object.setPrototypeOf` primitive (which rejects cycles).
         if let Some(sc) = super_class {
             self.emit(Instr::Pick(0), span); // dup C
-            self.emit(Instr::ObjGet(RcStr::from("prototype")), span); // C.prototype
+            self.emit(Instr::ObjGet(JsString::from("prototype")), span); // C.prototype
             self.compile_expr(sc); // Parent
-            self.emit(Instr::ObjGet(RcStr::from("prototype")), span); // Parent.prototype
+            self.emit(Instr::ObjGet(JsString::from("prototype")), span); // Parent.prototype
             // setPrototypeOf(C.prototype, Parent.prototype) → returns C.prototype.
             self.emit(Instr::CallBuiltin(Builtin::ObjSetProtoOf, 2), span);
             self.emit(Instr::Pop(1), span); // drop the returned C.prototype, leaving C
@@ -224,7 +224,7 @@ impl super::Compiler {
 
     /// Extract a class member's property name. Computed (`[expr]`) and private
     /// (`#x`) keys are rejected in the MVP.
-    fn class_key_name(&mut self, key: &ast::PropertyKey, computed: bool) -> Option<RcStr> {
+    fn class_key_name(&mut self, key: &ast::PropertyKey, computed: bool) -> Option<JsString> {
         if computed {
             self.error(
                 key.span().into(),
@@ -233,11 +233,11 @@ impl super::Compiler {
             return None;
         }
         match key {
-            ast::PropertyKey::StaticIdentifier(id) => Some(RcStr::from(id.name.as_str())),
-            ast::PropertyKey::StringLiteral(s) => Some(RcStr::from(s.value.as_str())),
-            ast::PropertyKey::NumericLiteral(n) => {
-                Some(RcStr::from(super::number_key_to_string(n.value).as_str()))
-            }
+            ast::PropertyKey::StaticIdentifier(id) => Some(JsString::from(id.name.as_str())),
+            ast::PropertyKey::StringLiteral(s) => Some(super::cook::string_literal(s)),
+            ast::PropertyKey::NumericLiteral(n) => Some(JsString::from(
+                super::number_key_to_string(n.value).as_str(),
+            )),
             ast::PropertyKey::PrivateIdentifier(_) => {
                 self.error(
                     key.span().into(),

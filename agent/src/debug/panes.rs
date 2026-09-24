@@ -191,7 +191,7 @@ pub fn preview(vm: &VM, v: &Value, max: usize) -> String {
         Value::PosInt(n) => n.to_string(),
         Value::NegInt(n) => n.to_string(),
         Value::Float(f) => format!("{f}"),
-        Value::String(s) => format!("{:?}", s.as_str()),
+        Value::String(s) => format!("{s:?}"),
         // A boxed (captured) slot: dereference its cell.
         Value::Upval(c) => {
             return match vm.cells.get(*c as usize) {
@@ -215,7 +215,7 @@ pub fn preview(vm: &VM, v: &Value, max: usize) -> String {
             };
             format!("Promise#{p}({state})")
         }
-        Value::RegExp(r) => format!("/{}/{}", r.pattern.as_str(), r.flags.as_str()),
+        Value::RegExp(r) => format!("/{}/{}", r.pattern, r.flags),
         Value::Map(_) | Value::Set(_) => vm
             .stack_value_to_json(v, 0)
             .map(|j| j.to_string())
@@ -354,7 +354,11 @@ mod tests {
         }
         let p = preview(&r.vm, &Value::Undefined, 20);
         assert_eq!(p, "undefined");
-        let long = preview(&r.vm, &Value::String(interp::RcStr::from("abcdefghij")), 6);
+        let long = preview(
+            &r.vm,
+            &Value::String(interp::JsString::from("abcdefghij")),
+            6,
+        );
         assert!(long.ends_with('…'), "{long}");
     }
 }

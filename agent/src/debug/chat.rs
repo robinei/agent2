@@ -1126,9 +1126,7 @@ impl ChatState {
                             *idx += 1;
                             detail
                         };
-                        for (k, line) in
-                            self.entry_lines(i, *kind, text, render_markdown, width)
-                        {
+                        for (k, line) in self.entry_lines(i, *kind, text, render_markdown, width) {
                             out.push((k, line, detail.clone(), *id));
                         }
                     }
@@ -2019,7 +2017,8 @@ mod tests {
     /// of the listing.
     #[test]
     fn every_cell_fence_is_punctuation_and_none_of_it_reaches_the_pane() {
-        let source = "```js\nconst a = 1;\n```\n```js\nconst b = 2;\n```\n```js\nconst c = 3;\n```\n";
+        let source =
+            "```js\nconst a = 1;\n```\n```js\nconst b = 2;\n```\n```js\nconst c = 3;\n```\n";
         let (lines, dialect) = unfenced(source);
         assert_eq!(dialect, Some("js"), "the lid still names the dialect");
         assert!(

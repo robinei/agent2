@@ -1015,7 +1015,7 @@ pub(crate) fn ta_join(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     };
     let sep = match args.get(vm, 1) {
         Value::Undefined => ",".to_string(),
-        v => vm.to_js_string(v, 0).as_str().to_owned(),
+        v => vm.to_js_string(v, 0).to_string(),
     };
     let (length, elem_size, kind, buf_ptr, byte_offset) = ta_view!(vm, ta_ptr);
     let mut joined = String::new();
@@ -1025,9 +1025,9 @@ pub(crate) fn ta_join(vm: &mut VM, args: Args) -> Result<Value, VMError> {
         }
         let off = byte_offset + i * elem_size;
         let v = ta_decode_bytes(kind, &vm.buffers[buf_ptr as usize][off..]);
-        joined.push_str(vm.to_js_string(&v, 0).as_str());
+        joined.push_str(&vm.to_js_string(&v, 0).to_utf8_lossy());
     }
-    Ok(Value::String(crate::vm::RcStr::from(joined)))
+    Ok(Value::String(crate::vm::JsString::from(joined)))
 }
 
 /// `ta.fill(value[, start[, end]])` — fill in-place, returns receiver.

@@ -291,7 +291,7 @@ fn pe_const_truthy(i: &Instr) -> Option<bool> {
         Instr::PushPosInt(u) => *u != 0,
         Instr::PushNegInt(_) => true, // always negative ⇒ nonzero ⇒ truthy
         Instr::PushFloat(n) => *n != 0.0 && !n.is_nan(),
-        Instr::PushStr(s) => !s.as_str().is_empty(),
+        Instr::PushStr(s) => !s.as_units().is_empty(),
         _ => return None,
     })
 }

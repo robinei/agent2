@@ -202,7 +202,7 @@ fn alloc_baseline_makecounter() {
     // Verify correctness.
     assert_eq!(input_val(&vm, "r"), crate::testutil::num(101.0));
     match input_val(&vm, "s") {
-        Value::String(s) => assert_eq!(s.len(), 101),
+        Value::String(s) => assert_eq!(s.as_units().len(), 101),
         other => panic!("not a string: {other:?}"),
     }
 }

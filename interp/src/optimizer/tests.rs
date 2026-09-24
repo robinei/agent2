@@ -1,7 +1,7 @@
 use super::*;
 use crate::builtin::Builtin;
 use crate::span::Span;
-use crate::vm::RcStr;
+use crate::vm::JsString;
 use thin_vec::ThinVec;
 
 fn s0(n: usize) -> Vec<Span> {
@@ -69,7 +69,7 @@ fn peephole_constant_branch_folding() {
     // "" is falsy, "0" is truthy.
     assert_eq!(
         peephole(
-            vec![Instr::PushStr(RcStr::from("")), Instr::JFalse(0)],
+            vec![Instr::PushStr(JsString::from("")), Instr::JFalse(0)],
             s0(2)
         )
         .0,
@@ -174,13 +174,13 @@ fn constfold_string_and_compare_and_unary() {
     // String concat.
     let (c, _) = peephole(
         vec![
-            Instr::PushStr(RcStr::from("a")),
-            Instr::PushStr(RcStr::from("b")),
+            Instr::PushStr(JsString::from("a")),
+            Instr::PushStr(JsString::from("b")),
             Instr::Add,
         ],
         s0(3),
     );
-    assert_eq!(c, vec![Instr::PushStr(RcStr::from("ab"))]);
+    assert_eq!(c, vec![Instr::PushStr(JsString::from("ab"))]);
     // Comparison → Bool.
     let (c, _) = peephole(
         vec![Instr::PushPosInt(1), Instr::PushPosInt(2), Instr::Lt],

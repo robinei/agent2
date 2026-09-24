@@ -230,20 +230,18 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        Some("login") => {
-            match host::openai_oauth::login() {
-                Ok(_) => {
-                    let path = host::openai_oauth::token_path()
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_default();
-                    eprintln!("Signed in. Token saved to {path} (mode 0600).");
-                }
-                Err(e) => {
-                    eprintln!("{e}");
-                    std::process::exit(1);
-                }
+        Some("login") => match host::openai_oauth::login() {
+            Ok(_) => {
+                let path = host::openai_oauth::token_path()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default();
+                eprintln!("Signed in. Token saved to {path} (mode 0600).");
             }
-        }
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        },
         Some("capture") => {
             if let Err(e) = capture_document(&args[2..]) {
                 eprintln!("{e}");

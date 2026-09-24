@@ -3303,11 +3303,16 @@ mod tests {
     fn a_spinner_marks_the_wait_where_the_next_message_will_land() {
         let mut app = a_session_with_one_of_everything();
         assert!(
-            Screen::chat(&app, 64, 26).find("waiting for the model").is_none(),
+            Screen::chat(&app, 64, 26)
+                .find("waiting for the model")
+                .is_none(),
             "nothing is happening, so nothing is claimed"
         );
 
-        app.busy = Some(("thinking".into(), Instant::now() - std::time::Duration::from_secs(47)));
+        app.busy = Some((
+            "thinking".into(),
+            Instant::now() - std::time::Duration::from_secs(47),
+        ));
         let screen = Screen::chat(&app, 64, 26);
         let row = screen
             .find("waiting for the model")
@@ -3320,7 +3325,9 @@ mod tests {
 
         // **Last of all**: it marks where the answer will appear, so
         // every row of the conversation is above it.
-        let last = screen.find("a.txt is 5 characters").expect("the final prose");
+        let last = screen
+            .find("a.txt is 5 characters")
+            .expect("the final prose");
         assert!(row > last, "the spinner is below the transcript");
 
         // A running program says what it is, not the same word.
@@ -3333,7 +3340,11 @@ mod tests {
 
         // And it goes when the work does.
         app.busy = None;
-        assert!(Screen::chat(&app, 64, 26).find("running a program").is_none());
+        assert!(
+            Screen::chat(&app, 64, 26)
+                .find("running a program")
+                .is_none()
+        );
     }
 
     /// **Air falls between turns, and never inside one.** A turn is the
@@ -3353,7 +3364,11 @@ mod tests {
         let screen = Screen::chat(&app, 64, 26);
         let user = screen.find("how long is a.txt").expect("the question");
         assert_eq!(screen.inner(user - 1), "", "air above the person's turn");
-        assert_eq!(screen.inner(user + 1), "", "and below it, before the answer");
+        assert_eq!(
+            screen.inner(user + 1),
+            "",
+            "and below it, before the answer"
+        );
 
         // One response, one unbroken run: lid, source, prose, call,
         // closing prose, with the call in the middle of it rather than
@@ -3492,7 +3507,10 @@ mod tests {
         println!("--- with the block selected:");
         println!("{}", Screen::chat(&app, 64, 26).dump());
         app.selected_program = None;
-        app.busy = Some(("thinking".into(), Instant::now() - std::time::Duration::from_secs(47)));
+        app.busy = Some((
+            "thinking".into(),
+            Instant::now() - std::time::Duration::from_secs(47),
+        ));
         println!("--- waiting on the model:");
         println!("{}", Screen::chat(&app, 64, 26).dump());
     }

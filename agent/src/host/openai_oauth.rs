@@ -362,14 +362,16 @@ pub fn login() -> Result<Tokens, String> {
 
 /// A usable bearer, refreshing if the stored one is stale.
 pub fn access_token() -> Result<String, String> {
-    let stored = load().ok_or(
-        "not signed in — run `agent login` to authorise with a ChatGPT subscription",
-    )?;
+    let stored = load()
+        .ok_or("not signed in — run `agent login` to authorise with a ChatGPT subscription")?;
     if !stored.stale() {
         return Ok(stored.access_token);
     }
     let Some(refresh) = stored.refresh_token.clone() else {
-        return Err("the stored token has expired and there is no refresh token — run `agent login` again".into());
+        return Err(
+            "the stored token has expired and there is no refresh token — run `agent login` again"
+                .into(),
+        );
     };
     let mut fresh = form_post(&[
         ("grant_type", "refresh_token"),
@@ -428,7 +430,11 @@ mod tests {
             &[0xfb, 0xff],
             br#"{"https://api.openai.com/auth":{"chatgpt_account_id":"abc-123"}}"#,
         ] {
-            assert_eq!(b64url_decode(&b64url(case)).as_deref(), Some(case), "{case:?}");
+            assert_eq!(
+                b64url_decode(&b64url(case)).as_deref(),
+                Some(case),
+                "{case:?}"
+            );
         }
         assert_eq!(b64url_decode("Zm9vYmFy==").as_deref(), Some(&b"foobar"[..]));
         assert!(b64url_decode("not valid!").is_none());

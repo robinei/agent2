@@ -215,10 +215,8 @@ pub fn iter_source(vm: &mut VM, args: Args) -> Result<Value, VMError> {
         // rather than a new rule. It costs the same array those two
         // allocate.
         Value::String(s) => {
-            let chars: ThinVec<Value> = s
-                .as_str()
-                .chars()
-                .map(|c| Value::String(c.to_string().into()))
+            let chars: ThinVec<Value> = crate::units::code_points(s.as_units())
+                .map(|cp| Value::String(crate::vm::JsString::from_units(cp)))
                 .collect();
             Ok(vm.alloc_array(chars))
         }

@@ -1,5 +1,13 @@
 # Phase 30 — strings stop being bytes
 
+**Shipped 2026-09-24.** Conformance 8,321 → 8,374 (+53, inside the +50–75
+this document predicted and outside the ±wrong band it named), with one
+was-Pass-now-Fail that is not a regression — see the correction to Stage 5
+below. `interp` 1,118 → 1,132 tests, `agent` 731. The estimate is left as
+written, because an estimate that is edited after the fact cannot be scored.
+Three things it got wrong are corrected in place and marked **CORRECTION**;
+everything else held.
+
 Read `25_JS_DIALECT.md` first. Its organising idea is the whole case for
 this file: *a loud divergence costs a round trip, a silent divergence
 costs the task*. The byte-string model was chosen as a loud divergence —
@@ -90,6 +98,16 @@ so. `interp/src/compiler/expr.rs:22` reads that field and interns it.
 **This is independent of any representation choice and must be fixed
 separately** — see Stage 5, and see the honesty check at the end of the
 recommendation.
+
+> **CORRECTION — it does say so.** As of oxc 0.134 both `StringLiteral`
+> and `TemplateElement` carry a `lone_surrogates: bool`, and when it is
+> set, `value` is a documented in-band encoding: U+FFFD followed by four
+> hex digits per lone surrogate, and U+FFFD followed by `fffd` for a
+> genuine U+FFFD. The seven bytes above *are* that encoding, read as if
+> they were text. The rest of the paragraph holds — it is still
+> independent of the representation and still had to be fixed separately
+> — but see the Stage 5 correction: it made that stage about a sixth of
+> the size planned here.
 
 **And `charCodeAt`, `codePointAt`, `normalize`, `isWellFormed`,
 `toWellFormed` do not exist at all.** There is no way in this dialect to
@@ -518,6 +536,17 @@ Regex-heavy programs — and agent programs use `split(/…/)`, `match`,
 Nothing measured this; it should be, on a representative `replace` over
 a 100 KB file, before Stage 4 is called done.
 
+**CORRECTION — measured, and it costs nothing.** Worst case 1.03× on
+100 KB of ASCII source; the literal-prefix case is 0.85×, i.e. *faster*,
+because `Ucs2Input` indexes fixed-width where `&str` decodes variable-width
+UTF-8 on every position step, and that saving is about the size of the
+prefilter's. The instrument is `interp/tests/regex_input_cost.rs`
+(`#[ignore]`d, fails only above 5×). Note the shape of the near-miss: the
+first two patterns measured had 410 matches in 100 KB, where a prefilter
+has almost nothing to skip, and would have flattered the result. The row
+that answers the question is one match in the whole corpus — the
+prefilter's best case — and it is the 1.03×.
+
 **Does it help conformance?** Barely — see the numbers. 1,296 RegExp
 files fail; the attributable ones are about six. The rest are `Symbol.*`
 protocol methods, the regexp-modifiers proposal, and regex *parser*
@@ -735,6 +764,32 @@ per the spec. ≈250 lines, one new module, touching
 `compiler/call.rs:659`, `compiler/destructure.rs:41`/`:72`,
 `analyzer/const_fns.rs:41`.
 
+**CORRECTION — this is not what was needed, and the difference is 6×.**
+Re-cooking from raw source would have meant a second implementation of JS
+string escapes maintained beside the parser's, and being subtly wrong about
+one of them. It is unnecessary: oxc already preserves lone surrogates
+through the `lone_surrogates` flag described above, so the whole job is
+undoing that encoding — ≈40 lines in `compiler/cook.rs`, with oxc still
+doing every escape form it already did. The two cases collapse, which is
+why it is so small: the four hex digits are the code unit to emit whatever
+they say, and `fffd` emits U+FFFD, which is exactly what the escaped escape
+means. The file list above was right, `analyzer/const_fns.rs:41` included —
+and that last one was the interesting site, because `ConstValue::Str` held
+a `String`, so `const s = "\uD800"` propagated the encoding while the same
+literal inline compiled correctly. Two spellings of one literal
+disagreeing: the shape of this whole phase, reappearing inside the fix for
+it.
+
+**What found that hole**, and the one was-Pass-now-Fail of the sweep:
+`staging/sm/RegExp/unicode-back-reference.js`. It is not a regression. The
+file tests `/u` back-reference behaviour around lone surrogates *in the
+subject*, and until this stage no subject could contain one, so every
+assertion ran against mangled input — green because it was testing
+nothing, which is `39b5559` and `736093d` in a third place. The residual
+failure is regress's: `/foo(.+)bar\1/u.exec("foo\uD834bar\uD834\uDC00")`
+must be `null`, because a back-reference cannot match a lead surrogate that
+has its trail surrogate, and regress matches it anyway.
+
 **Gate:** `"\uD800".length === 1`, `"\uD800".charCodeAt(0) === 55296`,
 `"\uD83D\uDE00".length === 2`. Conformance not lower.
 
@@ -756,6 +811,18 @@ serde.
 
 **Gate:** `built-ins/JSON` subset ≥ 23 pass (today 22);
 `JSON.stringify("\uD834") === '"\\ud834"'`; `cargo test -p agent` green.
+
+**CORRECTION — the stringify half shipped; the parse half did not, and on
+purpose.** 24 pass. The serializer is there, and it walks code *points*
+rather than units, because a paired surrogate beside a lone one must still
+come out as the character. The parse side was left alone because the claim
+motivating it does not survive measurement: of the 142 failing
+`built-ins/JSON` tests, none turns on lone-surrogate escapes — 20 are
+`json-parse-with-source` and the rest are error-*type* failures, where the
+tests want `SyntaxError` and this dialect raises `ValueError`. Replacing
+serde's reader is a separate change with no evidence behind it yet.
+`JSON.parse('"\\ud834"')` therefore still throws, which makes the round
+trip one-way; that is pinned as a test so it is not mistaken for working.
 
 ### Stage 7 — `edit.rs` and the card
 
@@ -828,3 +895,14 @@ in a test.
 - **Unpaired surrogates leaving the VM are lossy and always will be.**
   JSON has no representation for them. The only question was whether to
   be loud or quiet about it, and this plan chooses quiet with a counter.
+  *(Shipped without the counter: `to_utf8_lossy` is the single function
+  that decides, so it is one edit away, but nothing yet reads it.)*
+- **`JSON.parse` cannot read a lone-surrogate escape back**, so the round
+  trip through JSON is one-way. See the Stage 6 correction.
+- **A `Map` or `Set` nested inside a `JSON.stringify` argument** still
+  narrows its strings through `stack_value_to_json`, so a lone surrogate
+  in one of those is U+FFFD. `JSON.stringify` of a Map is already a
+  divergence (JS gives `{}`), so this is a corner of a corner.
+- **regress's `/u` back-references** can match a lead surrogate that has
+  its trail surrogate. One test262 file, newly visible rather than newly
+  broken — see the Stage 5 correction.

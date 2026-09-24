@@ -8,11 +8,12 @@ pub mod builtin;
 pub mod compiler;
 pub mod debuginfo;
 pub mod diag;
+pub mod js_string;
 pub mod optimizer;
 pub mod prelude;
-pub mod rc_str;
 pub mod repl;
 pub mod span;
+pub mod units;
 pub mod vm;
 
 #[cfg(test)]
@@ -21,7 +22,7 @@ pub(crate) mod testutil;
 pub use compiler::{Program, compile, compile_for_test262, count_statements};
 pub use debuginfo::{DebugTable, FnDebug};
 pub use diag::{DiagKind, Diagnostic};
-pub use rc_str::RcStr;
+pub use js_string::JsString;
 pub use repl::{Repl, ReplCore};
 pub use span::Span;
 pub use vm::{

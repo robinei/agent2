@@ -286,11 +286,7 @@ fn settle_at_dispatch_verbs_yield_settle_with_or_without_await() {
         ("fork()", "fork", vec![]),
         ("list_agents()", "list_agents", vec![]),
         ("fetch_history(7)", "fetch_history", vec![Value::PosInt(7)]),
-        (
-            "note_history(1)",
-            "note_history",
-            vec![Value::PosInt(1)],
-        ),
+        ("note_history(1)", "note_history", vec![Value::PosInt(1)]),
         (
             "answer(1, 2, 3)",
             "answer",
@@ -501,7 +497,7 @@ fn spawn_yields_its_handle_without_a_source_level_await() {
     let prog = compile("const h = spawn(\"charter\"); return h;").expect("compiles");
     let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
     match vm.step(u64::MAX).unwrap() {
-        StepResult::Settle { call } => assert_eq!(call.name.as_str(), "spawn"),
+        StepResult::Settle { call } => assert_eq!(call.name, "spawn"),
         other => panic!("expected the spawn to yield, got {other:?}"),
     }
     vm.push_settled(Value::Float(7.0)).unwrap();
@@ -652,7 +648,7 @@ fn a_settle_in_a_plain_arrow_makes_no_strand() {
     loop {
         match vm.step(u64::MAX).expect("no trap") {
             StepResult::Settle { call } => {
-                assert_eq!(call.name.as_str(), "spawn");
+                assert_eq!(call.name, "spawn");
                 handles += 1.0;
                 vm.push_settled(Value::Float(handles)).expect("outstanding");
             }
@@ -685,7 +681,7 @@ fn a_throw_after_a_settle_belongs_to_the_caller() {
     let prog = compile(src).expect("compiles");
     let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
     match vm.step(u64::MAX).expect("no trap") {
-        StepResult::Settle { call } => assert_eq!(call.name.as_str(), "spawn"),
+        StepResult::Settle { call } => assert_eq!(call.name, "spawn"),
         other => panic!("expected a settle, got {other:?}"),
     }
     vm.push_settled(Value::String("h1".into()))
@@ -781,7 +777,7 @@ fn every_harness_verb_lowers_to_a_host_call() {
             "finish" => prog.code.iter().any(|i| matches!(i, Instr::Finish)),
             _ => prog.code.iter().any(|i| {
                 matches!(i, Instr::Invoke(n, _) | Instr::Notify(n, _) | Instr::Settle(n, _)
-                    if n.as_str() == *verb)
+                    if n.eq_str(verb))
             }),
         };
         assert!(emitted, "`{verb}` does not lower to a host call");

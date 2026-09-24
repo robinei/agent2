@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::compiler::compile;
-use crate::rc_str::RcStr;
+use crate::js_string::JsString;
 use crate::testutil;
 use crate::testutil::{eval, eval_str};
 use crate::vm::{ErrorKind, Instr, StepResult, VM, Value};
@@ -28,7 +28,7 @@ fn member_and_index_assignment() {
     match input_val(&vm, "obj") {
         Value::Object(p) => {
             let o = &vm.objects[p as usize];
-            assert_eq!(o.map.get(&RcStr::from("a")), Some(&Value::PosInt(9)))
+            assert_eq!(o.map.get(&JsString::from("a")), Some(&Value::PosInt(9)))
         }
         other => panic!("{other:?}"),
     }
@@ -398,7 +398,7 @@ fn computed_object_key_with_spread() {
     );
     match input_val(&vm, "r") {
         Value::String(s) => {
-            let json = s.as_str();
+            let json = &s.to_string();
             assert!(json.contains("\"a\":1"), "got {json}");
             assert!(json.contains("\"b\":2"), "got {json}");
             assert!(json.contains("\"c\":3"), "got {json}");
@@ -545,11 +545,8 @@ fn input_is_ptr_zero() {
     let vm = testutil::run_vm("input.a = 1; input.r = JSON.stringify(input);");
     match input_val(&vm, "r") {
         Value::String(s) => {
-            assert!(
-                s.as_str().contains("\"a\":1"),
-                "got {}",
-                s.as_str().to_owned()
-            )
+            let got = s.to_string();
+            assert!(got.contains("\"a\":1"), "got {got}")
         }
         other => panic!("{other:?}"),
     }
@@ -1109,7 +1106,7 @@ fn new_constructor_returning_undefined_yields_instance() {
             "const p = new P();",
             "return p.tag;"
         )),
-        Value::String(RcStr::from("ok"))
+        Value::String(JsString::from("ok"))
     );
 }
 
@@ -1125,7 +1122,7 @@ fn function_prototype_lazy_allocation() {
             "const p2 = F.prototype;",
             "return p2.tag;"
         )),
-        Value::String(RcStr::from("proto"))
+        Value::String(JsString::from("proto"))
     );
 }
 
@@ -1190,7 +1187,7 @@ fn new_keyword_compiles_for_user_functions() {
             "const e = new Empty();",
             "return typeof e;"
         )),
-        Value::String(RcStr::from("object"))
+        Value::String(JsString::from("object"))
     );
 }
 
@@ -1264,7 +1261,7 @@ fn bound_function_is_function_type() {
     // `typeof` on a bound function returns `"function"`.
     assert_eq!(
         testutil::run_val("const f = (function(){}).bind(null); return typeof f;"),
-        Value::String(RcStr::from("function"))
+        Value::String(JsString::from("function"))
     );
 }
 
@@ -1428,7 +1425,7 @@ fn bound_function_to_string() {
     // `String(f.bind(x))` should return a JS-like string representation.
     assert_eq!(
         testutil::run_val("return String((function(){}).bind(null));"),
-        Value::String(RcStr::from("function () { [native code] }"))
+        Value::String(JsString::from("function () { [native code] }"))
     );
 }
 

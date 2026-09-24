@@ -189,7 +189,7 @@ impl Runner {
             // fails at its call site — which, being a throw rather than
             // a rejection, is exactly what the paused program shows.
             Ok(StepResult::Settle { call }) => {
-                let msg = interp::Value::String(interp::RcStr::from(
+                let msg = interp::Value::String(interp::JsString::from(
                     format!(
                         "`{}` needs a harness; this is the debugger's stub host",
                         call.name
@@ -247,11 +247,11 @@ impl Runner {
                     .args
                     .into_iter()
                     .next()
-                    .unwrap_or_else(|| Value::String(interp::RcStr::from("tool failed")));
+                    .unwrap_or_else(|| Value::String(interp::JsString::from("tool failed")));
                 let _ = self.vm.reject_promise(call.promise, v);
             }
             other => {
-                let msg = Value::String(interp::RcStr::from(
+                let msg = Value::String(interp::JsString::from(
                     format!("unknown stub tool `{other}` (have: echo, wait_until, fail)").as_str(),
                 ));
                 let _ = self.vm.reject_promise(call.promise, msg);

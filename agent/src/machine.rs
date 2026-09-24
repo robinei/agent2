@@ -30,7 +30,7 @@ use std::collections::HashMap;
 use std::io;
 
 use interp::{
-    InvokeCall, PromisePtr, RcStr, ResumeMode, SettleCall, StepResult, VM, VMError, Value,
+    InvokeCall, JsString, PromisePtr, ResumeMode, SettleCall, StepResult, VM, VMError, Value,
 };
 
 use crate::host::ProgramStatus;
@@ -2163,7 +2163,7 @@ impl Runner {
                                 .expect("pending promise is settleable");
                         }
                         Err(msg) => {
-                            let val = Value::String(RcStr::from(msg.as_str()));
+                            let val = Value::String(JsString::from(msg.as_str()));
                             vm.reject_promise(promise, val)
                                 .expect("pending promise is settleable");
                         }
@@ -2966,10 +2966,7 @@ impl Runner {
                 // them would be a rule with nothing behind it.
                 let (id, from_object) = match args.first() {
                     Some(v) if v.is_u64() => (v.as_u64(), None),
-                    Some(v) => (
-                        v.get("id").and_then(|i| i.as_u64()),
-                        Some(v.clone()),
-                    ),
+                    Some(v) => (v.get("id").and_then(|i| i.as_u64()), Some(v.clone())),
                     None => (None, None),
                 };
                 let Some(id) = id.filter(|n| *n > 0).map(EventId::new) else {
@@ -3019,7 +3016,11 @@ impl Runner {
                 };
                 tree.append(
                     &mut self.spine,
-                    EventPayload::Render { of: id, mode, value },
+                    EventPayload::Render {
+                        of: id,
+                        mode,
+                        value,
+                    },
                 )?;
                 self.settle(Ok(serde_json::json!(id.as_u64())));
                 Ok(true)
@@ -3065,7 +3066,7 @@ impl Runner {
     /// uncaught throw takes.
     fn settle_err(&mut self, message: &str) {
         let vm = self.settling_vm();
-        let v = Value::String(RcStr::from(message));
+        let v = Value::String(JsString::from(message));
         vm.settle_throw(v).expect("a Settle is outstanding");
     }
 
@@ -3127,7 +3128,7 @@ impl Runner {
     /// the rejection is the program's to catch (6_LANGUAGE Part B), and
     /// only an uncaught one traps into a condition.
     fn reject_call(&mut self, promise: PromisePtr, message: &str) {
-        let v = Value::String(RcStr::from(message));
+        let v = Value::String(JsString::from(message));
         self.running_vm()
             .reject_promise(promise, v)
             .expect("fresh promise");
@@ -4138,7 +4139,9 @@ impl Runner {
         // The byte path stays for the two cases where there is nothing
         // to count against: no window configured, and no reply has
         // reported a `prompt_tokens` yet.
-        let Some((measured, limit, unit)) = self.fullness(tree, crate::host::context_tokens(), rendered, budget) else {
+        let Some((measured, limit, unit)) =
+            self.fullness(tree, crate::host::context_tokens(), rendered, budget)
+        else {
             return Ok(None);
         };
         self.last_fullness = Some((measured, limit, unit));
@@ -4370,10 +4373,7 @@ impl Runner {
             .map(|e| e.id)
             .collect();
         for of in blocks {
-            tree.append(
-                &mut self.spine,
-                EventPayload::Compacted { of, text: None },
-            )?;
+            tree.append(&mut self.spine, EventPayload::Compacted { of, text: None })?;
         }
         Ok(())
     }
@@ -5321,15 +5321,13 @@ fn substitute_within(
     rows: &[(EventId, &serde_json::Value)],
 ) -> usize {
     match value {
-        serde_json::Value::String(s) => {
-            match copy_of(&[s.as_str()], rows.iter().copied()) {
-                Some((row, bytes)) => {
-                    *s = reference_to(row, bytes);
-                    1
-                }
-                None => 0,
+        serde_json::Value::String(s) => match copy_of(&[s.as_str()], rows.iter().copied()) {
+            Some((row, bytes)) => {
+                *s = reference_to(row, bytes);
+                1
             }
-        }
+            None => 0,
+        },
         serde_json::Value::Array(xs) => xs.iter_mut().map(|x| substitute_within(x, rows)).sum(),
         serde_json::Value::Object(m) => m.values_mut().map(|x| substitute_within(x, rows)).sum(),
         _ => 0,
@@ -5486,8 +5484,7 @@ pub(crate) fn menu_rows(
             // `history.replace` that did not shrink the thing it named
             // would be the same broken promise a `history.remove` was.
             // Something else stands here.
-            if let Some(crate::tree::CompactedView { text: Some(text) }) =
-                compacted.get(&event.id)
+            if let Some(crate::tree::CompactedView { text: Some(text) }) = compacted.get(&event.id)
             {
                 return Some(Artifact {
                     id,
@@ -6457,7 +6454,6 @@ fn asker_of(tree: &Tree, question: EventId) -> Option<Author> {
 #[cfg(test)]
 mod tests {
 
-
     use super::*;
     use crate::testkit::{Conversation, Ending, Invariant};
     use serde_json::json;
@@ -6610,7 +6606,7 @@ mod tests {
                     let vm = state.settling_vm();
                     let unanswered = vm.stack.iter().any(|v| {
                         matches!(v, Value::String(s)
-                            if s.as_str().contains("is not a settle-at-dispatch verb"))
+                            if s.to_string().contains("is not a settle-at-dispatch verb"))
                     });
                     assert!(
                         !unanswered,
@@ -7814,7 +7810,10 @@ mod tests {
             .resolve_address(&tree, Some(&json!("parent")))
             .unwrap_err();
         assert!(err.contains("no parent"), "{err}");
-        assert!(err.contains("user"), "and says who it does answer to: {err}");
+        assert!(
+            err.contains("user"),
+            "and says who it does answer to: {err}"
+        );
 
         // `"user"` still means the person, from anywhere.
         assert!(matches!(
@@ -9653,9 +9652,7 @@ mod tests {
             .path_events(state.spine.leaf_id)
             .iter()
             .filter_map(|e| match &e.payload {
-                EventPayload::Render { mode, value, .. } => {
-                    Some((*mode, note_text(value)))
-                }
+                EventPayload::Render { mode, value, .. } => Some((*mode, note_text(value))),
                 _ => None,
             })
             .collect();
@@ -10150,7 +10147,10 @@ mod tests {
         // The shape every one of the five had: a result's field, put
         // under a key of its own.
         let mut c = Conversation::new();
-        c.answers("bash", serde_json::json!({ "status": 0, "stdout": bulk.clone() }));
+        c.answers(
+            "bash",
+            serde_json::json!({ "status": 0, "stdout": bulk.clone() }),
+        );
         c.reply(
             "```js\nconst r = await tools.bash(\"cat log\");\n\
              history.note({ snapshot: r.stdout });\n```\n",
@@ -10169,7 +10169,8 @@ mod tests {
         let v = noted(&c);
         let stored = v["snapshot"].as_str().expect("still a string");
         assert!(
-            stored.contains(&format!("[{row}]")) && stored.contains(&format!("history.keep({row})")),
+            stored.contains(&format!("[{row}]"))
+                && stored.contains(&format!("history.keep({row})")),
             "the reference names the row and the verb: {stored}"
         );
         assert!(
@@ -10187,7 +10188,10 @@ mod tests {
         // survives beside the reference — refusing the call would have
         // thrown this sentence away with it.
         let mut c = Conversation::new();
-        c.answers("bash", serde_json::json!({ "status": 0, "stdout": bulk.clone() }));
+        c.answers(
+            "bash",
+            serde_json::json!({ "status": 0, "stdout": bulk.clone() }),
+        );
         c.reply(
             "```js\nconst r = await tools.bash(\"cat log\");\n\
              history.note({ finding: \"it stalls at batch 7\", dump: r.stdout });\n```\n",
@@ -10202,7 +10206,10 @@ mod tests {
         // A sentence in front of the dump is still the dump — the
         // variation a whole-string comparison misses.
         let mut c = Conversation::new();
-        c.answers("bash", serde_json::json!({ "status": 0, "stdout": bulk.clone() }));
+        c.answers(
+            "bash",
+            serde_json::json!({ "status": 0, "stdout": bulk.clone() }),
+        );
         c.reply(
             "```js\nconst r = await tools.bash(\"cat log\");\n\
              history.note(`the log said:\\n${r.stdout}`);\n```\n",
@@ -10225,7 +10232,10 @@ mod tests {
              history.note({ finding: \"batch 7 is where it stalls. \".repeat(90) });\n```\n",
         );
         assert!(
-            noted(&c)["finding"].as_str().unwrap().starts_with("batch 7"),
+            noted(&c)["finding"]
+                .as_str()
+                .unwrap()
+                .starts_with("batch 7"),
             "a long finding of the reply's own words is untouched"
         );
     }
@@ -10254,7 +10264,6 @@ mod tests {
             "and the row is on the menu, with an id a later reply can name: {doc}"
         );
     }
-
 
     /// The search's own edges, away from the handler.
     #[test]
@@ -10285,7 +10294,7 @@ mod tests {
         assert_eq!(bytes, 800, "the shared run, not the 4,800-byte string");
     }
 
-        /// **A result its tool marks `show_once` is peeked without being
+    /// **A result its tool marks `show_once` is peeked without being
     /// asked, and an explicit `keep` or `peek` overrides it.**
     ///
     /// The override is not a special case: the harness appends an
@@ -10316,18 +10325,27 @@ mod tests {
 
         // Left alone, the harness peeks it.
         let mut c = Conversation::new();
-        c.answers("replace_file", serde_json::json!({ "version": "v2", "diff": "@@\n+a" }));
+        c.answers(
+            "replace_file",
+            serde_json::json!({ "version": "v2", "diff": "@@\n+a" }),
+        );
         c.reply("```js\nawait tools.replace_file(\"a\", \"x\", \"v1\");\n```\n");
         assert_eq!(
             seen(&c),
             vec![(4, crate::types::RenderMode::Peeked)],
             "the tool asked for one look and got it"
         );
-        assert!(c.document().contains("@@"), "and it is in front of the reply");
+        assert!(
+            c.document().contains("@@"),
+            "and it is in front of the reply"
+        );
 
         // A program that wants it kept says so, and wins by being later.
         let mut c = Conversation::new();
-        c.answers("replace_file", serde_json::json!({ "version": "v2", "diff": "@@\n+a" }));
+        c.answers(
+            "replace_file",
+            serde_json::json!({ "version": "v2", "diff": "@@\n+a" }),
+        );
         c.reply("```js\nconst w = await tools.replace_file(\"a\", \"x\", \"v1\");\nhistory.keep(w);\n```\n");
         let r = seen(&c);
         assert_eq!(
@@ -10358,7 +10376,10 @@ mod tests {
     #[test]
     fn keeping_several_rows_is_a_map_and_the_refusal_says_so() {
         let mut c = Conversation::new();
-        c.answers("read_file", serde_json::json!({ "content": "x", "version": "v" }));
+        c.answers(
+            "read_file",
+            serde_json::json!({ "content": "x", "version": "v" }),
+        );
         c.reply(
             "```js\nconst rs = [await tools.read_file(\"a\"), await tools.read_file(\"b\")];\n\
              try { history.keep(rs.map((r) => r.id)); } catch (e) { history.note(String(e)); }\n```\n",
@@ -10371,7 +10392,10 @@ mod tests {
 
         // And the map itself works: one row shown per result.
         let mut c = Conversation::new();
-        c.answers("read_file", serde_json::json!({ "content": "x", "version": "v" }));
+        c.answers(
+            "read_file",
+            serde_json::json!({ "content": "x", "version": "v" }),
+        );
         c.reply(
             "```js\nconst rs = [await tools.read_file(\"a\"), await tools.read_file(\"b\")];\n\
              rs.map((r) => history.keep(r));\n```\n",
@@ -11387,7 +11411,6 @@ mod tests {
             .map(|m| (m.role, m.content.clone()))
             .collect()
     }
-
 
     /// **A marker the model wrote is replaced, not doubled.** It reads
     /// these in its own turns and writes them back — that is what

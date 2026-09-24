@@ -3,7 +3,7 @@ use oxc_span::GetSpan;
 
 use crate::builtin::Builtin;
 use crate::span::Span;
-use crate::vm::{Instr, RcStr, Value};
+use crate::vm::{Instr, JsString, Value};
 
 impl super::Compiler {
     /// Every expression leaves exactly one value on the stack (the
@@ -20,7 +20,9 @@ impl super::Compiler {
                 _ => unreachable!(),
             },
             ast::Expression::StringLiteral(lit) => {
-                let s = self.intern_string(lit.value.as_str());
+                // Not `lit.value.as_str()`: a literal holding a lone surrogate
+                // reaches us as oxc's in-band encoding. See `cook.rs`.
+                let s = self.intern_units(&super::cook::string_literal_units(lit));
                 self.emit(Instr::PushStr(s), lit.span.into());
             }
             ast::Expression::BooleanLiteral(lit) => {
@@ -216,7 +218,7 @@ impl super::Compiler {
             },
         }
         self.emit(
-            Instr::ObjNew(vec![RcStr::from("name"), RcStr::from("message")].into()),
+            Instr::ObjNew(vec![JsString::from("name"), JsString::from("message")].into()),
             span,
         );
     }

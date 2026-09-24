@@ -1670,11 +1670,11 @@ mod tests {
         let existing = dir.path().join("a.rs");
         std::fs::write(&existing, "fn f() {}\n").unwrap();
         let existing = existing.to_str().unwrap().to_owned();
-        let version = (read_file_def().handler)(serde_json::json!([existing.clone()]))
-            .unwrap()["version"]
-            .as_str()
-            .unwrap()
-            .to_owned();
+        let version =
+            (read_file_def().handler)(serde_json::json!([existing.clone()])).unwrap()["version"]
+                .as_str()
+                .unwrap()
+                .to_owned();
         let fresh = dir.path().join("new.txt").to_str().unwrap().to_owned();
 
         // One live call per tool, in the shape its own signature asks
@@ -1706,8 +1706,7 @@ mod tests {
             if returns.trim() == "null" {
                 continue;
             }
-            let got = (def.handler)(args)
-                .unwrap_or_else(|e| panic!("{}: {e}", def.name));
+            let got = (def.handler)(args).unwrap_or_else(|e| panic!("{}: {e}", def.name));
             if got.as_object().is_none() {
                 panic!("{}: returns {returns} but delivered {got}", def.name);
             }

@@ -3,7 +3,7 @@ use oxc_span::GetSpan;
 
 use crate::builtin::Builtin;
 use crate::span::Span;
-use crate::vm::{Instr, LocalIndex, RcStr, SetMode};
+use crate::vm::{Instr, JsString, LocalIndex, SetMode};
 
 impl super::Compiler {
     /// Assignment is an expression: when `value_needed` is true, it leaves the
@@ -207,7 +207,7 @@ impl super::Compiler {
             let mode = if u.prefix { SetMode::New } else { SetMode::Old };
             match &lv {
                 super::LValue::Member(_, field) => {
-                    self.emit(Instr::ObjSet(RcStr::from(field.as_str()), mode), span);
+                    self.emit(Instr::ObjSet(JsString::from(field.as_str()), mode), span);
                 }
                 super::LValue::Index(..) => {
                     self.emit(Instr::IndexSet(mode), span);
@@ -345,7 +345,7 @@ impl super::Compiler {
             super::LValue::Local(slot) => self.emit(Instr::GetLocal(*slot as LocalIndex), span),
             super::LValue::Member(_, field) => {
                 self.emit(Instr::Pick(0), span); // copy the object
-                self.emit(Instr::ObjGet(RcStr::from(field.as_str())), span);
+                self.emit(Instr::ObjGet(JsString::from(field.as_str())), span);
             }
             super::LValue::Index(..) => {
                 self.emit(Instr::Pick(1), span); // copy the object
@@ -364,7 +364,7 @@ impl super::Compiler {
                 self.emit(Instr::TeeLocal(*slot as LocalIndex), span);
             }
             super::LValue::Member(_, field) => self.emit(
-                Instr::ObjSet(RcStr::from(field.as_str()), SetMode::New),
+                Instr::ObjSet(JsString::from(field.as_str()), SetMode::New),
                 span,
             ),
             super::LValue::Index(..) => self.emit(Instr::IndexSet(SetMode::New), span),
@@ -382,7 +382,7 @@ impl super::Compiler {
             }
             super::LValue::Member(_, field) => {
                 self.emit(
-                    Instr::ObjSet(RcStr::from(field.as_str()), SetMode::New),
+                    Instr::ObjSet(JsString::from(field.as_str()), SetMode::New),
                     span,
                 );
                 self.emit(Instr::Pop(1), span);

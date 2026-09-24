@@ -29,7 +29,7 @@
 //! is a well-formed expression.
 
 use crate::vm::instr::{ArrayPtr, MapPtr, SetPtr, TypeTag};
-use crate::vm::{ErrorKind, RcStr, VM, VMError, Value};
+use crate::vm::{ErrorKind, JsString, VM, VMError, Value};
 
 mod array;
 mod console;
@@ -127,7 +127,7 @@ const VARARG: u32 = u32::MAX;
 macro_rules! method_check {
     (false, $lit:literal, $variant:ident, $var:ident) => {};
     (true, $lit:literal, $variant:ident, $var:ident) => {
-        if $lit == $var {
+        if $crate::js_string::NameEq::name_eq($var, $lit) {
             return Some(Builtin::$variant);
         }
     };
@@ -266,10 +266,13 @@ macro_rules! builtins {
 
             /// Look up a namespaced builtin by namespace + method name (for
             /// `Math.abs(…)` style calls and `Math.sqrt` as a value).
-            pub fn for_namespace(ns: &str, name: &str) -> Option<Builtin> {
+            pub fn for_namespace(
+                ns: &str,
+                name: &(impl $crate::js_string::NameEq + ?Sized),
+            ) -> Option<Builtin> {
                 $(
                     if let BuiltinKind::Namespace(ns_val) = $kind {
-                        if ns_val == ns && $name == name {
+                        if ns_val == ns && $crate::js_string::NameEq::name_eq(name, $name) {
                             return Some(Builtin::$variant);
                         }
                     }
@@ -301,10 +304,12 @@ macro_rules! builtins {
             /// Look up a constructor builtin by its JS name (`Array`, `Map`, …).
             /// Step 2a Part 2: constructors are callable `Value::Builtin`s, so
             /// the bare identifier `Array` and `new Map(…)` resolve through this.
-            pub fn for_constructor(name: &str) -> Option<Builtin> {
+            pub fn for_constructor(
+                name: &(impl $crate::js_string::NameEq + ?Sized),
+            ) -> Option<Builtin> {
                 $(
                     if let BuiltinKind::Constructor { type_tag } = $kind {
-                        if type_tag.name() == name {
+                        if $crate::js_string::NameEq::name_eq(name, type_tag.name()) {
                             return Some(Builtin::$variant);
                         }
                     }
@@ -352,7 +357,10 @@ macro_rules! builtins {
             /// Generated from the `builtins!` rows — dispatches on receiver
             /// type first, then does a type-limited name search. Zero runtime
             /// iteration; zero dead `if false` blocks in source.
-            pub fn method_for_receiver(recv: &Value, name: &str) -> Option<Builtin> {
+            pub fn method_for_receiver(
+                recv: &Value,
+                name: &(impl $crate::js_string::NameEq + ?Sized),
+            ) -> Option<Builtin> {
                 match recv {
                     Value::Array(_) => {
                         $(method_check!($array, $name, $variant, name);)*
@@ -518,6 +526,16 @@ builtins! {
     StrCharAt,       BuiltinKind::Method, "charAt",       2, 2, str_char_at,       false, true, false, false, false, false, false, false, false, false;
     StrAt,           BuiltinKind::Method, "at",           2, 2, at_poly,           true,  true, false, false, false, false, false, false, false, false;
     StrConcat,       BuiltinKind::Method, "concat",       1, VARARG, concat_poly,  true,  true, false, false, false, false, false, false, false, false;
+    // **Undefinable over UTF-8 bytes, one-liners over code units.** There was
+    // no way in this dialect to ask what unit sits at position `i`; a model
+    // reaching for the JS spelling got `cannot call a undefined as a
+    // function`. `isWellFormed`/`toWellFormed` are the other half of the
+    // U+FFFD policy at the JSON boundary — they let a program ask before the
+    // crossing loses something.
+    StrCharCodeAt,   BuiltinKind::Method, "charCodeAt",   2, 2, str_char_code_at,  false, true, false, false, false, false, false, false, false, false;
+    StrCodePointAt,  BuiltinKind::Method, "codePointAt",  2, 2, str_code_point_at, false, true, false, false, false, false, false, false, false, false;
+    StrIsWellFormed, BuiltinKind::Method, "isWellFormed", 1, 1, str_is_well_formed, false, true, false, false, false, false, false, false, false, false;
+    StrToWellFormed, BuiltinKind::Method, "toWellFormed", 1, 1, str_to_well_formed, false, true, false, false, false, false, false, false, false, false;
 
     // ── RegExp methods ──
     RegExpTest,     BuiltinKind::Method, "test",     2, 2, regexp_test, false, false, false, false, true, false, false, false, false, false;
@@ -723,17 +741,9 @@ impl Args {
         }
     }
 
-    /// Receiver as a borrowed string slice (else the method-receiver error).
-    fn str_receiver<'a>(&self, vm: &'a VM) -> Result<&'a str, VMError> {
-        match self.get(vm, 0) {
-            Value::String(s) => Ok(s.as_str()),
-            recv => Err(vm.method_receiver_error(recv, "a string")),
-        }
-    }
-
-    /// Receiver as an owned `RcStr` (a refcount bump; for handlers that retain
+    /// Receiver as an owned `JsString` (a refcount bump; for handlers that retain
     /// the string past a borrow of the VM). Else the method-receiver error.
-    fn string_receiver(&self, vm: &VM) -> Result<RcStr, VMError> {
+    fn string_receiver(&self, vm: &VM) -> Result<JsString, VMError> {
         match self.get(vm, 0) {
             Value::String(s) => Ok(s.clone()),
             recv => Err(vm.method_receiver_error(recv, "a string")),
@@ -775,7 +785,7 @@ mod tests {
         let mut vm = VM::new(vec![Instr::PushBuiltin(Builtin::MathMax), Instr::TypeOf]);
         while !matches!(vm.step(u64::MAX).unwrap(), StepResult::Done { .. }) {}
         match vm.stack.last() {
-            Some(Value::String(s)) => assert_eq!(s.as_str(), "function"),
+            Some(Value::String(s)) => assert!(s.eq_str("function")),
             other => panic!("{other:?}"),
         }
     }

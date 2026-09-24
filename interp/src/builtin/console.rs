@@ -74,7 +74,7 @@ fn console_write(vm: &mut VM, args: Args, prefix: &str) -> Result<Value, VMError
             line.push(' ');
         }
         let s = match args.get(vm, i) {
-            Value::String(s) => s.as_str().to_owned(),
+            Value::String(s) => s.to_string(),
             other => match vm.stack_value_to_json(other, 2) {
                 Ok(serde_json::Value::String(s)) => s,
                 Ok(j) => serde_json::to_string(&j).unwrap_or_default(),

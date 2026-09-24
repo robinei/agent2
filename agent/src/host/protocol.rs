@@ -307,7 +307,9 @@ mod tests {
         });
         roundtrip_cmd(SessionCommand::Fork {
             from: id,
-            name: Some("retry".into()), text: None });
+            name: Some("retry".into()),
+            text: None,
+        });
         roundtrip_cmd(SessionCommand::Resume(id));
         roundtrip_cmd(SessionCommand::Shutdown);
 

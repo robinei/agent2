@@ -1,5 +1,5 @@
 use crate::builtin::Args;
-use crate::vm::{ErrorKind, IntegrityLevel, ObjData, RcStr, VM, VMError, Value};
+use crate::vm::{ErrorKind, IntegrityLevel, JsString, ObjData, VM, VMError, Value};
 use indexmap::IndexMap;
 use thin_vec::ThinVec;
 
@@ -110,7 +110,7 @@ pub fn obj_from_entries(vm: &mut VM, args: Args) -> Result<Value, VMError> {
         .arrays
         .get(arr_ptr as usize)
         .ok_or_else(|| vm.fail(ErrorKind::TypeError, "type error"))?;
-    let mut map = IndexMap::<RcStr, Value>::new();
+    let mut map = IndexMap::<JsString, Value>::new();
     for entry in entries {
         let pair_ptr = match entry {
             Value::Array(p) => p,
@@ -157,7 +157,7 @@ pub fn obj_assign(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     // Copy from all source objects (args 1..) into target.
     let ip = vm.ip;
     // Collect all source entries before mutating target (avoid borrow conflict).
-    let mut entries: Vec<(RcStr, Value)> = Vec::new();
+    let mut entries: Vec<(JsString, Value)> = Vec::new();
     for i in 1..args.argc {
         let source_ptr = match args.get(vm, i) {
             Value::Object(p) => *p,
@@ -185,7 +185,7 @@ pub fn obj_assign(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 pub fn obj_has_own(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let recv = args.get(vm, 0).clone();
     let key = vm.to_js_string(args.get(vm, 1), 0);
-    match vm.own_prop_contains(&recv, key.as_str()) {
+    match vm.own_prop_contains(&recv, &key) {
         Some(has) => Ok(Value::Bool(has)),
         None => Err(object_needs_an_object(vm, "hasOwn", &recv)),
     }
@@ -201,7 +201,7 @@ pub fn obj_has_own(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 pub fn obj_has_own_property(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let recv = args.get(vm, 0).clone();
     let key = vm.to_js_string(args.get(vm, 1), 0);
-    match vm.own_prop_contains(&recv, key.as_str()) {
+    match vm.own_prop_contains(&recv, &key) {
         Some(has) => Ok(Value::Bool(has)),
         None => Err(object_needs_an_object(vm, "hasOwn", &recv)),
     }

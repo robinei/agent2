@@ -1,5 +1,6 @@
 use crate::builtin::Args;
-use crate::vm::{RcStr, VM, VMError, Value};
+use crate::units;
+use crate::vm::{JsString, RcRegExp, VM, VMError, Value};
 use indexmap::IndexMap;
 
 /// `RegExp(pattern[, flags])` — the constructor as a plain call. Same as
@@ -17,7 +18,7 @@ pub fn regexp_ctor(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let flags = if args.argc >= 2 {
         vm.string_from(args.get(vm, 1))?
     } else {
-        RcStr::from("")
+        JsString::from("")
     };
     vm.alloc_regexp(pattern, flags)
 }
@@ -30,54 +31,87 @@ pub fn regexp_ctor(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 pub(crate) fn build_exec_result(
     vm: &mut VM,
     m: &regress::Match,
-    input: RcStr,
-) -> IndexMap<RcStr, Value> {
-    let text = input.as_str();
+    input: JsString,
+) -> IndexMap<JsString, Value> {
+    let text = input.as_units();
     let n_captures = m.captures.len();
     let mut obj = IndexMap::with_capacity(5 + n_captures);
     obj.insert(
-        RcStr::from("0"),
-        Value::String(RcStr::from(&text[m.range.clone()])),
+        JsString::from("0"),
+        Value::String(JsString::from_units(&text[m.range.clone()])),
     );
     for (i, cap) in m.captures.iter().enumerate() {
-        let key = RcStr::from((i + 1).to_string());
+        let key = JsString::from((i + 1).to_string());
         let val = match cap {
-            Some(range) => Value::String(RcStr::from(&text[range.clone()])),
+            Some(range) => Value::String(JsString::from_units(&text[range.clone()])),
             None => Value::Undefined,
         };
         obj.insert(key, val);
     }
     // Named groups → `groups` (only when present; else `.groups` is undefined).
-    let mut named: IndexMap<RcStr, Value> = IndexMap::new();
+    let mut named: IndexMap<JsString, Value> = IndexMap::new();
     for (name, range) in m.named_groups() {
         let val = match range {
-            Some(r) => Value::String(RcStr::from(&text[r])),
+            Some(r) => Value::String(JsString::from_units(&text[r])),
             None => Value::Undefined,
         };
-        named.insert(RcStr::from(name), val);
+        named.insert(JsString::from(name), val);
     }
-    obj.insert(RcStr::from("index"), Value::PosInt(m.range.start as u64));
-    obj.insert(RcStr::from("input"), Value::String(input));
+    obj.insert(JsString::from("index"), Value::PosInt(m.range.start as u64));
+    obj.insert(JsString::from("input"), Value::String(input));
     obj.insert(
-        RcStr::from("length"),
+        JsString::from("length"),
         Value::PosInt((1 + n_captures) as u64),
     );
     if !named.is_empty() {
         let groups = vm.alloc_object(named);
-        obj.insert(RcStr::from("groups"), groups);
+        obj.insert(JsString::from("groups"), groups);
     }
     obj
+}
+
+/// Match `rx` against code units, from `start`.
+///
+/// **The engine already had the right shape; it was being fed the wrong
+/// input type.** `Utf16Input` pairs surrogates and `Ucs2Input` does not,
+/// which is the `u` flag's whole meaning, and both report positions as
+/// code-unit offsets. Running over a `&str` meant every `index`,
+/// `lastIndex` and `match.indices` was a UTF-8 byte offset, so
+/// `"a😀b".match(/b/).index` was 5 where JS says 3.
+///
+/// Cost, stated: both u16 inputs declare `CODE_UNITS_ARE_BYTES = false`,
+/// which disables regress's memchr-backed literal-prefix prefilter
+/// (`classicalbacktrack.rs:1078`, `scm.rs:118`). Measured on a
+/// `replace(/…/g, …)` over 100 KB before taking it — see the commit.
+pub(crate) fn find_at(rx: &RcRegExp, text: &[u16], start: usize) -> Option<regress::Match> {
+    if rx.unicode() {
+        rx.compiled.find_from_utf16(text, start).next()
+    } else {
+        rx.compiled.find_from_ucs2(text, start).next()
+    }
+}
+
+/// Every non-overlapping match, from the start of `text`.
+///
+/// Collected rather than returned lazily because the two input types are two
+/// concrete iterator types; a `Box<dyn>` per call would cost more than the
+/// `Vec`, and every caller consumed the whole run anyway.
+pub(crate) fn find_all(rx: &RcRegExp, text: &[u16]) -> Vec<regress::Match> {
+    if rx.unicode() {
+        rx.compiled.find_from_utf16(text, 0).collect()
+    } else {
+        rx.compiled.find_from_ucs2(text, 0).collect()
+    }
 }
 
 /// Find the next match honoring `/g` statefulness: a global regex resumes
 /// at its `lastIndex`, advances it past the match, and resets it to `0` on
 /// no match (so the standard `while ((m = re.exec(s)) !== null)` loop
-/// terminates). A zero-width match steps forward one char to guarantee
-/// progress. A non-global regex always scans from `0` and never touches
-/// `lastIndex`.
-fn next_match(rx: &crate::vm::RcRegExp, text: &str) -> Option<regress::Match> {
-    let global = rx.flags.contains('g');
-    let sticky = rx.flags.contains('y');
+/// terminates). A zero-width match steps forward to guarantee progress. A
+/// non-global regex always scans from `0` and never touches `lastIndex`.
+fn next_match(rx: &RcRegExp, text: &[u16]) -> Option<regress::Match> {
+    let global = rx.has_flag(b'g');
+    let sticky = rx.has_flag(b'y');
     // Both `/g` and `/y` resume from `lastIndex`; `/y` additionally requires
     // the match to begin *exactly* there (anchored), not merely after it.
     let stateful = global || sticky;
@@ -88,12 +122,19 @@ fn next_match(rx: &crate::vm::RcRegExp, text: &str) -> Option<regress::Match> {
         }
         return None;
     }
-    match rx.compiled.find_from(text, start).next() {
+    match find_at(rx, text, start) {
         Some(m) if !sticky || m.range.start == start => {
             if stateful {
                 let end = if m.range.end == m.range.start {
-                    // zero-width: advance one full char so we don't re-match
-                    m.range.end + text[m.range.end..].chars().next().map_or(1, char::len_utf8)
+                    // Zero-width: advance so we do not re-match. `AdvanceStringIndex`
+                    // steps a whole code point only in Unicode mode; otherwise one
+                    // code unit, even through a surrogate pair.
+                    let step = if rx.unicode() {
+                        units::code_point_at(text, m.range.end).map_or(1, |(_, n)| n)
+                    } else {
+                        1
+                    };
+                    m.range.end + step
                 } else {
                     m.range.end
                 };
@@ -116,7 +157,7 @@ fn next_match(rx: &crate::vm::RcRegExp, text: &str) -> Option<regress::Match> {
 pub fn regexp_test(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let rx = args.regexp_receiver(vm)?.clone();
     let input = vm.string_from(args.get(vm, 1))?;
-    Ok(Value::Bool(next_match(&rx, input.as_str()).is_some()))
+    Ok(Value::Bool(next_match(&rx, input.as_units()).is_some()))
 }
 
 /// `regexp.exec(str)` — returns an object `{ "0": full, "1": cap1, ...,
@@ -127,7 +168,7 @@ pub fn regexp_test(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 pub fn regexp_exec(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let rx = args.regexp_receiver(vm)?.clone();
     let input = vm.string_from(args.get(vm, 1))?;
-    match next_match(&rx, input.as_str()) {
+    match next_match(&rx, input.as_units()) {
         Some(m) => {
             let obj = build_exec_result(vm, &m, input);
             Ok(vm.alloc_object(obj))
@@ -333,14 +374,14 @@ mod tests {
         let val =
             testutil::run_val("let r = /(\\d+)/; let m = r.exec('abc 123 def'); return m[0];");
         match val {
-            Value::String(s) => assert_eq!(s.as_str(), "123"),
+            Value::String(s) => assert!(s.eq_str("123")),
             _ => panic!("expected '123', got {val:?}"),
         }
         // Capture group via m[1].
         let val =
             testutil::run_val("let r = /(\\d+)/; let m = r.exec('abc 123 def'); return m[1];");
         match val {
-            Value::String(s) => assert_eq!(s.as_str(), "123"),
+            Value::String(s) => assert!(s.eq_str("123")),
             _ => panic!("expected '123', got {val:?}"),
         }
     }
@@ -351,7 +392,7 @@ mod tests {
         assert_eq!(val, Value::PosInt(4));
         let val = testutil::run_val("let m = /(\\d+)/.exec('abc 123 def'); return m.input;");
         match val {
-            Value::String(s) => assert_eq!(s.as_str(), "abc 123 def"),
+            Value::String(s) => assert!(s.eq_str("abc 123 def")),
             _ => panic!("expected 'abc 123 def', got {val:?}"),
         }
     }
@@ -366,13 +407,13 @@ mod tests {
     fn regexp_source_and_flags_properties() {
         let val = testutil::run_val("let r = /hello/gi; return r.source;");
         match val {
-            Value::String(s) => assert_eq!(s.as_str(), "hello"),
+            Value::String(s) => assert!(s.eq_str("hello")),
             _ => panic!("expected 'hello', got {val:?}"),
         }
 
         let val = testutil::run_val("let r = /hello/gi; return r.flags;");
         match val {
-            Value::String(s) => assert_eq!(s.as_str(), "gi"),
+            Value::String(s) => assert!(s.eq_str("gi")),
             _ => panic!("expected 'gi', got {val:?}"),
         }
     }
@@ -397,7 +438,7 @@ mod tests {
     fn typeof_regexp_is_object() {
         let val = testutil::run_val("return typeof /test/;");
         match val {
-            Value::String(s) => assert_eq!(s.as_str(), "object"),
+            Value::String(s) => assert!(s.eq_str("object")),
             _ => panic!("expected 'object', got {val:?}"),
         }
     }
@@ -412,13 +453,13 @@ mod tests {
     fn regexp_to_string_method() {
         let val = testutil::run_val("return /hello/gi.toString();");
         match val {
-            Value::String(s) => assert_eq!(s.as_str(), "/hello/gi"),
+            Value::String(s) => assert!(s.eq_str("/hello/gi")),
             _ => panic!("expected '/hello/gi', got {val:?}"),
         }
         // No flags case.
         let val = testutil::run_val("return /x/.toString();");
         match val {
-            Value::String(s) => assert_eq!(s.as_str(), "/x/"),
+            Value::String(s) => assert!(s.eq_str("/x/")),
             _ => panic!("expected '/x/', got {val:?}"),
         }
     }
@@ -428,7 +469,7 @@ mod tests {
         // Non-global: returns exec-like object.
         let val = testutil::run_val("let m = 'abc 123 def'.match(/(\\d+)/); return m[0];");
         match val {
-            Value::String(s) => assert_eq!(s.as_str(), "123"),
+            Value::String(s) => assert!(s.eq_str("123")),
             _ => panic!("expected '123', got {val:?}"),
         }
         // Non-global: has index/input.
@@ -438,7 +479,7 @@ mod tests {
         let val = testutil::run_val("return JSON.stringify('a1 b2 c3'.match(/\\d/g));");
         match val {
             Value::String(s) => {
-                let parsed: serde_json::Value = serde_json::from_str(s.as_str()).unwrap();
+                let parsed: serde_json::Value = serde_json::from_str(&s.to_string()).unwrap();
                 assert_eq!(parsed, serde_json::json!(["1", "2", "3"]));
             }
             _ => panic!("expected JSON array, got {val:?}"),
@@ -449,7 +490,7 @@ mod tests {
         // String pattern.
         let val = testutil::run_val("let m = 'hello'.match('ll'); return m[0];");
         match val {
-            Value::String(s) => assert_eq!(s.as_str(), "ll"),
+            Value::String(s) => assert!(s.eq_str("ll")),
             _ => panic!("expected 'll', got {val:?}"),
         }
     }
@@ -470,19 +511,19 @@ mod tests {
         // Non-global: replaces first only.
         let val = testutil::run_val("return 'a a a'.replace(/a/, 'b');");
         match val {
-            Value::String(s) => assert_eq!(s.as_str(), "b a a"),
+            Value::String(s) => assert!(s.eq_str("b a a")),
             _ => panic!("expected 'b a a', got {val:?}"),
         }
         // Global: replaces all.
         let val = testutil::run_val("return 'a a a'.replace(/a/g, 'b');");
         match val {
-            Value::String(s) => assert_eq!(s.as_str(), "b b b"),
+            Value::String(s) => assert!(s.eq_str("b b b")),
             _ => panic!("expected 'b b b', got {val:?}"),
         }
         // Case-insensitive.
         let val = testutil::run_val("return 'Hello'.replace(/h/i, 'J');");
         match val {
-            Value::String(s) => assert_eq!(s.as_str(), "Jello"),
+            Value::String(s) => assert!(s.eq_str("Jello")),
             _ => panic!("expected 'Jello', got {val:?}"),
         }
     }
@@ -491,7 +532,7 @@ mod tests {
     fn string_replace_all_with_regexp() {
         let val = testutil::run_val("return 'a a a'.replaceAll(/a/g, 'b');");
         match val {
-            Value::String(s) => assert_eq!(s.as_str(), "b b b"),
+            Value::String(s) => assert!(s.eq_str("b b b")),
             _ => panic!("expected 'b b b', got {val:?}"),
         }
         // Non-global RegExp should error.
@@ -504,7 +545,7 @@ mod tests {
         let val = testutil::run_val("return JSON.stringify('a,b,c'.split(/,/));");
         match val {
             Value::String(s) => {
-                let parsed: serde_json::Value = serde_json::from_str(s.as_str()).unwrap();
+                let parsed: serde_json::Value = serde_json::from_str(&s.to_string()).unwrap();
                 assert_eq!(parsed, serde_json::json!(["a", "b", "c"]));
             }
             _ => panic!("expected JSON array, got {val:?}"),
@@ -513,7 +554,7 @@ mod tests {
         let val = testutil::run_val("return JSON.stringify('a,b,c'.split(/,/, 2));");
         match val {
             Value::String(s) => {
-                let parsed: serde_json::Value = serde_json::from_str(s.as_str()).unwrap();
+                let parsed: serde_json::Value = serde_json::from_str(&s.to_string()).unwrap();
                 assert_eq!(parsed, serde_json::json!(["a", "b"]));
             }
             _ => panic!("expected JSON array, got {val:?}"),

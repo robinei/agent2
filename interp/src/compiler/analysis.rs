@@ -86,7 +86,7 @@ impl super::Compiler {
         match v {
             ConstValue::Null => Instr::PushNull,
             ConstValue::Bool(b) => Instr::PushBool(*b),
-            ConstValue::Str(s) => Instr::PushStr(self.intern_string(s)),
+            ConstValue::Str(s) => Instr::PushStr(self.intern_units(s)),
             ConstValue::Num(n) => match super::f64_to_value(*n) {
                 Value::PosInt(u) => Instr::PushPosInt(u),
                 Value::NegInt(i) => Instr::PushNegInt(i),

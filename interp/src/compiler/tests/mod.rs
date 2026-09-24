@@ -35,7 +35,7 @@ pub(super) fn run_program(prog: Program) -> VM {
 pub(super) fn input_val(vm: &VM, key: &str) -> Value {
     vm.objects[0]
         .map
-        .get(&RcStr::from(key))
+        .get(&JsString::from(key))
         .cloned()
         .unwrap_or_else(|| panic!("no input.{key}"))
 }

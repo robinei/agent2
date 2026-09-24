@@ -1,7 +1,7 @@
 use oxc_ast::ast;
 use oxc_span::GetSpan;
 
-use crate::vm::{Instr, RcStr, SetMode};
+use crate::vm::{Instr, JsString, SetMode};
 
 impl super::Compiler {
     pub(super) fn compile_array(&mut self, arr: &ast::ArrayExpression) {
@@ -72,7 +72,7 @@ impl super::Compiler {
     /// field name. Reports a compile error and returns `None` for getters/
     /// setters, methods, and unsupported key forms (computed keys return
     /// `None` without error — the caller falls through to the IndexSet path).
-    pub(super) fn static_property_name(&mut self, p: &ast::ObjectProperty) -> Option<RcStr> {
+    pub(super) fn static_property_name(&mut self, p: &ast::ObjectProperty) -> Option<JsString> {
         if p.kind != ast::PropertyKind::Init {
             self.error(p.span.into(), "getters/setters are not supported");
             return None;
@@ -84,11 +84,11 @@ impl super::Compiler {
             return None;
         }
         match &p.key {
-            ast::PropertyKey::StaticIdentifier(id) => Some(RcStr::from(id.name.as_str())),
-            ast::PropertyKey::StringLiteral(s) => Some(RcStr::from(s.value.as_str())),
-            ast::PropertyKey::NumericLiteral(num) => {
-                Some(RcStr::from(super::number_key_to_string(num.value).as_str()))
-            }
+            ast::PropertyKey::StaticIdentifier(id) => Some(JsString::from(id.name.as_str())),
+            ast::PropertyKey::StringLiteral(s) => Some(super::cook::string_literal(s)),
+            ast::PropertyKey::NumericLiteral(num) => Some(JsString::from(
+                super::number_key_to_string(num.value).as_str(),
+            )),
             _ => {
                 self.error(p.key.span().into(), "unsupported object key");
                 None
@@ -104,7 +104,7 @@ impl super::Compiler {
                 || matches!(prop, ast::ObjectPropertyKind::ObjectProperty(p) if p.computed)
         });
         if !needs_slow {
-            let mut names: Vec<RcStr> = Vec::with_capacity(obj.properties.len());
+            let mut names: Vec<JsString> = Vec::with_capacity(obj.properties.len());
             for prop in &obj.properties {
                 let p = match prop {
                     ast::ObjectPropertyKind::ObjectProperty(p) => p,
@@ -132,7 +132,7 @@ impl super::Compiler {
             })
             .count();
 
-        let mut leading_names: Vec<RcStr> = Vec::with_capacity(leading_count);
+        let mut leading_names: Vec<JsString> = Vec::with_capacity(leading_count);
         for prop in &obj.properties[..leading_count] {
             let p = match prop {
                 ast::ObjectPropertyKind::ObjectProperty(p) => p,
@@ -187,20 +187,12 @@ impl super::Compiler {
         // result = quasi0 + expr0 + quasi1 + expr1 + … . The accumulator starts
         // as a string (interned constant) and stays one, so every `Add` takes
         // the concat path and ToString-coerces each interpolated value, as JS does.
-        let quasi_str = |q: &ast::TemplateElement| {
-            q.value
-                .cooked
-                .as_ref()
-                .map(|s| s.as_str())
-                .unwrap_or_else(|| q.value.raw.as_str())
-                .to_string()
-        };
-        let q0 = self.intern_string(quasi_str(&tl.quasis[0]).as_str());
+        let q0 = self.intern_units(&super::cook::template_element_units(&tl.quasis[0]));
         self.emit(Instr::PushStr(q0), span);
         for (i, expr) in tl.expressions.iter().enumerate() {
             self.compile_expr(expr);
             self.emit(Instr::Add, span);
-            let qn = self.intern_string(quasi_str(&tl.quasis[i + 1]).as_str());
+            let qn = self.intern_units(&super::cook::template_element_units(&tl.quasis[i + 1]));
             self.emit(Instr::PushStr(qn), span);
             self.emit(Instr::Add, span);
         }

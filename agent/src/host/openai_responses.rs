@@ -132,8 +132,8 @@ pub(crate) fn request_body(
         // A summary is a paraphrase, not the stream: counting drafted
         // blocks in it is a weaker measurement than counting them in
         // raw reasoning, and anything derived from it should say so.
-        let summary = super::provider::var("REASONING_SUMMARY")
-            .unwrap_or_else(|| "auto".to_owned());
+        let summary =
+            super::provider::var("REASONING_SUMMARY").unwrap_or_else(|| "auto".to_owned());
         body["reasoning"] = if summary == "off" {
             serde_json::json!({ "effort": effort })
         } else {
@@ -494,7 +494,10 @@ mod tests {
             "the fence was not at a line start: {:?}",
             turn.source
         );
-        assert_eq!(streamed, turn.source, "the session would see something else");
+        assert_eq!(
+            streamed, turn.source,
+            "the session would see something else"
+        );
     }
 
     /// And one item's deltas are never broken up — the separator is

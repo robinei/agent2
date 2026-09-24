@@ -57,7 +57,7 @@ pub fn number_to_fixed(vm: &mut VM, args: Args) -> Result<Value, VMError> {
         let digits = digits as usize;
         format!("{n:.digits$}")
     };
-    Ok(Value::String(crate::vm::RcStr::from(s)))
+    Ok(Value::String(crate::vm::JsString::from(s)))
 }
 
 /// `Number.isInteger(x)` → bool.
@@ -81,7 +81,7 @@ pub fn number_parse_int(vm: &mut VM, args: Args) -> Result<Value, VMError> {
             _ => 0,
         },
     };
-    Ok(Value::int_from_f64(js_parse_int(s.as_str(), radix)))
+    Ok(Value::int_from_f64(js_parse_int(&s.to_utf8_lossy(), radix)))
 }
 
 /// `Number.isFinite(x)` → true if x is a number (not coerced) and finite.
@@ -119,7 +119,7 @@ pub fn number_parse_float(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     // believing it had succeeded. The two verbs disagreeing is what
     // made it look like the data's fault rather than the dialect's.
     let s = vm.to_js_string(args.get(vm, 0), 0);
-    let n = js_parse_float(s.as_str());
+    let n = js_parse_float(&s.to_utf8_lossy());
     Ok(Value::Float(n))
 }
 
