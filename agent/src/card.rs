@@ -1151,9 +1151,22 @@ mod tests {
     /// failed: leading `note` with its distinguishing jobs was null,
     /// and replacing "Loop over two hundred items here, not above" with
     /// a *justification* — that a bounded tail is cheaper than rows —
-    /// took `prints` from 15% to 40%. Telling the model a channel is
-    /// cheap is an invitation to use it; the prohibition was doing the
-    /// work.
+    /// took `prints` from 15% to 40% — but at n=20 and p=0.155, which
+    /// is not a result, and "a prohibition beats an explanation" is not
+    /// a law this measured. The prediction it makes was tested and
+    /// failed: replacing the paragraph's closing consequence with a
+    /// flat ban naming the syntax (`console.log(f.content)`) moved
+    /// content-dumping 9/60 to 11/60, p=0.81.
+    ///
+    /// **What the residual looks like.** On the current card 9 of 60
+    /// first replies still print a whole file, 8 more print only counts
+    /// and branches, which is the channel's job. Two different wordings
+    /// have failed to shift the 9. The paragraph as a whole is worth
+    /// its bytes and the sentences inside it are, so far, not
+    /// separately measurable — so the next thing to try is not a third
+    /// wording but a mechanism: the report already tells a program when
+    /// it copied a row's bytes (`copied_note`), and nothing tells it
+    /// when it printed them.
     #[test]
     fn the_index_of_channels_names_every_way_a_value_crosses() {
         let card = card();
