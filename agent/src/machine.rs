@@ -4233,9 +4233,23 @@ impl Runner {
         };
         match (context, counted) {
             (Some(context), Some(tokens)) => {
-                let usable = context
-                    .saturating_sub(crate::host::completion_reserve())
-                    .min(crate::host::max_document_tokens());
+                // **The model's window, less what the reply needs.**
+                // There used to be a second cap here — a flat
+                // `DEFAULT_MAX_DOCUMENT_TOKENS` of 128k — on the
+                // argument that a window is what fits rather than what
+                // is economical, and that compacting a 1M window at
+                // three quarters means paying for ~780k input tokens a
+                // turn.
+                //
+                // That argument is about *cost*, and this is the wrong
+                // place to make it: it turned one limit into two, so
+                // the number a session compacted against was neither
+                // the model's window nor anything the operator had
+                // set, and "how full am I" had an answer that did not
+                // follow from either. One limit, and it is the one the
+                // model actually has. `AGENT2_CONTEXT_TOKENS` still
+                // overrides it for anybody who wants to spend less.
+                let usable = context.saturating_sub(crate::host::completion_reserve());
                 // **A count describes the request that returned it, and
                 // the program that ran since then has been appending.**
                 // Usage arrives at the end of a stream, so the trigger

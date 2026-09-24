@@ -268,7 +268,7 @@ fn last_user_turn(c: &Conversation) -> String {
 /// into every prompt — and doubly wrong, because the generator runs
 /// with no model configured, so `context_tokens` was `None` and the
 /// measurement fell back to bytes. A live session against a model with
-/// a known window measures tokens against `max_document_tokens`: the
+/// a known window measures tokens against that window: the
 /// same conversation reads "31360 tokens of 131072". So the number was
 /// false, the unit was false, and the limit was false.
 fn without_a_readout_of_someone_elses_budget(turn: &str) -> String {
@@ -374,7 +374,7 @@ mod tests {
     /// the prompt. It was wrong three ways over: the generator runs
     /// with no model configured, so the measurement fell back to bytes
     /// against the byte budget, where a live session against a known
-    /// window reports tokens against `max_document_tokens` — the same
+    /// window reports tokens against that window — the same
     /// conversation reads "31360 tokens of 131072".
     #[test]
     fn no_worked_example_reports_a_fullness() {

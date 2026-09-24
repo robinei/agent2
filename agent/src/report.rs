@@ -88,8 +88,9 @@ pub const CONSOLE_MAX_BYTES: usize = 256 * 1024;
 /// from something.
 /// **Sized against the document budget, and it moved.** 4096 was
 /// 6.25% of `DEFAULT_DOCUMENT_BUDGET`'s 64 KB, which was proportionate.
-/// The budget is now the model's own window (`provider::CONTEXT_WINDOWS`,
-/// capped at `DEFAULT_MAX_DOCUMENT_TOKENS`), and 4 KB of that is under
+/// The budget is now the model's own window
+/// (`provider::CONTEXT_WINDOWS`, less the completion reserve), and 4 KB
+/// of that is under
 /// one percent — so a reply could see four kilobytes of whatever it had
 /// read, however much it read, and the only way through a large file
 /// was to read it again.

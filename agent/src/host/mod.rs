@@ -155,30 +155,6 @@ pub(crate) fn context_tokens() -> Option<usize> {
         .and_then(provider::context_window)
 }
 
-/// **How much of the window is worth using**, whatever its size.
-///
-/// A window is what *fits*, not what is economical. `deepseek-v4-flash`
-/// holds 1,048,576 tokens; compacting at three quarters of that would
-/// mean paying for ~780k input tokens on every turn, which is not a
-/// budget anyone would choose — it is the absence of one. So the
-/// trigger takes the smaller of the model's usable window and this.
-///
-/// 128k because it is roughly where recall over a long document starts
-/// to cost more than it returns, and because it is eight times the
-/// ~14k the byte budget was actually allowing rather than the
-/// fifty-five times the raw window would.
-///
-/// Overridable with `AGENT2_MAX_DOCUMENT_TOKENS`; a model whose window
-/// is *smaller* than this is unaffected, which is every local one.
-pub const DEFAULT_MAX_DOCUMENT_TOKENS: usize = 131_072;
-
-pub(crate) fn max_document_tokens() -> usize {
-    std::env::var("AGENT2_MAX_DOCUMENT_TOKENS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|n| *n > 0)
-        .unwrap_or(DEFAULT_MAX_DOCUMENT_TOKENS)
-}
 
 /// Tokens held back from the context for the reply itself.
 ///
