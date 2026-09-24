@@ -63,7 +63,10 @@ pub fn json_stringify(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     if matches!(args.get(vm, 0), Value::Undefined) {
         return Ok(Value::Undefined);
     }
-    let json = vm.stack_value_to_json(args.get(vm, 0), 0)?;
+    // Asked first, and then thrown away: the walker below emits the text, but
+    // this is what decides that a promise or a closure has no JSON form at
+    // all, and the two must not disagree about that.
+    vm.stack_value_to_json(args.get(vm, 0), 0)?;
     // Check replacer: only null/undefined are accepted.
     if args.argc >= 2 {
         match args.get(vm, 1) {
@@ -100,25 +103,9 @@ pub fn json_stringify(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     } else {
         String::new()
     };
-    if indent.is_empty() {
-        let s = serde_json::to_string(&json).map_err(|e| {
-            vm.fail(
-                ErrorKind::ValueError,
-                format!("this value cannot be written as JSON: {e}").as_str(),
-            )
-        })?;
-        Ok(Value::String(JsString::from(s)))
-    } else {
-        let s = pretty_print_json(&json, &indent);
-        Ok(Value::String(JsString::from(s)))
-    }
-}
-
-/// Simple JSON pretty-printer with custom indent.
-fn pretty_print_json(value: &serde_json::Value, indent: &str) -> String {
     let mut out = String::new();
-    pretty_print_value(value, indent, 0, &mut out);
-    out
+    write_json_value(vm, args.get(vm, 0), 0, &indent, 0, &mut out)?;
+    Ok(Value::String(JsString::from(out)))
 }
 
 fn pretty_print_value(value: &serde_json::Value, indent: &str, depth: usize, out: &mut String) {
@@ -166,7 +153,273 @@ fn pretty_print_value(value: &serde_json::Value, indent: &str, depth: usize, out
     }
 }
 
+// ── the string boundary JSON cannot cross on its own ─────────────────────────
+
+/// Append `units` to `out` as a JSON string literal, emitting `\udXXX` for an
+/// unpaired surrogate.
+///
+/// **`serde_json` structurally cannot do this.** Its `Value::String` holds a
+/// Rust `String`, so an unpaired surrogate has already become U+FFFD before
+/// the serializer ever sees it, and it has no way to emit a lone escape
+/// anyway. `built-ins/JSON/stringify/value-string-escape-unicode.js` requires
+/// `JSON.stringify("\uD834")` to be `"\ud834"` — and requires the *paired*
+/// case next to it to come out as the character, which is why this walks code
+/// points rather than escaping every surrogate it sees.
+///
+/// This is the one place in the crate where routing through `serde_json`
+/// stopped being free. See `docs/30_STRINGS.md`.
+fn write_json_string(units: &[u16], out: &mut String) {
+    out.push('"');
+    let mut i = 0;
+    while i < units.len() {
+        let u = units[i];
+        match u {
+            0x22 => out.push_str("\\\""),
+            0x5C => out.push_str("\\\\"),
+            0x08 => out.push_str("\\b"),
+            0x0C => out.push_str("\\f"),
+            0x0A => out.push_str("\\n"),
+            0x0D => out.push_str("\\r"),
+            0x09 => out.push_str("\\t"),
+            _ if u < 0x20 => out.push_str(&format!("\\u{u:04x}")),
+            _ => {
+                let (cp, n) = crate::units::code_point_at(units, i).expect("i is in range");
+                match char::from_u32(cp) {
+                    // A real code point, a paired surrogate included: the
+                    // character itself, as serde would have written it.
+                    Some(c) => {
+                        out.push(c);
+                        i += n;
+                        continue;
+                    }
+                    // Only an unpaired surrogate reaches here.
+                    None => out.push_str(&format!("\\u{u:04x}")),
+                }
+            }
+        }
+        i += 1;
+    }
+    out.push('"');
+}
+
+/// Write `v` as JSON text.
+///
+/// Strings, arrays and objects are walked here so that every string — a
+/// value or a key — goes through [`write_json_string`]. Everything else
+/// delegates to `stack_value_to_json`, which owns the rules this must not
+/// drift from: what has no JSON form and what that costs, `undefined`
+/// dropped in an object and `null`ed in an array, the depth cap, the refusal
+/// to serialize a builtin prototype.
+///
+/// The seam is honest but not free: a `Map` or `Set` nested inside the value
+/// is converted by that function, so a lone surrogate inside *one of those*
+/// is still U+FFFD. `JSON.stringify` of a `Map` is already a divergence
+/// (JS gives `{}`), so this is a corner of a corner, and naming it is
+/// cheaper than duplicating the collection rules to cover it.
+fn write_json_value(
+    vm: &VM,
+    v: &Value,
+    depth: usize,
+    indent: &str,
+    level: usize,
+    out: &mut String,
+) -> Result<(), VMError> {
+    match v {
+        Value::String(s) => {
+            write_json_string(s.as_units(), out);
+            Ok(())
+        }
+        Value::Array(p) => {
+            let arr = vm
+                .arrays
+                .get(*p as usize)
+                .ok_or_else(|| vm.fail(ErrorKind::ValueError, "value error"))?
+                .clone();
+            if arr.is_empty() {
+                out.push_str("[]");
+                return Ok(());
+            }
+            let (open, sep, close) = brackets("[", "]", indent, level);
+            out.push_str(&open);
+            for (i, elem) in arr.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(&sep);
+                }
+                match elem {
+                    // JS: `undefined` array slots stringify to `null`.
+                    Value::Undefined => out.push_str("null"),
+                    _ => write_json_value(vm, elem, depth + 1, indent, level + 1, out)?,
+                }
+            }
+            out.push_str(&close);
+            Ok(())
+        }
+        Value::Object(p) => {
+            // `stack_value_to_json` owns the refusals; ask it about this
+            // object before walking it, so the two cannot disagree about
+            // which objects have a JSON form.
+            let obj = vm
+                .objects
+                .get(*p as usize)
+                .ok_or_else(|| vm.fail(ErrorKind::ValueError, "value error"))?;
+            if !matches!(obj.kind, crate::vm::ObjKind::Ordinary) {
+                vm.stack_value_to_json(v, depth)?;
+            }
+            let entries: Vec<(JsString, Value)> = obj
+                .map
+                .iter()
+                // JS: properties whose value is `undefined` are omitted.
+                .filter(|(_, val)| !matches!(val, Value::Undefined))
+                .map(|(k, val)| (k.clone(), val.clone()))
+                .collect();
+            if entries.is_empty() {
+                out.push_str("{}");
+                return Ok(());
+            }
+            let (open, sep, close) = brackets("{", "}", indent, level);
+            out.push_str(&open);
+            for (i, (k, val)) in entries.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(&sep);
+                }
+                write_json_string(k.as_units(), out);
+                out.push_str(if indent.is_empty() { ":" } else { ": " });
+                write_json_value(vm, val, depth + 1, indent, level + 1, out)?;
+            }
+            out.push_str(&close);
+            Ok(())
+        }
+        other => {
+            let j = vm.stack_value_to_json(other, depth)?;
+            if indent.is_empty() {
+                out.push_str(&j.to_string());
+            } else {
+                pretty_print_value(&j, indent, level, out);
+            }
+            Ok(())
+        }
+    }
+}
+
+/// The three pieces of punctuation a container needs, compact or indented.
+fn brackets(open: &str, close: &str, indent: &str, level: usize) -> (String, String, String) {
+    if indent.is_empty() {
+        (open.to_string(), ",".to_string(), close.to_string())
+    } else {
+        let pad = indent.repeat(level + 1);
+        (
+            format!("{open}\n{pad}"),
+            format!(",\n{pad}"),
+            format!("\n{}{close}", indent.repeat(level)),
+        )
+    }
+}
+
 // ── tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod surrogate_tests {
+    use crate::testutil;
+
+    /// **The one place routing through `serde_json` stopped being free.**
+    ///
+    /// `serde_json::Value::String` holds a Rust `String`, so an unpaired
+    /// surrogate is U+FFFD before the serializer sees it and there is no way
+    /// to ask for a lone `\udXXX` anyway. The paired case next to it has to
+    /// keep coming out as the character, which is why the writer walks code
+    /// points rather than escaping every surrogate it meets.
+    #[test]
+    fn a_lone_surrogate_survives_stringify_as_an_escape() {
+        assert_eq!(
+            testutil::eval_str(r#"JSON.stringify("\uD834")"#),
+            r#""\ud834""#
+        );
+        assert_eq!(
+            testutil::eval_str(r#"JSON.stringify("\uDF06")"#),
+            r#""\udf06""#
+        );
+        // A pair is the character, not two escapes.
+        assert_eq!(
+            testutil::eval_str(r#"JSON.stringify("\uD834\uDF06")"#),
+            "\"\u{1D306}\""
+        );
+        // Mixed: lone, pair, lone — the case that catches a writer which
+        // escapes on sight or decodes greedily.
+        assert_eq!(
+            testutil::eval_str(r#"JSON.stringify("\uD834\uD834\uDF06\uD834")"#),
+            "\"\\ud834\u{1D306}\\ud834\""
+        );
+        // Inside a container, and as a key.
+        assert_eq!(
+            testutil::eval_str(r#"JSON.stringify(["\uD834"])"#),
+            r#"["\ud834"]"#
+        );
+        assert_eq!(
+            testutil::eval_str(r#"JSON.stringify({ "\uD834": 1 })"#),
+            r#"{"\ud834":1}"#
+        );
+    }
+
+    /// The ordinary output has to be byte-for-byte what it was, because every
+    /// tool result and log line in the harness crosses here.
+    #[test]
+    fn ordinary_values_are_written_exactly_as_before() {
+        assert_eq!(
+            testutil::eval_str(r#"JSON.stringify("a\"b\\c")"#),
+            r#""a\"b\\c""#
+        );
+        assert_eq!(
+            testutil::eval_str(r#"JSON.stringify("\n\t\r")"#),
+            r#""\n\t\r""#
+        );
+        assert_eq!(
+            testutil::eval_str(r#"JSON.stringify("\u0000")"#),
+            r#""\u0000""#
+        );
+        // Non-ASCII is written as itself, as serde does — not \u-escaped.
+        assert_eq!(testutil::eval_str(r#"JSON.stringify("é→😀")"#), "\"é→😀\"");
+        assert_eq!(
+            testutil::eval_str(r#"JSON.stringify({a:1,b:[1,2],c:null,d:undefined,e:""})"#),
+            r#"{"a":1,"b":[1,2],"c":null,"e":""}"#
+        );
+        assert_eq!(testutil::eval_str("JSON.stringify([])"), "[]");
+        assert_eq!(testutil::eval_str("JSON.stringify({})"), "{}");
+        assert_eq!(
+            testutil::eval_str("JSON.stringify([1,undefined,2])"),
+            "[1,null,2]"
+        );
+        // Indented output, including a nested empty container.
+        assert_eq!(
+            testutil::eval_str("JSON.stringify({a:[1,{b:2}],c:{},d:[]}, null, 2)"),
+            "{\n  \"a\": [\n    1,\n    {\n      \"b\": 2\n    }\n  ],\n  \"c\": {},\n  \"d\": []\n}"
+        );
+        // A round trip through parse still holds for everything JSON can say.
+        assert_eq!(
+            testutil::eval_str(r#"JSON.stringify(JSON.parse('{"x":[1,"é",true,null]}'))"#),
+            r#"{"x":[1,"é",true,null]}"#
+        );
+    }
+
+    /// **What is still broken, pinned so it is not mistaken for working.**
+    /// `serde_json` *rejects* a lone-surrogate escape on parse, so the
+    /// round trip is one-way: a program can write `"\ud834"` out and cannot
+    /// read it back. Fixing that means our own JSON reader, which is a
+    /// separate change with a separate justification — none of the 142
+    /// failing `built-ins/JSON` tests turns on it (they are error-type and
+    /// `json-parse-with-source` failures).
+    #[test]
+    fn parse_still_refuses_a_lone_surrogate_escape() {
+        let m = testutil::run_ret(
+            r#"try { JSON.parse('"\\ud834"'); return "parsed"; } catch (e) { return "threw"; }"#,
+        );
+        assert_eq!(m, "threw");
+        // A *paired* escape reads back fine, which is the common case.
+        assert_eq!(
+            testutil::eval_str(r#"JSON.parse('"\\ud834\\udf06"')"#),
+            "\u{1D306}"
+        );
+    }
+}
 
 #[cfg(test)]
 mod indent_argument_tests {

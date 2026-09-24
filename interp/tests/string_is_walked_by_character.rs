@@ -272,3 +272,45 @@ fn trim_uses_the_js_whitespace_set() {
     // A zero-width space is *not* whitespace in JS and must survive.
     assert_eq!(val(r#"return "​x".trim().length;"#), 2);
 }
+
+/// **`Edit.*` offsets are the program's offsets.**
+///
+/// `edit.rs` is 1,500 lines built on byte offsets and it stays that way; what
+/// changed is that the two edges where an offset is *visible to the program*
+/// convert. If they did not — if `indexOf` returned code units while
+/// `extractBlock` took bytes — the change would have manufactured a new
+/// papercut of exactly the kind it was meant to remove.
+#[test]
+fn edit_offsets_agree_with_index_of() {
+    // An em dash before the block: byte offsets and unit offsets diverge from
+    // the third character on, so every number here was a different one.
+    assert_eq!(
+        val(r#"const t = "// — note\nfn f() { let x = 1; }\n";
+               const head = t.indexOf("fn f");
+               const r = Edit.extractBlock(t, head);
+               return [t.length, head, t.slice(r.start, r.end)];"#),
+        serde_json::json!([32, 10, "{ let x = 1; }"])
+    );
+    // `extractEnclosing` takes an index *inside* the span, likewise.
+    assert_eq!(
+        val(r#"const t = "x — (a, b) y";
+               const i = t.indexOf("a");
+               const r = Edit.extractEnclosing(t, i, "(", ")");
+               return t.slice(r.start, r.end);"#),
+        "(a, b)"
+    );
+    // And the text a replace hands back is the text, em dash included.
+    assert_eq!(
+        val(r#"return Edit.replaceOnce("a — b", "—", "-");"#),
+        "a - b"
+    );
+    assert_eq!(val(r#"return Edit.count("— — x", "—");"#), 2);
+    // The refusal no longer says "byte index", because it is not one.
+    assert_eq!(
+        val(
+            r#"try { Edit.extractBlock("— no brace", 1); return "no throw"; }
+               catch (e) { return e.message.indexOf("byte") === -1; }"#
+        ),
+        true
+    );
+}
