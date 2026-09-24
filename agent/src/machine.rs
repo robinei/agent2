@@ -364,6 +364,32 @@ const REPLY_SHAPE_TAIL: &str = "Someone has asked you something and you have no 
 /// block — write it") and was ignored six times, so force may be the
 /// thing that already failed, and the explanation may be what worked.
 /// One run per arm either way — this is a probe, not a result.
+///
+/// **And three levers have now missed it, at n=90 per arm** (2026-09-24,
+/// `deepseek-v4-flash`, three task shapes held still: a rename-and-check,
+/// a search, a read-and-explain).
+///
+/// - This line, already shipped: drafting still runs 19%.
+/// - A paragraph saying what a trapped block costs — the diagnostic, the
+///   line, the calls that landed, the rows they made, what was printed,
+///   all of it true: **19% -> 16%, p=0.69**. The account it tested was
+///   that rehearsal hedges against an unknown cost, since the card
+///   describes failure only as obligation and never says what one costs.
+///   Supplying the fact changed nothing, so that account is wrong.
+/// - A paragraph ruling out Node, added for another reason: **raised**
+///   drafting, 19% against 8%, p=0.047. Naming a thing at length appears
+///   to put it in mind.
+///
+/// What it does track is the task — 33% on the edit, 10% on the search,
+/// 13% on the read — not what the card says. Reading one run closely,
+/// much of it is real work ("what if `note_json` already exists? That's
+/// a real hazard"). Drafted replies cost 4-17x wall clock and 8-21x
+/// completion tokens when they happen, which is a reason to care and not
+/// yet a lever.
+///
+/// Earlier figures here were measured on documents whose tool manifest
+/// declared one tool beside examples calling three others; those showed
+/// 43-80% and are not comparable. Capture from real sessions.
 const NO_REHEARSAL_TAIL: &str =
     "- Thinking is for reasoning! Never draft code blocks! One-shot them in the reply.";
 
