@@ -8,6 +8,6 @@ const fixed = Edit.replaceOnce(f.content, "OLD", "NEW");
 await tools.replace_file("PATH", fixed, f.version);
 const check = await tools.bash("CHECK");
 if (check.status !== 0) return `changed PATH, but CHECK fails:\n${check.stdout}`;
-tell(【← snipped - history[16]】);
+tell(【snipped - history[16]】);
 finish();
 ```

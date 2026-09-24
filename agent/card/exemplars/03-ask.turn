@@ -4,7 +4,7 @@ Which way this should go is not mine to guess, and it is a closed choice — the
 【↓ history[63]】
 ```js
 const f = await tools.read_file("PATH");
-const pick = await choose(【← snipped - history[69]】);
+const pick = await choose(【snipped - history[69]】);
 if (pick === "leave it") {
   tell("left PATH alone.");
 } else {

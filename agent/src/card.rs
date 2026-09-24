@@ -169,6 +169,12 @@ fn the_card_teaches_the_markers_the_document_uses() {
         card.contains(&format!("{open}{left} history[")),
         "and the call annotation as it renders: {open}{left} history[N]{close}"
     );
+    assert!(
+        card.contains(&format!("{open}{} history[", crate::document::SNIPPED)),
+        "and the snip as it renders — no arrow, because it replaced \
+         something rather than pointing at it: {open}{} history[N]{close}",
+        crate::document::SNIPPED
+    );
     // **The fence is the rule now, so the fence is what must be
     // named.** It used to be the two arrows — and naming those was the
     // best available, because they were all the model had to go on.
@@ -1014,7 +1020,7 @@ mod tests {
         // `card()` shows up as a diff review must look at, not a byte
         // count that silently drifts. Comparing full text (not just a
         // hash) so the diff itself is legible in a failure message.
-        const EXPECTED_LEN: usize = 24493;
+        const EXPECTED_LEN: usize = 24710;
         assert_eq!(
             card().len(),
             EXPECTED_LEN,

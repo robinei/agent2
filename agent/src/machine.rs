@@ -5440,10 +5440,10 @@ fn substitute_within(
 fn reference_to(row: EventId, bytes: usize) -> String {
     let id = row.as_u64();
     let (open, close) = (crate::document::FENCE_OPEN, crate::document::FENCE_CLOSE);
-    let arrow = crate::document::ARROW;
+    let snipped = crate::document::SNIPPED;
     format!(
-        "{open}{arrow} snipped - history[{id}] holds these {bytes} bytes. A print cannot show \
-         you a row; history.peek({id}) puts them in front of your next reply{close}"
+        "{open}{snipped} history[{id}] holds these {bytes} bytes. A print cannot show you a \
+         row; history.peek({id}) puts them in front of your next reply{close}"
     )
 }
 
@@ -7000,7 +7000,7 @@ mod tests {
             .content
             .clone();
         assert!(
-            program.contains("tell(【← snipped - history["),
+            program.contains("tell(【snipped - history["),
             "the long literal tell became a reference: {program}"
         );
         assert!(
@@ -11808,7 +11808,7 @@ mod tests {
             "the long literal should have been snipped:\n{shown}"
         );
         assert!(
-            shown.contains("← snipped - history["),
+            shown.contains("【snipped - history["),
             "and replaced by its row:\n{shown}"
         );
         // Everything around it is intact: the prose, both fences, and

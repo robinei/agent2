@@ -8,6 +8,6 @@ const fixed = Edit.replaceOnce(conf.content, "3", "5");
 await tools.replace_file("CONF.json", fixed, conf.version);
 const check = await tools.bash("CHECK 2>&1");
 if (check.status !== 0) return `set retries to 5, CHECK still fails:\n${check.stdout}`;
-tell(【← snipped - history[114]】);
+tell(【snipped - history[114]】);
 finish();
 ```

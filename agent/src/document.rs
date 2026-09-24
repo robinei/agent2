@@ -514,10 +514,9 @@ fn annotate_history_calls(
         // stripped from a reply before it is logged or compiled
         // (`strip_annotations`), so the annotation never reaches a
         // parser and does not have to survive one.
-        let snipped = format!(
-            "{FENCE_OPEN}{ARROW} snipped - history[{}]{FENCE_CLOSE}",
-            c.row
-        );
+        // **No arrow**: this span is not pointing at the literal, it is
+        // standing where the literal was. See [`SNIPPED`].
+        let snipped = format!("{FENCE_OPEN}{SNIPPED} history[{}]{FENCE_CLOSE}", c.row);
         let marked = format!(" {FENCE_OPEN}{ARROW} history[{}]{FENCE_CLOSE}", c.row);
         if c.literal && snipped.len() < c.end - c.start {
             // Keep the callee, so the call still reads as a call:
@@ -581,6 +580,23 @@ pub(crate) const BLOCK_ARROW: &str = "↓";
 /// Everything the harness adds goes between these, so a reply can be
 /// cleaned by deleting the spans and nothing else — see
 /// `strip_annotations`.
+/// **What stands where bytes were taken out**, and the one annotation
+/// that carries no arrow.
+///
+/// An arrow points at something the model wrote and left in place:
+/// [`BLOCK_ARROW`] down at the block below it, [`ARROW`] left at the
+/// call beside it. A snip has nothing adjacent to point at — the bytes
+/// are gone and this span is what stands in for them — so an arrow
+/// here would be pointing at itself. The absence is the distinction,
+/// and card.md states it as one: *no arrow means the span replaced
+/// something*.
+///
+/// Both snips share it: a long literal inside a call
+/// ([`mark_calls`]), and a print or note that repeated a row
+/// (`machine::reference_to`). They are one act — bytes removed, and
+/// the row they are on — so they are one shape.
+pub(crate) const SNIPPED: &str = "snipped -";
+
 pub(crate) const FENCE_OPEN: &str = "【";
 pub(crate) const FENCE_CLOSE: &str = "】";
 
@@ -2078,7 +2094,7 @@ mod tests {
             .content
             .clone();
         assert!(
-            program.contains(&format!("tell(【← snipped - history[{}]】)", a.as_u64())),
+            program.contains(&format!("tell(【snipped - history[{}]】)", a.as_u64())),
             "the long literal is replaced by its row: {program}"
         );
         assert!(
@@ -2399,7 +2415,7 @@ mod tests {
         let all: String = doc.messages.iter().map(|m| m.content.clone()).collect();
         assert!(
             all.contains(&format!(
-                "const a = await ask(【← snipped - history[{}]】)",
+                "const a = await ask(【snipped - history[{}]】)",
                 q.as_u64()
             )),
             "{all}"
