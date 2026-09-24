@@ -16,6 +16,8 @@ mod score;
 #[cfg(test)]
 mod scripted;
 #[cfg(test)]
+mod exemplar_gen;
+#[cfg(test)]
 mod testkit;
 mod transcript;
 mod tree;

@@ -510,6 +510,20 @@ impl Conversation {
         self.post(Author::Harness, text, false)
     }
 
+    /// The person speaks the way a person actually does: a task, not a
+    /// question held open until something answers it.
+    ///
+    /// `user` marks the post `expects_reply`, which is right for the
+    /// tests that check what an unanswered question does to a branch
+    /// and wrong for anything reproducing an ordinary session — live
+    /// logs record `expects_reply: false` on every direct post. The
+    /// difference shows: four tasks driven through `user` leave
+    /// `## RIGHT NOW` reading "4 open: #2 (the user), #20 (the user)…",
+    /// which no real session says.
+    pub fn user_says(&mut self, text: &str) -> EventId {
+        self.post(Author::User, text, false)
+    }
+
     fn post(&mut self, from: Author, text: &str, expects_reply: bool) -> EventId {
         let origin = Origin::Direct {
             text: text.to_owned(),
