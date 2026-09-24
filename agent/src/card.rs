@@ -1105,6 +1105,56 @@ mod tests {
         );
     }
 
+    /// **The index of channels is load-bearing in a way the
+    /// declarations below it are not.**
+    ///
+    /// "What crosses from this reply to the next" lists every way a
+    /// value reaches the next reply. Measured 2026-09-24 against a
+    /// frozen document (`lab/readverb`), n=20 per arm, deleting one
+    /// thing at a time from the shipped card:
+    ///
+    /// ```text
+    ///                           shows   notes  prints
+    ///   as shipped               90%      0%     45%
+    ///   − this paragraph         75%     30%     60%
+    ///   − the 05-keep exemplar   65%      5%     70%
+    ///   − both                   45%     15%     65%
+    /// ```
+    ///
+    /// **Removing both halves `keep`/`peek` adoption** — 90% to 45%,
+    /// Fisher p=0.0057, and the median reply in that arm calls
+    /// neither. Neither change alone is significant, so the pair earns
+    /// its place together and the credit does not divide.
+    ///
+    /// **The attribution in the commit that added this paragraph is
+    /// wrong.** It claimed the paragraph drove `keep`/`peek` adoption;
+    /// alone that is p=0.41. What it does on its own is stop the
+    /// copying — `history.note` at 0/20 against 6/20, p=0.0202 — which
+    /// is the 52 KB-into-one-row failure the live runs were loudest
+    /// about. Right paragraph, wrong reason, and the reason is what
+    /// the next person would have edited against.
+    #[test]
+    fn the_index_of_channels_names_every_way_a_value_crosses() {
+        let card = card();
+        let (_, index) = card
+            .split_once("## What crosses from this reply to the next")
+            .expect("the section itself");
+        let index = &index[..index.find("## ").unwrap_or(index.len())];
+        for verb in [
+            "history.note(v)",
+            "history.keep(r)",
+            "history.peek(r)",
+            "console.log(x)",
+            "tell(text)",
+        ] {
+            assert!(
+                index.contains(verb),
+                "the index does not list {verb}; a channel the model \
+                 cannot find in this list it reaches for by habit"
+            );
+        }
+    }
+
     /// **Every history verb the card declares is demonstrated by a
     /// worked example, and no example uses one the card does not
     /// declare.**
