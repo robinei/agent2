@@ -73,6 +73,8 @@ fi
 # asks for. Four runs queueing behind each other and being killed at 900
 # seconds is what "the LAN model is too slow to measure with" was
 # partly made of.
+ORIGINAL_ARGS=("$@")
+
 have() {
   local needle=$1
   shift
@@ -82,6 +84,37 @@ have() {
 extra=()
 have --jobs "$@" || extra+=(--jobs 1)
 have --timeout "$@" || extra+=(--timeout 3000)
+
+# **One GPU, so one run.** `--jobs 1` is the default above, but a
+# caller can pass their own — and this box is a single GPU serving a
+# single slot, so anything above 1 does not run in parallel, it
+# queues. What that produces is not a slower suite, it is a wrong one:
+# every run's wall clock includes the time it spent waiting behind the
+# others, and runs get killed at the timeout for a queue they were
+# never told about. That is most of what the discredited
+# "~450s/program" figure was made of, and the bug that caused it was in
+# this very function. A default can be overridden by accident; this
+# cannot.
+while [ $# -gt 0 ]; do
+  case $1 in
+    --jobs)
+      [ "${2:-1}" -gt 1 ] 2>/dev/null && {
+        echo "evals/local.sh: --jobs $2 — this box is one GPU serving one slot," >&2
+        echo "  so concurrent runs queue and every timing is wrong. Use --jobs 1." >&2
+        exit 2
+      }
+      ;;
+    --jobs=*)
+      [ "${1#--jobs=}" -gt 1 ] 2>/dev/null && {
+        echo "evals/local.sh: ${1} — this box is one GPU serving one slot," >&2
+        echo "  so concurrent runs queue and every timing is wrong. Use --jobs 1." >&2
+        exit 2
+      }
+      ;;
+  esac
+  shift
+done
+set -- "${ORIGINAL_ARGS[@]}"
 
 echo "evals/local.sh: $LOCAL_MODEL at $LOCAL_BASE_URL" >&2
 exec python3 "$(dirname "$0")/drive.py" "${extra[@]}" "$@"
