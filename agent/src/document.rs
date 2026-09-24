@@ -1437,11 +1437,10 @@ fn push_flush(messages: &mut Vec<ChatMessage>, pending: &mut Vec<String>) {
 /// the ephemeral tail and is never logged; so does the one
 /// `stopped_short` prod that is about no defect
 /// (`machine::NOT_FINISHED_NOTICE`). The reply each one earns
-/// therefore follows the reply before it with no event in between —
-/// and dropping the empty turn
-/// leaves two assistant messages back to back, which is not a shape
-/// the transport has, and gives the model no boundary between one of
-/// its replies and the next.
+/// therefore follows the reply before it with no event in between — and
+/// dropping the empty turn leaves two assistant messages back to back,
+/// which is not a shape the transport has, and gives the model no
+/// boundary between one of its replies and the next.
 ///
 /// So the turn is rendered, saying the one true thing there is to say
 /// about it. The readout that actually caused the wake is gone by
