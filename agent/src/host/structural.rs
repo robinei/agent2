@@ -69,7 +69,7 @@ pub fn outline_def() -> ToolDef {
             "maxItems": 1
         }),
         guidelines: vec![
-            "**If you will read this yourself — not just compute on it — you must `history.peek(r)` in this same reply, or `history.keep(r)` to have it from here on.** Nothing else shows it to you: the result is a variable, and printing it back is replaced by the id of the row it repeats.".into(),
+            "**If you will read this yourself — not just compute on it — you must `history.peek(r)` in this same reply.** Nothing else shows it to you: the result is a variable, and printing it back is replaced by the id of the row it repeats. `history.keep(r)` instead only if you will read it again later — its bytes are in every request from here on, where a peek's are in one.".into(),
             "Nothing here tells you a definition is unused. A name can be reached without appearing anywhere as that name — `getattr(mod, \"f_\" + i)`, a table keyed by strings, a decorator registry — so neither this nor a search for the name can see it. Before deleting a definition, look for the *mechanisms*: read the callers, and grep for the prefix and for `getattr`/`globals`/registry calls. Then work out which names that mechanism can actually reach — a dispatch table is usually a list you can read, and \"a lookup exists\" is not the same answer as \"every name is reachable\".".into(),
             "`start_line` is an edit anchor, not just a fact: `Edit.replaceLines(text, start_line, end_line, …)` names one place exactly, where a string that looks distinctive often is not. A marker like `TODO(perf)` appears seven times in a small file; `parse_header` appears once, and outline says which lines it spans.".into(),
         ],

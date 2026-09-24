@@ -5557,6 +5557,15 @@ fn substitute_within(
 /// cost, and naming it here asked the model to pay by the turn for a
 /// thing it needed once.
 ///
+/// **And it names the habit, not only the recovery.** By the time
+/// this is read the cheap moment has gone — the call was made last
+/// reply — so `history.peek(12)` on its own is a whole turn spent on
+/// a read. `live/t8` did exactly that three times in ten replies, and
+/// its reasoning says why in as many words: "Let me peek at the
+/// listing I got." It was obeying this line. So the line now says
+/// where the peek belongs as well as which verb it is: alongside the
+/// next call, in the reply that makes it.
+///
 /// **Fenced, because the harness wrote it.** `【…】` marks every span
 /// this harness puts inside the model's own content — the `↓` above a
 /// block, the `←` beside a call — and a reference standing where the
@@ -5581,7 +5590,8 @@ fn reference_to(row: EventId, bytes: usize) -> String {
     let snipped = crate::document::SNIPPED;
     format!(
         "{open}{snipped} history[{id}] holds these {bytes} bytes. A print cannot show you a \
-         row; history.peek({id}) puts them in front of your next reply{close}"
+         row; history.peek({id}) can, alongside whatever you call next — peek the result in the \
+         reply that makes the call and you never come back for it{close}"
     )
 }
 

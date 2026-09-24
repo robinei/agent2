@@ -141,13 +141,15 @@ declare namespace history {
   function fetch(id: number): unknown;
   /** **The row writes its value out**, from your next reply onwards. Give it the result or its id — `history.keep(f)` or `history.keep(4)` — and a projection when you want part of it, either a value or a function of the result: `history.keep(f, v => v.content.slice(0, 2000))`. The function form lets the result stay anonymous, so no `const` is needed to hold it.
 
-  **This is how you read.** `note` copies bytes into a row of your own; `keep` makes the row that already exists show what it got, so a file in front of you is not also stored twice. Nothing moves: the value appears under that row's own line, under the id you already have.
+  **This is how you read something you will read again.** `note` copies bytes into a row of your own; `keep` makes the row that already exists show what it got, so a file in front of you is not also stored twice. Nothing moves: the value appears under that row's own line, under the id you already have.
+
+  **Its bytes are in every request you send from here on**, which is the difference between the two verbs and the only one that matters when you are choosing: an unread `peek` costs you one reply, an unnecessary `keep` costs you every reply after it. Reach for `peek` unless you know you will come back to this.
 
   Leave the projection out for the whole result, or for the way it was cut last time. */
   function keep(result: number | { id: number }, project?: unknown | ((r: unknown) => unknown)): number;
   /** **The same for your next reply and no further**, and it arrives at the end of that reply's page rather than on the row: there for one reading, gone from the one after, and the row itself never changes.
 
-  **For what you need to look at once** — the file you are about to edit, the listing you are about to take four paths out of. Costs nothing to give up, because nothing above it is rewritten. Peek nothing you will not read next reply: it is there once, and a reply that does not use it has paid for it anyway. `peek` again to have it another reply; `keep` when it turns out to be load-bearing, and `peek` something you kept to stop paying for it after one more look. `fetch` still answers either way. */
+  **For what you need to look at once** — the file you are about to edit, the listing you are about to take four paths out of. Costs nothing to give up, because nothing above it is rewritten. Peek what you will read next reply: it is there once. `peek` again to have it another reply; `keep` when it turns out to be load-bearing, and `peek` something you kept to stop paying for it after one more look. `fetch` still answers either way. */
   function peek(result: number | { id: number }, project?: unknown | ((r: unknown) => unknown)): number;
   /** Show `text` in place of that entry — **when you have found out it is wrong**, or when it is worth one line and not eighty. A later reader cannot discover that a row is wrong; only you, now, know that. Spend the words on what is true, not on saying something changed. Never replace an entry already showing as `[id] … text`: it is already standing in for something longer.
 
