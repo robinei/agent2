@@ -482,11 +482,48 @@ pub fn edit_extract_enclosing(vm: &mut VM, args: Args) -> Result<Value, VMError>
         .ok_or_else(|| {
             vm.fail(
                 ErrorKind::ValueError,
-                format!("no enclosing `{open_ch}`…`{close_ch}` pair around byte index {idx}"),
+                format!(
+                    "no enclosing `{open_ch}`…`{close_ch}` pair around byte index {idx}{}",
+                    block_hint(text, idx, open_ch, close_ch)
+                ),
             )
         })?;
 
     build_range_obj(vm, best.0, best.1)
+}
+
+/// The sentence that names `extractBlock`, when the index the caller
+/// passed looks like a definition *head* rather than a byte inside the
+/// span they want.
+///
+/// **The two verbs are one letter apart in meaning and the wrong one is
+/// the plausible pick.** A live run held `i = text.indexOf("fn compact(")`,
+/// wanted that function's body, and wrote
+/// `Edit.extractEnclosing(text, i, "{", "}")`. The call failed
+/// correctly — `fn compact(` is at module level, and that byte is
+/// inside its parameter list, enclosed by nothing — and the message
+/// said only that, so the run had no way to get from a true statement
+/// to the verb it wanted, `extractBlock(text, headIndex)`.
+///
+/// Naming the other verb in the error rather than in the card is
+/// deliberate: it reaches exactly the run that guessed wrong, at the
+/// moment it guessed, and costs nothing in the prompt every other run
+/// pays for. Card prose measured here has twice made the behaviour it
+/// named *worse*.
+///
+/// Only for braces, and only when there is a `{` at or after `idx` —
+/// that is precisely the condition under which `extractBlock(text, idx)`
+/// would have found something, so the suggestion is never a guess.
+fn block_hint(text: &str, idx: usize, open_ch: char, close_ch: char) -> String {
+    if open_ch != '{' || close_ch != '}' || !text[idx..].contains('{') {
+        return String::new();
+    }
+    format!(
+        " — that byte is not inside any pair. If it is the start of a \
+         definition head (from `indexOf(\"fn name(\")`), the block you \
+         want is `Edit.extractBlock(text, {idx})`: the block whose head \
+         starts there, rather than one around it."
+    )
 }
 
 fn char_from_val(vm: &VM, val: &Value, label: &str) -> Result<char, VMError> {
@@ -1246,6 +1283,46 @@ mod tests {
     fn extract_enclosing_no_pair_errors() {
         let kind = testutil::run_err_kind("return Edit.extractEnclosing('hello', 2, '{', '}');");
         assert_eq!(kind, ErrorKind::ValueError);
+    }
+
+    /// **The error names the verb the caller wanted.** A live run held
+    /// `i = text.indexOf("fn compact(")`, wanted the function body, and
+    /// wrote `Edit.extractEnclosing(text, i, "{", "}")`. It failed
+    /// correctly — that byte is inside the parameter list of a
+    /// module-level `fn`, enclosed by nothing — and the message said
+    /// only that. A true statement the reader cannot act on is how two
+    /// turns get spent; `extractBlock(text, headIndex)` was one line
+    /// away.
+    #[test]
+    fn extract_enclosing_on_a_definition_head_names_extract_block() {
+        let err = testutil::run_runtime_err(
+            "const text = 'mod m {}\\nfn compact(a: u32) -> u32 { a }\\n';
+             return Edit.extractEnclosing(text, text.indexOf('fn compact('), '{', '}');",
+        );
+        assert_eq!(err.kind, ErrorKind::ValueError);
+        assert!(
+            err.message.contains("Edit.extractBlock(text, "),
+            "the message does not name the verb that works: {}",
+            err.message
+        );
+
+        // The suggestion is not a guess: with no `{` left in the text,
+        // `extractBlock` would fail too, so it is not offered.
+        let bare = testutil::run_runtime_err("return Edit.extractEnclosing('hello', 2, '{', '}');");
+        assert!(
+            !bare.message.contains("extractBlock"),
+            "offered a verb that would also fail: {}",
+            bare.message
+        );
+
+        // And it is about braces. `(`…`)` has no `extractBlock`.
+        let parens =
+            testutil::run_runtime_err("return Edit.extractEnclosing('a { b } c', 0, '(', ')');");
+        assert!(
+            !parens.message.contains("extractBlock"),
+            "extractBlock balances braces only: {}",
+            parens.message
+        );
     }
 
     // ── replaceLines ────────────────────────────────────────────────────
