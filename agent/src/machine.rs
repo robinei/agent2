@@ -5336,12 +5336,21 @@ fn substitute_within(
     }
 }
 
-/// What stands in the note's place: what was there, where it still is,
-/// and the one verb that puts it back in front of the reply. Short,
-/// because it is stored for the life of the row.
+/// What stands in the substituted bytes' place: what was there, where
+/// it still is, and the one verb that puts it back in front of the
+/// reply. Short, because it is stored for the life of the row.
+///
+/// **Fenced, because the harness wrote it.** `【…】` marks every span
+/// this harness puts inside the model's own content — the `↓` above a
+/// block, the `←` beside a call — and a reference standing where the
+/// model's bytes used to be is the same kind of thing. One delimiter
+/// for one meaning: *this is not yours*. It also means a reference
+/// copied back into a reply is stripped like any other annotation,
+/// rather than being read as text the model wrote.
 fn reference_to(row: EventId, bytes: usize) -> String {
     let id = row.as_u64();
-    format!("← the {bytes} bytes already on [{id}]; history.keep({id}) shows them here")
+    let (open, close) = (crate::document::FENCE_OPEN, crate::document::FENCE_CLOSE);
+    format!("{open}← the {bytes} bytes already on [{id}]; history.keep({id}) shows them here{close}")
 }
 
 /// The search itself, over any sequence of rows — separated from the
@@ -10083,7 +10092,8 @@ mod tests {
             .expect("something was printed");
         assert_eq!(printed.len(), 1, "one print, one entry: {printed:?}");
         assert!(
-            printed[0].contains(&format!("[{row}]")),
+            printed[0].starts_with(crate::document::FENCE_OPEN)
+                && printed[0].contains(&format!("[{row}]")),
             "the entry names the row it repeated: {printed:?}"
         );
         assert!(
@@ -10184,7 +10194,10 @@ mod tests {
         );
         let v = noted(&c);
         assert_eq!(v["finding"], "it stalls at batch 7", "the finding is kept");
-        assert!(v["dump"].as_str().unwrap().starts_with('←'), "the copy is not");
+        assert!(
+            v["dump"].as_str().unwrap().starts_with(crate::document::FENCE_OPEN),
+            "the copy is not"
+        );
 
         // A sentence in front of the dump is still the dump — the
         // variation a whole-string comparison misses.
@@ -10195,7 +10208,10 @@ mod tests {
              history.note(`the log said:\\n${r.stdout}`);\n```\n",
         );
         assert!(
-            noted(&c).as_str().unwrap().starts_with('←'),
+            noted(&c)
+                .as_str()
+                .unwrap()
+                .starts_with(crate::document::FENCE_OPEN),
             "a prefixed copy is a copy: {:?}",
             noted(&c)
         );

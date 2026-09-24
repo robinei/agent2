@@ -52,7 +52,7 @@ A block fenced `ts` or `typescript` runs too, types erased first. **Write JavaSc
 
 **Your own blocks come back annotated.** `【↓ history[12]】` above a block names it: read that block back with `history.fetch(12)`. A `tell`, `ask` or `history.note` comes back carrying `【← history[40]】`, naming the row it wrote. A long literal becomes `【← snipped - history[40]】` — the words themselves are on that row.
 
-**Never type `【` or `】`: everything between them is the harness writing in your reply.** They are added after the reply is logged, so an id you write there is a guess and a wrong `history.fetch` follows it. Anything you do write between them is deleted before the reply is kept, and the next request says how much.
+**Never type `【` or `】`: everything between them is the harness writing in your reply.** They are added after the reply is logged, so an id you write there is a guess and a wrong `history.fetch` follows it. Anything you do write between them is deleted before the reply is kept, and the next request says how much. They also stand where the harness has taken bytes out of something you wrote — a note or a print that repeated a row you already have, replaced by the id of that row.
 
 **Nothing else crosses — least of all your variables.** Across replies no scope is shared, so a later `ls.stdout` or `content` is a `ReferenceError`. A reply that finds something and neither acts on it nor hands it on has thrown the finding away.
 

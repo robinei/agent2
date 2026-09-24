@@ -1014,7 +1014,7 @@ mod tests {
         // `card()` shows up as a diff review must look at, not a byte
         // count that silently drifts. Comparing full text (not just a
         // hash) so the diff itself is legible in a failure message.
-        const EXPECTED_LEN: usize = 23680;
+        const EXPECTED_LEN: usize = 23849;
         assert_eq!(
             card().len(),
             EXPECTED_LEN,
@@ -2434,7 +2434,7 @@ mod tests {
         if !dir.join("card.md").is_file() {
             return;
         }
-        let ex = load_from(&dir).unwrap().exemplars;
+        let _ex = load_from(&dir).unwrap().exemplars;
 
         // The first finishes a task it actually changed, and checks the
         // change by running the thing that would fail.

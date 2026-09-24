@@ -231,12 +231,6 @@ pub struct ConditionReport {
     /// its artifacts instead of each one re-listing its predecessor's.
     /// The trailing line says how many exist in total and their id range.
     pub artifacts: Vec<Artifact>,
-    /// Rows this run appended that hold bytes already on the log — see
-    /// [`CompletionReport::copied_rows`], and [`copied_note`] for why
-    /// this is on both shapes.
-    pub copied_rows: Vec<(u64, u64)>,
-    /// Calls whose bytes this run printed — see [`printed_rows`].
-    pub printed_rows: Vec<u64>,
 }
 
 impl ConditionReport {
@@ -261,8 +255,6 @@ impl ConditionReport {
         let rows: Vec<&Artifact> = self.artifacts.iter().collect();
         sections.extend(render_rows(&rows));
         sections.extend(render_console(&self.console, self.console_id));
-        sections.extend(copied_note(&self.copied_rows));
-        sections.extend(printed_note(&self.printed_rows));
         sections.join("\n\n")
     }
 }
@@ -398,23 +390,6 @@ pub struct CompletionReport {
     /// success. The fix belongs in the report, not in a new event — so
     /// the report counts them and says so.
     pub failed_calls: usize,
-    /// Rows this run appended whose bytes were already on the log, as
-    /// `(the note, what it copied)`.
-    ///
-    /// **72% of everything appended across 96 kept runs was already
-    /// there** — 79 KB carried twice, in 19 runs. The card says it in
-    /// bold ("Not the bytes of something you read") and the worked
-    /// example that broke the rule has been fixed, and a run on
-    /// 2026-09-20 still opened with `history.note({cargoToml:
-    /// cargoToml.content, lib: lib.content, fmt: fmt.content, …})` over
-    /// three files it had read in the same program. Prose in the card
-    /// is 16 KB from the decision; this is next to it.
-    ///
-    /// Exact byte equality only, and only for strings big enough to
-    /// matter, so there is nothing to be wrong about.
-    pub copied_rows: Vec<(u64, u64)>,
-    /// Calls whose bytes this run printed — see [`printed_rows`].
-    pub printed_rows: Vec<u64>,
     /// Bytes of the longest `bash` command this run issued, when it was
     /// long enough to be a script rather than a pipeline. Zero
     /// otherwise. See `host::tools`'s command ceiling for why this is a
@@ -466,17 +441,6 @@ impl CompletionReport {
                  script either way.",
                 self.long_bash
             ));
-        }
-
-        for note in [
-            printed_note(&self.printed_rows),
-            copied_note(&self.copied_rows),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            out.push_str("\n\n");
-            out.push_str(&note);
         }
 
         if self.wrote_without_verifying() {
@@ -1303,201 +1267,11 @@ pub fn derive_report(tree: &Tree, leaf: EventId, outcome: EventId, budget: usize
     text
 }
 
-/// The "you copied a row" advisory, shared by both report shapes.
-///
-/// **On both, because the rows were added either way.** It lived only
-/// on the completion report at first, and the run that prompted it
-/// appended four copies in a program that ended in a `ReferenceError`
-/// — so the one report it would have helped was the one shape it did
-/// not appear on. The same mistake as `CellFailed` hiding the work a
-/// reply had already done, one field over.
-/// The "you printed a result" half of `### worth knowing`.
-///
-/// **The same advice as [`copied_note`], and deliberately not the same
-/// words.** A note at least keeps the bytes fetchable under an id;
-/// printing them buys a clipped tail of something the record already
-/// holds whole, and the next reply has to read it again to get at it.
-/// So this one names what was lost, not just what it cost.
-fn printed_note(sources: &[u64]) -> Option<String> {
-    if sources.is_empty() {
-        return None;
-    }
-    let list = sources
-        .iter()
-        .map(|s| format!("`[{s}]`"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    Some(format!(
-        "You printed the bytes of {list}. The console is a trace of what a program did, kept as \
-         a tail and fetchable under no id of its own — so those bytes are now in front of you \
-         once, clipped, and still have to be read from {list} to be used. `history.keep(id)` \
-         shows a result from here on and `history.peek(id)` for one reply, both without a copy."
-    ))
-}
 
-fn copied_note(rows: &[(u64, u64)]) -> Option<String> {
-    if rows.is_empty() {
-        return None;
-    }
-    // Grouped by the note, so four sources read as one sentence
-    // rather than four.
-    let mut by_note: Vec<(u64, Vec<u64>)> = Vec::new();
-    for (note, src) in rows {
-        match by_note.iter_mut().find(|(n, _)| n == note) {
-            Some((_, srcs)) => srcs.push(*src),
-            None => by_note.push((*note, vec![*src])),
-        }
-    }
-    let pairs = by_note
-        .iter()
-        .map(|(note, srcs)| {
-            let list = srcs
-                .iter()
-                .map(|s| format!("`[{s}]`"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!("`[{note}]` holds the bytes of {list}")
-        })
-        .collect::<Vec<_>>()
-        .join("; ");
-    Some(format!(
-        "### worth knowing\n\n{pairs}. A call's result is on the record already, so a \
-         copy of it is a second charge on every turn from here for bytes you \
-         had. To put a result in front of you, name the call: `history.keep(id)` \
-         from here on, `history.peek(id)` for one reply, and a projection on either \
-         for the part of it you actually read. What is worth a row of its own is what \
-         you concluded from those bytes."
-    ))
-}
 
-/// How long a string has to be before carrying it twice is worth a
-/// word. Shorter than a `read_file` of anything real, longer than any
-/// conclusion worth appending.
-const COPY_MIN_BYTES: usize = 400;
 
-/// Notes this run appended that hold bytes already on the log — see
-/// [`CompletionReport::copied_rows`].
-///
-/// Exact equality on string leaves, so there is nothing to be wrong
-/// about: either those bytes are on the log twice or they are not. The
-/// earliest matching result wins, because that is the one whose id the
-/// model should have kept.
-/// Calls whose delivered bytes this run **printed** — the same mistake
-/// as [`copied_rows`], on the channel it moved to.
-///
-/// **Measured, after two card wordings failed to shift it.** On the
-/// card of 2026-09-24, 9 of 60 first replies to a reading task still
-/// wrote `console.log(f.content)`; 8 more printed counts and branches,
-/// which is what the channel is for. Saying it a third way in the card
-/// was not the next thing to try — the report already tells a program
-/// when it copied a row's bytes into a note, and said nothing when it
-/// printed them instead, so the one advisory that fires on this
-/// mistake was blind to where the mistake had gone.
-///
-/// A console line **containing** a delivered string, not equal to it:
-/// what a program writes is `console.log("DESIGN:\n" + f.content)`, and
-/// an equality test sees nothing wrong with that.
-fn printed_rows(h: &Handback<'_>) -> Vec<u64> {
-    let mut delivered: Vec<(String, u64)> = Vec::new();
-    for ev in h.path.iter() {
-        if let EventPayload::Result {
-            call,
-            outcome: crate::types::Outcome::Delivered(v),
-        } = &ev.payload
-        {
-            let mut found = Vec::new();
-            result_strings(v, &mut found);
-            for text in found {
-                delivered.push((text, call.as_u64()));
-            }
-        }
-    }
-    let mut out: Vec<u64> = Vec::new();
-    if delivered.is_empty() {
-        return out;
-    }
-    // **The console is stored as lines, and a printed payload is not
-    // one line.** `console.log(f.content)` becomes sixty rows of
-    // `h.console`, so a per-line containment test finds nothing —
-    // which is what the first version of this did, on the very shape
-    // it was written for. The run's output is one blob for this
-    // question.
-    let printed = h.console.join("\n");
-    if printed.len() < COPY_MIN_BYTES {
-        return out;
-    }
-    for (text, call) in &delivered {
-        // **Trimmed, because the console is stored line by line.** A
-        // `stdout` ends in a newline; splitting it into lines and
-        // joining them back drops that last one, so an untrimmed
-        // containment test misses by exactly one byte — on every
-        // command output there is, which is most of what gets printed.
-        let text = text.trim_end();
-        if text.len() >= COPY_MIN_BYTES && printed.contains(text) && !out.contains(call) {
-            out.push(*call);
-        }
-    }
-    out
-}
 
-/// Strings in a delivered result big enough to be worth not copying.
-/// Shared by [`copied_rows`] and [`printed_rows`] so the two advisories
-/// cannot disagree about what counts as a payload.
-fn result_strings(v: &serde_json::Value, out: &mut Vec<String>) {
-    match v {
-        serde_json::Value::String(s) if s.len() >= COPY_MIN_BYTES => out.push(s.clone()),
-        serde_json::Value::Array(xs) => xs.iter().for_each(|x| result_strings(x, out)),
-        serde_json::Value::Object(m) => m.values().for_each(|x| result_strings(x, out)),
-        _ => {}
-    }
-}
 
-fn copied_rows(h: &Handback<'_>) -> Vec<(u64, u64)> {
-    // Everything a result on this branch has already delivered, keyed
-    // by the bytes and valued by the *call* id — which is the id a row
-    // advertises and a program reuses. A map rather than a scan: this
-    // runs on every completed program, and comparing every note's
-    // strings against every result's is quadratic in a conversation's
-    // length for no reason.
-    let mut delivered: std::collections::HashMap<String, u64> = Default::default();
-    for ev in h.path.iter() {
-        if let EventPayload::Result {
-            call,
-            outcome: crate::types::Outcome::Delivered(v),
-        } = &ev.payload
-        {
-            let mut found = Vec::new();
-            result_strings(v, &mut found);
-            for s in found {
-                // The earliest delivery of these bytes is the id the
-                // program should have kept.
-                delivered.entry(s).or_insert(call.as_u64());
-            }
-        }
-    }
-    let mut out = Vec::new();
-    for ev in &h.path[h.turn_at + 1..=h.outcome_at] {
-        let EventPayload::Note { value, .. } = &ev.payload else {
-            continue;
-        };
-        let mut mine = Vec::new();
-        result_strings(value, &mut mine);
-        // **Every source, not the first.** A note holding four files
-        // holds four results, and naming one of them understates what
-        // it cost — seen on `sweep-8` at HEAD, where `[18]` carried
-        // `[9]`, `[10]`, `[11]` and `[12]` and the report said `[10]`.
-        let mut seen = Vec::new();
-        for m in &mine {
-            if let Some(src) = delivered.get(m)
-                && !seen.contains(src)
-            {
-                seen.push(*src);
-                out.push((ev.id.as_u64(), *src));
-            }
-        }
-    }
-    out
-}
 
 fn render_handback(h: &Handback<'_>, budget: usize) -> String {
     let _ = budget;
@@ -1517,8 +1291,6 @@ fn render_handback(h: &Handback<'_>, budget: usize) -> String {
             console: h.console.clone(),
             console_id: h.console_id,
             new_artifacts: menu_since(h, h.previous_outcome),
-            copied_rows: copied_rows(h),
-            printed_rows: printed_rows(h),
             long_bash: h.path[h.turn_at + 1..=h.outcome_at]
                 .iter()
                 .filter_map(|e| match &e.payload {
@@ -1581,8 +1353,6 @@ fn render_handback(h: &Handback<'_>, budget: usize) -> String {
                 console: h.console.clone(),
                 console_id: h.console_id,
                 artifacts,
-                copied_rows: copied_rows(h),
-                printed_rows: printed_rows(h),
             }
             .render()
         }
@@ -1599,8 +1369,6 @@ fn render_handback(h: &Handback<'_>, budget: usize) -> String {
             console: h.console.clone(),
             console_id: h.console_id,
             artifacts: menu_since(h, h.previous_outcome),
-            copied_rows: copied_rows(h),
-            printed_rows: printed_rows(h),
         }
         .render(),
     }
@@ -2648,7 +2416,7 @@ mod tests {
             },
         )
         .unwrap();
-        let note = tree
+        let _note = tree
             .append(
                 &mut spine,
                 EventPayload::Note {
@@ -2674,20 +2442,22 @@ mod tests {
             .unwrap();
         let leaf = tree.list_leaves()[0].0;
         let text = derive_report(&tree, leaf, o, 64 * 1024);
-        assert!(
-            text.contains(&format!(
-                "`[{}]` holds the bytes of `[{}]`",
-                note.as_u64(),
-                call.as_u64()
-            )),
-            "names both rows: {text}"
-        );
-        // And it names the verb that does the job instead of the copy.
-        // It used to say "Keep the id", which meant *remember* it — a
-        // phrase that stopped being readable the day `history.keep(id)`
-        // became a thing you can call.
-        assert!(text.contains("history.keep(id)"), "{text}");
-        assert!(text.contains("history.peek(id)"), "{text}");
+        // **The report no longer says anything about this, because
+        // the state cannot occur.** It used to name both rows — "`[9]`
+        // holds the bytes of `[6]`" — and point at `history.keep(id)`.
+        // A note that copies a row is now substituted before it is
+        // appended, so the copy the advice was for never reaches the
+        // log: what that note holds is a reference to the row, which
+        // is the same message where the bytes would have been. The
+        // handler's own test (`machine.rs`,
+        // `a_note_that_copies_a_row_stores_a_reference_to_it`) is what
+        // holds that now.
+        //
+        // This one still builds the copy by hand, straight onto the
+        // tree, which is the one way it can still exist — a log
+        // written before the substitution did. It renders; it is not
+        // annotated.
+        assert!(text.contains("### rows it added"), "{text}");
 
         // Compaction: the handler has to be told what it is being asked
         // for and how much, or it reads the report as an ordinary
@@ -3053,8 +2823,6 @@ mod tests {
     fn what_section_is_bounded() {
         let report = ConditionReport {
             heading: RUN_HEADING,
-            copied_rows: Vec::new(),
-            printed_rows: Vec::new(),
             what: "w".repeat(10_000),
             whence: Whence::Stack(vec!["<root>".into()]),
             console: Vec::new(),
@@ -3088,8 +2856,6 @@ mod tests {
             }],
             failed_calls: 0,
             long_bash: 0,
-            copied_rows: Vec::new(),
-            printed_rows: Vec::new(),
         }
         .render();
         assert!(rendered.contains(&long), "the row is not clipped");
@@ -3183,8 +2949,6 @@ mod tests {
     fn a_menu_row_indexes_a_value_instead_of_replaying_it() {
         let report = ConditionReport {
             heading: RUN_HEADING,
-            copied_rows: Vec::new(),
-            printed_rows: Vec::new(),
             what: "boom".into(),
             whence: Whence::Stack(vec!["<root>".into()]),
             console: Vec::new(),
@@ -3208,8 +2972,6 @@ mod tests {
     fn a_failed_row_still_carries_its_reason() {
         let report = ConditionReport {
             heading: RUN_HEADING,
-            copied_rows: Vec::new(),
-            printed_rows: Vec::new(),
             what: "boom".into(),
             whence: Whence::Stack(vec!["<root>".into()]),
             console: Vec::new(),
@@ -3259,8 +3021,6 @@ mod tests {
             new_artifacts: artifacts,
             failed_calls: 0,
             long_bash: 0,
-            copied_rows: Vec::new(),
-            printed_rows: Vec::new(),
         }
         .render()
     }
@@ -3375,8 +3135,6 @@ mod tests {
             new_artifacts: Vec::new(),
             failed_calls: 0,
             long_bash: 0,
-            copied_rows: Vec::new(),
-            printed_rows: Vec::new(),
         }
         .render();
         assert_eq!(rendered, format!("{RUN_HEADING}\n\nIt completed."));
