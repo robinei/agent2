@@ -126,6 +126,17 @@ impl RcStr {
         self.as_str().as_bytes()
     }
 
+    /// Whether this string's content equals a UTF-8 literal.
+    ///
+    /// **The one spelling of `s == "literal"` that survives the payload
+    /// change.** `PartialEq<str>` can only exist while the payload *is* UTF-8;
+    /// an allocation-free comparison against a literal does not have to be an
+    /// operator, and naming it keeps ~30 call sites from having to be revisited
+    /// when the element type moves.
+    pub fn eq_str(&self, other: &str) -> bool {
+        self.as_str() == other
+    }
+
     /// Current strong-reference count. Test/diagnostic use only.
     #[cfg(test)]
     fn strong_count(&self) -> usize {
@@ -277,6 +288,71 @@ impl fmt::Debug for RcStr {
     }
 }
 
+// ── compile-time widened literals ────────────────────────────────────────────
+
+/// Widen an ASCII literal to a `[u16; N]` at compile time.
+///
+/// **The `wide!` macro below is the only intended caller.** `N` comes from
+/// `$s.len()`, which equals the code-unit count exactly when the literal is
+/// ASCII — so the length assert and the per-byte assert together make a
+/// non-ASCII literal a *compile* error (this runs in const position) rather
+/// than a lookup that silently misses at runtime.
+pub const fn ascii_wide<const N: usize>(s: &str) -> [u16; N] {
+    let b = s.as_bytes();
+    assert!(b.len() == N, "wide!: literal is not ASCII");
+    let mut out = [0u16; N];
+    let mut i = 0;
+    while i < N {
+        assert!(b[i] < 0x80, "wide!: literal is not ASCII");
+        out[i] = b[i] as u16;
+        i += 1;
+    }
+    out
+}
+
+/// A `&'static [u16]` for an ASCII string literal, built at compile time.
+///
+/// The map keys in this crate are `RcStr`; a lookup by literal has to present
+/// the same shape the key hashes as. `wide!("length")` is that shape, with no
+/// allocation and no runtime transcode.
+#[macro_export]
+macro_rules! wide {
+    ($s:literal) => {{
+        const W: [u16; $s.len()] = $crate::rc_str::ascii_wide($s);
+        &W as &'static [u16]
+    }};
+}
+
+/// A chain of literal comparisons, written as a `match`.
+///
+/// **A property name stops being a `str` and so stops being matchable.** A
+/// `match` on `&str` already lowers to a length-dispatched chain of `memcmp`s,
+/// so this expands to the same class of machine code; what it buys is that the
+/// source still reads as a table of names, and that the comparison is
+/// `eq_str`, which is defined for whatever the payload happens to be.
+#[macro_export]
+macro_rules! match_wide {
+    ($field:expr => { $($lit:literal => $arm:expr,)* _ => $default:expr $(,)? }) => {{
+        let __f = $field;
+        $(if $crate::rc_str::RcStr::eq_str(__f, $lit) { $arm } else)* { $default }
+    }};
+}
+
+/// The property names this crate looks up by literal.
+///
+/// **Named, not spelled inline, because the type of a map key is about to
+/// change.** Every one of these is an `IndexMap<RcStr, _>::get` against a
+/// borrowed literal; routing them through one module means the shape that a
+/// literal key takes is decided in one place rather than at eleven call sites.
+pub mod keys {
+    pub const LENGTH: &str = "length";
+    pub const SIZE: &str = "size";
+    pub const NAME: &str = "name";
+    pub const MESSAGE: &str = "message";
+    pub const OLD: &str = "old";
+    pub const NEW: &str = "new";
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -359,6 +435,26 @@ mod tests {
         assert_eq!(m.get("one"), Some(&1));
         assert_eq!(m.get("two"), Some(&2));
         assert_eq!(m.get("three"), None);
+    }
+
+    #[test]
+    fn wide_literal_matches_encode_utf16() {
+        // The macro is unused for now (the payload is still UTF-8); this is
+        // what pins its meaning until the call sites arrive.
+        assert_eq!(wide!("length"), &[108u16, 101, 110, 103, 116, 104][..]);
+        assert_eq!(wide!(""), &[] as &[u16]);
+        for lit in ["length", "size", "name", "message", "old", "new"] {
+            let expected: Vec<u16> = lit.encode_utf16().collect();
+            let got: &[u16] = match lit {
+                "length" => wide!("length"),
+                "size" => wide!("size"),
+                "name" => wide!("name"),
+                "message" => wide!("message"),
+                "old" => wide!("old"),
+                _ => wide!("new"),
+            };
+            assert_eq!(got, &expected[..], "{lit}");
+        }
     }
 
     #[test]

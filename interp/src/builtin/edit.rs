@@ -2,6 +2,7 @@ use indexmap::IndexMap;
 
 use crate::builtin::Args;
 use crate::builtin::regexp::try_reg_exp;
+use crate::rc_str::keys;
 use crate::vm::{ErrorKind, RcStr, VM, VMError, Value};
 
 // ── Edit.replaceOnce ──────────────────────────────────────────────────────────
@@ -867,7 +868,7 @@ fn parse_edits<'a>(vm: &'a VM, val: &'a Value) -> Result<Vec<(RcStr, RcStr)>, VM
 
         let old = obj
             .map
-            .get("old")
+            .get(keys::OLD)
             .and_then(|v| match v {
                 Value::String(s) => Some(s.clone()),
                 _ => None,
@@ -880,7 +881,7 @@ fn parse_edits<'a>(vm: &'a VM, val: &'a Value) -> Result<Vec<(RcStr, RcStr)>, VM
             })?;
         let new = obj
             .map
-            .get("new")
+            .get(keys::NEW)
             .and_then(|v| match v {
                 Value::String(s) => Some(s.clone()),
                 _ => None,

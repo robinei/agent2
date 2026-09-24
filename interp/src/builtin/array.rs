@@ -1,4 +1,5 @@
 use crate::builtin::Args;
+use crate::rc_str::keys;
 use crate::vm::{ErrorKind, RcStr, VM, VMError, Value};
 use smallvec::SmallVec;
 use thin_vec::ThinVec;
@@ -58,7 +59,7 @@ pub fn array_from(vm: &mut VM, args: Args) -> Result<Value, VMError> {
                 .ok_or_else(|| vm.fail(ErrorKind::ValueError, "value error"))?;
             let len = obj
                 .map
-                .get("length")
+                .get(keys::LENGTH)
                 .and_then(|v| v.to_number())
                 .unwrap_or(0.0);
             let n = (len as usize).min(10_000_000);

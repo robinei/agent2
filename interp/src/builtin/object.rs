@@ -185,7 +185,7 @@ pub fn obj_assign(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 pub fn obj_has_own(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let recv = args.get(vm, 0).clone();
     let key = vm.to_js_string(args.get(vm, 1), 0);
-    match vm.own_prop_contains(&recv, key.as_str()) {
+    match vm.own_prop_contains(&recv, &key) {
         Some(has) => Ok(Value::Bool(has)),
         None => Err(object_needs_an_object(vm, "hasOwn", &recv)),
     }
@@ -201,7 +201,7 @@ pub fn obj_has_own(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 pub fn obj_has_own_property(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let recv = args.get(vm, 0).clone();
     let key = vm.to_js_string(args.get(vm, 1), 0);
-    match vm.own_prop_contains(&recv, key.as_str()) {
+    match vm.own_prop_contains(&recv, &key) {
         Some(has) => Ok(Value::Bool(has)),
         None => Err(object_needs_an_object(vm, "hasOwn", &recv)),
     }

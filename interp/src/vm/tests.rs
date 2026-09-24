@@ -2993,7 +2993,7 @@ fn proto_chain_own_hit() {
         map,
         ..Default::default()
     });
-    let val = vm.resolve_proto_chain(0, "x").unwrap();
+    let val = vm.resolve_proto_chain(0, &RcStr::from("x")).unwrap();
     assert_eq!(val, Value::PosInt(42));
 }
 
@@ -3018,7 +3018,7 @@ fn proto_chain_proto_hit() {
         map: child,
         ..Default::default()
     });
-    let val = vm.resolve_proto_chain(1, "x").unwrap();
+    let val = vm.resolve_proto_chain(1, &RcStr::from("x")).unwrap();
     assert_eq!(val, Value::PosInt(99));
 }
 
@@ -3031,7 +3031,7 @@ fn proto_chain_miss() {
         map: IndexMap::new(),
         ..Default::default()
     });
-    let val = vm.resolve_proto_chain(0, "nope").unwrap();
+    let val = vm.resolve_proto_chain(0, &RcStr::from("nope")).unwrap();
     assert_eq!(val, Value::Undefined);
 }
 
@@ -3045,7 +3045,7 @@ fn proto_chain_none_short_circuit() {
         map: IndexMap::new(),
         ..Default::default()
     });
-    let val = vm.resolve_proto_chain(0, "missing").unwrap();
+    let val = vm.resolve_proto_chain(0, &RcStr::from("missing")).unwrap();
     assert_eq!(val, Value::Undefined);
 }
 
@@ -3069,7 +3069,7 @@ fn proto_chain_own_shadows_proto() {
         map: child,
         ..Default::default()
     });
-    let val = vm.resolve_proto_chain(1, "x").unwrap();
+    let val = vm.resolve_proto_chain(1, &RcStr::from("x")).unwrap();
     assert_eq!(val, Value::PosInt(2), "own must shadow proto");
 }
 
@@ -3085,7 +3085,7 @@ fn proto_chain_self_referential_no_hang() {
         map,
         ..Default::default()
     });
-    let val = vm.resolve_proto_chain(0, "nope").unwrap();
+    let val = vm.resolve_proto_chain(0, &RcStr::from("nope")).unwrap();
     assert_eq!(val, Value::Undefined);
 }
 
@@ -3107,7 +3107,7 @@ fn obj_has_walks_proto_chain() {
         map: IndexMap::new(),
         ..Default::default()
     });
-    let val = vm.resolve_proto_chain(1, "a").unwrap();
+    let val = vm.resolve_proto_chain(1, &RcStr::from("a")).unwrap();
     assert_eq!(val, Value::PosInt(1), "proto-chain hit via resolve");
 }
 

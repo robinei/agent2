@@ -1,4 +1,5 @@
 use super::*;
+use crate::rc_str::keys;
 
 use crate::compiler::{ConstVal, namespace_constants};
 use crate::diag::Diagnostic;
@@ -325,7 +326,7 @@ impl VM {
         if let Value::Object(p) = value
             && let Some(obj) = self.objects.get(*p as usize)
             && let (Some(Value::String(name)), Some(Value::String(msg))) =
-                (obj.map.get("name"), obj.map.get("message"))
+                (obj.map.get(keys::NAME), obj.map.get(keys::MESSAGE))
         {
             return format!("uncaught {}: {}", name.as_str(), msg.as_str());
         }
@@ -1256,7 +1257,7 @@ impl VM {
     pub(crate) fn resolve_proto_chain(
         &self,
         obj_ptr: ObjectPtr,
-        field: &str,
+        field: &RcStr,
     ) -> Result<Value, VMError> {
         const MAX_PROTO_DEPTH: u32 = 100;
         let mut cur = obj_ptr;
@@ -1269,7 +1270,7 @@ impl VM {
             }
             // Virtual rung: `constructor` on a builtin prototype.
             if obj.kind == ObjKind::BuiltinPrototype
-                && field == "constructor"
+                && field.eq_str("constructor")
                 && let Some(v) = self.prototype_constructor(cur)
             {
                 return Ok(v);

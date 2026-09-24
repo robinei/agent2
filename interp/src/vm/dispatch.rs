@@ -1,5 +1,6 @@
 use super::*;
 use crate::builtin::{Builtin, BuiltinKind};
+use crate::rc_str::keys;
 use smallvec::SmallVec;
 
 /// How much of a string rejection survives into the error a program's
@@ -269,14 +270,14 @@ impl VM {
 
         // Named-key path: coerce the key to a string.
         let field = self.to_js_string(key, 0);
-        self.named_get_property(receiver, field.as_str())
+        self.named_get_property(receiver, &field)
     }
 
     /// The named half of [`get_property`] — virtual rungs, own-property
     /// bags, and proto-chain walk for a `&str` field. Called after the
     /// integer-key fast path above (which lives in `get_property` so
     /// array-index reads inline to exactly today's code).
-    fn named_get_property(&mut self, receiver: &Value, field: &str) -> Result<Value, VMError> {
+    fn named_get_property(&mut self, receiver: &Value, field: &RcStr) -> Result<Value, VMError> {
         match receiver {
             Value::Null | Value::Undefined | Value::Promise(_) | Value::Upval(_) => {
                 unreachable!("handled before named_get_property")
@@ -287,7 +288,7 @@ impl VM {
 
             // ── RegExp: virtual rungs (folded from `regexp_prop`) ─
             Value::RegExp(r) => {
-                let v = match field {
+                let v = crate::match_wide!(field => {
                     "source" => Value::String(r.pattern.clone()),
                     "flags" => Value::String(r.flags.clone()),
                     "global" => Value::Bool(r.flags.contains('g')),
@@ -298,7 +299,7 @@ impl VM {
                     "sticky" => Value::Bool(r.flags.contains('y')),
                     "lastIndex" => Value::PosInt(r.last_index.get() as u64),
                     _ => Value::Undefined,
-                };
+                });
                 if !matches!(v, Value::Undefined) {
                     return Ok(v);
                 }
@@ -307,20 +308,17 @@ impl VM {
 
             // ── Closure: virtual rungs → inline bag → Function proto ─
             Value::Closure { ptr, .. } => {
-                match field {
-                    "prototype" => {
-                        return Ok(Value::Object(self.resolve_prototype(*ptr)?));
+                if field.eq_str("prototype") {
+                    return Ok(Value::Object(self.resolve_prototype(*ptr)?));
+                }
+                if field.eq_str("name") || field.eq_str(keys::LENGTH) {
+                    let c = self.closures.get(*ptr as usize).ok_or_else(|| {
+                        self.fail_not_resumable(ErrorKind::TypeError, "bad closure pointer")
+                    })?;
+                    if field.eq_str("name") {
+                        return Ok(Value::String(RcStr::from("")));
                     }
-                    "name" | "length" => {
-                        let c = self.closures.get(*ptr as usize).ok_or_else(|| {
-                            self.fail_not_resumable(ErrorKind::TypeError, "bad closure pointer")
-                        })?;
-                        if field == "name" {
-                            return Ok(Value::String(RcStr::from("")));
-                        }
-                        return Ok(Value::Float(c.arity as f64));
-                    }
-                    _ => {}
+                    return Ok(Value::Float(c.arity as f64));
                 }
                 // Inline own-property bag (Step 2e).
                 let c = self.closures.get(*ptr as usize).ok_or_else(|| {
@@ -337,37 +335,27 @@ impl VM {
             // ── Builtin: virtual rungs (constructor) or Function proto ─
             Value::Builtin(b) => {
                 if let Some(tag) = b.constructor_type_tag() {
-                    match field {
-                        "prototype" => {
-                            return Ok(Value::Object(self.prototype_for(tag)?));
-                        }
-                        "name" => {
-                            return Ok(Value::String(RcStr::from(b.meta().name)));
-                        }
-                        "length" => {
-                            let meta = b.meta();
-                            let n = match meta.kind {
-                                crate::builtin::BuiltinKind::Method => {
-                                    meta.min_args.saturating_sub(1)
-                                }
-                                crate::builtin::BuiltinKind::Namespace(_)
-                                | crate::builtin::BuiltinKind::Constructor { .. } => meta.min_args,
-                            };
-                            return Ok(Value::Float(n as f64));
-                        }
+                    if field.eq_str("prototype") {
+                        return Ok(Value::Object(self.prototype_for(tag)?));
+                    } else if field.eq_str("name") {
+                        return Ok(Value::String(RcStr::from(b.meta().name)));
+                    } else if field.eq_str(keys::LENGTH) {
+                        let meta = b.meta();
+                        let n = match meta.kind {
+                            crate::builtin::BuiltinKind::Method => meta.min_args.saturating_sub(1),
+                            crate::builtin::BuiltinKind::Namespace(_)
+                            | crate::builtin::BuiltinKind::Constructor { .. } => meta.min_args,
+                        };
+                        return Ok(Value::Float(n as f64));
+                    } else if field.eq_str("BYTES_PER_ELEMENT") {
                         // Static BYTES_PER_ELEMENT on TypedArray constructors.
-                        "BYTES_PER_ELEMENT" => {
-                            if let Some(kind) = tag.typed_array_kind() {
-                                return Ok(Value::Float(kind.element_size() as f64));
-                            }
+                        if let Some(kind) = tag.typed_array_kind() {
+                            return Ok(Value::Float(kind.element_size() as f64));
                         }
-                        _ => {
-                            if let Some(static_b) =
-                                crate::builtin::Builtin::for_namespace(tag.name(), field)
-                            {
-                                return Ok(Value::Builtin(static_b));
-                            }
-                        }
+                    } else if let Some(static_b) =
+                        crate::builtin::Builtin::for_namespace(tag.name(), field)
+                    {
+                        return Ok(Value::Builtin(static_b));
                     }
                 }
                 self.type_proto_lookup(crate::vm::instr::TypeTag::Function, field, receiver)
@@ -375,7 +363,7 @@ impl VM {
 
             // ── Array: `length` virtual rung → Array proto ───────
             Value::Array(_) => {
-                if field == "length" {
+                if field.eq_str(keys::LENGTH) {
                     let len = match receiver {
                         Value::Array(p) => {
                             self.arrays.get(*p as usize).map(|a| a.len()).unwrap_or(0)
@@ -389,7 +377,7 @@ impl VM {
 
             // ── Map: `size` virtual rung → Map proto ────────────
             Value::Map(_) => {
-                if field == "size" {
+                if field.eq_str(keys::SIZE) {
                     let sz = match receiver {
                         Value::Map(p) => self.maps.get(*p as usize).map(|m| m.len()).unwrap_or(0),
                         _ => unreachable!(),
@@ -401,7 +389,7 @@ impl VM {
 
             // ── Set: `size` virtual rung → Set proto ────────────
             Value::Set(_) => {
-                if field == "size" {
+                if field.eq_str(keys::SIZE) {
                     let sz = match receiver {
                         Value::Set(p) => self.sets.get(*p as usize).map(|s| s.len()).unwrap_or(0),
                         _ => unreachable!(),
@@ -429,7 +417,7 @@ impl VM {
 
             // ── ArrayBuffer: byteLength rung → ArrayBuffer proto ──
             Value::ArrayBuffer(_) => {
-                if field == "byteLength" {
+                if field.eq_str("byteLength") {
                     let len = match receiver {
                         Value::ArrayBuffer(p) => {
                             self.buffers.get(*p as usize).map(|b| b.len()).unwrap_or(0)
@@ -470,7 +458,7 @@ impl VM {
     fn type_proto_lookup(
         &mut self,
         tag: crate::vm::instr::TypeTag,
-        field: &str,
+        field: &RcStr,
         receiver: &Value,
     ) -> Result<Value, VMError> {
         let proto = self.prototype_for(tag)?;
@@ -486,37 +474,41 @@ impl VM {
     /// Resolve typed-array virtual properties (length, byteLength,
     /// byteOffset, buffer, BYTES_PER_ELEMENT). Returns `Some(Value)` for a
     /// matched rung, `None` to fall through to the proto chain.
-    fn typed_array_virtual(&self, field: &str, receiver: &Value) -> Option<Result<Value, VMError>> {
+    fn typed_array_virtual(
+        &self,
+        field: &RcStr,
+        receiver: &Value,
+    ) -> Option<Result<Value, VMError>> {
         let ptr = match receiver {
             Value::TypedArray(p) => *p,
             _ => return None,
         };
         let view = self.typed_arrays.get(ptr as usize)?;
-        match field {
+        crate::match_wide!(field => {
             "length" => Some(Ok(Value::Float(view.length() as f64))),
             "byteLength" => Some(Ok(Value::Float(view.byte_length as f64))),
             "byteOffset" => Some(Ok(Value::Float(view.byte_offset as f64))),
             "buffer" => Some(Ok(Value::ArrayBuffer(view.buffer))),
             "BYTES_PER_ELEMENT" => Some(Ok(Value::Float(view.kind.element_size() as f64))),
             _ => None,
-        }
+        })
     }
 
     /// Resolve DataView virtual properties (byteLength, byteOffset,
     /// buffer). Returns `Some(Value)` for a matched rung, `None` to fall
     /// through to the proto chain.
-    fn data_view_virtual(&self, field: &str, receiver: &Value) -> Option<Result<Value, VMError>> {
+    fn data_view_virtual(&self, field: &RcStr, receiver: &Value) -> Option<Result<Value, VMError>> {
         let ptr = match receiver {
             Value::DataView(p) => *p,
             _ => return None,
         };
         let dv = self.data_views.get(ptr as usize)?;
-        match field {
+        crate::match_wide!(field => {
             "byteLength" => Some(Ok(Value::Float(dv.byte_length as f64))),
             "byteOffset" => Some(Ok(Value::Float(dv.byte_offset as f64))),
             "buffer" => Some(Ok(Value::ArrayBuffer(dv.buffer))),
             _ => None,
-        }
+        })
     }
 
     // ── set_property: the canonical write ladder ────────────────────
@@ -656,14 +648,14 @@ impl VM {
         }
 
         let field = self.to_js_string(key, 0);
-        self.named_set_property(receiver, field.as_str(), val, mode)
+        self.named_set_property(receiver, &field, val, mode)
     }
 
     /// Named half of [`set_property`].
     fn named_set_property(
         &mut self,
         receiver: &Value,
-        field: &str,
+        field: &RcStr,
         val: Value,
         mode: SetMode,
     ) -> Result<Value, VMError> {
@@ -716,7 +708,7 @@ impl VM {
                         if let Some(slot) = obj.map.get_mut(field) {
                             *slot = val;
                         } else {
-                            obj.map.insert(RcStr::from(field), val);
+                            obj.map.insert(field.clone(), val);
                         }
                         old
                     }
@@ -725,7 +717,7 @@ impl VM {
                         if let Some(slot) = obj.map.get_mut(field) {
                             *slot = val;
                         } else {
-                            obj.map.insert(RcStr::from(field), val);
+                            obj.map.insert(field.clone(), val);
                         }
                         result
                     }
@@ -776,7 +768,7 @@ impl VM {
                         if let Some(slot) = bag.get_mut(field) {
                             *slot = val;
                         } else {
-                            bag.insert(RcStr::from(field), val);
+                            bag.insert(field.clone(), val);
                         }
                         old
                     }
@@ -785,7 +777,7 @@ impl VM {
                         if let Some(slot) = bag.get_mut(field) {
                             *slot = val;
                         } else {
-                            bag.insert(RcStr::from(field), val);
+                            bag.insert(field.clone(), val);
                         }
                         result
                     }
@@ -866,7 +858,13 @@ impl VM {
             Value::Object(p) => *p,
             _ => return Ok(None),
         };
-        let val = self.resolve_proto_chain(obj_ptr, name)?;
+        // `name` is a builtin's `&'static str`, and a property key is an
+        // `RcStr`; building one here costs a short allocation. It sits on the
+        // path that was already going to walk a prototype chain, and only for
+        // a builtin method called on an `Object` receiver — not on the
+        // `CallBuiltin` fast path, which is the case this whole helper exists
+        // to keep fast.
+        let val = self.resolve_proto_chain(obj_ptr, &RcStr::from(name))?;
         Ok(if matches!(val, Value::Undefined) {
             None
         } else {
@@ -904,7 +902,7 @@ impl VM {
     /// `Object.hasOwn` and `obj.hasOwnProperty`. Mirrors `own_enumerable_props`'s
     /// receiver handling (Object `map` or function `props` bag); `None` for a
     /// receiver the reflection builtins reject.
-    pub(crate) fn own_prop_contains(&self, value: &Value, key: &str) -> Option<bool> {
+    pub(crate) fn own_prop_contains(&self, value: &Value, key: &RcStr) -> Option<bool> {
         match value {
             Value::Object(p) => self
                 .objects
@@ -2512,7 +2510,7 @@ impl VM {
                             if self
                                 .objects
                                 .get(obj_ptr as usize)
-                                .and_then(|o| o.map.get("length"))
+                                .and_then(|o| o.map.get(keys::LENGTH))
                                 .and_then(Value::to_number)
                                 .is_some() =>
                         {
@@ -2521,7 +2519,7 @@ impl VM {
                             })?;
                             let n = obj
                                 .map
-                                .get("length")
+                                .get(keys::LENGTH)
                                 .and_then(Value::to_number)
                                 .unwrap_or(0.0)
                                 .max(0.0) as usize;
@@ -2618,7 +2616,7 @@ impl VM {
                             .get(p as usize)
                             .ok_or_else(|| self.fail(ErrorKind::ValueError, "bad object pointer"))?
                             .map
-                            .get("length")
+                            .get(keys::LENGTH)
                             .cloned()
                             .unwrap_or(Value::Undefined),
                         Value::Closure { ptr, .. } => {
@@ -2693,7 +2691,7 @@ impl VM {
                             .get(p as usize)
                             .ok_or_else(|| self.fail(ErrorKind::ValueError, "bad object pointer"))?
                             .map
-                            .get("size")
+                            .get(keys::SIZE)
                             .cloned()
                             .unwrap_or(Value::Undefined),
                         _ => {
@@ -2959,13 +2957,13 @@ impl VM {
                                     if self
                                         .objects
                                         .get(*p as usize)
-                                        .and_then(|o| o.map.get("message"))
+                                        .and_then(|o| o.map.get(keys::MESSAGE))
                                         .is_some_and(|m| matches!(m, Value::String(_))) =>
                                 {
                                     let m = self
                                         .objects
                                         .get(*p as usize)
-                                        .and_then(|o| o.map.get("message").cloned())
+                                        .and_then(|o| o.map.get(keys::MESSAGE).cloned())
                                         .unwrap_or(Value::Undefined);
                                     let text = match &m {
                                         Value::String(s) => s.as_str().to_owned(),
