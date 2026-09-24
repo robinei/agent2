@@ -5290,11 +5290,50 @@ fn value_json(vm: &VM, v: &Value) -> serde_json::Value {
 /// `Undefined` into a source file is a mistake it cannot see at all,
 /// and the failure surfaces later, somewhere else, as somebody else's
 /// syntax error.
+///
+/// **`NaN` is that mistake wearing a disguise**, and it is checked
+/// separately because the conversion *succeeds*. `JSON.stringify(NaN)`
+/// is `"null"` — spec-correct, and what
+/// `stack_value_to_json` does — so a non-finite number arrives at the
+/// tool as an argument that was never passed. For most tools an
+/// omitted argument means "all of it".
+///
+/// Seen live on 2026-09-24 (`live/t4`): a reply parsed a grep line,
+/// got `Number("    pub(crate) fn …")` for the line number, and called
+/// `read_file(path, Math.max(1, NaN - 5), NaN + 60)`. Both bounds
+/// arrived `null`, the tool read the whole of `dispatch.rs` — **157,788
+/// bytes onto one row** — nothing raised, and the same `NaN` went into
+/// the answer the person was given, as `dispatch.rs:NaN`.
+///
+/// **Top-level arguments only.** A tool's parameters are the
+/// positional arguments, which is where the failure was and where a
+/// number is expected; reaching inside an object argument means
+/// walking the heap through the VM for a case nobody has hit.
 fn args_as_json(vm: &VM, call: &InvokeCall) -> Result<Vec<serde_json::Value>, String> {
     call.args
         .iter()
         .enumerate()
         .map(|(i, v)| {
+            if let Value::Float(n) = v
+                && !n.is_finite()
+            {
+                let what = if n.is_nan() {
+                    "NaN"
+                } else if *n > 0.0 {
+                    "Infinity"
+                } else {
+                    "-Infinity"
+                };
+                return Err(format!(
+                    "{}() argument {} is {what} — nothing was called. {what} has no JSON \
+                     form, so it would reach the tool as an argument you never passed, and \
+                     a missing argument mostly means *all of it*: this is how one slip in \
+                     arithmetic becomes a whole file on a row. Check what it was computed \
+                     from.",
+                    call.name,
+                    i + 1,
+                ));
+            }
             vm.stack_value_to_json(v, 0).map_err(|_| {
                 let what = match v {
                     Value::Undefined => "is `undefined`".to_string(),
@@ -8763,6 +8802,55 @@ mod tests {
             "the program is told which argument, and that nothing ran: {:?}",
             r.tells
         );
+    }
+
+    /// **`NaN` is the same mistake wearing a disguise**, and it used to
+    /// get through because the conversion *succeeds*:
+    /// `JSON.stringify(NaN)` is `"null"`, so a non-finite number
+    /// reaches a tool as an argument that was never passed — and a
+    /// missing argument mostly means "all of it".
+    ///
+    /// Live on 2026-09-24 (`live/t4`): a reply parsed a grep line, got
+    /// `Number("    pub(crate) fn …")` for the line number, and called
+    /// `read_file(path, Math.max(1, NaN - 5), NaN + 60)`. Both bounds
+    /// arrived `null`, the whole of `dispatch.rs` landed on one row —
+    /// 157,788 bytes — nothing raised, and the same `NaN` reached the
+    /// person in the answer, as `dispatch.rs:NaN`.
+    #[test]
+    fn a_call_with_a_non_finite_number_is_refused_not_silently_dropped() {
+        let mut c = Conversation::new();
+        let r = c.reply(
+            "```js\nconst n = Number(\"    not a line number\");\n             try { await tools.read_file(\"f.rs\", Math.max(1, n - 5), n + 60); }\n             catch (e) { tell(`refused: ${e}`); }\n             tell(\"ok\"); finish();\n```\n",
+        );
+        assert!(
+            r.calls.is_empty(),
+            "the read was issued anyway, and it would have been the whole file: {:?}",
+            r.calls
+        );
+        assert!(
+            r.tells.iter().any(|t| t.contains("argument 2 is NaN")),
+            "the program is told which argument, and what it is: {:?}",
+            r.tells
+        );
+        assert!(
+            r.tells.iter().any(|t| t.contains("all of it")),
+            "and why that matters, which is the half that stops it recurring: {:?}",
+            r.tells
+        );
+
+        // Infinity goes the same way, and says which it was.
+        let r = c.reply(
+            "```js\ntry { await tools.read_file(\"f.rs\", 1 / 0, 9); }\n             catch (e) { tell(`refused: ${e}`); }\n             tell(\"ok\"); finish();\n```\n",
+        );
+        assert!(
+            r.tells.iter().any(|t| t.contains("argument 2 is Infinity")),
+            "{:?}",
+            r.tells
+        );
+
+        // And an ordinary number is untouched.
+        let r = c.reply("```js\nawait tools.read_file(\"f.rs\", 10, 20);\nfinish();\n```\n");
+        assert_eq!(r.calls.len(), 1, "a real range still calls: {:?}", r.calls);
     }
 
     #[test]
