@@ -34,7 +34,7 @@ A block fenced `ts` or `typescript` runs too, types erased first. **Write JavaSc
 
 ## What crosses from this reply to the next
 
-**`history.note(v)`** — a row of its own, any number of times, from anywhere. It lands the moment you call it, so it survives a block that traps afterwards, and hands back that row's id.
+**`history.note(v)`** — a row of its own, any number of times, from anywhere. It lands the moment you call it, so it survives a block that traps afterwards.
 
 **`history.keep(r)`** — a result you already have, written out on the row it is already on, from your next reply onwards. **`history.peek(r)`** the same for your next reply only, then gone. Either takes a projection for the part you actually read: `history.keep(f, (v) => v.content)`. This is how you put bytes in front of yourself; the console is not. **Neither shows you anything in *this* reply** — nothing does; what this reply has is its variables.
 
@@ -125,14 +125,14 @@ declare function list_agents(opts?: { under?: number; deep?: boolean }):
 
 /** The conversation itself, by the `[id]` shown against each entry. Answered from the log: costs nothing, adds nothing. */
 declare namespace history {
-  /** Put something on the record as a row of *its own*, and get that row's id back.
+  /** Put something on the record as a row of *its own*. The row prints what it holds, so there is no `keep` to do and no id to hold: later replies name it from the menu.
 
   Note a **conclusion** — the four paths that matter, never the two hundred you listed. Every row is paid for again on every turn until something compacts it.
 
   **This is for words of your own.** To put a result in front of the next reply, `keep` it: the bytes are already on the record and a note would be a second copy. Note what you worked out; keep what you were given; fetch what you will only compute with.
 
-  **Key it by the name the thing already has**, as a quoted string: `{ "src/shipping.py": "rate table is hard-coded at line 40" }`, never `{ shipping_py: … }`. Mangling a path, command or id drops the only thing tying the row to the call it came from. And the value is what you found, never the file: `{ "src/shipping.py": f.content }` is a second copy of bytes the record already has — `keep` that row instead. */
-  function note(value: unknown): number;
+  **Key it by the name the thing already has**, as a quoted string: `{ "src/shipping.py": "rate table is hard-coded at line 40" }`, never `{ shipping_py: … }`. Mangling a path, command or id drops the only thing tying the row to the call it came from. And the value is what you found, never the file: `{ "src/shipping.py": f.content }` is a second copy of bytes the record already has — `keep` that row instead. Write one anyway and the row stores a reference to the row that already holds those bytes, not the bytes. */
+  function note(value: unknown): void;
   /** Read any entry back, whole, by its id — including ones no longer shown. A call's row gives the tool's own result, the object its signature describes: `read_file` hands back `{ content, version, id }`, not the text. The value goes straight to this block: `const f = await history.fetch(9)`, and the next line already has `f.content`. Fetch in the reply that uses it.
 
   **A row shows its first 32 KB and says so.** `fetch` hands back all of it however long it is. */

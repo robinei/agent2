@@ -2878,53 +2878,48 @@ impl Runner {
                         self.pending_decision = Some(value.clone());
                         self.settle(Ok(serde_json::Value::Null));
                     }
-                    // **A note that copies a row is refused, naming
-                    // the row.** See `note_copies_a_row` for what the
-                    // record showed: 93% of every byte ever written to
-                    // a note was a second copy of something already on
-                    // it. Refused rather than trimmed, because the
-                    // program is the only thing that knows what it
-                    // meant to say, and `keep` says the other thing
-                    // better than any automatic shortening would.
-                    Some(value)
-                        if let Some((row, bytes)) =
-                            note_copies_a_row(tree, self.spine.leaf_id, value) =>
-                    {
-                        let id = row.as_u64();
-                        self.settle_err(&format!(
-                            "history.note carries what you worked out, not bytes the record \
-                             already has: {bytes} of these are on `[{id}]` verbatim. \
-                             `history.keep({id})` puts that row's value in front of your next \
-                             reply with no second copy, and \
-                             `history.keep({id}, (v) => v.stdout)` just the part you read. \
-                             Note what you concluded from it instead."
-                        ));
-                    }
                     Some(value) => {
                         let (site, site_end) =
                             (self.rebase_site(call.site), self.rebase_site(call.site_end));
+                        // **Bytes the record already holds become a
+                        // reference to the row that holds them.** See
+                        // `substitute_copied_rows`: 93% of every byte
+                        // ever written to a note was a second copy of
+                        // something already on the spine, and a note is
+                        // the durable channel — what survives, and what
+                        // compaction then has to carry. Done before the
+                        // append, so what the row stores and what
+                        // `history.fetch` hands back are the same thing.
+                        let mut value = value.clone();
+                        substitute_copied_rows(&mut value, tree, self.spine.leaf_id);
                         let row = tree.append(
                             &mut self.spine,
                             EventPayload::Note {
-                                value: value.clone(),
+                                value,
                                 site,
                                 site_end,
                             },
                         )?;
-                        // **The id, because the program asked for it.**
-                        // It used to settle `null` and throw the id
-                        // away, so a program that wanted to refer to
-                        // the row it had just written had nothing to
-                        // hold: the document shows `/* ← history[40] */`
-                        // only on the way *back*, a turn later. Two
-                        // live programs invented an identifier for it
-                        // rather than do without —
-                        // `history_append_id_placeholder` and
-                        // `history_rows_at_this_point` — and died with
-                        // `is not defined`. A value the caller reaches
-                        // for by making up a name for it is one the
-                        // call should be handing over.
-                        self.settle(Ok(serde_json::json!(row.as_u64())));
+                        // **Nothing back.** It returned the row's id
+                        // for a while, added because two live programs
+                        // invented an identifier for it
+                        // (`history_append_id_placeholder`,
+                        // `history_rows_at_this_point`) and died with
+                        // `is not defined`. That diagnosis was half
+                        // right: those programs wanted a row to point
+                        // at, and what gave them one was the menu
+                        // printing `[12] noted:` — not a return value.
+                        // Nothing has bound it since: **0 of 26
+                        // `history.note` calls across the kept corpus**.
+                        //
+                        // Its readers are `replace` and `fetch`, and
+                        // both are a *later* reply's business, reading
+                        // the id off the menu. A program replacing the
+                        // note it wrote two lines above is not a shape
+                        // worth a return value, and a note needs no
+                        // `keep`: its row prints what it holds already.
+                        let _ = row;
+                        self.settle(Ok(serde_json::Value::Null));
                     }
                     None => self.settle_err(
                         "history.note(value) needs the value to carry over: \
@@ -5210,23 +5205,62 @@ fn strings_within<'v>(v: &'v serde_json::Value, out: &mut Vec<&'v str>) {
 /// flags those five too but misses four of nine realistic variations,
 /// among them the likeliest — a dump with a sentence in front of it.
 ///
+/// **Substituted, not refused.** Refusing threw away the rest of the
+/// reply — a trap cancels the generation still arriving — to punish a
+/// mistake that costs one line to repair. This costs nothing: the note
+/// lands, keeps every word the reply meant, and the copied stretch
+/// becomes a reference to the row that already holds it.
+///
+/// It needs no warning beside it either. A tail line is for what is
+/// true of one request; this is true of the row for as long as the row
+/// exists, and it sits exactly where the bytes would have been, which
+/// is where it will be read.
+///
 /// Compared against call rows only. Those are the ones `keep` answers.
-fn note_copies_a_row(
-    tree: &Tree,
-    leaf: EventId,
-    value: &serde_json::Value,
-) -> Option<(EventId, usize)> {
-    let mut mine: Vec<&str> = Vec::new();
-    strings_within(value, &mut mine);
+fn substitute_copied_rows(value: &mut serde_json::Value, tree: &Tree, leaf: EventId) -> usize {
     let path = tree.path_events(leaf);
-    let rows = path.iter().filter_map(|e| match &e.payload {
-        EventPayload::Result {
-            call,
-            outcome: Outcome::Delivered(v),
-        } => Some((*call, v)),
-        _ => None,
-    });
-    copy_of(&mine, rows)
+    let rows: Vec<(EventId, &serde_json::Value)> = path
+        .iter()
+        .filter_map(|e| match &e.payload {
+            EventPayload::Result {
+                call,
+                outcome: Outcome::Delivered(v),
+            } => Some((*call, v)),
+            _ => None,
+        })
+        .collect();
+    substitute_within(value, &rows)
+}
+
+/// Rewrite every copied string in `value`, returning how many were
+/// replaced. Each is matched on its own, because one note can repeat
+/// two rows.
+fn substitute_within(
+    value: &mut serde_json::Value,
+    rows: &[(EventId, &serde_json::Value)],
+) -> usize {
+    match value {
+        serde_json::Value::String(s) => {
+            match copy_of(&[s.as_str()], rows.iter().copied()) {
+                Some((row, bytes)) => {
+                    *s = reference_to(row, bytes);
+                    1
+                }
+                None => 0,
+            }
+        }
+        serde_json::Value::Array(xs) => xs.iter_mut().map(|x| substitute_within(x, rows)).sum(),
+        serde_json::Value::Object(m) => m.values_mut().map(|x| substitute_within(x, rows)).sum(),
+        _ => 0,
+    }
+}
+
+/// What stands in the note's place: what was there, where it still is,
+/// and the one verb that puts it back in front of the reply. Short,
+/// because it is stored for the life of the row.
+fn reference_to(row: EventId, bytes: usize) -> String {
+    let id = row.as_u64();
+    format!("← the {bytes} bytes already on [{id}]; history.keep({id}) shows them here")
 }
 
 /// The search itself, over any sequence of rows — separated from the
@@ -6330,6 +6364,7 @@ fn asker_of(tree: &Tree, question: EventId) -> Option<Author> {
 
 #[cfg(test)]
 mod tests {
+
 
     use super::*;
     use crate::testkit::{Conversation, Ending, Invariant};
@@ -9877,22 +9912,33 @@ mod tests {
         );
     }
 
-/// **A note that copies a row is refused, and the refusal names the
-    /// row.** `note` is for what a reply worked out; `keep` is for bytes
-    /// it was given. The record said that was not landing: five of
-    /// seventeen notes across the kept sessions carried a verbatim copy
-    /// of a result already on the spine, and those five were 74,180 of
-    /// the 79,531 bytes ever written to a note — 93% of the channel by
-    /// volume. The largest was an entire file under
-    /// `{"docs/DESIGN.md": …}`.
+/// **A note that copies a row stores a reference to it instead.**
+    /// `note` is for what a reply worked out; `keep` is for bytes it was
+    /// given. The record said that was not landing: five of seventeen
+    /// notes across the kept sessions carried a verbatim copy of a
+    /// result already on the spine, and those five were 74,180 of the
+    /// 79,531 bytes ever written to a note — 93% of the channel by
+    /// volume. The largest re-printed a whole file and cost 32,768 of
+    /// its document's 76,185 bytes, every turn.
     ///
-    /// Run against that corpus, this refuses exactly those five and
-    /// allows the other twelve, including a 3,480-byte note that is the
-    /// model's own written-up finding — bigger than three of the five
-    /// it refuses. Size is not the test; provenance is.
+    /// **Substituted rather than refused, and without a warning beside
+    /// it.** Refusing cost the rest of the reply — a trap cancels the
+    /// generation still arriving — to punish a mistake that repairs in
+    /// one line. The reference costs nothing, keeps every word the
+    /// reply meant, and says what happened where it will be read.
     #[test]
-    fn a_note_that_copies_a_row_is_refused_and_told_which_row() {
+    fn a_note_that_copies_a_row_stores_a_reference_to_it() {
         let bulk = "migrating batch 7 of 8; 41231 rows done\n".repeat(60);
+        let noted = |c: &Conversation| {
+            c.tree()
+                .path_events(c.runner().spine.leaf_id)
+                .iter()
+                .find_map(|e| match &e.payload {
+                    EventPayload::Note { value, .. } => Some(value.clone()),
+                    _ => None,
+                })
+                .expect("a note is on the record")
+        };
 
         // The shape every one of the five had: a result's field, put
         // under a key of its own.
@@ -9902,13 +9948,6 @@ mod tests {
             "```js\nconst r = await tools.bash(\"cat log\");\n\
              history.note({ snapshot: r.stdout });\n```\n",
         );
-        let doc = c.document();
-        assert!(
-            doc.contains("history.note carries what you worked out"),
-            "the copy is refused: {doc}"
-        );
-        // The row it names is *the* row, found the same way the model
-        // would find it — not a number this test happens to know.
         let row = c
             .tree()
             .path_events(c.runner().spine.leaf_id)
@@ -9920,15 +9959,38 @@ mod tests {
                 _ => None,
             })
             .expect("the bash call is on the record");
+        let v = noted(&c);
+        let stored = v["snapshot"].as_str().expect("still a string");
         assert!(
-            doc.contains(&format!("history.keep({row})")),
-            "the refusal names the row that already has the bytes: {doc}"
+            stored.contains(&format!("[{row}]")) && stored.contains(&format!("history.keep({row})")),
+            "the reference names the row and the verb: {stored}"
+        );
+        assert!(
+            !stored.contains("migrating batch"),
+            "and the bytes are not stored twice: {stored}"
+        );
+        // Nothing trapped: the reply ran to the end.
+        assert!(
+            !c.document().contains("uncaught"),
+            "substituting costs no reply: {}",
+            c.document()
         );
 
-        // **A sentence in front of the dump is still the dump.** This
-        // is the likeliest variation and the one a whole-string
-        // comparison misses — four of nine realistic variations escape
-        // that, this among them.
+        // **A note is not all-or-nothing.** What the reply worked out
+        // survives beside the reference — refusing the call would have
+        // thrown this sentence away with it.
+        let mut c = Conversation::new();
+        c.answers("bash", serde_json::json!({ "status": 0, "stdout": bulk.clone() }));
+        c.reply(
+            "```js\nconst r = await tools.bash(\"cat log\");\n\
+             history.note({ finding: \"it stalls at batch 7\", dump: r.stdout });\n```\n",
+        );
+        let v = noted(&c);
+        assert_eq!(v["finding"], "it stalls at batch 7", "the finding is kept");
+        assert!(v["dump"].as_str().unwrap().starts_with('←'), "the copy is not");
+
+        // A sentence in front of the dump is still the dump — the
+        // variation a whole-string comparison misses.
         let mut c = Conversation::new();
         c.answers("bash", serde_json::json!({ "status": 0, "stdout": bulk.clone() }));
         c.reply(
@@ -9936,25 +9998,50 @@ mod tests {
              history.note(`the log said:\\n${r.stdout}`);\n```\n",
         );
         assert!(
-            c.document().contains("history.note carries what you worked out"),
-            "a prefixed copy is a copy: {}",
-            c.document()
+            noted(&c).as_str().unwrap().starts_with('←'),
+            "a prefixed copy is a copy: {:?}",
+            noted(&c)
         );
 
-        // What the channel is *for* goes through, at a size larger than
-        // three of the copies above.
+        // What the channel is *for* goes through untouched, at a size
+        // larger than three of the copies above.
         let mut c = Conversation::new();
         c.answers("bash", serde_json::json!({ "status": 0, "stdout": bulk }));
         c.reply(
             "```js\nconst r = await tools.bash(\"cat log\");\n\
-             history.note({ finding: \"batch 7 is where it stalls\".repeat(90) });\n```\n",
+             history.note({ finding: \"batch 7 is where it stalls. \".repeat(90) });\n```\n",
         );
-        let doc = c.document();
         assert!(
-            !doc.contains("history.note carries what you worked out"),
-            "a long finding of the reply's own words is not a copy: {doc}"
+            noted(&c)["finding"].as_str().unwrap().starts_with("batch 7"),
+            "a long finding of the reply's own words is untouched"
         );
     }
+
+    /// **`note` hands nothing back.** It returned the row's id for a
+    /// while; nothing ever bound it — 0 of 26 calls across the kept
+    /// corpus — because its readers, `replace` and `fetch`, are a later
+    /// reply's business and read the id off the menu. A note needs no
+    /// `keep` either: its row prints what it holds.
+    #[test]
+    fn note_hands_nothing_back_and_the_row_still_has_an_id() {
+        let mut c = Conversation::new();
+        c.reply(
+            "```js\nconst back = history.note(\"found it\");\n\
+             console.log(\"an id came back: \" + (typeof back === \"number\"));\n```\n",
+        );
+        let doc = c.document();
+        // `null`, as `history.replace` settles for the same reason —
+        // the point is that nothing comes back that `fetch` would take.
+        assert!(
+            doc.contains("an id came back: false"),
+            "nothing usable comes back: {doc}"
+        );
+        assert!(
+            doc.contains("noted: \"found it\""),
+            "and the row is on the menu, with an id a later reply can name: {doc}"
+        );
+    }
+
 
     /// The search's own edges, away from the handler.
     #[test]
@@ -11082,23 +11169,6 @@ mod tests {
             .collect()
     }
 
-    /// **`history.note` hands back the row's id.** A program that
-    /// wants to name what it just wrote should not have to wait a turn
-    /// to read the annotation off its own source — two live programs
-    /// invented an identifier rather than do without, and died on it.
-    #[test]
-    fn appending_to_history_returns_the_row_it_made() {
-        let mut c = Conversation::new();
-        c.user("go");
-        let r = c.reply(
-            "```js\nconst id = history.note({ a: 1 });\nconsole.log(typeof id, id);\n```\n",
-        );
-        assert_eq!(
-            r.printed,
-            [format!("number {}", r.row().id.as_u64())],
-            "the id of the row it just wrote, as a number it can pass to fetch"
-        );
-    }
 
     /// **A marker the model wrote is replaced, not doubled.** It reads
     /// these in its own turns and writes them back — that is what
