@@ -58,7 +58,7 @@ pub fn outline_def() -> ToolDef {
         // its top-level definitions") was accurate and said nothing
         // about what is absent, which is what a reader needs in order to
         // pick a different tool.
-        description: "Top-level definitions of a source file, language inferred from the extension — Rust, JavaScript, TypeScript or Python. Read-only. It lists what a file *defines*, never what uses it."
+        description: "The definitions in a source file, language inferred from the extension — Rust, JavaScript, TypeScript or Python. Nested ones are included: a method in an `impl` or `class`, a test in `#[cfg(test)] mod tests`, each with `parent` naming the scope that holds it. Read-only. It lists what a file *defines*, never what uses it."
             .into(),
         input_schema: json!({
             "type": "array",
@@ -74,10 +74,11 @@ pub fn outline_def() -> ToolDef {
         ],
         example: Some("const { items } = await tools.outline(path);".into()),
         returns: Some(
-            "{ items: Array<{ name: string; kind: \"function\" | \"method\" | \"class\" | \
+            "{ items: Array<{ name: string; kind: \"function\" | \"class\" | \
              \"struct\" | \"enum\" | \"trait\" | \"impl\" | \"module\" | \"const\" | \"static\" | \
              \"type\" | \"macro\" | \"interface\" | \"variable\"; start_line: number; \
-             end_line: number; signature?: string; attributes?: string[]; doc?: string }> }"
+             end_line: number; signature?: string; attributes?: string[]; doc?: string; \
+             parent?: string }> }"
                 .into(),
         ),
         handler: Box::new(|args| {
@@ -144,6 +145,19 @@ struct OutlineEntry {
     /// entry already points at.
     #[serde(skip_serializing_if = "Option::is_none")]
     doc: Option<String>,
+    /// What encloses this definition, as a scope path —
+    /// `tests`, `Compactor`, `tests::helpers` — absent at file level.
+    ///
+    /// **`name` stays bare so a search by name still finds it.** The
+    /// live failure this field exists for was a run searching
+    /// `items` for a test by name; qualifying `name` into
+    /// `tests::renders_a_line` would have left that search failing for
+    /// a second reason. The qualification goes beside the name, not
+    /// into it, and it is what tells `mod tests`'s `fn compact` from
+    /// the `fn compact` at module level — which are otherwise two
+    /// entries with the same name and kind.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parent: Option<String>,
 }
 
 /// Attributes/decorators and the doc summary attached to `node`, read
@@ -207,13 +221,22 @@ fn leading_context(node: &Node, source: &str) -> (Vec<String>, Option<String>) {
 /// The distinctions the grammars make are kept — a Rust `struct` and
 /// an `enum` do not both become "type" — only the spelling is made
 /// language-independent, so one filter works on any file.
+///
+/// **A method is a function.** `method_definition` used to render as
+/// `"method"`, which was unreachable while nothing descended into a
+/// class and became the same bug the moment something did: a JS class
+/// method would have been `"method"` where the Rust `fn` in an `impl`
+/// and the Python `def` in a `class` are both `"function"`, so
+/// `filter(i => i.kind === "function")` would silently skip one
+/// language's methods and no other's. `parent` carries what
+/// `"method"` used to say, and carries it in every language.
 fn readable_kind(kind: &str) -> &str {
     match kind {
         "function_item"
         | "function_declaration"
         | "function_definition"
+        | "method_definition"
         | "generator_function_declaration" => "function",
-        "method_definition" => "method",
         "class_declaration" | "class_definition" | "abstract_class_declaration" => "class",
         "struct_item" => "struct",
         "enum_item" | "enum_declaration" => "enum",
@@ -233,7 +256,7 @@ fn readable_kind(kind: &str) -> &str {
 }
 
 /// One entry for a definition node, or `None` when it has no name.
-fn entry_for(node: &Node, source: &str, lang: &str) -> Option<OutlineEntry> {
+fn entry_for(node: &Node, source: &str, lang: &str, parent: Option<&str>) -> Option<OutlineEntry> {
     let name = find_name(node, source)?;
     let (attributes, doc) = leading_context(node, source);
     Some(OutlineEntry {
@@ -244,40 +267,92 @@ fn entry_for(node: &Node, source: &str, lang: &str) -> Option<OutlineEntry> {
         signature: signature_for(node, source, lang),
         attributes,
         doc,
+        parent: parent.map(str::to_owned),
     })
 }
 
 fn collect_definitions(node: Node, source: &str, lang: &str) -> Vec<OutlineEntry> {
     let mut entries = Vec::new();
-    collect_definitions_impl(node, source, lang, &mut entries);
+    collect_definitions_impl(node, source, lang, None, &mut entries);
     entries
 }
 
-fn collect_definitions_impl(node: Node, source: &str, lang: &str, entries: &mut Vec<OutlineEntry>) {
-    let is_def = is_definition_node(node.kind(), lang);
-    let mut def_children: Vec<Node> = Vec::with_capacity(node.named_child_count());
-    for i in 0..node.child_count() {
-        if let Some(child) = node.child(i)
-            && child.is_named()
-        {
-            def_children.push(child);
-            if !is_definition_node(child.kind(), lang) {
-                collect_definitions_impl(child, source, lang, entries);
-            }
+/// Walk the tree in source order, emitting one entry per definition and
+/// **descending into the definitions that are containers** — a Rust
+/// `mod`/`impl`/`trait`, a class in any of the four languages.
+///
+/// **It used to stop at the first definition on every path, so a file's
+/// outline was its module level and nothing else.** A live run asked to
+/// explain a Rust test called `outline` on `compaction.rs`, searched
+/// `items` for the test by name and found nothing; its own reasoning
+/// log worked out why — "the outline only lists top-level definitions,
+/// so the `#[cfg(test)]` module's tests are not in it" — and it spent
+/// two turns recovering. That file has eight module-level definitions
+/// and around forty more inside `mod tests` and its `impl` blocks, so
+/// the index was hiding the majority of what it indexes. In this
+/// codebase the tests carry most of the documentation, which makes
+/// `mod tests` the part most worth finding.
+///
+/// Containers, not everything: a `fn` nested inside another `fn` body
+/// and a closure stay out, because an outline is a list of places you
+/// can navigate to and name, not a parse dump. `#[cfg(test)]` gets no
+/// special case — a module is descended into because it is a module,
+/// and a rule that singled out one attribute would hide `mod parser`
+/// for the same reason it used to hide `mod tests`.
+fn collect_definitions_impl(
+    node: Node,
+    source: &str,
+    lang: &str,
+    parent: Option<&str>,
+    entries: &mut Vec<OutlineEntry>,
+) {
+    for i in 0..node.named_child_count() {
+        let Some(child) = node.named_child(i) else {
+            continue;
+        };
+        if !is_definition_node(child.kind(), lang) {
+            // Not a definition itself — a `decorated_definition`, a
+            // `declaration_list`, an `export_statement`: keep looking
+            // underneath it at the same scope.
+            collect_definitions_impl(child, source, lang, parent, entries);
+            continue;
         }
-    }
-
-    if is_def && let Some(entry) = entry_for(&node, source, lang) {
-        entries.push(entry);
-    }
-
-    // Process def children that were deferred.
-    for child in def_children {
-        if is_definition_node(child.kind(), lang)
-            && let Some(entry) = entry_for(&child, source, lang)
-        {
+        let entry = entry_for(&child, source, lang, parent);
+        let own_name = entry.as_ref().map(|e| e.name.clone());
+        if let Some(entry) = entry {
             entries.push(entry);
         }
+        if is_container_node(child.kind(), lang) {
+            let inner = match (parent, own_name.as_deref()) {
+                (Some(outer), Some(name)) => {
+                    Some(format!("{outer}{}{name}", scope_separator(lang)))
+                }
+                (None, Some(name)) => Some(name.to_owned()),
+                (outer, None) => outer.map(str::to_owned),
+            };
+            collect_definitions_impl(child, source, lang, inner.as_deref(), entries);
+        }
+    }
+}
+
+/// How the language writes a scope path, so `parent` reads the way the
+/// file it came from does: `tests::helpers`, `Outer.Inner`.
+fn scope_separator(lang: &str) -> &'static str {
+    if lang == "rust" { "::" } else { "." }
+}
+
+/// A definition whose body holds more definitions worth indexing.
+///
+/// Deliberately narrower than "has a block": a function body is not one
+/// of these. See [`collect_definitions_impl`] for why.
+fn is_container_node(kind: &str, lang: &str) -> bool {
+    match lang {
+        "rust" => matches!(kind, "mod_item" | "impl_item" | "trait_item"),
+        "python" => matches!(kind, "class_definition"),
+        "javascript" | "typescript" => {
+            matches!(kind, "class_declaration" | "abstract_class_declaration")
+        }
+        _ => false,
     }
 }
 
@@ -526,21 +601,6 @@ mod tests {
         (dir, path)
     }
 
-
-    #[test]
-    fn zz_probe() {
-        let src = std::fs::read_to_string("src/compaction.rs").unwrap();
-        let r = run_outline(&src, "rust").unwrap();
-        let arr = r["items"].as_array().unwrap();
-        eprintln!("PROBE count={}", arr.len());
-        for e in arr { eprintln!("PROBE {} {} {}", e["kind"], e["name"], e["start_line"]); }
-        let r2 = run_outline("struct S;\nimpl S { fn m(&self){} }\nmod tests { fn t(){} }\n", "rust").unwrap();
-        eprintln!("PROBE2 {}", r2);
-        let r3 = run_outline("class A:\n    def m(self):\n        pass\n", "python").unwrap();
-        eprintln!("PROBE3 {}", r3);
-        let r4 = run_outline("class A { m() {} }\n", "javascript").unwrap();
-        eprintln!("PROBE4 {}", r4);
-    }
     #[test]
     fn outline_rust_lists_definitions() {
         let (_dir, path) = temp_path_with_ext("rs");
@@ -595,9 +655,12 @@ mod tests {
 
         // And every word the declaration promises is one this produces.
         let declared = outline_def().returns.unwrap();
+        assert!(
+            !declared.contains("\"method\""),
+            "a method is a `function` here, in every language — see readable_kind"
+        );
         for word in [
             "function",
-            "method",
             "class",
             "struct",
             "enum",
@@ -657,6 +720,120 @@ mod tests {
         let plain = arr.iter().find(|e| e["name"] == "Plain").expect("Plain");
         assert!(plain.get("doc").is_none(), "{plain:?}");
         assert!(plain.get("attributes").is_none(), "{plain:?}");
+    }
+
+    /// **The tests are in the outline.** A live run asked to explain a
+    /// Rust test called `outline("agent/src/compaction.rs")`, searched
+    /// `items` for the test by name, found nothing and burned two turns
+    /// working out why: "the outline only lists top-level definitions,
+    /// so the `#[cfg(test)]` module's tests are not in it". In this
+    /// codebase the tests carry most of the documentation, so an index
+    /// blind to them hides the majority of what is worth finding.
+    ///
+    /// `name` stays bare — the search that failed was by name, and
+    /// qualifying it would have left that search failing for a second
+    /// reason. `parent` is what tells the two `compact`s apart.
+    #[test]
+    fn a_test_inside_cfg_test_mod_tests_is_in_the_outline() {
+        let (_dir, path) = temp_path_with_ext("rs");
+        std::fs::write(
+            &path,
+            "pub fn compact() {}\n\
+             \n\
+             #[cfg(test)]\n\
+             mod tests {\n\
+             \x20   use super::*;\n\
+             \x20   #[test]\n\
+             \x20   fn renders_a_line() {}\n\
+             \x20   fn compact() {}\n\
+             \x20   mod inner {\n\
+             \x20       fn deep() {}\n\
+             \x20   }\n\
+             }\n",
+        )
+        .unwrap();
+        let result = call_handler(&outline_def(), json!([path.to_str().unwrap()])).unwrap();
+        let arr = result["items"].as_array().unwrap();
+
+        let by_name = |n: &str| -> Vec<&Value> { arr.iter().filter(|e| e["name"] == n).collect() };
+
+        let rendered = by_name("renders_a_line");
+        assert_eq!(rendered.len(), 1, "{arr:#?}");
+        assert_eq!(rendered[0]["parent"], "tests");
+        assert_eq!(rendered[0]["kind"], "function");
+        // The attribute that made it a test comes with it, which is how
+        // a caller tells a test from a helper beside it.
+        assert_eq!(rendered[0]["attributes"][0], "#[test]");
+
+        // Same name at two scopes, told apart by `parent` and by nothing
+        // else: this is the case the field exists for.
+        let compacts = by_name("compact");
+        assert_eq!(compacts.len(), 2, "{arr:#?}");
+        assert!(compacts.iter().any(|e| e.get("parent").is_none()));
+        assert!(compacts.iter().any(|e| e["parent"] == "tests"));
+
+        // Nesting composes, in the notation the language writes.
+        let deep = by_name("deep");
+        assert_eq!(deep.len(), 1, "{arr:#?}");
+        assert_eq!(deep[0]["parent"], "tests::inner");
+    }
+
+    /// **A method is a function, and `parent` says whose.** Rust's
+    /// `impl`, Python's `class` and JS's `class` all hide their bodies
+    /// from an outline that stops at the first definition on a path;
+    /// once it descends, the three had better agree on what they call
+    /// what they found. `method_definition` rendering as `"method"`
+    /// would have meant `filter(i => i.kind === "function")` silently
+    /// skipping JS methods and no others — the same silent-empty
+    /// failure `readable_kind` was written to end.
+    #[test]
+    fn a_method_is_a_function_with_a_parent_in_every_language() {
+        for (ext, src, parent) in [
+            (
+                "rs",
+                "struct S;\nimpl S {\n    fn probe(&self) {}\n}\n",
+                "S",
+            ),
+            ("py", "class S:\n    def probe(self):\n        pass\n", "S"),
+            ("js", "class S {\n    probe() {}\n}\n", "S"),
+            ("ts", "class S {\n    probe(): void {}\n}\n", "S"),
+        ] {
+            let (_dir, path) = temp_path_with_ext(ext);
+            std::fs::write(&path, src).unwrap();
+            let result = call_handler(&outline_def(), json!([path.to_str().unwrap()])).unwrap();
+            let arr = result["items"].as_array().unwrap();
+            let probe = arr
+                .iter()
+                .find(|e| e["name"] == "probe")
+                .unwrap_or_else(|| panic!("{ext}: no `probe` in {arr:#?}"));
+            assert_eq!(probe["kind"], "function", "{ext}: {probe:?}");
+            assert_eq!(probe["parent"], parent, "{ext}: {probe:?}");
+        }
+    }
+
+    /// **Containers, not everything.** An outline is a list of places
+    /// you can navigate to and name; a helper defined inside a function
+    /// body is not one, and listing it would turn the index back into a
+    /// parse dump — which is the cost that makes descending into
+    /// modules affordable at all.
+    #[test]
+    fn a_definition_inside_a_function_body_stays_out() {
+        for (ext, src) in [
+            ("rs", "fn outer() {\n    fn helper() {}\n}\n"),
+            ("py", "def outer():\n    def helper():\n        pass\n"),
+            ("js", "function outer() {\n    function helper() {}\n}\n"),
+        ] {
+            let (_dir, path) = temp_path_with_ext(ext);
+            std::fs::write(&path, src).unwrap();
+            let result = call_handler(&outline_def(), json!([path.to_str().unwrap()])).unwrap();
+            let names: Vec<&str> = result["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|e| e["name"].as_str().unwrap())
+                .collect();
+            assert_eq!(names, vec!["outer"], "{ext}");
+        }
     }
 
     #[test]
