@@ -196,6 +196,32 @@ pub fn iter_source(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     match args.get(vm, 0) {
         Value::Map(_) => map_entries(vm, args),
         Value::Set(_) => super::set_values(vm, args),
+        // **A string iterates by character, like everything else that
+        // walks one.** `for-of` lowers to an index loop — `c[i]` while
+        // `i < c.length` — and strings here index and measure in UTF-8
+        // *bytes*, so `for (const ch of s)` stepped one byte at a time
+        // and trapped on the second byte of the first non-ASCII
+        // character in `s`. Not an edge: this repository's own sources
+        // are full of em dashes, and `for…of` is the idiom a program
+        // reaches for once told that `.length` counts bytes.
+        //
+        // Seen live on 2026-09-24: a model walking `report.rs` to
+        // brace-match a function body was cut off mid-character, and
+        // the only reason it recovered cheaply is that it gave up on
+        // scanning and used `outline` instead.
+        //
+        // `[...s]` and `s.split("")` already both answered 3 for
+        // `"a—b"` — this is the third spelling agreeing with them
+        // rather than a new rule. It costs the same array those two
+        // allocate.
+        Value::String(s) => {
+            let chars: ThinVec<Value> = s
+                .as_str()
+                .chars()
+                .map(|c| Value::String(c.to_string().into()))
+                .collect();
+            Ok(vm.alloc_array(chars))
+        }
         other => Ok(other.clone()),
     }
 }

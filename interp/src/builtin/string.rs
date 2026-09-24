@@ -617,7 +617,18 @@ pub fn str_trim_end(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     Ok(Value::String(RcStr::from(s.trim_end())))
 }
 
-/// `s.charAt(index)` → single character (UTF-8 byte range) or empty string.
+/// `s.charAt(index)` → the character starting at that UTF-8 byte
+/// offset, or empty string when the offset is out of range.
+///
+/// **The same answer as `s[index]`, because it is the same question.**
+/// Both of these read a byte offset; `s[i]` returns the character
+/// there and errors inside a multi-byte one, while `charAt` used to
+/// hand back `byte as char` — the raw byte reinterpreted as a
+/// codepoint. On `"—b"` (bytes E2 80 94 62) that made `s[0]` give
+/// `"—"` and `s.charAt(0)` give `"â"`: `s[0] === s.charAt(0)` was
+/// *false* at a perfectly valid boundary, and the character `charAt`
+/// returned was not in the string at all. Every byte over 0x7F was
+/// wrong, which is why ASCII-only tests never saw it.
 pub fn str_char_at(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let s = args.string_receiver(vm)?;
     let idx = args
@@ -627,9 +638,23 @@ pub fn str_char_at(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     if idx < 0 || idx as usize >= s.len() {
         return Ok(Value::String(RcStr::from("")));
     }
-    let byte = s.as_bytes()[idx as usize];
-    // Return the single byte as a char (charAt is per-byte in our string model)
-    Ok(Value::String(RcStr::from((byte as char).to_string())))
+    char_at_byte(vm, s.as_str(), idx as usize)
+}
+
+/// The character beginning at `idx` in `s`, or the same error `s[idx]`
+/// raises when `idx` is inside one. Shared so the three spellings of
+/// this cannot drift apart again.
+fn char_at_byte(vm: &mut VM, s: &str, idx: usize) -> Result<Value, VMError> {
+    if !s.is_char_boundary(idx) {
+        return Err(vm.fail(
+            ErrorKind::ValueError,
+            format!(
+                "cannot index string at byte offset {idx}: falls inside a multi-byte UTF-8 character"
+            ),
+        ));
+    }
+    let ch = s[idx..].chars().next().expect("in range and on a boundary");
+    Ok(Value::String(RcStr::from(ch.to_string())))
 }
 
 /// `s.at(index)` → character at index (negative counts from end), or undefined.
@@ -648,8 +673,9 @@ pub fn str_at(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     if i < 0 || i as usize >= s.len() {
         return Ok(Value::Undefined);
     }
-    let byte = s.as_bytes()[i as usize];
-    Ok(Value::String(RcStr::from((byte as char).to_string())))
+    // Same reading as `s[i]` and `charAt` — see `char_at_byte`. The
+    // negative index counts back in bytes, because `length` does.
+    char_at_byte(vm, s.as_str(), i as usize)
 }
 
 /// `s.concat(str1, str2, …)` → concatenated string. Receiver must be a string.

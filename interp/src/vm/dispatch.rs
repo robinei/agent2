@@ -223,10 +223,27 @@ impl VM {
                         // (see the module doc on string indexing) — landing
                         // mid-codepoint is the price of that, surfaced rather
                         // than silently coerced.
+                        //
+                        // **It says what to do instead**, because there is
+                        // exactly one way to arrive here and the writer of
+                        // the program cannot be expected to know it. A
+                        // reader of text walks it one index at a time, and
+                        // told that `.length` counts bytes will write
+                        // `for (let i = 0; i < s.length; i++) s[i]` —
+                        // correct-looking, self-consistent, and certain to
+                        // land here on the first character over 0x7F. Seen
+                        // live on 2026-09-24, walking a Rust file full of
+                        // em dashes.
                         return Err(self.fail(
                             ErrorKind::ValueError,
                             format!(
-                                "cannot index string at byte offset {idx}: falls inside a multi-byte UTF-8 character"
+                                "cannot index string at byte offset {idx}: falls inside a \
+                                 multi-byte UTF-8 character. `.length` and every index here \
+                                 count UTF-8 bytes, so stepping one at a time lands inside a \
+                                 character on any text that is not pure ASCII. To walk \
+                                 characters, `for (const ch of s)`. To find something, \
+                                 `s.indexOf(…)` and `s.slice(…)`, whose offsets are always \
+                                 on a boundary."
                             ),
                         ));
                     }

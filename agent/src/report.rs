@@ -708,8 +708,24 @@ pub(crate) fn render_row(a: &Artifact) -> String {
 /// nineteenth. Nor does a row showing a `keep`/`peek` value, which has
 /// a body of its own to print underneath.
 fn fold_repeats<'a>(artifacts: &[&'a Artifact]) -> Vec<(&'a Artifact, Vec<u64>)> {
-    let foldable =
-        |a: &Artifact| !a.label.is_empty() && a.shown.is_none() && matches!(a.state, ArtifactState::Delivered(_));
+    // **A clipped label is not an identity.** `arg_preview` cuts each
+    // argument at 48 bytes and marks the cut with a bare `…` — no
+    // length, no hash — so `bash("cargo test -p agent --lib --features
+    // one")` and `… --features two` render the same line. Folding on
+    // the rendered label would report two different calls as one
+    // repeat. A command over 48 characters is ordinary, so this is a
+    // collision waiting rather than a theoretical one.
+    //
+    // The `…` can only have come from a clip, so its absence means the
+    // label is the whole call and two equal ones are the same call.
+    // The cost is that a long argument stops folding — a missed fold,
+    // never a false one.
+    let foldable = |a: &Artifact| {
+        !a.label.is_empty()
+            && !a.label.contains('…')
+            && a.shown.is_none()
+            && matches!(a.state, ArtifactState::Delivered(_))
+    };
     let mut out: Vec<(&Artifact, Vec<u64>)> = Vec::new();
     for a in artifacts {
         if let Some((last, earlier)) = out.last_mut()
@@ -3412,6 +3428,37 @@ mod tests {
         assert!(
             out.contains("and 2 the same before it: [10] [11]"),
             "{out}"
+        );
+    }
+
+    /// **Two calls that merely *look* the same are two rows.** The
+    /// label is a preview: `arg_preview` cuts each argument at 48
+    /// bytes and marks it with a bare `…`, so distinct commands
+    /// sharing a prefix render identically. Folding on that would
+    /// report them as one call repeated.
+    #[test]
+    fn calls_that_only_share_a_clipped_label_do_not_fold() {
+        let long = |tail: &str| Artifact {
+            id: 1,
+            label: format!(
+                "bash({})",
+                crate::report::arg_preview(&json!([format!(
+                    "cargo test -p agent --lib --all-targets --features {tail}"
+                )]))
+            ),
+            state: ArtifactState::Delivered(json!({ "status": 0 })),
+            shown: None,
+        };
+        let (a, b) = (long("alpha_one"), long("alpha_two"));
+        assert_eq!(a.label, b.label, "the preview really does collide");
+        assert!(a.label.contains('…'), "and it collides by being clipped");
+
+        let refs: Vec<&Artifact> = vec![&a, &b];
+        let out = render_row_list("### rows", &refs).unwrap();
+        assert_eq!(
+            out.matches("- `[").count(),
+            2,
+            "two different calls stay two rows: {out}"
         );
     }
 

@@ -150,9 +150,14 @@ fn string_mid_codepoint_index_reports_the_offset() {
     // string indexing); "é" is 2 bytes, so byte 1 lands inside it.
     let err = testutil::run_runtime_err("return \"\u{e9}\"[1];");
     assert_eq!(err.kind, crate::vm::ErrorKind::ValueError);
-    assert_eq!(
-        err.message,
-        "cannot index string at byte offset 1: falls inside a multi-byte UTF-8 character"
+    // The offset is the point of this test; the remedy that follows it
+    // belongs to `tests/string_is_walked_by_character.rs`, which is
+    // also where the three readings of a character are held together.
+    assert!(
+        err.message
+            .starts_with("cannot index string at byte offset 1: falls inside a multi-byte"),
+        "{}",
+        err.message
     );
 }
 

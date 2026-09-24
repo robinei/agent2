@@ -201,6 +201,6 @@ Everything else that differs stops the block and says what to write instead, so 
 
 | you write | you get | |
 |---|---|---|
-| `"aéb".length` | `4` | strings count UTF-8 bytes, not characters |
+| `"aéb".length` | `4` | strings count UTF-8 bytes, not characters, so walk one with `for (const ch of s)` rather than an index |
 | `1 < "2"` | `false` | `<` `>` `<=` `>=` do not coerce across types, so a number parsed out of a tool's output is a string until you write `Number(x)` |
 | `e instanceof Error` | `false` | a caught error is a plain `{ name, message }`, so branch on `e.name` |
