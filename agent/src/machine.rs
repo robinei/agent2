@@ -2924,10 +2924,25 @@ impl Runner {
                     None => (None, None),
                 };
                 let Some(id) = id.filter(|n| *n > 0).map(EventId::new) else {
-                    let verb = call.name.as_str();
+                    // **The spelling the model wrote, not the one the
+                    // host dispatches on.** A program says
+                    // `history.keep(…)`; the settle verb is
+                    // `keep_history`, and the refusal quoted that back —
+                    // so a live run on 2026-09-24 was handed
+                    // `keep_history(result) needs …` for a call it had
+                    // spelled the other way, and told to fix code it had
+                    // not written.
+                    let verb = match call.name.as_str() {
+                        TOOL_KEEP_HISTORY => "history.keep",
+                        TOOL_PEEK_HISTORY => "history.peek",
+                        other => other,
+                    };
                     self.settle_err(&format!(
-                        "{verb}(result) needs a tool result, or the id of one — \
-                         `{verb}(f)` or `{verb}(f.id)`"
+                        "{verb}(result) takes one row: a tool result, or the id of one — \
+                         `{verb}(f)` or `{verb}(f.id)`. For several, one call each: \
+                         `reads.map((r) => {verb}(r))`. One row shows one value; there \
+                         is no combined view, and a note joining them would be a second \
+                         copy of bytes the record already has."
                     ));
                     return Ok(true);
                 };
@@ -9703,6 +9718,54 @@ mod tests {
             Some(&(4, crate::types::RenderMode::Kept)),
             "the explicit keep is the newest word on the row: {r:?}"
         );
+    }
+
+    /// **`keep` takes one row, and says how to do several.**
+    ///
+    /// A live run on 2026-09-24 read thirteen spans and wrote
+    /// `history.keep(reads.map((r) => r.id), (rows) => rows.map(…))` —
+    /// an array and a projection over all of it. The throw ended the
+    /// reply.
+    ///
+    /// Two things invited it. The declaration said `result: unknown`,
+    /// which excludes nothing, and every exemplar around it is in
+    /// map-shape: `Promise.all(hits.map(…))`, `cfgs.map((f) => f.id)`.
+    /// So the type now says `{ id: number } | number`, and the refusal
+    /// names the map instead of restating the singular form it had
+    /// already failed to read.
+    ///
+    /// A combined view is not the missing feature. One row shows one
+    /// value; joining thirteen into a note would be a second copy of
+    /// bytes the record already holds, which is the thing `keep` exists
+    /// to avoid.
+    #[test]
+    fn keeping_several_rows_is_a_map_and_the_refusal_says_so() {
+        let mut c = Conversation::new();
+        c.answers("read_file", serde_json::json!({ "content": "x", "version": "v" }));
+        c.reply(
+            "```js\nconst rs = [await tools.read_file(\"a\"), await tools.read_file(\"b\")];\n\
+             try { history.keep(rs.map((r) => r.id)); } catch (e) { history.note(String(e)); }\n```\n",
+        );
+        let said = c.document();
+        assert!(
+            said.contains("history.keep(r))"),
+            "the refusal names the map that would have worked: {said}"
+        );
+
+        // And the map itself works: one row shown per result.
+        let mut c = Conversation::new();
+        c.answers("read_file", serde_json::json!({ "content": "x", "version": "v" }));
+        c.reply(
+            "```js\nconst rs = [await tools.read_file(\"a\"), await tools.read_file(\"b\")];\n\
+             rs.map((r) => history.keep(r));\n```\n",
+        );
+        let shown = c
+            .tree()
+            .path_events(c.runner().spine.leaf_id)
+            .iter()
+            .filter(|e| matches!(e.payload, EventPayload::Render { .. }))
+            .count();
+        assert_eq!(shown, 2, "one row kept per result");
     }
 
     /// **A stray fence is not a message.**

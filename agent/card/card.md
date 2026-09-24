@@ -142,11 +142,11 @@ declare namespace history {
   **This is how you read.** `note` copies bytes into a row of your own; `keep` makes the row that already exists show what it got, so a file in front of you is not also stored twice. Nothing moves: the value appears under that row's own line, under the id you already have.
 
   Leave the projection out for the whole result, or for the way it was cut last time. */
-  function keep(result: unknown, project?: unknown | ((r: unknown) => unknown)): number;
+  function keep(result: number | { id: number }, project?: unknown | ((r: unknown) => unknown)): number;
   /** **The same for your next reply and no further**, and it arrives at the end of that reply's page rather than on the row: there for one reading, gone from the one after, and the row itself never changes.
 
   **For what you need to look at once** — the file you are about to edit, the listing you are about to take four paths out of. Costs nothing to give up, because nothing above it is rewritten. `peek` again to have it another reply; `keep` when it turns out to be load-bearing, and `peek` something you kept to stop paying for it after one more look. `fetch` still answers either way. */
-  function peek(result: unknown, project?: unknown | ((r: unknown) => unknown)): number;
+  function peek(result: number | { id: number }, project?: unknown | ((r: unknown) => unknown)): number;
   /** Show `text` in place of that entry — **when you have found out it is wrong**, or when it is worth one line and not eighty. A later reader cannot discover that a row is wrong; only you, now, know that. Spend the words on what is true, not on saying something changed. Never replace an entry already showing as `[id] … text`: it is already standing in for something longer.
 
   There is no verb here for *dropping* a row. Not keeping it costs nothing and undoing costs a rewrite of everything after it, so the choice is `peek` rather than `keep`, made before the fact. */
