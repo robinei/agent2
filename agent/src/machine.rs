@@ -11136,6 +11136,31 @@ mod tests {
             "no harness post was written at all: {logged}"
         );
 
+        // **So the request ends on a turn that is the tail and
+        // nothing else.** With no post to carry, there is no
+        // `# NEW EVENTS` section for this wake at all — `with_tail`
+        // opens a fresh user turn rather than appending to one, and
+        // the model is handed its own prose-only reply followed by
+        // the readout about it.
+        let last = c
+            .runner()
+            .document(c.tree(), 64 * 1024)
+            .with_tail(&tail)
+            .messages
+            .pop()
+            .expect("a request");
+        assert_eq!(last.role, crate::document::ChatRole::User);
+        assert!(
+            last.content.starts_with("## RIGHT NOW"),
+            "the turn is the tail from its first byte: {:?}",
+            last.content
+        );
+        assert!(
+            !last.content.contains(crate::document::TURN_HEADING),
+            "and carries no events section, because there are no events: {:?}",
+            last.content
+        );
+
         // A reply that runs something discharges it, and the request
         // after that does not still carry the prod.
         c.reply("```js\nlet b = 2;\n```\n");
