@@ -60,6 +60,16 @@ def metrics(r):
     src = r.get("source") or ""
     u = r.get("usage") or {}
     return {
+        # **Which channel the reply reached for to read with.** The
+        # three are not interchangeable and the card says so: `keep` and
+        # `peek` put a result in front of the next reply without a copy,
+        # `note` writes bytes of its own, `console.log` is a trace of
+        # the run that is clipped to a tail and cannot be fetched. A
+        # reply that reads by printing has the same shape on every other
+        # metric here and is doing the expensive thing.
+        "shows": len(re.findall(r"history\.(?:keep|peek)\(", src)),
+        "notes": len(re.findall(r"history\.note\(", src)),
+        "prints": len(re.findall(r"console\.log\(", src)),
         "drafts": len(FENCE.findall(think)),
         "think_b": len(think),
         "reply_b": len(src),
@@ -133,7 +143,18 @@ def main(paths):
         note = f"  ({failed} failed, dropped)" if failed else ""
         print(f"{p}: n={len(ok)}{note}")
 
-    keys = ["drafts", "think_b", "reply_b", "cells", "reasoning_tok", "completion_tok", "ms"]
+    keys = [
+        "shows",
+        "notes",
+        "prints",
+        "drafts",
+        "think_b",
+        "reply_b",
+        "cells",
+        "reasoning_tok",
+        "completion_tok",
+        "ms",
+    ]
     print(f"\n{'':<28}" + "".join(f"{k:>15}" for k in keys))
     for p, rows in arms.items():
         med = "".join(f"{st.median([r[k] for r in rows]):>15.0f}" for k in keys)
@@ -144,13 +165,21 @@ def main(paths):
         print(f"\n=== {a}  vs  {b}")
         # Rate: did it happen at all. Robust, and answers a different
         # question from the count below.
-        xa = sum(1 for r in arms[a] if r["drafts"] > 0)
-        xb = sum(1 for r in arms[b] if r["drafts"] > 0)
+        #
+        # **One rate line per channel**, because a card change that
+        # moves a reply from printing a file to keeping it does not
+        # change how *much* it does of anything — it changes which verb
+        # it reaches for, and only a rate can see that. This block was
+        # hardcoded to `drafts` for as long as drafting was the only
+        # question anyone brought here.
         na, nb = len(arms[a]), len(arms[b])
-        print(
-            f"  drafted at all   {xa}/{na} = {100*xa/na:3.0f}%   "
-            f"{xb}/{nb} = {100*xb/nb:3.0f}%   Fisher p={fisher(xa, na-xa, xb, nb-xb):.4f}"
-        )
+        for k in ("shows", "notes", "prints", "drafts"):
+            xa = sum(1 for r in arms[a] if r[k] > 0)
+            xb = sum(1 for r in arms[b] if r[k] > 0)
+            print(
+                f"  {k + ' at all':<16} {xa}/{na} = {100*xa/na:3.0f}%   "
+                f"{xb}/{nb} = {100*xb/nb:3.0f}%   Fisher p={fisher(xa, na-xa, xb, nb-xb):.4f}"
+            )
         # Counts.
         for k in keys:
             x = [r[k] for r in arms[a]]
