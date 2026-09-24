@@ -1014,7 +1014,7 @@ mod tests {
         // `card()` shows up as a diff review must look at, not a byte
         // count that silently drifts. Comparing full text (not just a
         // hash) so the diff itself is legible in a failure message.
-        const EXPECTED_LEN: usize = 23258;
+        const EXPECTED_LEN: usize = 23680;
         assert_eq!(
             card().len(),
             EXPECTED_LEN,

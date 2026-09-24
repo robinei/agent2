@@ -4515,6 +4515,31 @@ impl Runner {
     ///   the model needs the id to reach for `answer` even when only one
     ///   post is open.
     /// - **presence**: whether a client is attached right now.
+    /// The row the last program's console output repeats, if it does.
+    fn console_repeats_a_row(&self, tree: &Tree) -> Option<(EventId, usize)> {
+        let path = tree.path_events(self.spine.leaf_id);
+        let printed = path.iter().rev().find_map(|e| match &e.payload {
+            EventPayload::Console { lines, .. } => Some(lines),
+            _ => None,
+        })?;
+        // **Joined, because the console is kept as lines.** A program
+        // that prints a row prints it one line at a time, and forty
+        // lines of forty bytes are each far under the threshold that
+        // decides what counts as a copy — so comparing them
+        // one by one finds nothing however much was repeated. What was
+        // printed is the lines put back together.
+        let printed = printed.join("\n");
+        let mine = [printed.as_str()];
+        let rows = path.iter().filter_map(|e| match &e.payload {
+            EventPayload::Result {
+                call,
+                outcome: Outcome::Delivered(v),
+            } => Some((*call, v)),
+            _ => None,
+        });
+        copy_of(&mine, rows)
+    }
+
     pub(crate) fn request_tail(&self, tree: &Tree) -> Option<String> {
         // While a compaction is outstanding the directive *is* the tail,
         // and nothing else rides with it — the directive's own words are
@@ -4629,6 +4654,26 @@ impl Runner {
         // nothing downstream has to cope with them — but a silent
         // deletion teaches nothing, and the ids in what was deleted
         // were guesses the model may still be reasoning from.
+        // **Printing a row's bytes is the same mistake as noting
+        // them, one reply cheaper.** `note` copies them onto the
+        // record for good and is refused; the console copies them into
+        // one request and is not — but a program that fetches four
+        // rows and prints all four has still paid for those bytes
+        // twice and put them where nothing can `keep` them. Live on
+        // 2026-09-24: one program printed 10,137 bytes across 217
+        // lines, almost all of it the contents of rows it had fetched
+        // two lines earlier, and 17 of those lines were dropped for
+        // the budget.
+        //
+        // A line, not a refusal: the console is where a program is
+        // *supposed* to be able to say anything, and a value it
+        // computed from a row is its own even when it looks alike.
+        if let Some((row, bytes)) = self.console_repeats_a_row(tree) {
+            let id = row.as_u64();
+            lines.push(format!(
+                "- your last program printed {bytes} bytes that are already on `[{id}]`.                  `history.keep({id})` shows that row without printing it, and survives                  the next reply — the console does not."
+            ));
+        }
         if self.annotations_stripped > 0 {
             let n = self.annotations_stripped;
             lines.push(format!(
@@ -10031,7 +10076,67 @@ mod tests {
         );
     }
 
-/// **A note that copies a row stores a reference to it instead.**
+/// **Printing a row's bytes is noticed, and the row is named.** Live
+    /// on 2026-09-24 a program fetched five rows and printed all five
+    /// contents — 10,137 bytes across 217 lines, 17 of them dropped
+    /// for the budget. The console is not a row: nothing can `keep`
+    /// it, and it goes when the report around it goes. So those bytes
+    /// were paid for twice and landed where they could not be read
+    /// again.
+    ///
+    /// A line rather than a refusal — the console is the one channel a
+    /// program may say anything on, and a value computed from a row is
+    /// its own even when it looks alike.
+    #[test]
+    fn printing_a_row_back_is_noticed_and_the_row_is_named() {
+        let bulk = "matched line in the config, with some detail\n".repeat(40);
+        let mut c = Conversation::new();
+        c.answers("bash", serde_json::json!({ "status": 0, "stdout": bulk.clone() }));
+        c.user_says("go");
+        c.reply("```js\nconst r = await tools.bash(\"grep x .\");\n```\n");
+        let row = c
+            .tree()
+            .path_events(c.runner().spine.leaf_id)
+            .iter()
+            .find_map(|e| match &e.payload {
+                EventPayload::Call(Call::Invoke { name, .. }) if name == "bash" => {
+                    Some(e.id.as_u64())
+                }
+                _ => None,
+            })
+            .expect("the call is on the record");
+        c.reply(
+            &"```js\nconsole.log((await history.fetch(ROW)).stdout);\n```\n"
+                .replace("ROW", &row.to_string()),
+        );
+
+        let doc = c.document();
+        assert!(
+            doc.contains(&format!("already on `[{row}]`")),
+            "the tail names the row it repeated: {doc}"
+        );
+        assert!(
+            doc.contains(&format!("history.keep({row})")),
+            "and the verb that shows it without printing: {doc}"
+        );
+
+        // A program that prints what it worked out, rather than what it
+        // was given, is left alone.
+        let mut c = Conversation::new();
+        c.answers("bash", serde_json::json!({ "status": 0, "stdout": bulk }));
+        c.user_says("go");
+        c.reply(
+            "```js\nconst r = await tools.bash(\"grep x .\");\n\
+             console.log(`${r.stdout.split(\"\\n\").length} lines matched`);\n```\n",
+        );
+        assert!(
+            !c.document().contains("already on `["),
+            "a count is not the bytes it counted: {}",
+            c.document()
+        );
+    }
+
+    /// **A note that copies a row stores a reference to it instead.**
     /// `note` is for what a reply worked out; `keep` is for bytes it was
     /// given. The record said that was not landing: five of seventeen
     /// notes across the kept sessions carried a verbatim copy of a

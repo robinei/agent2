@@ -135,6 +135,8 @@ declare namespace history {
   function note(value: unknown): void;
   /** Read any entry back, whole, by its id — including ones no longer shown. A call's row gives the tool's own result, the object its signature describes: `read_file` hands back `{ content, version, id }`, not the text. The value goes straight to this block: `const f = await history.fetch(9)`, and the next line already has `f.content`. Fetch in the reply that uses it.
 
+  **Rows from *this* reply have no ids yet.** An id is assigned when a row lands, which is after the reply is written — so there is no number to name for a call your own blocks just made, and any you write is a guess at something else. What this reply has instead is its variables: a later block reads `f` that an earlier one bound, because the blocks share one scope. `fetch` is for rows from replies that are *over*.
+
   **A row shows its first 32 KB and says so.** `fetch` hands back all of it however long it is. */
   function fetch(id: number): unknown;
   /** **The row writes its value out**, from your next reply onwards. Give it the result or its id — `history.keep(f)` or `history.keep(4)` — and a projection when you want part of it, either a value or a function of the result: `history.keep(f, v => v.content.slice(0, 2000))`. The function form lets the result stay anonymous, so no `const` is needed to hold it.
