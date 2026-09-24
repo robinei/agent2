@@ -5426,12 +5426,24 @@ fn substitute_within(
 /// for one meaning: *this is not yours*. It also means a reference
 /// copied back into a reply is stripped like any other annotation,
 /// rather than being read as text the model wrote.
+///
+/// **And it opens in the shape the card already teaches.** `【←
+/// snipped - history[40]】` is what a long literal in a call becomes
+/// (`document::mark_calls`), and card.md names it in as many words —
+/// so a reply that meets this one has already been told what the first
+/// four tokens mean and that the harness, not it, wrote them. The
+/// version before this opened `【← [194] already holds…`: a row
+/// notation used nowhere else, no word for what the span *is*, and the
+/// reader left to infer both from a sentence. Two annotations for one
+/// act — bytes taken out, and the row they are on — should not be two
+/// shapes.
 fn reference_to(row: EventId, bytes: usize) -> String {
     let id = row.as_u64();
     let (open, close) = (crate::document::FENCE_OPEN, crate::document::FENCE_CLOSE);
+    let arrow = crate::document::ARROW;
     format!(
-        "{open}← [{id}] already holds these {bytes} bytes; a print cannot show you a row — \
-         history.peek({id}) puts them in front of your next reply{close}"
+        "{open}{arrow} snipped - history[{id}] holds these {bytes} bytes. A print cannot show \
+         you a row; history.peek({id}) puts them in front of your next reply{close}"
     )
 }
 
