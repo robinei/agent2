@@ -10769,6 +10769,12 @@ mod tests {
             "idle",
             "a conclusion that marks itself finished rests the branch"
         );
+        // The shape `NOT_FINISHED_NOTICE` asks for in as many words:
+        // "reply with a single ∎ and nothing else". A branch that had
+        // already said its piece has nothing left to add, and the mark
+        // alone has to be enough or the notice is asking for something
+        // that does not work.
+        assert_eq!(ran_nothing("∎"), "idle", "the mark alone is an ending");
     }
 
     /// **The mark beside a program is not an ending, and does not stay
