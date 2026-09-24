@@ -25,5 +25,13 @@ tree-sitter-rust = "0.23"
 tree-sitter-javascript = "0.23"
 tree-sitter-typescript = "0.23"
 tree-sitter-python = "0.23"
+# The line diff behind `replace_file`'s `diff` field. Same argument as
+# `sha2` above, and stronger: what it replaced was a hand-rolled diff
+# that reported one giant hunk per file and, once clipped, showed the
+# removals and none of the additions — so a model read a rename as a
+# deletion. Hand-rolling a second one repeats that bet in the one place
+# where being subtly wrong is the whole defect. Apache-2.0, no
+# transitive dependencies, and it emits git's exact unified format.
+similar = { version = "3.2.0", default-features = false, features = ["text"] }
 
 [dev-dependencies]

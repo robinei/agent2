@@ -95,69 +95,387 @@ fn hash_bytes(bytes: &[u8]) -> String {
     format!("{:016x}", h.finish())
 }
 
-/// Minimal line diff: common-prefix + common-suffix scan, reporting the
-/// changed middle with `-`/`+` markers and one line of context on each
-/// side.  Produces a clipped summary for condition messages — full
-/// fidelity lives in the tool results.
+/// A line diff in `git diff -U3` form, reporting **every** changed
+/// region rather than the span between the first and last difference.
+///
+/// What this replaces was a common-prefix + common-suffix scan: one
+/// hunk covering everything between the outermost differences, every
+/// `-` line first and every `+` line after. On a live run that renamed
+/// `note_display` to `note_json` at four sites in a 500 KB file (lines
+/// ~4805 to ~7586) it emitted `@@ -4801,2786 +4801,2786 @@` and ~5,500
+/// body lines for four one-line edits. `replace_file` clips the result
+/// to 2 KB, and because the `-` side came first the clip removed the
+/// `+` side *entirely*: the model read 37 deletions and no additions
+/// for an edit that added exactly as many lines as it removed. The card
+/// sells `diff` as the cheap check that a write landed, and the shipped
+/// `04-many` example teaches `w.diff ? "changed" : "NO CHANGE"` — so a
+/// diff that describes the opposite of what happened is worse than none.
+///
+/// **The diff itself is `similar`'s** (Apache-2.0, no transitive
+/// dependencies, the engine behind `insta`). That follows the argument
+/// already written beside `sha2` in Cargo.toml — "not a sentence worth
+/// defending when the standard crate is this small" — and it applies
+/// harder here, because what we are replacing *is* a hand-rolled diff
+/// that shipped a confident lie; hand-rolling a second one repeats the
+/// bet in the one place where being subtly wrong is the whole defect.
+/// It also emits git's exact hunk headers (`,1` elided, an empty side
+/// numbered from the line before) and git's `\ No newline at end of
+/// file` marker, so the output is the format every model has already
+/// read a million times.
+///
+/// This wrapper owns everything about *fitting in the channel*, which
+/// is the part the crate cannot know:
+///
+/// - **`(no change)` for identical bytes**, unchanged and exact.
+///   `replace_file` keys on that string and `delivered_tail` in
+///   report.rs keys on the absent `diff` field it produces. A
+///   `sweep-40` run that wrote identical bytes and reported 24
+///   deletions is why that path exists.
+/// - **A byte budget of its own** ([`DIFF_MAX_BYTES`]), under the 2 KB
+///   `clip` at the call sites. The clip stays, but it must never be
+///   the thing that truncates: a clip cuts mid-stream and reports only
+///   a byte count, which is exactly how the `+` side vanished without
+///   a word. Here the diff states its own truncation, in whole hunks,
+///   and the clip becomes a no-op.
+/// - **A per-op line cap** ([`DIFF_MAX_OP_LINES`]) so a large
+///   replacement is elided *symmetrically* — some `-`, some `+`, and a
+///   count for each — rather than spending the whole budget on the
+///   removals and never reaching the additions. It is applied only when
+///   the hunk does not fit whole, so an ordinary edit is never elided
+///   for a rule's sake.
+/// - **Long-line handling** ([`DIFF_MAX_LINE_BYTES`]). `read_file` has
+///   no line-length assumption, so minified JS and single-line JSON are
+///   real inputs. Printing a 500 KB line the way git does would leave
+///   the reader nothing; a one-line-for-one-line replacement is instead
+///   shown as a window around the first byte that differs.
+///
+/// **Cost bound.** The diff runs under [`DIFF_TIMEOUT`]; past it
+/// `similar` stops searching for the minimal edit script and returns a
+/// coarser but still correct one. On a 1 MB, 20,000-line file with four
+/// scattered edits the whole call is single-digit milliseconds, so the
+/// bound is only reachable by adversarial input. The cost of the bound
+/// is determinism under load, which is worth it: the alternative to a
+/// non-minimal diff is a blocked worker thread.
+///
+/// Checked against `git diff --no-index -U3` on four real edits to
+/// `agent/src/report.rs` — a rename at five sites, a function inserted,
+/// a 25-line block deleted, an indentation change — and byte-identical
+/// to it on all four. The one deliberate omission is git's
+/// function-context hint after the second `@@`: that is a language
+/// heuristic, and a confidently wrong function name is the exact shape
+/// of failure this change exists to remove. `outline` is the tool that
+/// actually knows where a function starts.
 fn diff_lines(old: &str, new: &str) -> String {
-    let old_lines: Vec<&str> = old.lines().collect();
-    let new_lines: Vec<&str> = new.lines().collect();
-
-    // Common prefix
-    let mut prefix = 0;
-    while prefix < old_lines.len()
-        && prefix < new_lines.len()
-        && old_lines[prefix] == new_lines[prefix]
-    {
-        prefix += 1;
-    }
-    // Common suffix (after the prefix)
-    let mut suffix = 0;
-    while suffix < old_lines.len() - prefix
-        && suffix < new_lines.len() - prefix
-        && old_lines[old_lines.len() - 1 - suffix] == new_lines[new_lines.len() - 1 - suffix]
-    {
-        suffix += 1;
-    }
-
-    let old_start = prefix;
-    let old_end = old_lines.len() - suffix;
-    let new_start = prefix;
-    let new_end = new_lines.len() - suffix;
-
-    if old_start == old_end && new_start == new_end {
+    if old == new {
         return "(no change)".into();
     }
+    let diff = similar::TextDiff::configure()
+        .timeout(DIFF_TIMEOUT)
+        .diff_lines(old, new);
+    render_diff(&diff)
+}
 
-    let old_count = old_end.saturating_sub(old_start);
-    let new_count = new_end.saturating_sub(new_start);
+/// Lines of unchanged context around each hunk — `git diff -U3`'s
+/// default, and enough to place an edit in code the reader has not seen.
+const DIFF_CONTEXT: usize = 3;
 
-    let mut out = format!(
-        "@@ -{},{} +{},{} @@\n",
-        old_start + 1,
-        old_count,
-        new_start + 1,
-        new_count,
-    );
+/// Byte budget [`diff_lines`] holds *itself* to, below the 2 KB `clip`
+/// at the call sites. See the note on the clip above.
+const DIFF_MAX_BYTES: usize = 1800;
 
-    // One context line before (if available)
-    if prefix > 0 {
-        out.push_str(&format!("  {}\n", old_lines[prefix - 1]));
+/// Lines shown per side of a single insert/delete/replace before it is
+/// elided with a count. Ordinary edits are far under it, so their
+/// output is byte-identical to `git diff -U3`; the cap exists so that a
+/// 2,786-line replacement spends half the budget on `-` and half on
+/// `+` instead of all of it on `-`.
+const DIFF_MAX_OP_LINES: usize = 20;
+
+/// A line longer than this is clipped, with its true length stated.
+/// Wide enough that no ordinary source line is touched.
+const DIFF_MAX_LINE_BYTES: usize = 300;
+
+/// Bytes of a long line shown either side of where it starts (and
+/// stops) differing from its counterpart.
+const DIFF_LINE_LEAD: usize = 48;
+
+/// Wall-clock bound on the edit-script search. See [`diff_lines`].
+const DIFF_TIMEOUT: Duration = Duration::from_millis(250);
+
+fn render_diff(diff: &similar::TextDiff<'_, '_, str>) -> String {
+    use similar::DiffOp;
+
+    let (mut dels, mut ins) = (0usize, 0usize);
+    for op in diff.ops() {
+        match *op {
+            DiffOp::Equal { .. } => {}
+            DiffOp::Delete { old_len, .. } => dels += old_len,
+            DiffOp::Insert { new_len, .. } => ins += new_len,
+            DiffOp::Replace {
+                old_len, new_len, ..
+            } => {
+                dels += old_len;
+                ins += new_len;
+            }
+        }
     }
 
-    for line in &old_lines[old_start..old_end] {
-        out.push_str(&format!("-{}\n", line));
-    }
-    for line in &new_lines[new_start..new_end] {
-        out.push_str(&format!("+{}\n", line));
+    let mut unified = diff.unified_diff();
+    unified.context_radius(DIFF_CONTEXT);
+    let hunks: Vec<_> = unified.iter_hunks().collect();
+
+    let mut out = String::new();
+    let mut shown = 0usize;
+    for (i, hunk) in hunks.iter().enumerate() {
+        // Try it git's way first — every line, no elision — and only
+        // fall back to the symmetric cap if that does not fit. A 25-line
+        // deletion is an ordinary edit and there is usually room for it;
+        // capping it when there was room would be inventing a difference
+        // from `git diff -U3` for nothing.
+        let room = DIFF_MAX_BYTES.saturating_sub(out.len());
+        let text = render_hunk(diff, hunk, usize::MAX, room)
+            .unwrap_or_else(|| render_hunk(diff, hunk, DIFF_MAX_OP_LINES, usize::MAX).unwrap());
+        if i > 0 && out.len() + text.len() > DIFF_MAX_BYTES {
+            break;
+        }
+        out.push_str(&text);
+        shown += 1;
+        if out.len() >= DIFF_MAX_BYTES {
+            break;
+        }
     }
 
-    // One context line after (if available)
-    if suffix > 0 {
-        out.push_str(&format!("  {}\n", old_lines[old_end]));
+    // A single hunk can still overrun. Cut on a line boundary rather
+    // than leaving it to `clip`, so the note below survives.
+    let mut cut_mid_hunk = false;
+    if out.len() > DIFF_MAX_BYTES {
+        let at = floor_boundary(&out, DIFF_MAX_BYTES);
+        let at = out[..at].rfind('\n').map_or(0, |p| p + 1);
+        out.truncate(at);
+        cut_mid_hunk = true;
     }
 
+    if shown < hunks.len() || cut_mid_hunk {
+        out.push_str(&format!(
+            "… {dels} line{} removed and {ins} added across {} region{}; \
+             the first {shown} shown here{} …\n",
+            plural(dels),
+            hunks.len(),
+            plural(hunks.len()),
+            if cut_mid_hunk {
+                ", the last cut short"
+            } else {
+                ""
+            },
+        ));
+    }
     out
+}
+
+/// One hunk, with each op's `-` and `+` runs capped at `cap` lines.
+/// Returns `None` if the body passed `abort_at` bytes, so the caller can
+/// try again with a cap rather than build a megabyte it cannot use.
+///
+/// The header is git's, minus the trailing function-context hint git
+/// appends after the second `@@`. That hint is a language heuristic, and
+/// a confidently wrong function name is the exact failure mode this
+/// whole change exists to remove; `outline` is the tool that actually
+/// knows where a function starts.
+fn render_hunk(
+    diff: &similar::TextDiff<'_, '_, str>,
+    hunk: &similar::udiff::UnifiedDiffHunk<'_, '_, '_, str>,
+    cap: usize,
+    abort_at: usize,
+) -> Option<String> {
+    let mut out = format!("{}\n", hunk.header());
+    for op in hunk.ops() {
+        render_op(&mut out, diff, op, cap);
+        if out.len() > abort_at {
+            return None;
+        }
+    }
+    Some(out)
+}
+
+/// One insert / delete / replace / equal run. Deletions and insertions
+/// are capped independently so a large replacement elides both sides,
+/// and the insertions are buffered so they still follow the deletions
+/// in git's order.
+fn render_op(
+    out: &mut String,
+    diff: &similar::TextDiff<'_, '_, str>,
+    op: &similar::DiffOp,
+    cap: usize,
+) {
+    use similar::{ChangeTag, DiffOp};
+
+    // The degenerate input `read_file` makes possible: a file that is
+    // one enormous line (minified JS, a JSON blob). Printed whole, the
+    // two lines would fill the budget and — being identical for their
+    // first few thousand bytes — would show the reader nothing.
+    if let DiffOp::Replace {
+        old_len: 1,
+        new_len: 1,
+        ..
+    } = *op
+    {
+        let changes: Vec<_> = diff.iter_changes(op).collect();
+        let (a, b) = (changes[0].value(), changes[1].value());
+        if trimmed(a).len() > DIFF_MAX_LINE_BYTES || trimmed(b).len() > DIFF_MAX_LINE_BYTES {
+            render_long_pair(out, &changes[0], &changes[1]);
+            return;
+        }
+    }
+
+    let (mut del_total, mut del_shown) = (0usize, 0usize);
+    let (mut ins_total, mut ins_shown) = (0usize, 0usize);
+    let mut inserted = String::new();
+    for change in diff.iter_changes(op) {
+        match change.tag() {
+            // Context runs are already bounded by the context radius.
+            ChangeTag::Equal => push_change(out, ' ', &change),
+            ChangeTag::Delete => {
+                del_total += 1;
+                if del_shown < cap {
+                    push_change(out, '-', &change);
+                    del_shown += 1;
+                }
+            }
+            ChangeTag::Insert => {
+                ins_total += 1;
+                if ins_shown < cap {
+                    push_change(&mut inserted, '+', &change);
+                    ins_shown += 1;
+                }
+            }
+        }
+    }
+    if del_total > del_shown {
+        out.push_str(&format!(
+            "… {} more line{} removed here …\n",
+            del_total - del_shown,
+            plural(del_total - del_shown)
+        ));
+    }
+    out.push_str(&inserted);
+    if ins_total > ins_shown {
+        out.push_str(&format!(
+            "… {} more line{} added here …\n",
+            ins_total - ins_shown,
+            plural(ins_total - ins_shown)
+        ));
+    }
+}
+
+/// One body line, git's `\ No newline at end of file` marker included,
+/// clipped if it is longer than any line anyone reads.
+fn push_change(out: &mut String, marker: char, change: &similar::Change<&str>) {
+    let text = trimmed(change.value());
+    out.push(marker);
+    if text.len() > DIFF_MAX_LINE_BYTES {
+        out.push_str(&text[..floor_boundary(text, DIFF_MAX_LINE_BYTES)]);
+        out.push_str(&format!("… [clipped; the line is {} bytes]", text.len()));
+    } else {
+        out.push_str(text);
+    }
+    out.push('\n');
+    if change.missing_newline() {
+        out.push_str("\\ No newline at end of file\n");
+    }
+}
+
+/// A one-line-for-one-line replacement where at least one side is far
+/// too long to print: show where the two lines actually diverge, with a
+/// window of context, instead of two near-identical walls of bytes.
+fn render_long_pair(out: &mut String, old: &similar::Change<&str>, new: &similar::Change<&str>) {
+    let (a, b) = (trimmed(old.value()), trimmed(new.value()));
+    let head = common_prefix(a, b);
+    let tail = common_suffix(a, b, head);
+    out.push_str(&format!(
+        "… one line, {} bytes → {} bytes; identical up to byte {head}, \
+         and again from byte {} (old) / {} (new). The window between is shown …\n",
+        a.len(),
+        b.len(),
+        a.len() - tail,
+        b.len() - tail,
+    ));
+    out.push('-');
+    out.push_str(&window(a, head, a.len() - tail));
+    out.push('\n');
+    if old.missing_newline() {
+        out.push_str("\\ No newline at end of file\n");
+    }
+    out.push('+');
+    out.push_str(&window(b, head, b.len() - tail));
+    out.push('\n');
+    if new.missing_newline() {
+        out.push_str("\\ No newline at end of file\n");
+    }
+}
+
+/// `[from, to)` plus [`DIFF_LINE_LEAD`] bytes either side, elided to
+/// [`DIFF_MAX_LINE_BYTES`], with `…` wherever bytes were dropped.
+fn window(line: &str, from: usize, to: usize) -> String {
+    let start = floor_boundary(line, from.saturating_sub(DIFF_LINE_LEAD));
+    let want = (to + DIFF_LINE_LEAD).min(line.len());
+    let end = floor_boundary(line, want.min(start + DIFF_MAX_LINE_BYTES));
+    let mut out = String::new();
+    // Both elisions carry their size: a bare `…` at the front would
+    // leave the reader guessing how far into the line the window sits,
+    // and the byte offsets in the note above are only usable against it.
+    if start > 0 {
+        out.push_str(&format!("…[{start} bytes elided]"));
+    }
+    out.push_str(&line[start..end]);
+    if end < line.len() {
+        out.push_str(&format!("…[{} bytes elided]", line.len() - end));
+    }
+    out
+}
+
+/// Bytes shared at the front of two lines, on a char boundary.
+fn common_prefix(a: &str, b: &str) -> usize {
+    let limit = a.len().min(b.len());
+    let mut i = 0;
+    while i < limit && a.as_bytes()[i] == b.as_bytes()[i] {
+        i += 1;
+    }
+    floor_boundary(a, i)
+}
+
+/// Bytes shared at the end of two lines, never overlapping `head`.
+fn common_suffix(a: &str, b: &str, head: usize) -> usize {
+    let limit = a.len().min(b.len()) - head;
+    let mut i = 0;
+    while i < limit && a.as_bytes()[a.len() - 1 - i] == b.as_bytes()[b.len() - 1 - i] {
+        i += 1;
+    }
+    // Snap inwards on both sides: the suffix is byte-identical, so one
+    // index is a char boundary exactly when the other is.
+    while i > 0 && !(a.is_char_boundary(a.len() - i) && b.is_char_boundary(b.len() - i)) {
+        i -= 1;
+    }
+    i
+}
+
+/// A line without its terminator. `\r` is deliberately kept: a CRLF/LF
+/// conversion is a real edit, and `str::lines()` hiding it is one of
+/// the reasons this does not use `str::lines()`.
+fn trimmed(line: &str) -> &str {
+    line.strip_suffix('\n').unwrap_or(line)
+}
+
+fn floor_boundary(s: &str, mut i: usize) -> usize {
+    if i >= s.len() {
+        return s.len();
+    }
+    while !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+fn plural(n: usize) -> &'static str {
+    if n == 1 { "" } else { "s" }
 }
 
 /// Atomic write via temp file + rename in the target's directory.
@@ -1420,5 +1738,491 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── diff_lines ─────────────────────────────────────────────────
+    //
+    // The case these exist for: a live run renamed `note_display` to
+    // `note_json` at four sites in a 500 KB file and the old
+    // prefix/suffix scan reported one 2,786-line hunk whose `+` side
+    // the 2 KB clip then removed entirely. See `diff_lines`.
+    //
+    // The output was also checked against `git diff -U3` on four real
+    // edits to `agent/src/report.rs` — a rename at five sites, a
+    // function inserted, a 25-line block deleted, an indentation
+    // change — and is byte-identical to it bar git's function-context
+    // hint after the second `@@`. `matches_git_unified_format` pins a
+    // small case of that; the rest is what `walk_hunks` enforces.
+
+    /// Every changed line in a rendered diff, `-`/`+` marker included.
+    fn changed_lines(diff: &str) -> Vec<&str> {
+        diff.lines()
+            .filter(|l| l.starts_with('-') || l.starts_with('+'))
+            .filter(|l| !l.starts_with("@@"))
+            .collect()
+    }
+
+    /// Replay a diff against both files, asserting that **every** line
+    /// it prints is at the line number its hunk header implies.
+    ///
+    /// This is the property the card claims for `outline`'s
+    /// `start_line` — "an edit anchor, not just a fact" — and a diff's
+    /// numbers are acted on the same way, by `Edit.replaceLines`. An
+    /// off-by-one here is worse than printing no number at all.
+    fn walk_hunks(diff: &str, old: &str, new: &str) -> usize {
+        let old_lines: Vec<&str> = old.split_inclusive('\n').collect();
+        let new_lines: Vec<&str> = new.split_inclusive('\n').collect();
+        let strip = |s: &str| s.strip_suffix('\n').unwrap_or(s).to_owned();
+        let (mut o, mut n) = (0usize, 0usize);
+        let mut hunks = 0;
+        for line in diff.lines() {
+            if let Some(rest) = line.strip_prefix("@@ -") {
+                let (old_part, rest) = rest.split_once(" +").unwrap();
+                let new_part = rest.split_once(" @@").unwrap().0;
+                let num =
+                    |p: &str| -> usize { p.split(',').next().unwrap().parse::<usize>().unwrap() };
+                // 1-based; a zero-length side is numbered from the line
+                // before, which is 0 at the top of the file.
+                o = num(old_part).max(1) - 1;
+                n = num(new_part).max(1) - 1;
+                hunks += 1;
+                continue;
+            }
+            let Some(marker) = line.chars().next() else {
+                continue;
+            };
+            let body = &line[1..];
+            match marker {
+                ' ' => {
+                    assert_eq!(strip(old_lines[o]), body, "context at old line {}", o + 1);
+                    assert_eq!(strip(new_lines[n]), body, "context at new line {}", n + 1);
+                    o += 1;
+                    n += 1;
+                }
+                '-' => {
+                    assert_eq!(strip(old_lines[o]), body, "removal at old line {}", o + 1);
+                    o += 1;
+                }
+                '+' => {
+                    assert_eq!(strip(new_lines[n]), body, "addition at new line {}", n + 1);
+                    n += 1;
+                }
+                // `\ No newline…` and the `…` notes carry no line.
+                _ => {}
+            }
+        }
+        hunks
+    }
+
+    /// The motivating file: 7,600 lines, one signature repeated at four
+    /// scattered sites, renamed at all four.
+    fn rename_case() -> (String, String) {
+        let sig = "pub(crate) fn note_display(value: &serde_json::Value) -> String {";
+        let sites = [4804usize, 5500, 6800, 7585];
+        let mut old = String::new();
+        for i in 0..7600 {
+            if sites.contains(&i) {
+                old.push_str(sig);
+                old.push('\n');
+            } else {
+                old.push_str(&format!("    // filler line {i}\n"));
+            }
+        }
+        let new = old.replace("note_display", "note_json");
+        (old, new)
+    }
+
+    #[test]
+    fn scattered_edits_produce_one_small_hunk_each() {
+        let (old, new) = rename_case();
+        let diff = diff_lines(&old, &new);
+        let headers: Vec<&str> = diff.lines().filter(|l| l.starts_with("@@")).collect();
+        assert_eq!(headers.len(), 4, "one hunk per site, got:\n{diff}");
+        for h in &headers {
+            // Seven lines a side: three context, the change, three more.
+            assert!(h.ends_with(",7 @@"), "hunk should be tiny: {h}\n{diff}");
+        }
+        let changed = changed_lines(&diff);
+        assert_eq!(
+            changed.iter().filter(|l| l.starts_with('-')).count(),
+            4,
+            "{diff}"
+        );
+        // The `+` side is the half the clip used to eat.
+        assert_eq!(
+            changed.iter().filter(|l| l.starts_with('+')).count(),
+            4,
+            "{diff}"
+        );
+        assert!(diff.contains("+pub(crate) fn note_json"), "{diff}");
+        assert!(!diff.contains("…"), "nothing should be elided:\n{diff}");
+        assert!(
+            diff.len() < 2048,
+            "the whole diff must survive the 2 KB clip, was {} bytes:\n{diff}",
+            diff.len()
+        );
+        // And the hunks are where the edits are, not at line 1.
+        assert!(diff.contains("@@ -4802,7 +4802,7 @@"), "{diff}");
+        assert!(diff.contains("@@ -7583,7 +7583,7 @@"), "{diff}");
+    }
+
+    #[test]
+    fn every_printed_line_is_at_the_number_its_hunk_claims() {
+        let (old, new) = rename_case();
+        assert_eq!(walk_hunks(&diff_lines(&old, &new), &old, &new), 4);
+
+        // The same guarantee on shapes that move the two sides out of
+        // step with each other.
+        let cases = [
+            (
+                "a\nb\nc\nd\ne\nf\ng\nh\n",
+                "a\nb\nX\nY\nZ\nc\nd\ne\nf\ng\nh\n",
+            ),
+            ("a\nb\nc\nd\ne\nf\ng\nh\n", "a\ne\nf\ng\nh\n"),
+            ("a\nb\nc\nd\ne\nf\ng\nh\n", "A\nb\nc\nd\ne\nf\ng\nH\n"),
+            ("", "a\nb\n"),
+            ("a\nb\n", ""),
+            ("a\nb\nc", "a\nB\nc"),
+        ];
+        for (old, new) in cases {
+            assert!(walk_hunks(&diff_lines(old, new), old, new) > 0, "{old:?}");
+        }
+    }
+
+    #[test]
+    fn matches_git_unified_format() {
+        // Both bodies are `git diff --no-index -U3` verbatim, with only
+        // the `---`/`+++` file header and git's function-context hint
+        // removed — the two things a diff of a buffer cannot have.
+
+        // Close enough together that git merges them into one hunk.
+        let old = "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\n";
+        let new = "one\ntwo\nTHREE\nfour\nfive\nsix\nseven\neight\nnine\nTEN\n";
+        assert_eq!(
+            diff_lines(old, new),
+            [
+                "@@ -1,10 +1,10 @@",
+                " one",
+                " two",
+                "-three",
+                "+THREE",
+                " four",
+                " five",
+                " six",
+                " seven",
+                " eight",
+                " nine",
+                "-ten",
+                "+TEN",
+                "",
+            ]
+            .join("\n")
+        );
+
+        // Far enough apart that git splits them.
+        let old: String = (1..=20).map(|i| format!("l{i}\n")).collect();
+        let new: String = (1..=20)
+            .map(|i| match i {
+                3 | 14 => format!("L{i}\n"),
+                _ => format!("l{i}\n"),
+            })
+            .collect();
+        assert_eq!(
+            diff_lines(&old, &new),
+            [
+                "@@ -1,6 +1,6 @@",
+                " l1",
+                " l2",
+                "-l3",
+                "+L3",
+                " l4",
+                " l5",
+                " l6",
+                "@@ -11,7 +11,7 @@",
+                " l11",
+                " l12",
+                " l13",
+                "-l14",
+                "+L14",
+                " l15",
+                " l16",
+                " l17",
+                "",
+            ]
+            .join("\n")
+        );
+    }
+
+    #[test]
+    fn identical_bytes_are_exactly_no_change() {
+        // `replace_file` keys on this string and `delivered_tail` keys
+        // on the absent `diff` field it produces.
+        assert_eq!(diff_lines("a\nb\nc\n", "a\nb\nc\n"), "(no change)");
+        assert_eq!(diff_lines("", ""), "(no change)");
+    }
+
+    #[test]
+    fn pure_insertion_shows_only_additions() {
+        let diff = diff_lines("a\nb\nc\n", "a\nb\nX\nY\nc\n");
+        assert_eq!(changed_lines(&diff), vec!["+X", "+Y"], "{diff}");
+        assert!(diff.starts_with("@@ -1,3 +1,5 @@\n"), "{diff}");
+    }
+
+    #[test]
+    fn pure_deletion_shows_only_removals() {
+        let diff = diff_lines("a\nb\nX\nY\nc\n", "a\nb\nc\n");
+        assert_eq!(changed_lines(&diff), vec!["-X", "-Y"], "{diff}");
+        assert!(diff.starts_with("@@ -1,5 +1,3 @@\n"), "{diff}");
+    }
+
+    #[test]
+    fn edits_at_the_very_first_and_very_last_line() {
+        let old = "first\nb\nc\nd\nlast\n";
+        let new = "FIRST\nb\nc\nd\nLAST\n";
+        let diff = diff_lines(old, new);
+        // Close enough together that the context merges them into one.
+        assert!(diff.starts_with("@@ -1,5 +1,5 @@\n"), "{diff}");
+        assert_eq!(
+            changed_lines(&diff),
+            vec!["-first", "+FIRST", "-last", "+LAST"],
+            "{diff}"
+        );
+        assert_eq!(walk_hunks(&diff, old, new), 1);
+    }
+
+    #[test]
+    fn far_apart_first_and_last_line_edits_stay_two_hunks() {
+        let mut old = String::from("first\n");
+        for i in 0..200 {
+            old.push_str(&format!("body {i}\n"));
+        }
+        old.push_str("last\n");
+        let new = old
+            .replace("first\n", "FIRST\n")
+            .replace("last\n", "LAST\n");
+        let diff = diff_lines(&old, &new);
+        assert_eq!(walk_hunks(&diff, &old, &new), 2, "{diff}");
+        assert!(diff.starts_with("@@ -1,4 +1,4 @@\n"), "{diff}");
+        assert!(diff.contains("@@ -199,4 +199,4 @@"), "{diff}");
+    }
+
+    #[test]
+    fn empty_on_either_side() {
+        let diff = diff_lines("", "a\nb\n");
+        assert!(diff.starts_with("@@ -0,0 +1,2 @@\n"), "{diff}");
+        assert_eq!(changed_lines(&diff), vec!["+a", "+b"], "{diff}");
+
+        let diff = diff_lines("a\nb\n", "");
+        assert!(diff.starts_with("@@ -1,2 +0,0 @@\n"), "{diff}");
+        assert_eq!(changed_lines(&diff), vec!["-a", "-b"], "{diff}");
+    }
+
+    #[test]
+    fn a_dropped_trailing_newline_is_a_change_not_no_change() {
+        // `str::lines()` drops the final terminator, so this edit would
+        // render as `(no change)` for anything built on it — the precise
+        // lie `(no change)` exists to prevent.
+        let diff = diff_lines("a\nb\nc\n", "a\nb\nc");
+        assert_ne!(diff, "(no change)");
+        assert!(diff.contains("\\ No newline at end of file"), "{diff}");
+        assert_eq!(changed_lines(&diff), vec!["-c", "+c"], "{diff}");
+
+        // And the other direction.
+        let diff = diff_lines("a\nb\nc", "a\nb\nc\n");
+        assert_ne!(diff, "(no change)");
+        assert!(diff.contains("\\ No newline at end of file"), "{diff}");
+    }
+
+    #[test]
+    fn a_file_with_no_trailing_newline_diffs_normally() {
+        let diff = diff_lines("a\nb\nc", "a\nB\nc");
+        assert_eq!(changed_lines(&diff), vec!["-b", "+B"], "{diff}");
+        assert!(diff.starts_with("@@ -1,3 +1,3 @@\n"), "{diff}");
+        // The unchanged last line still carries the marker, as git does.
+        assert!(diff.contains("\\ No newline at end of file"), "{diff}");
+    }
+
+    #[test]
+    fn a_line_ending_conversion_is_not_no_change() {
+        // `str::lines()` also eats the `\r` of a CRLF pair.
+        let diff = diff_lines("a\r\nb\r\n", "a\nb\n");
+        assert_ne!(diff, "(no change)");
+        assert_eq!(changed_lines(&diff).len(), 4, "{diff}");
+    }
+
+    #[test]
+    fn alternating_lines_with_two_far_apart_edits_stay_two_hunks() {
+        // Nothing in this file is unique, which is the shape that makes
+        // a naive anchor diff give up and a prefix/suffix scan report
+        // the whole 1,980-line span as changed.
+        let mut old = String::new();
+        for i in 0..2000 {
+            old.push_str(if i % 2 == 0 { "a\n" } else { "b\n" });
+        }
+        let mut lines: Vec<&str> = old.split_inclusive('\n').collect();
+        lines[10] = "c\n";
+        lines[1990] = "d\n";
+        let new: String = lines.concat();
+
+        let diff = diff_lines(&old, &new);
+        assert_eq!(walk_hunks(&diff, &old, &new), 2, "{diff}");
+        assert_eq!(changed_lines(&diff), vec!["-a", "+c", "-a", "+d"], "{diff}");
+        assert!(diff.len() < 256, "{} bytes:\n{diff}", diff.len());
+    }
+
+    #[test]
+    fn a_large_replacement_elides_both_sides_not_just_the_additions() {
+        // The original defect, in miniature: 400 lines replaced by 400.
+        // A truncation that keeps every `-` and no `+` is what taught a
+        // model that an edit had deleted code it had in fact rewritten.
+        let mut old = String::new();
+        let mut new = String::new();
+        for i in 0..400 {
+            old.push_str(&format!("old body line {i}\n"));
+            new.push_str(&format!("new body line {i}\n"));
+        }
+        let diff = diff_lines(&old, &new);
+        let changed = changed_lines(&diff);
+        let dels = changed.iter().filter(|l| l.starts_with('-')).count();
+        let adds = changed.iter().filter(|l| l.starts_with('+')).count();
+        assert_eq!(dels, DIFF_MAX_OP_LINES, "{diff}");
+        assert_eq!(adds, DIFF_MAX_OP_LINES, "{diff}");
+        assert!(diff.contains("380 more lines removed here"), "{diff}");
+        assert!(diff.contains("380 more lines added here"), "{diff}");
+        assert!(diff.len() < 2048, "{} bytes", diff.len());
+    }
+
+    #[test]
+    fn a_hunk_that_fits_is_not_elided_at_all() {
+        // The cap must not invent a difference from `git diff -U3` when
+        // there was room: a 25-line deletion is an ordinary edit.
+        let mut old = String::new();
+        for i in 0..40 {
+            old.push_str(&format!("line {i}\n"));
+        }
+        let new: String = old
+            .split_inclusive('\n')
+            .enumerate()
+            .filter(|(i, _)| !(5..30).contains(i))
+            .map(|(_, l)| l)
+            .collect();
+        let diff = diff_lines(&old, &new);
+        assert!(!diff.contains("…"), "{diff}");
+        assert_eq!(changed_lines(&diff).len(), 25, "{diff}");
+        assert_eq!(walk_hunks(&diff, &old, &new), 1);
+    }
+
+    #[test]
+    fn many_regions_are_counted_rather_than_half_shown() {
+        // 300 scattered one-line edits: far more hunks than fit.
+        let mut old = String::new();
+        let mut new = String::new();
+        for i in 0..3000 {
+            old.push_str(&format!("line {i}\n"));
+            new.push_str(&format!(
+                "{} {i}\n",
+                if i % 10 == 0 { "LINE" } else { "line" }
+            ));
+        }
+        let diff = diff_lines(&old, &new);
+        assert!(
+            diff.contains("300 lines removed and 300 added across 300 regions"),
+            "{diff}"
+        );
+        // Under the clip, so the note is the last word rather than
+        // something `clip` cuts off mid-sentence.
+        assert!(diff.len() < 2048, "{} bytes", diff.len());
+        assert_eq!(clip(&diff, 2048), diff);
+        // Both sides present in what did fit — the original failure was
+        // a clip that kept every `-` and no `+`.
+        let changed = changed_lines(&diff);
+        assert!(changed.iter().any(|l| l.starts_with('-')), "{diff}");
+        assert!(changed.iter().any(|l| l.starts_with('+')), "{diff}");
+    }
+
+    #[test]
+    fn a_file_that_is_one_enormous_line_shows_where_it_differs() {
+        // Minified JS and single-line JSON are real inputs: `read_file`
+        // makes no assumption about line length. Printing the line the
+        // way git does would spend the whole budget on bytes identical
+        // on both sides.
+        let mut old = String::from("var DATA=[");
+        for i in 0..20000 {
+            old.push_str(&format!("{{\"k{i}\":\"vvvvvvvv\"}},"));
+        }
+        old.push_str("];");
+        let new = old.replace("\"k9000\":\"vvvvvvvv\"", "\"k9000\":\"REPLACED\"");
+        assert!(old.len() > 400_000 && !old.contains('\n'));
+
+        let diff = diff_lines(&old, &new);
+        assert!(diff.starts_with("@@ -1 +1 @@\n"), "{diff}");
+        assert!(diff.len() < 800, "{} bytes:\n{diff}", diff.len());
+        // The changed bytes themselves, in context, on both sides.
+        assert!(diff.contains("-…[") && diff.contains("+…["), "{diff}");
+        assert!(diff.contains("\"k9000\":\"vvvvvvvv\""), "{diff}");
+        assert!(diff.contains("\"k9000\":\"REPLACED\""), "{diff}");
+        assert!(diff.contains("bytes elided"), "{diff}");
+        // And it says how long the line really is, both sides.
+        assert!(
+            diff.contains(&format!(
+                "one line, {} bytes → {} bytes",
+                old.len(),
+                new.len()
+            )),
+            "{diff}"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_long_line_is_clipped_with_its_true_length() {
+        let long = "x".repeat(5000);
+        let old = format!("a\n{long}\nb\n");
+        let new = format!("a\n{long}\nb\nc\n");
+        let diff = diff_lines(&old, &new);
+        assert!(diff.contains("[clipped; the line is 5000 bytes]"), "{diff}");
+        assert!(diff.contains("+c"), "{diff}");
+        assert!(diff.len() < 800, "{} bytes", diff.len());
+    }
+
+    #[test]
+    fn a_half_megabyte_file_diffs_in_well_under_the_timeout() {
+        // 500 KB files are the stated scale; the timeout is a fence
+        // against adversarial input, not something a real edit nears.
+        let mut old = String::new();
+        for i in 0..20000 {
+            old.push_str(&format!("    let value_{i} = compute_{i}(input, {i});\n"));
+        }
+        assert!(old.len() > 500_000);
+        let new = old
+            .replace("compute_4804(", "computed_4804(")
+            .replace("compute_19900(", "computed_19900(");
+        let started = std::time::Instant::now();
+        let diff = diff_lines(&old, &new);
+        assert!(
+            started.elapsed() < DIFF_TIMEOUT,
+            "took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(walk_hunks(&diff, &old, &new), 2, "{diff}");
+    }
+
+    #[test]
+    fn cas_mismatch_error_carries_a_readable_multi_hunk_diff() {
+        let (_dir, path) = temp_path();
+        let mut on_disk = String::new();
+        for i in 0..400 {
+            on_disk.push_str(&format!("line {i}\n"));
+        }
+        let result = create_file(json!([path.to_str().unwrap(), on_disk])).unwrap();
+        let stale = result["version"].as_str().unwrap().to_owned();
+        std::fs::write(&path, on_disk.replace("line 5\n", "line 5 edited\n")).unwrap();
+
+        let mine = on_disk.replace("line 300\n", "line 300 mine\n");
+        let err = replace_file(json!([path.to_str().unwrap(), mine, stale])).unwrap_err();
+        assert!(err.contains("diff (expected→your content)"), "{err}");
+        // Both divergences, each in its own hunk, not one 295-line blob.
+        assert!(err.contains("-line 5 edited"), "{err}");
+        assert!(err.contains("+line 300 mine"), "{err}");
+        assert_eq!(err.matches("@@").count(), 4, "{err}");
     }
 }
