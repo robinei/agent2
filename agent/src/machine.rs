@@ -449,7 +449,7 @@ const NO_REHEARSAL_TAIL: &str =
 /// a model quoting one of these in a sentence would be a false
 /// positive, and the cost of that is one extra turn, against a run
 /// silently abandoning its task.
-fn foreign_tool_call(text: &str) -> bool {
+pub(crate) fn foreign_tool_call(text: &str) -> bool {
     const SHAPES: [&str; 7] = [
         "<tool_call>",
         "<function=",
@@ -491,7 +491,7 @@ const UNFENCED_PROGRAM_NOTICE: &str = "- Your last reply was a program with no f
 /// keeps its other lines. That is why this reads whole lines rather
 /// than searching for a substring: 1 prose segment in 1,686 across the
 /// kept corpus matches, and it is the one this was written for.
-fn unfenced_program(text: &str) -> bool {
+pub(crate) fn unfenced_program(text: &str) -> bool {
     if text.contains("```") {
         return false;
     }
@@ -8257,6 +8257,80 @@ mod tests {
                     if format!("{origin:?}").contains("no fence around it")
             )),
             "and nothing of it is on the log"
+        );
+    }
+
+    /// **The correction outlives the prod, because the reply does.**
+    ///
+    /// Both of these prods are about a defect in the reply, and both
+    /// ride the ephemeral tail — so a turn later the reply is still
+    /// there and the only thing saying it failed is gone. What is left
+    /// is a clean example, in the model's own voice, of writing a tool
+    /// call in a syntax that does not run. The measurement behind
+    /// `FOREIGN_TOOL_CALL_NOTICE` is exactly that shape: a card
+    /// sentence forbidding it was "ignored 3/3 — the model complied on
+    /// one reply and drifted back on the next".
+    ///
+    /// So the verdict is marked on the turn, above the text it is
+    /// about, for as long as the turn is read — which is what an empty
+    /// reply and a cut-off reply already get.
+    #[test]
+    fn a_reply_whose_syntax_could_not_run_says_so_for_as_long_as_it_is_read() {
+        let marked = |reply: &str| {
+            let mut c = Conversation::new();
+            c.user_says("go");
+            c.reply(reply);
+            // A turn later: the prod that woke it is long gone.
+            c.reply("```js\nlet z = 1;\n```\n");
+            assert!(
+                !c.runner()
+                    .request_tail(c.tree())
+                    .unwrap_or_default()
+                    .contains("reached the person"),
+                "the prod is spent"
+            );
+            let m = c.runner().document(c.tree(), 64 * 1024).messages;
+            m.iter()
+                .rev()
+                .find(|x| {
+                    x.role == crate::document::ChatRole::Assistant && !x.content.contains("let z")
+                })
+                .expect("the reply is still in the document")
+                .content
+                .clone()
+        };
+
+        let foreign = marked(
+            "Let me look.\n\n<tool_call>\n<function=bash>\n             <parameter=command>\nls -la\n</parameter>\n</function>\n</tool_call>",
+        );
+        assert!(
+            foreign.starts_with(&format!(
+                "{}{} not parsed",
+                crate::document::FENCE_OPEN,
+                crate::document::BLOCK_ARROW
+            )),
+            "the verdict is the first thing read, before the thing it is about: {foreign}"
+        );
+        assert!(
+            foreign.contains("<tool_call>"),
+            "and what was written is still what is shown — the person saw it: {foreign}"
+        );
+
+        let unfenced = marked("tell(\"The closing balance is 1200.\");\nfinish();\n");
+        assert!(
+            unfenced.contains("not fenced") && unfenced.contains("reached the person as text"),
+            "{unfenced}"
+        );
+
+        // A reply that ran something is not branded on a shape it may
+        // merely have been quoting — the same guard `stopped_short`
+        // applies, and a wrong mark here is wrong for the life of the
+        // log rather than for one turn.
+        let quoted =
+            marked("Other harnesses write `<tool_call>` for this.\n\n```js\nlet a = 1;\n```\n");
+        assert!(
+            !quoted.contains("not parsed"),
+            "a reply that ran a cell is left alone: {quoted}"
         );
     }
 
