@@ -23,7 +23,7 @@ pub fn set_add(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let set = vm
         .sets
         .get_mut(set_ptr as usize)
-        .ok_or_else(|| VMError::fail_at(ip, ErrorKind::ValueError, "value error"))?;
+        .ok_or_else(|| VMError::fail_at(ip, ErrorKind::BadPointer, "bad set pointer"))?;
     set.insert(MapKey(value));
     Ok(Value::Set(set_ptr))
 }
@@ -34,7 +34,7 @@ pub fn set_has(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let set = vm
         .sets
         .get(set_ptr as usize)
-        .ok_or_else(|| vm.fail_invariant(ErrorKind::ValueError, "value error"))?;
+        .ok_or_else(|| vm.fail_invariant(ErrorKind::BadPointer, "bad set pointer"))?;
     Ok(Value::Bool(set.contains(&MapKey(value))))
 }
 
@@ -45,7 +45,7 @@ pub fn set_delete(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let set = vm
         .sets
         .get_mut(set_ptr as usize)
-        .ok_or_else(|| VMError::fail_at(ip, ErrorKind::ValueError, "value error"))?;
+        .ok_or_else(|| VMError::fail_at(ip, ErrorKind::BadPointer, "bad set pointer"))?;
     let removed = set.shift_remove(&MapKey(value));
     Ok(Value::Bool(removed))
 }
@@ -56,7 +56,7 @@ pub fn set_clear(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let set = vm
         .sets
         .get_mut(set_ptr as usize)
-        .ok_or_else(|| VMError::fail_at(ip, ErrorKind::ValueError, "value error"))?;
+        .ok_or_else(|| VMError::fail_at(ip, ErrorKind::BadPointer, "bad set pointer"))?;
     set.clear();
     Ok(Value::Undefined)
 }
@@ -66,7 +66,7 @@ pub fn set_values(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let set = vm
         .sets
         .get(set_ptr as usize)
-        .ok_or_else(|| vm.fail_invariant(ErrorKind::ValueError, "value error"))?;
+        .ok_or_else(|| vm.fail_invariant(ErrorKind::BadPointer, "bad set pointer"))?;
     let values: ThinVec<Value> = set.iter().map(|k| k.0.clone()).collect();
     Ok(vm.alloc_array(values))
 }

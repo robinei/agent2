@@ -233,7 +233,7 @@ fn write_json_value(
             let arr = vm
                 .arrays
                 .get(*p as usize)
-                .ok_or_else(|| vm.fail_invariant(ErrorKind::ValueError, "value error"))?
+                .ok_or_else(|| vm.fail_invariant(ErrorKind::BadPointer, "bad array pointer"))?
                 .clone();
             if arr.is_empty() {
                 out.push_str("[]");
@@ -261,7 +261,7 @@ fn write_json_value(
             let obj = vm
                 .objects
                 .get(*p as usize)
-                .ok_or_else(|| vm.fail_invariant(ErrorKind::ValueError, "value error"))?;
+                .ok_or_else(|| vm.fail_invariant(ErrorKind::BadPointer, "bad object pointer"))?;
             if !matches!(obj.kind, crate::vm::ObjKind::Ordinary) {
                 vm.stack_value_to_json(v, depth)?;
             }

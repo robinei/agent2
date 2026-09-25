@@ -179,7 +179,8 @@ impl VM {
             | ErrorKind::BadCall
             | ErrorKind::BadAlloc
             | ErrorKind::BadArg
-            | ErrorKind::BadLocal => ResumeMode::InvariantViolation,
+            | ErrorKind::BadLocal
+            | ErrorKind::BadPointer => ResumeMode::InvariantViolation,
             // The language kinds: most sites pop their operands first
             // (macros, take_args, check_arity!), so the default is
             // resumable. A site that errors before popping overrides with
@@ -1023,7 +1024,7 @@ impl VM {
             Some(PromiseState::Pending { waiters }) => waiters.push(cont_id),
             _ => {
                 return Err(
-                    self.fail_invariant(ErrorKind::ValueError, "bad awaited promise pointer")
+                    self.fail_invariant(ErrorKind::BadPointer, "bad awaited promise pointer")
                 );
             }
         }
@@ -1060,7 +1061,7 @@ impl VM {
                     }
                     None => {
                         return Err(self
-                            .fail_invariant(ErrorKind::ValueError, "bad adopted promise pointer"));
+                            .fail_invariant(ErrorKind::BadPointer, "bad adopted promise pointer"));
                     }
                 }
             }
@@ -1069,7 +1070,7 @@ impl VM {
                 .get_mut(id as usize)
                 .and_then(Option::take)
                 .ok_or_else(|| {
-                    self.fail_invariant(ErrorKind::ValueError, format!("bad continuation id {id}"))
+                    self.fail_invariant(ErrorKind::BadPointer, format!("bad continuation id {id}"))
                 })?;
             // A rejection arriving at a frame with no handler around its
             // await needs no frame materialization: the rejection
@@ -1867,10 +1868,9 @@ impl VM {
     pub(crate) fn iterable_elements(&mut self, arg: &Value) -> Result<Option<Vec<Value>>, VMError> {
         match arg {
             Value::Array(p) => {
-                let arr = self
-                    .arrays
-                    .get(*p as usize)
-                    .ok_or_else(|| self.fail_invariant(ErrorKind::ValueError, "value error"))?;
+                let arr = self.arrays.get(*p as usize).ok_or_else(|| {
+                    self.fail_invariant(ErrorKind::BadPointer, "bad array pointer")
+                })?;
                 Ok(Some(arr.iter().cloned().collect()))
             }
             Value::String(s) => Ok(Some(
@@ -1882,15 +1882,14 @@ impl VM {
                 let set = self
                     .sets
                     .get(*p as usize)
-                    .ok_or_else(|| self.fail_invariant(ErrorKind::ValueError, "value error"))?;
+                    .ok_or_else(|| self.fail_invariant(ErrorKind::BadPointer, "bad set pointer"))?;
                 Ok(Some(set.iter().map(|k| k.0.clone()).collect()))
             }
             Value::Map(p) => {
                 let pairs: Vec<(Value, Value)> = {
-                    let map = self
-                        .maps
-                        .get(*p as usize)
-                        .ok_or_else(|| self.fail_invariant(ErrorKind::ValueError, "value error"))?;
+                    let map = self.maps.get(*p as usize).ok_or_else(|| {
+                        self.fail_invariant(ErrorKind::BadPointer, "bad map pointer")
+                    })?;
                     map.iter().map(|(k, v)| (k.0.clone(), v.clone())).collect()
                 };
                 let mut out = Vec::with_capacity(pairs.len());
@@ -1928,10 +1927,9 @@ impl VM {
                         return Err(self.fail(ErrorKind::TypeError, "type error"));
                     }
                 };
-                let pair = self
-                    .arrays
-                    .get(pair_ptr as usize)
-                    .ok_or_else(|| self.fail_invariant(ErrorKind::ValueError, "value error"))?;
+                let pair = self.arrays.get(pair_ptr as usize).ok_or_else(|| {
+                    self.fail_invariant(ErrorKind::BadPointer, "bad array pointer")
+                })?;
                 if pair.len() < 2 {
                     continue;
                 }
@@ -2387,10 +2385,9 @@ impl VM {
             // function that decides, so the loss is countable.
             Value::String(s) => serde_json::Value::String(s.to_utf8_lossy()),
             Value::Array(p) => {
-                let arr = self
-                    .arrays
-                    .get(*p as usize)
-                    .ok_or_else(|| self.fail_invariant(ErrorKind::ValueError, "value error"))?;
+                let arr = self.arrays.get(*p as usize).ok_or_else(|| {
+                    self.fail_invariant(ErrorKind::BadPointer, "bad array pointer")
+                })?;
                 serde_json::Value::Array(
                     arr.iter()
                         .map(|v| match v {
@@ -2402,10 +2399,9 @@ impl VM {
                 )
             }
             Value::Object(p) => {
-                let obj = self
-                    .objects
-                    .get(*p as usize)
-                    .ok_or_else(|| self.fail_invariant(ErrorKind::ValueError, "value error"))?;
+                let obj = self.objects.get(*p as usize).ok_or_else(|| {
+                    self.fail_invariant(ErrorKind::BadPointer, "bad object pointer")
+                })?;
                 // JSON boundary (guardrail 2): builtin prototypes and
                 // namespaces (Step 2a Part 2: `Math`, `JSON`) are reflective
                 // artifacts with no JSON form, unlike a user
@@ -2437,7 +2433,7 @@ impl VM {
                 let map = self
                     .maps
                     .get(*p as usize)
-                    .ok_or_else(|| self.fail_invariant(ErrorKind::ValueError, "value error"))?;
+                    .ok_or_else(|| self.fail_invariant(ErrorKind::BadPointer, "bad map pointer"))?;
                 let entries: Result<Vec<_>, _> = map
                     .iter()
                     .map(|(k, v)| {
@@ -2452,7 +2448,7 @@ impl VM {
                 let set = self
                     .sets
                     .get(*p as usize)
-                    .ok_or_else(|| self.fail_invariant(ErrorKind::ValueError, "value error"))?;
+                    .ok_or_else(|| self.fail_invariant(ErrorKind::BadPointer, "bad set pointer"))?;
                 let entries: Result<Vec<_>, _> = set
                     .iter()
                     .map(|k| self.stack_value_to_json(&k.0, depth + 1))

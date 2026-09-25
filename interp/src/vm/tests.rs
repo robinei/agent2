@@ -1894,7 +1894,7 @@ fn dangling_pointer_does_not_panic() {
     // A PushPtr with no backing heap cell must error, not panic.
     assert!(matches!(
         run_err(vec![PushObject(99), GetLength]).kind,
-        ErrorKind::ValueError
+        ErrorKind::BadPointer
     ));
     // Type predicates stay total (false) on a dangling pointer.
     assert_eq!(run(vec![PushObject(99), IsStr]), vec![b(false)]);

@@ -915,7 +915,7 @@ fn parse_edits<'a>(vm: &'a VM, val: &'a Value) -> Result<Vec<(String, String)>, 
     let arr = vm
         .arrays
         .get(arr_ptr)
-        .ok_or_else(|| vm.fail(ErrorKind::ValueError, "applyEdits: bad array pointer"))?;
+        .ok_or_else(|| vm.fail_invariant(ErrorKind::BadPointer, "applyEdits: bad array pointer"))?;
 
     let mut out = Vec::with_capacity(arr.len());
     for (i, elem) in arr.iter().enumerate() {
@@ -930,10 +930,9 @@ fn parse_edits<'a>(vm: &'a VM, val: &'a Value) -> Result<Vec<(String, String)>, 
                 ));
             }
         };
-        let obj = vm
-            .objects
-            .get(obj_ptr)
-            .ok_or_else(|| vm.fail(ErrorKind::ValueError, "applyEdits: bad object pointer"))?;
+        let obj = vm.objects.get(obj_ptr).ok_or_else(|| {
+            vm.fail_invariant(ErrorKind::BadPointer, "applyEdits: bad object pointer")
+        })?;
 
         let old = obj
             .map

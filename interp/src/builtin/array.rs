@@ -49,14 +49,14 @@ pub fn array_from(vm: &mut VM, args: Args) -> Result<Value, VMError> {
             let arr = vm
                 .arrays
                 .get(*p as usize)
-                .ok_or_else(|| vm.fail_invariant(ErrorKind::ValueError, "value error"))?;
+                .ok_or_else(|| vm.fail_invariant(ErrorKind::BadPointer, "bad array pointer"))?;
             Ok(vm.alloc_array(arr.clone()))
         }
         Value::Object(p) => {
             let obj = vm
                 .objects
                 .get(*p as usize)
-                .ok_or_else(|| vm.fail_invariant(ErrorKind::ValueError, "value error"))?;
+                .ok_or_else(|| vm.fail_invariant(ErrorKind::BadPointer, "bad object pointer"))?;
             let len = obj
                 .map
                 .get(keys::LENGTH)

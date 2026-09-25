@@ -858,6 +858,23 @@ pub enum ErrorKind {
     BadAlloc,
     BadArg,
     BadLocal,
+    /// A heap handle that does not resolve: a cell, object, array, map, set,
+    /// promise or continuation id whose slot is gone, or an internal `Upval`
+    /// marker reaching the expression stack where `GetLocal` should already
+    /// have dereferenced it. The VM is broken, not the program.
+    ///
+    /// **Deliberately not a JS error class.** It has no `TypeTag`, no
+    /// prototype and no global, because there is nothing a program could do
+    /// with one: every site raises it through `fail_invariant` /
+    /// `VMError::fail_at`, so it ends the run rather than becoming a value a
+    /// `catch` can bind. It exists only so the host diagnostic says which
+    /// invariant broke — `bad map pointer` and `stack underflow` want
+    /// different first questions.
+    ///
+    /// It used to be `ValueError`, which was also a catchable JS-visible
+    /// class, so the one name covered both "the program handed us an
+    /// impossible value" and "our own heap is corrupt".
+    BadPointer,
     TypeError,
     ValueError,
     /// An uncaught program-level `throw` (no active `try` handler). Distinct
@@ -953,14 +970,14 @@ pub enum ErrorKind {
 /// | Await (rejected promise, no handler, root strand) | ValueError | Resumable | promise popped before failing; host may substitute a value for the rejection (with a reachable handler the rejection value unwinds to `catch`; inside a resumed strand it rejects the strand's promise — neither reaches the host) |
 /// | **IncLocal** (non-numeric local) | TypeError | **NoResultSlot** | reads its local by peek, so there is no consumed slot to fill — but `x--` on a non-number is a language error, and `catch` sees it |
 /// | **Throw** (no handler) | UncaughtException | **NoResultSlot** | the operand was popped, but a `throw` owes the stack no result a substituted value could fill. Nominally catchable and never actually caught: it is *constructed* only after the handler search failed, so the same search in `step` fails again and it escalates. The thrown value rides in `VMError::payload` |
-/// | bad heap/cell/promise/continuation pointer (`get`/`get_mut` on arrays/objects/cells/closures/buffers) | TypeError/ValueError | **InvariantViolation** | corrupt heap — the VM is broken, not the program |
+/// | bad heap/cell/promise/continuation pointer (`get`/`get_mut` on arrays/objects/cells/closures/buffers), and an `Upval` marker reaching `typeof` or a property read | TypeError/BadPointer | **InvariantViolation** | corrupt heap — the VM is broken, not the program |
 /// | Raise with argc > 1 | BadArg | InvariantViolation | instruction contract violated (compiler emits 0 or 1) |
 /// | TryEnter (bad handler address) | BadCall | InvariantViolation | compiler bug |
 /// | TryExit (empty handler stack) | BadArg | InvariantViolation | unmatched TryExit = compiler bug |
-/// | StackUnderflow, BadReturn, BadCall, BadAlloc, BadArg, BadLocal | — | InvariantViolation | compiler bug / host misuse |
+/// | StackUnderflow, BadReturn, BadCall, BadAlloc, BadArg, BadLocal, BadPointer | — | InvariantViolation | compiler bug / host misuse |
 /// | Deadlock | — | InvariantViolation | circular awaits: every strand is parked and no settlement can arrive. Not a broken invariant, but it shares the bucket's one rule — a program must not be able to `catch` it and carry on, because there is nothing to carry on with |
 ///
-/// All 12 `ErrorKind`s are covered. (Fuel exhaustion is not an error:
+/// All 13 `ErrorKind`s are covered. (Fuel exhaustion is not an error:
 /// `step(fuel)` running dry yields `StepResult::OutOfFuel` — nothing
 /// consumed, call `step` again to continue.)
 #[derive(Debug, PartialEq)]

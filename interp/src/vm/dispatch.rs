@@ -149,13 +149,18 @@ impl VM {
                 ));
             }
             Value::Upval(_) => {
+                // Unreachable via normal execution, like the `typeof` arm
+                // below: a Boxed slot's `Upval` marker is dereferenced by
+                // `GetLocal`/`SetLocal` before the value reaches the
+                // expression stack, so a property read can never see one.
+                // If it does, the marker escaped — a broken VM, not a
+                // program that can be told to try something else.
                 let name = self.to_js_string(key, 0);
-                return Err(self.fail(
-                    ErrorKind::ValueError,
+                return Err(self.fail_invariant(
+                    ErrorKind::BadPointer,
                     format!(
-                        "cannot read property '{}' on {}",
-                        name,
-                        receiver.type_name()
+                        "cannot read property '{}' on an internal upvalue marker",
+                        name
                     ),
                 ));
             }
@@ -1736,7 +1741,7 @@ impl VM {
                             .cells
                             .get(*c as usize)
                             .ok_or_else(|| {
-                                self.fail_invariant(ErrorKind::ValueError, "bad cell pointer")
+                                self.fail_invariant(ErrorKind::BadPointer, "bad cell pointer")
                             })?
                             .clone(),
                         other => other.clone(),
@@ -1764,7 +1769,7 @@ impl VM {
                         Value::Upval(c) => {
                             let ip = self.ip;
                             *self.cells.get_mut(c as usize).ok_or_else(|| {
-                                VMError::fail_at(ip, ErrorKind::ValueError, "bad cell pointer")
+                                VMError::fail_at(ip, ErrorKind::BadPointer, "bad cell pointer")
                             })? = val;
                         }
                         _ => self.stack[slot] = val,
@@ -1785,7 +1790,7 @@ impl VM {
                         Value::Upval(c) => {
                             let ip = self.ip;
                             *self.cells.get_mut(c as usize).ok_or_else(|| {
-                                VMError::fail_at(ip, ErrorKind::ValueError, "bad cell pointer")
+                                VMError::fail_at(ip, ErrorKind::BadPointer, "bad cell pointer")
                             })? = val;
                         }
                         _ => self.stack[slot] = val,
@@ -1804,7 +1809,7 @@ impl VM {
                             .cells
                             .get(*c as usize)
                             .ok_or_else(|| {
-                                self.fail_invariant(ErrorKind::ValueError, "bad cell pointer")
+                                self.fail_invariant(ErrorKind::BadPointer, "bad cell pointer")
                             })?
                             .clone(),
                         other => other.clone(),
@@ -1827,7 +1832,7 @@ impl VM {
                             .cells
                             .get(*c as usize)
                             .ok_or_else(|| {
-                                self.fail_invariant(ErrorKind::ValueError, "bad cell pointer")
+                                self.fail_invariant(ErrorKind::BadPointer, "bad cell pointer")
                             })?
                             .clone(),
                         other => other.clone(),
@@ -1858,7 +1863,7 @@ impl VM {
                         Value::Upval(c) => {
                             let ip = self.ip;
                             *self.cells.get_mut(c as usize).ok_or_else(|| {
-                                VMError::fail_at(ip, ErrorKind::ValueError, "bad cell pointer")
+                                VMError::fail_at(ip, ErrorKind::BadPointer, "bad cell pointer")
                             })? = new_val;
                         }
                         _ => self.stack[slot] = new_val,
@@ -1896,8 +1901,8 @@ impl VM {
                             // dereference a Boxed slot's Upval marker before the value
                             // reaches the expression stack (see the comment there), so
                             // typeof should never observe one.
-                            return Err(self.fail(
-                                ErrorKind::ValueError,
+                            return Err(self.fail_invariant(
+                                ErrorKind::BadPointer,
                                 "cannot apply typeof to an internal upvalue marker",
                             ));
                         }
@@ -2597,14 +2602,14 @@ impl VM {
                             self.arrays
                                 .get(p as usize)
                                 .ok_or_else(|| {
-                                    self.fail_invariant(ErrorKind::ValueError, "bad array pointer")
+                                    self.fail_invariant(ErrorKind::BadPointer, "bad array pointer")
                                 })?
                                 .len() as f64,
                         ),
                         Value::TypedArray(p) => {
                             let view = self.typed_arrays.get(p as usize).ok_or_else(|| {
                                 self.fail_invariant(
-                                    ErrorKind::ValueError,
+                                    ErrorKind::BadPointer,
                                     "bad typed array pointer",
                                 )
                             })?;
@@ -2614,7 +2619,7 @@ impl VM {
                             .objects
                             .get(p as usize)
                             .ok_or_else(|| {
-                                self.fail_invariant(ErrorKind::ValueError, "bad object pointer")
+                                self.fail_invariant(ErrorKind::BadPointer, "bad object pointer")
                             })?
                             .map
                             .get(keys::LENGTH)
@@ -2679,7 +2684,7 @@ impl VM {
                             self.maps
                                 .get(p as usize)
                                 .ok_or_else(|| {
-                                    self.fail_invariant(ErrorKind::ValueError, "bad map pointer")
+                                    self.fail_invariant(ErrorKind::BadPointer, "bad map pointer")
                                 })?
                                 .len() as f64,
                         ),
@@ -2687,7 +2692,7 @@ impl VM {
                             self.sets
                                 .get(p as usize)
                                 .ok_or_else(|| {
-                                    self.fail_invariant(ErrorKind::ValueError, "bad set pointer")
+                                    self.fail_invariant(ErrorKind::BadPointer, "bad set pointer")
                                 })?
                                 .len() as f64,
                         ),
@@ -2695,7 +2700,7 @@ impl VM {
                             .objects
                             .get(p as usize)
                             .ok_or_else(|| {
-                                self.fail_invariant(ErrorKind::ValueError, "bad object pointer")
+                                self.fail_invariant(ErrorKind::BadPointer, "bad object pointer")
                             })?
                             .map
                             .get(keys::SIZE)
@@ -2867,7 +2872,7 @@ impl VM {
                         }
                     };
                     let state = self.promises.get(id as usize).ok_or_else(|| {
-                        self.fail_invariant(ErrorKind::ValueError, "bad promise pointer")
+                        self.fail_invariant(ErrorKind::BadPointer, "bad promise pointer")
                     })?;
                     match state {
                         PromiseState::Resolved(v) => {

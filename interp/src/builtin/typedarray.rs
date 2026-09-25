@@ -148,7 +148,7 @@ pub(crate) fn arraybuffer_slice(vm: &mut VM, args: Args) -> Result<Value, VMErro
     let buf = vm
         .buffers
         .get(buf_ptr as usize)
-        .ok_or_else(|| vm.fail_invariant(ErrorKind::ValueError, "bad ArrayBuffer pointer"))?;
+        .ok_or_else(|| vm.fail_invariant(ErrorKind::BadPointer, "bad ArrayBuffer pointer"))?;
     let total = buf.len() as u32;
     let begin = clamp_index(args.get(vm, 1), total);
     let end = if args.argc >= 3 {
