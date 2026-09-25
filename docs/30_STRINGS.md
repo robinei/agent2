@@ -819,7 +819,10 @@ come out as the character. The parse side was left alone because the claim
 motivating it does not survive measurement: of the 142 failing
 `built-ins/JSON` tests, none turns on lone-surrogate escapes — 20 are
 `json-parse-with-source` and the rest are error-*type* failures, where the
-tests want `SyntaxError` and this dialect raises `ValueError`. Replacing
+tests want `SyntaxError` and this dialect then raised its own
+`ValueError`. (Both halves of that have since been fixed elsewhere: a
+`JSON.parse` failure is a `SyntaxError` now, and `ValueError` is gone —
+25_JS_DIALECT §25.4b and §25.4d.) Replacing
 serde's reader is a separate change with no evidence behind it yet.
 `JSON.parse('"\\ud834"')` therefore still throws, which makes the round
 trip one-way; that is pinned as a test so it is not mistaken for working.

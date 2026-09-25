@@ -297,7 +297,7 @@ ByteLength is a named virtual rung (like `.length` on arrays). One method:
       `vec![0u8; n]`, push `Value::ArrayBuffer(ptr)`. Length goes through
       JS `ToIndex`: a fractional value is **truncated** (`new ArrayBuffer(1.5)`
       → length 1, *not* an error); only a negative value or one exceeding
-      the index range → `RangeError` mapped to `ValueError`.
+      the index range → `RangeError`.
 - [ ] `ByteLength`: virtual rung (compiler reads `.byteLength` off
       ArrayBuffer values; the VM resolves through a new function
       `vm.get_buffer_byte_length(ptr)` that `ObjGet`/`GetLength` dispatch to).
@@ -385,7 +385,7 @@ At idx `i`: bounds-check `i < view.length()`, read
 `buffer[byte_offset + i*elem_size .. +elem_size]`, decode bytes →
 `Value::Float(f64)` or `Value::PosInt`. OOB **or negative → `Undefined`**
 (integer-indexed exotic `[[Get]]`, *not* the Array/string arms'
-negative-index `ValueError`).
+negative-index `RangeError`).
 
 **`named_get_property`** (dispatch.rs:120):
 Add receiver arms for `Value::TypedArray`, `Value::ArrayBuffer`,
@@ -399,7 +399,7 @@ Add `Value::TypedArray(p)` arm. In-bounds (`0 <= i < length`): read old
 value for `SetMode::Old`, encode `val` via `typed_array_write`, write
 buffer, return per `SetMode`. **Negative/OOB → silent no-op** (integer-
 indexed exotic `[[Set]]` discards the write — *not* the Array arm's
-`ValueError`); still return per `SetMode` without touching the buffer.
+`RangeError`); still return per `SetMode` without touching the buffer.
 
 **`named_set_property`** (dispatch.rs:344):
 Add arms for `Value::TypedArray`, `Value::ArrayBuffer`,

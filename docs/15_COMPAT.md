@@ -1566,7 +1566,7 @@ the per-name buckets below are stable to within that band.)
 | runtime: TypeError | 3,421 | 6,039 | +2,618 |
 | runtime: UncaughtException | 2,301 | 5,424 | +3,123 |
 | runtime: ReferenceError (per-name) | — | ~5,800 | new signal |
-| runtime: ValueError | 179 | 190 | +11 |
+| runtime: ValueError (the class, retired 2026-09-25) | 179 | 190 | +11 |
 | everything else | ~20 | ~24 | — |
 
 **ReferenceError buckets (top 15 — the per-name signal, 2026-06-19):**

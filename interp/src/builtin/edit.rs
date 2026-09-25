@@ -1535,7 +1535,7 @@ mod tests {
 
     #[test]
     fn edit_replace_once_catchable() {
-        // A ValueError from replaceOnce can be caught (resumable, not a raise).
+        // A `RangeError` from replaceOnce can be caught (resumable, not a raise).
         let out = testutil::run_ret(
             "try { return Edit.replaceOnce('hello', 'x', 'y'); } catch (e) { return 'caught'; }",
         );

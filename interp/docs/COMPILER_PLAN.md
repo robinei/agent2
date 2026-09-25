@@ -329,8 +329,9 @@ Consequences:
 - `Math.max`/`Math.min` are variadic builtins (0..N args), matching JS spec.
 - `f64::max`/`f64::min` semantics: a NaN operand is ignored (divergence from
   JS `Math.max`/`Math.min` which return NaN if any arg is NaN).
-- `s.slice(start[, end])` operates on a half-open byte range and rejects
-  negative indices (`ValueError`) instead of counting them from the end.
+- `s.slice(start[, end])` operated on a half-open byte range and rejected
+  negative indices instead of counting them from the end. Both are fixed:
+  offsets are code units and negative indices count from the end.
   `s.indexOf`/`includes`/`lastIndexOf` and `Number.parseInt` (incl. radix and
   `0x` prefix) otherwise follow JS semantics.
 

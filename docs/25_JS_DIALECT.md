@@ -218,7 +218,7 @@ rows and `VM::alloc_error`'s name → class mapping both read it, so a
 name cannot get a global without also getting the prototype that
 answers for it.
 
-**Three of the ten have no producer in this runtime, and that is the
+**Three of the nine have no producer in this runtime, and that is the
 point.** `URIError` needs an `encodeURI`/`decodeURI` there is none of;
 `AggregateError` needs `Promise.any`, which is a compile error;
 `SuppressedError` needs `using`/`DisposableStack`, which do not exist.
@@ -232,32 +232,23 @@ and `new SuppressedError(error, suppressed, message)` sets both halves
 of the pair, because the code that catches one of these is the code
 that reads those fields.
 
-**`ValueError` is in the set, and is not a JS name.** It is this
-dialect's own kind for "right type, impossible value", one of the five
-kinds a program can actually catch — `fail()` raises `TypeError`,
-`ValueError`, `RangeError`, `SyntaxError` and `ReferenceError`
-resumably; everything else ends the program. Omitting it would have left
-an error a program can catch with no class to test for, which is the
-opposite of the point. It is a deliberate dialect addition, with a
-global constructor like the rest.
+**The catalogue is exactly the nine standard classes, and nothing
+invented.** It held a tenth on the day it landed: `ValueError`, this
+dialect's own name for "right type, impossible value". It is gone —
+§25.4d — and every site that raised it now carries the name a real
+engine would give it.
 
-**But it was doing four jobs, and two of them have JS names.** Of its
-~145 raise sites, 36 moved: every out-of-range *magnitude* — a negative
-index, an array write past `length`, a shift amount outside `[0, 63]`, a
-radix outside `[2, 36]`, a `toFixed` precision, a `repeat` count, a code
-point, a string length, every typed-array `byteOffset`/`length` bound —
-is a `RangeError`, and `JSON.parse` failures and malformed regexps are
-`SyntaxError`. The first of those is not a judgement call: the spec
+The split began here. Of `ValueError`'s ~145 raise sites, 36 moved the
+same day: every out-of-range *magnitude* — a negative index, an array
+write past `length`, a shift amount outside `[0, 63]`, a radix outside
+`[2, 36]`, a `toFixed` precision, a `repeat` count, a code point, a
+string length, every typed-array `byteOffset`/`length` bound — is a
+`RangeError`, and `JSON.parse` failures and malformed regexps are
+`SyntaxError`. The first of those was not a judgement call: the spec
 *names* a `JSON.parse` failure a `SyntaxError`, so a program catching
 one by the book caught nothing. The name is what a program branches on,
 and the repair differs — `catch (e) { if (e instanceof RangeError)
 shrinkTheSlice() }` is not what a malformed document calls for.
-
-What kept the name is what the name was for: a value of the right type
-and the right size that this dialect still cannot use — a closure or a
-`RegExp` handed to `JSON.stringify`, a structure nested past the
-serializer's depth limit, the `edit` builtins' ambiguity failures.
-Corrupt-pointer checks kept it too, and should not have; see §25.4c.
 
 `ToolError` deliberately gets no class. It is the harness's concept
 (`agent/src/machine.rs`), and `interp` should not learn the name of
@@ -345,13 +336,86 @@ nothing to carry on with.
 The corrupt-pointer checks §25.4b left behind moved here: 37 sites that
 said `vm.fail(ErrorKind::ValueError, "bad object pointer")` and were
 therefore resumable *and* catchable now go through `fail_invariant`.
-Their `ErrorKind` is unchanged and no longer means anything — an
-`InvariantViolation` never becomes a JS value, so no program reads the
-name.
+Their `ErrorKind` was still `ValueError` at that point and no longer
+meant anything — an `InvariantViolation` never becomes a JS value, so no
+program reads the name. §25.4d gave them one of their own,
+`BadPointer`.
 
 Gate, met: `try { x--; } catch (e) { … }` catches, and reports
 `e.name === "TypeError"` with the message intact; the same bytecode that
 reads a dangling object pointer still escalates from inside a `try`.
+
+## 25.4d — `ValueError` retired — **done, 2026-09-25**
+
+The last invented name in the language. `ValueError` is Python's; every
+other class here is one a JS-trained model already knows, and the one it
+did not know was the one it met most often. It is removed outright — the
+`ErrorKind`, the `TypeTag`, the registry row, the constructor, the
+prototype and the global — so the catalogue is now **exactly**
+`Error`, `AggregateError`, `EvalError`, `RangeError`, `ReferenceError`,
+`SuppressedError`, `SyntaxError`, `TypeError`, `URIError`, and nothing
+else. Writing `ValueError` is a `ReferenceError` naming it, which is the
+one answer that says what to write instead.
+
+It turned out to be doing **three** jobs, not the one the name
+described, and each got a different answer.
+
+**The heap (47 sites) → `ErrorKind::BadPointer`, which is not a JS
+class.** `get`/`get_mut` returning `None` for a map, set, array, object,
+cell, promise or continuation handle, plus two where an internal `Upval`
+marker reached `typeof` or a property read. Every one goes through
+`fail_invariant`, so no program can ever catch one; the kind exists only
+to tell the host which invariant broke. Giving it a `TypeTag` would have
+been furniture. Twenty-seven of them said the bare words `"value error"`
+— the whole message, on a path that knows exactly which table it just
+failed to index — and now say `bad map pointer` and the like.
+
+**An unhandled rejection (1 site) → `ErrorKind::UnhandledRejection`,
+also not a JS class.** `await` on a rejected promise reaches this arm
+only after `reachable_handler()` and `in_strand()` have both said no, so
+`handlers` is empty and no `catch` can be reached. Real JS has no class
+here either: `await p` throws the rejection *value*, and a class appears
+only because there is nobody left to throw to. The harness renders the
+message and the resumability of this path and never the kind, which is
+what makes a non-JS name affordable. It is not folded into
+`UncaughtException` because a `throw` owes the stack no result slot
+while this `await` popped its operand — the host can still stand a value
+in.
+
+**Everything a program can catch (55 sites) → a standard class.**
+
+- **JSON (9) → `TypeError`.** `JSON.stringify` of a circular structure
+  is `TypeError: Converting circular structure to JSON` in every engine,
+  and two test262 files assert it; they were failing. There is no
+  seen-set here — a cycle is detected only by falling off
+  `MAX_JSON_DEPTH` — so the depth cap *is* the cycle check and takes the
+  cycle's name. A closure, a buffer, a promise, a `RegExp`, `undefined`
+  at the root and a builtin namespace follow it. `JSON.parse` of a
+  non-string is `TypeError` too: real JS would ToString the argument,
+  and the refusal is kept because the value is nearly always a field
+  that was not there.
+- **…except the parse-side depth cap, which is `RangeError`.** It looks
+  like the same rule and is not: JSON *text* cannot describe a cycle, so
+  nothing but real depth reaches it — a magnitude out of bounds, and
+  what V8 raises on the same input.
+- **`Edit.*` (30) → `TypeError` (6), `SyntaxError` (1),
+  `RangeError` (23).** Wrong argument type is a `TypeError`. The brace
+  scanner behind `extractBlock` — unbalanced braces, an unterminated
+  string literal, an unterminated block comment — is a `SyntaxError`,
+  which is the one name here that changes the repair: a `RangeError`
+  invites another index, a `SyntaxError` says no index will work.
+  Everything else is a `RangeError`: right types, and the call names a
+  place or a shape the text does not have. The widest bucket is
+  deliberately not `TypeError`, because a dustbin class makes
+  `e instanceof TypeError` mean nothing; the spec's own precedent for a
+  string whose *value* is unusable is `String.prototype.normalize("nope")`
+  → `RangeError`.
+
+Gate, met: the nine globals resolve and `ValueError` does not;
+`JSON.stringify(cyclic)` reports `TypeError`; a `1145`-test `interp`
+suite and a `751`-test `agent` suite stay green. test262 moved **2
+Fail → Pass** (both the circular-structure files) and none the other
+way: 9648 → 9650 pass, 28885 → 28883 fail, 15125 skip unchanged.
 
 ## 25.5 — Nothing built stays unmentioned
 

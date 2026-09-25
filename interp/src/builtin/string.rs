@@ -400,9 +400,9 @@ pub fn str_locale_compare(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 }
 
 /// Upper bound on a built string's code-unit length. JS engines cap string
-/// length (V8 ≈2^30) and throw `RangeError`; this dialect has no `RangeError`
-/// kind, so the string builders raise a loud `ValueError` instead of attempting
-/// a multi-gigabyte allocation that would OOM the whole process. test262's
+/// length (V8 ≈2^30) and throw `RangeError`; the string builders here raise
+/// the same `RangeError` rather than attempt a multi-gigabyte allocation
+/// that would OOM the whole process. test262's
 /// `staging/sm/String/replace-math.js` builds a 2^36-char (~64 GiB) string by
 /// expanding a 2^20-char `$1` capture 2^16 times in one `replace`, which is
 /// what motivated this guard. 256M units is far above any realistic agent
@@ -416,7 +416,7 @@ const TOO_LARGE: &str = "result string too large (max 256MiB)";
 /// `$&`, ``$` ``, `$'`, and `$$` from the match's captures. Returns `false` if
 /// the result would exceed [`MAX_STRING_LEN`] (checked before each token, so a
 /// single overshoot is bounded by one `text` length); the caller turns that
-/// into a `ValueError` rather than building an unbounded string.
+/// into a `RangeError` rather than building an unbounded string.
 #[must_use]
 fn push_replacement(out: &mut Vec<u16>, repl: &[u16], text: &[u16], m: &regress::Match) -> bool {
     let mut i = 0;

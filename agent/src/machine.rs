@@ -3149,8 +3149,12 @@ impl Runner {
     /// a tool rejecting    typeof=string   name=undefined  `${e}`=the message
     /// null.x              typeof=object   name=TypeError  `${e}`=[object Object]
     /// throw new Error(…)  typeof=object   name=Error      `${e}`=[object Object]
-    /// JSON.parse("{")     typeof=object   name=ValueError `${e}`=[object Object]
+    /// JSON.parse("{")     typeof=object   name=SyntaxError `${e}`=[object Object]
     /// ```
+    ///
+    /// (That last row read `ValueError` when it was measured — the class
+    /// this dialect had invented, retired 2026-09-25. The `name` column is
+    /// not what the measurement is about; the other three are.)
     ///
     /// So no `catch` block was right for both: `e.message` was
     /// `undefined` for a tool failure, and `${e}` was `[object Object]`
@@ -10377,7 +10381,7 @@ mod tests {
     /// a tool rejecting    typeof=string   name=undefined  `${e}`=the message
     /// null.x              typeof=object   name=TypeError  `${e}`=[object Object]
     /// throw new Error(…)  typeof=object   name=Error      `${e}`=[object Object]
-    /// JSON.parse("{")     typeof=object   name=ValueError `${e}`=[object Object]
+    /// JSON.parse("{")     typeof=object   name=SyntaxError `${e}`=[object Object]
     /// ```
     ///
     /// The card already promised the second shape for all of them —

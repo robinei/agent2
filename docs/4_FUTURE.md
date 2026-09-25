@@ -81,7 +81,8 @@ branches on `kind` yet. (Uncaught program throws already have their own
 `UncaughtException` kind, carrying the thrown value in `VMError::payload` —
 that split was structural, not cosmetic, and is done.)
 
-**Answered differently, 2026-09-25.** `ValueError` kept its name and
+**Answered differently, 2026-09-25 — and reversed by the end of the same
+day; read the two notes below before this one.** `ValueError` kept its name and
 gained a *class* instead (`docs/25_JS_DIALECT.md` §25.4b): it is the
 second commonest kind a program can catch, so it got a global
 constructor and a prototype alongside the JS-named ones rather than
@@ -99,10 +100,26 @@ out-of-bounds array write, shift amount, radix, `toFixed` precision,
 byteOffset/length bound) to `RangeError`, and `JSON.parse` failures and
 malformed regexps to `SyntaxError`. The first of those is not a
 judgement call: the spec *names* a `JSON.parse` failure a `SyntaxError`,
-so a program catching one by the book caught nothing. What stayed
-`ValueError` is what the name was for — a value of the right type and
-the right size that this dialect still cannot use, such as a closure
-handed to `JSON.stringify`.
+so a program catching one by the book caught nothing.
+
+**Closed the same day: the note's original answer was right after
+all.** `ValueError` is retired outright (§25.4d) — the kind, the class,
+the prototype and the global. The remaining sites turned out to be
+three unrelated groups rather than one: corrupt-heap checks, which a
+program cannot catch and which now say `ErrorKind::BadPointer`; a
+single unhandled-`await`-rejection escalation the host alone ever sees,
+now `ErrorKind::UnhandledRejection`; and fifty-five program-visible
+raises that each had a standard name waiting — `TypeError` for every
+`JSON` refusal (a circular `JSON.stringify` is `TypeError` in every
+engine, and two test262 files were failing on it), and `TypeError` /
+`SyntaxError` / `RangeError` across the `Edit.*` verbs. Neither of the
+two new kinds is a JS class: they have no `TypeTag`, no prototype and no
+global, because no program can reach either. The catalogue is now
+exactly the nine standard classes.
+
+The evidence bar this note set — "when a transcript shows a program
+actually branching on `e.name`" — was met by the corpus count in
+§25.4b: 82 `e.name` reads against two `instanceof`s.
 
 **Stdlib lang-items: move `Error`/`TypeError`/… into the prelude as classes
 (post-Phase-13).** Once Phase 13's `class` (Step 7) and `instanceof` (Step 8)
@@ -120,9 +137,10 @@ classes. `TypeTag::Error` gives errors a real `Error.prototype` and
 `VM::alloc_error` is the single builder every source goes through
 (§25.4); then each error *name* got its own `TypeTag`, constructor row and
 prototype chaining to `Error.prototype` (§25.4b), so `e instanceof
-TypeError` works through the ordinary proto walk. `ValueError` is one of
-the classes — the JS-named-error-kinds note above is answered by giving
-this dialect's own name a class rather than by renaming its raise sites.
+TypeError` works through the ordinary proto walk. The classes are
+exactly the nine JS names: `ValueError` had one for a few hours and was
+then retired (§25.4d), so the JS-named-error-kinds note above is
+answered the way it originally asked — by renaming the raise sites.
 The compiler special-form named above is gone too: `Instr::ErrNew` and
 `compile_error_ctor` are deleted, and `new Error(…)` does take the
 ordinary `New`/`NewReturn` path this note predicted — it reaches the

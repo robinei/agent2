@@ -224,8 +224,8 @@ impl VM {
                 }
                 Value::String(s) => {
                     // **One code unit, and no way to land between two.** This
-                    // used to read a UTF-8 byte offset and raise a
-                    // ValueError, with a paragraph of advice, whenever the
+                    // used to read a UTF-8 byte offset and raise an error,
+                    // with a paragraph of advice, whenever the
                     // offset fell inside a multi-byte character — which
                     // `for (let i = 0; i < s.length; i++) s[i]` did on the
                     // first character over 0x7F. Seen live on 2026-09-24,
@@ -2112,7 +2112,8 @@ impl VM {
                 Instr::BitOr => binary_int!(|a: i64, b: i64| a | b),
                 Instr::BitXor => binary_int!(|a: i64, b: i64| a ^ b),
                 // Shift count must be in [0, 63]; anything else would overflow
-                // (a panic in debug builds) so reject it as a ValueError.
+                // (a panic in debug builds) so reject it as a `RangeError` —
+                // a magnitude out of bounds, which is the name JS gives it.
                 Instr::BitLhs => {
                     let b = self.pop_int()?;
                     let a = self.pop_int()?;

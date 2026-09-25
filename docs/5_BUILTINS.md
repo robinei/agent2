@@ -120,7 +120,8 @@ a pure refactor.
       high-argc variadic call (e.g. `Math.max` with 12 arguments, in a
       loop) performs zero allocations per call.
 - [ ] Resumability test: a builtin failure (e.g. `[].pop()` while it is
-      still a `ValueError`, or a TypeError from a wrong-receiver call)
+      a `RangeError` from `[1][-1]`, or a `TypeError` from a
+      wrong-receiver call)
       leaves the stack with the operands consumed — `resume_with` a
       replacement value and run to completion successfully.
 
@@ -194,8 +195,9 @@ use it for every integer-valued result (lengths, indices, `-1`).
       order, return new length.
       Test: `const a=[3,4]; const n=a.unshift(1,2); return [n, a];` →
       `[4, [1,2,3,4]]`.
-- [ ] `arr.pop()` / `arr.shift()` on empty: today `ValueError`; JS returns
-      `undefined`. Test: `return [[].pop(), [].shift()];` →
+- [x] `arr.pop()` / `arr.shift()` on empty: **done** — both return
+      `undefined`, as JS does.
+      Test: `return [[].pop(), [].shift()];` →
       `[null, null]` via `run_ret` (undefined → JSON null), or assert
       `Value::Undefined` via `run_val`.
 - [ ] `s.split(d, limit)`: today Rust `splitn` (remainder stays unsplit in
@@ -211,8 +213,10 @@ use it for every integer-valued result (lengths, indices, `-1`).
       undefined. `"a,b".split(",", 0)` → `[]`;
       `"a,b".split(",", -1)` → `["a","b"]` (negative wraps huge →
       effectively no limit); `"a,b".split(",", 2.9)` → `["a","b"]`.
-- [ ] `parseFloat`: today whole-string `str::parse` → `ValueError` on
-      trailing garbage. JS: skip leading whitespace, take the longest
+- [ ] `parseFloat`: the prefix rule landed — `parseFloat("  3.5xyz")` is
+      `3.5` and `parseFloat("abc")` is `NaN`. What is left is
+      `Infinity`/`-Infinity`, still `NaN`. JS: skip leading whitespace,
+      take the longest
       numeric prefix; no prefix → `NaN`; accept `Infinity`/`-Infinity`;
       **never** errors on a string. Tests: `parseFloat("3.14abc")` →
       `3.14`; `parseFloat("abc")` → NaN; `parseFloat("  2.5")` → `2.5`;
@@ -228,7 +232,8 @@ use it for every integer-valued result (lengths, indices, `-1`).
       input unchanged when `n == 0.0`, else `signum` (NaN → NaN already).
 - [ ] `Math.min`/`Math.max` with a NaN operand: today ignored
       (`f64::min/max`); JS propagates NaN. Test: `Math.min(1, NaN)` → NaN.
-- [ ] `s.slice`: today negative/OOB/start>end are `ValueError`. JS:
+- [x] `s.slice`: **done** — negative indices count from the end, OOB
+      clamps, `start ≥ end` is `""`. JS:
       negative indices count from the end, everything clamps,
       `start ≥ end` → `""`. Tests: `"abcdef".slice(-3)` → `"def"`;
       `"abc".slice(2, 1)` → `""`; `"abc".slice(0, 99)` → `"abc"`. Keep
@@ -301,7 +306,7 @@ Skip `codePointAt` unless trivially defensible given byte-string semantics.
 
 - [ ] JS quirks covered by tests: `replace` replaces only the **first**
       occurrence, `replaceAll` all; `"ab".repeat(0)` → `""`,
-      `repeat(-1)` → error in JS (RangeError → our ValueError);
+      `repeat(-1)` → `RangeError`, as in JS;
       `"5".padStart(3, "0")` → `"005"`; `"abc".at(-1)` → `"c"`,
       `"abc".at(5)` → undefined; `charAt(5)` → `""` (note: `at` and
       `charAt` differ here — test both).

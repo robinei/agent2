@@ -117,7 +117,7 @@ Locked design decisions:
    `try`. This keeps exceptions (program-level) and conditions
    (operator-level) crisply separate.
 2. **Catchable:** explicit `throw`; runtime errors Phase 3 classified as
-   resumable (TypeError/ValueError class); tool-call failures the host
+   resumable (the TypeError/RangeError class); tool-call failures the host
    chooses to throw in. **Not catchable:** `OutOfFuel`, the memory budget,
    and `InvariantViolation` internal errors — a buggy retry loop must not
    trap its own kill switch. (A language error with no slot for a resumed
@@ -192,7 +192,8 @@ on the open choices and deltas:
   value** to `catch` (JS semantics), not a wrapped `{name, message}`; the
   no-handler escalation path is byte-for-byte unchanged.
 - An uncaught `throw` escalates as the dedicated
-  `ErrorKind::UncaughtException` (not `ValueError`): the program produced
+  `ErrorKind::UncaughtException` (not one of the language kinds): the
+  program produced
   this error value deliberately, and the host's policy differs from a VM
   failure. The thrown value is preserved structurally in
   `VMError::payload`; the message carries the `uncaught …` rendering.

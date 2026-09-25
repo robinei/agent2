@@ -515,7 +515,7 @@ Acceptance:
 *(Built: `Edit` namespace wired via `for_namespace` like `Math`/`JSON` — 9**
 *builtins in `interp/src/builtin/edit.rs`: `replaceOnce`, `replaceAll`,**
 *`count`, `extractBlock`, `extractByIndent`, `extractEnclosing`, `replaceLines`,*
-*`insertAt`, `applyEdits`. All error on ambiguity as catchable `ValueError`.**
+*`insertAt`, `applyEdits`. All error on ambiguity as a catchable `RangeError`.**
 *Brace + delimiter balancing skips JS string literals and comments to avoid**
 *false positives. `Edit` added to the compiler namespace match table in*
 *`interp/src/compiler/call.rs`. Documented in the dialect card's editing-files**
