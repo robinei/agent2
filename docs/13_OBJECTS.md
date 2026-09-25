@@ -907,12 +907,16 @@ together.
   the link is also what string coercion reads to render `"TypeError: …"`.
   Later the same day the *classes* landed too (`docs/25_JS_DIALECT.md`
   §25.4b): each name in `TypeTag::ERRORS` — `Error`, `TypeError`,
-  `ValueError`, `RangeError`, `SyntaxError`, `ReferenceError`, `EvalError` —
+  `ValueError`, `RangeError`, `SyntaxError`, `ReferenceError`, `EvalError`,
+  and since the same day `AggregateError`, `URIError` and `SuppressedError`
+  —
   has a constructor row and a prototype chaining to `Error.prototype`, so
   `e instanceof TypeError` is true of a type error, `e instanceof Error` is
   true of it as well, and `e instanceof RangeError` is false. `ValueError`
   is not a JS name; it is this dialect's own, and is included because it is
-  the second commonest kind the VM raises. Still unsupported: a
+  among the commonest kinds the VM raises. The last three have no producer
+  in this runtime at all and are declared for the program's own `throw`.
+  Still unsupported: a
   user-written `class AppError extends Error {}`, which needs Step 7b.
 - **`Object.getPrototypeOf(obj)`** — namespace builtin. Returns `obj`'s
   `[[Prototype]]` as `Value::Object(proto_ptr)`, or **`Value::Null`** when `proto`
