@@ -506,20 +506,65 @@ impl Value {
 
 // ── free helper functions ─────────────────────────────────────────────
 
-/// JS `Number.prototype.toString` for a finite-or-not f64. Integers print
-/// without a decimal point; NaN/±Infinity get their JS spellings (Rust's
-/// `Display` would otherwise emit "NaN"/"inf"). Diverges from JS only for the
-/// very large/small magnitudes JS renders in exponential form (e.g. `1e+21`),
-/// which don't arise from tool/JSON data here.
+/// JS `Number::toString(x, 10)` — ECMA-262 6.1.6.1.20.
+///
+/// Rust's `Display` never switches to exponential form, so
+/// `String(Number.MAX_VALUE)` printed 309 digits where every engine
+/// prints `1.7976931348623157e+308`, and `Number.MIN_VALUE` printed 324.
+/// The thresholds are the spec's and are not round numbers: decimal up to
+/// an exponent of 21, and down to -6, exponential outside that. `1e20`
+/// prints in full and `1e21` does not; `0.000001` prints in full and
+/// `1e-7` does not.
 pub(crate) fn js_number_to_string(n: f64) -> String {
     if n.is_nan() {
-        "NaN".to_string()
-    } else if n.is_infinite() {
-        if n > 0.0 { "Infinity" } else { "-Infinity" }.to_string()
-    } else if float_is_int(n) && n >= (i64::MIN as f64) && n <= (i64::MAX as f64) {
-        (n as i64).to_string()
+        return "NaN".to_string();
+    }
+    if n.is_infinite() {
+        return if n > 0.0 { "Infinity" } else { "-Infinity" }.to_string();
+    }
+    // Covers -0.0, which JS prints as "0".
+    if n == 0.0 {
+        return "0".to_string();
+    }
+    // Every integer inside this range has an exponent below 21, so the
+    // spec's first case applies and it is just the digits.
+    if float_is_int(n) && n >= (i64::MIN as f64) && n <= (i64::MAX as f64) {
+        return (n as i64).to_string();
+    }
+    if n < 0.0 {
+        return format!("-{}", js_number_to_string(-n));
+    }
+
+    // The spec wants the shortest digit string `s` (length `k`) and an
+    // exponent such that `s * 10^(exp-k) == n`. Rust's scientific
+    // formatter produces exactly those digits, shortest-round-trip.
+    let sci = format!("{n:e}");
+    let (mantissa, exponent) = sci.split_once('e').expect("{:e} emits an exponent");
+    let exponent: i32 = exponent.parse().expect("{:e} emits an integer exponent");
+    let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
+    let k = digits.len() as i32;
+    // `point` is the spec's `n`: the value is `0.<digits> * 10^point`.
+    let point = exponent + 1;
+
+    if k <= point && point <= 21 {
+        let mut out = digits;
+        out.push_str(&"0".repeat((point - k) as usize));
+        out
+    } else if 0 < point && point <= 21 {
+        let (int, frac) = digits.split_at(point as usize);
+        format!("{int}.{frac}")
+    } else if -6 < point && point <= 0 {
+        format!("0.{}{digits}", "0".repeat((-point) as usize))
     } else {
-        format!("{n}")
+        let e = point - 1;
+        let sign = if e >= 0 { '+' } else { '-' };
+        let magnitude = e.abs();
+        if k == 1 {
+            format!("{digits}e{sign}{magnitude}")
+        } else {
+            let (first, rest) = digits.split_at(1);
+            format!("{first}.{rest}e{sign}{magnitude}")
+        }
     }
 }
 
@@ -539,8 +584,9 @@ pub(crate) fn float_is_int(n: f64) -> bool {
 /// JS `ToNumber` applied to a string, as used when a loose `==` compares a
 /// number to a string. Trims whitespace, treats the empty string as 0, and
 /// otherwise parses as f64 — yielding NaN (which is never equal to anything)
-/// when unparseable. Diverges from spec ToNumber on a few literal forms it
-/// would accept (hex `0x…`, etc.), which don't arise from tool/JSON data here.
+/// when unparseable. Follows `StringNumericLiteral`, including the radix
+/// forms and the single exact spelling `Infinity` — see the test for the
+/// spellings Rust's own parser accepts and JS does not.
 pub(crate) fn js_str_to_number(units: &[u16]) -> f64 {
     let (a, b) = crate::units::trim_range(units);
     let t = &units[a..b];

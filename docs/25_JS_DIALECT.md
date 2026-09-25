@@ -230,9 +230,12 @@ property is checkable, and checking it is what found the two bugs below.
 the relational `A3.1_T*` tests, which exercise exactly the boolean / null /
 undefined / object coercion this refuses, plus four incidental.
 
-Still open, found on the way: `String(Number.MAX_VALUE)` prints 309 digits
-where JS prints `1.7976931348623157e+308`. `js_number_to_string` never
-switches to exponential form, which JS does at exponent ≥ 21 or ≤ -7.
+Also found on the way and since fixed: `js_number_to_string` never switched
+to exponential form, so `String(Number.MAX_VALUE)` printed 309 digits and
+`Number.MIN_VALUE` printed 324. It now implements `Number::toString(x, 10)`
+whole — decimal up to an exponent of 21 and down to -6, exponential outside
+that, with the digits taken shortest-round-trip from Rust's scientific
+formatter. Another +6, and the sweep stands at **9,747**.
 
 ## 25.3 — `==` against objects, and other quiet falses
 

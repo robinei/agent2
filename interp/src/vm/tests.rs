@@ -4297,3 +4297,37 @@ fn number_carries_its_constants() {
         serde_json::json!(false)
     );
 }
+
+/// **Numbers print in exponential form where JS does.** `Display` for
+/// `f64` never does, so `String(Number.MAX_VALUE)` was 309 digits and
+/// `Number.MIN_VALUE` was 324. The thresholds are the spec's and are not
+/// round numbers, so the pairs that straddle them are the test: `1e20`
+/// prints in full and `1e21` does not, `0.000001` prints in full and
+/// `1e-7` does not. Every expectation below was taken from node.
+#[test]
+fn numbers_print_the_way_js_prints_them() {
+    let cases: &[(&str, &str)] = &[
+        ("Number.MAX_VALUE", "1.7976931348623157e+308"),
+        ("Number.MIN_VALUE", "5e-324"),
+        ("Number.EPSILON", "2.220446049250313e-16"),
+        // The two thresholds, from both sides.
+        ("1e20", "100000000000000000000"),
+        ("1e21", "1e+21"),
+        ("0.000001", "0.000001"),
+        ("0.0000001", "1e-7"),
+        ("-1e21", "-1e+21"),
+        // Ordinary numbers are untouched, shortest-round-trip included.
+        ("0.1 + 0.2", "0.30000000000000004"),
+        ("1 / 3", "0.3333333333333333"),
+        ("123.456", "123.456"),
+        ("100", "100"),
+        ("-0.5", "-0.5"),
+        ("2.5e-10", "2.5e-10"),
+        // JS prints negative zero as "0".
+        ("-0", "0"),
+    ];
+    for (expr, want) in cases {
+        let got = testutil::run_ret(&format!("return String({expr});"));
+        assert_eq!(got, serde_json::json!(want), "String({expr})");
+    }
+}
