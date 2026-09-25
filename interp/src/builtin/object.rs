@@ -121,7 +121,6 @@ macro_rules! error_ctor {
 
 error_ctor!(error_ctor, Error);
 error_ctor!(type_error_ctor, TypeError);
-error_ctor!(value_error_ctor, ValueError);
 error_ctor!(range_error_ctor, RangeError);
 error_ctor!(syntax_error_ctor, SyntaxError);
 error_ctor!(reference_error_ctor, ReferenceError);

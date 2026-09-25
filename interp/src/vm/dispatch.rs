@@ -2995,7 +2995,7 @@ impl VM {
                                 ),
                             };
                             self.stack.pop();
-                            return Err(self.fail(ErrorKind::ValueError, msg));
+                            return Err(self.fail(ErrorKind::UnhandledRejection, msg));
                         }
                         PromiseState::Pending { .. } => {
                             // Below top level this Await is inside an async

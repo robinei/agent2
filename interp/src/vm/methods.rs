@@ -108,12 +108,11 @@ impl VM {
     /// should not have emitted, a host API called out of order. Neither
     /// resumable nor catchable.
     ///
-    /// **`kind` is a label here, not a classification.** Many of these sites
-    /// say `TypeError` or `ValueError` because that is what they said before
-    /// there was anywhere else to put them, and it does not matter: an
-    /// `InvariantViolation` never becomes a JS value, so no program ever
+    /// **`kind` is a label here, not a classification.** A corrupt-heap
+    /// check says `BadPointer`, which has no JS class at all, because an
+    /// `InvariantViolation` never becomes a JS value and no program ever
     /// reads the name. What matters is that it does not reach a `catch` —
-    /// `fail`'s per-kind default would make a `ValueError` resumable *and*
+    /// `fail`'s per-kind default would make a language kind resumable *and*
     /// catchable, and a program that swallowed a corrupt-heap report would
     /// carry on over the wreckage.
     pub fn fail_invariant(&self, kind: ErrorKind, msg: impl Into<String>) -> VMError {
@@ -188,10 +187,15 @@ impl VM {
             // `fail_invariant` — the kind alone cannot tell them apart,
             // which is why those two constructors exist.
             ErrorKind::TypeError
-            | ErrorKind::ValueError
             | ErrorKind::ReferenceError
             | ErrorKind::RangeError
             | ErrorKind::SyntaxError => ResumeMode::Resumable,
+            // An `await` whose rejection nothing was left to catch. Not a
+            // language kind — no `catch` can reach it, by construction —
+            // but resumable all the same: the promise operand was popped,
+            // so the host can stand a value in where the `await` would have
+            // produced one.
+            ErrorKind::UnhandledRejection => ResumeMode::Resumable,
             // An escaped program-level throw: the operand was consumed, but
             // a `throw` owes the stack no result a substituted value could
             // fill. Catchable in principle and never caught in fact — it is
@@ -1251,7 +1255,7 @@ impl VM {
     /// Compile and allocate a `Value::RegExp` from a pattern + flags string.
     /// Shared by the `RegExp` constructor handler (`regexp_ctor`) and
     /// `construct_builtin` (the `new RegExp(…)` path). Validates flags and
-    /// compiles via `regress`; an invalid pattern or flags → `ValueError`.
+    /// compiles via `regress`; an invalid pattern or flags → `SyntaxError`.
     pub(crate) fn alloc_regexp(
         &mut self,
         pattern: JsString,
@@ -1324,7 +1328,7 @@ impl VM {
     pub fn alloc_error(&mut self, name: JsString, message: JsString) -> Value {
         // The `name` picks the class, so this one mapping serves all three
         // sources at once: `error_to_thrown`'s `{:?}` of an `ErrorKind`
-        // (only ever `TypeError`/`ValueError`/`RangeError`/`SyntaxError`/
+        // (only ever `TypeError`/`RangeError`/`SyntaxError`/
         // `ReferenceError` — the other kinds are not resumable and end the
         // program instead of becoming a value), the `TypeTag::name()` each constructor handler passes in,
         // and the harness's `"ToolError"`, which has no class and lands on
@@ -2057,7 +2061,6 @@ impl VM {
             // the tag, which `alloc_error` recovers from the name it writes.
             crate::vm::instr::TypeTag::Error => crate::builtin::error_ctor(self, args)?,
             crate::vm::instr::TypeTag::TypeError => crate::builtin::type_error_ctor(self, args)?,
-            crate::vm::instr::TypeTag::ValueError => crate::builtin::value_error_ctor(self, args)?,
             crate::vm::instr::TypeTag::RangeError => crate::builtin::range_error_ctor(self, args)?,
             crate::vm::instr::TypeTag::SyntaxError => {
                 crate::builtin::syntax_error_ctor(self, args)?

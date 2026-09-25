@@ -90,7 +90,6 @@ pub(crate) use object::suppressed_error_ctor;
 pub(crate) use object::syntax_error_ctor;
 pub(crate) use object::type_error_ctor;
 pub(crate) use object::uri_error_ctor;
-pub(crate) use object::value_error_ctor;
 pub(crate) use regexp::regexp_ctor;
 pub(crate) use set::set_ctor;
 pub(crate) use string::string_ctor;
@@ -630,13 +629,13 @@ builtins! {
     // and `instanceof Error` both, and `instanceof RangeError` not at all.
     // A single shared row could only ever give all six the same answer.
     //
-    // `ValueError` is **not a JS name**: it is this dialect's own, for the
-    // "right type, impossible value" raises JS has no name for, and it is the
-    // VM's second commonest kind. Omitting it would have left the error a
-    // program is likeliest to catch as the one with no class to test.
+    // The list is **exactly the nine standard classes** and nothing invented.
+    // It held a tenth, `ValueError`, a Python name this dialect had adopted
+    // for "right type, impossible value"; every one of its raise sites now
+    // carries the name a real engine would give it, so a program that
+    // branches on `e.name` branches on something it already knows.
     ErrorCtor,          BuiltinKind::Constructor { type_tag: TypeTag::Error },          "Error",          0, 2, error_ctor,           false, false, false, false, false, false, false, false, false, false;
     TypeErrorCtor,      BuiltinKind::Constructor { type_tag: TypeTag::TypeError },      "TypeError",      0, 2, type_error_ctor,      false, false, false, false, false, false, false, false, false, false;
-    ValueErrorCtor,     BuiltinKind::Constructor { type_tag: TypeTag::ValueError },     "ValueError",     0, 2, value_error_ctor,     false, false, false, false, false, false, false, false, false, false;
     RangeErrorCtor,     BuiltinKind::Constructor { type_tag: TypeTag::RangeError },     "RangeError",     0, 2, range_error_ctor,     false, false, false, false, false, false, false, false, false, false;
     SyntaxErrorCtor,    BuiltinKind::Constructor { type_tag: TypeTag::SyntaxError },    "SyntaxError",    0, 2, syntax_error_ctor,    false, false, false, false, false, false, false, false, false, false;
     ReferenceErrorCtor, BuiltinKind::Constructor { type_tag: TypeTag::ReferenceError }, "ReferenceError", 0, 2, reference_error_ctor, false, false, false, false, false, false, false, false, false, false;

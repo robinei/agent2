@@ -181,13 +181,6 @@ pub enum TypeTag {
     //
     // Appended, again, so the tags above keep their discriminants.
     TypeError,
-    /// **Not a JS error name — a deliberate addition to this dialect.** The
-    /// VM raises `ValueError` more than any other kind except `TypeError`
-    /// (164 sites against 243), for the "right type, impossible value" cases
-    /// JS has no name for. Leaving it out would have left the *commonest*
-    /// catchable error the one with no class to test for, which is the
-    /// opposite of the point.
-    ValueError,
     RangeError,
     SyntaxError,
     ReferenceError,
@@ -215,7 +208,7 @@ impl TypeTag {
     /// "what type tags exist" — iterate this instead of hand-listing variants
     /// or mapping side-table indices back to tags by literal number (which
     /// silently breaks if the enum is reordered). `COUNT` is derived from it.
-    pub const ALL: [TypeTag; 32] = [
+    pub const ALL: [TypeTag; 31] = [
         TypeTag::Array,
         TypeTag::Object,
         TypeTag::Map,
@@ -240,7 +233,6 @@ impl TypeTag {
         TypeTag::DataView,
         TypeTag::Error,
         TypeTag::TypeError,
-        TypeTag::ValueError,
         TypeTag::RangeError,
         TypeTag::SyntaxError,
         TypeTag::ReferenceError,
@@ -263,10 +255,9 @@ impl TypeTag {
     /// `Error` is first because the rest chain to it — and because
     /// [`Self::error_tag_for_name`] scans this list, so `Error`'s own lookup
     /// is the one that costs least.
-    pub const ERRORS: [TypeTag; 10] = [
+    pub const ERRORS: [TypeTag; 9] = [
         TypeTag::Error,
         TypeTag::TypeError,
-        TypeTag::ValueError,
         TypeTag::RangeError,
         TypeTag::SyntaxError,
         TypeTag::ReferenceError,
@@ -282,7 +273,6 @@ impl TypeTag {
             self,
             TypeTag::Error
                 | TypeTag::TypeError
-                | TypeTag::ValueError
                 | TypeTag::RangeError
                 | TypeTag::SyntaxError
                 | TypeTag::ReferenceError
@@ -297,7 +287,7 @@ impl TypeTag {
     ///
     /// **The default is not a fallback nobody hits**, though it is a narrower
     /// job than it looks. Of the VM's own kinds only `TypeError`,
-    /// `ValueError`, `RangeError`, `SyntaxError` and `ReferenceError` are
+    /// `RangeError`, `SyntaxError` and `ReferenceError` are
     /// raised resumably (see
     /// `VM::fail`'s match on `ResumeMode`) — the rest are invariant
     /// violations that end the program rather than becoming a value, so they
@@ -343,7 +333,6 @@ impl TypeTag {
             TypeTag::DataView => "DataView",
             TypeTag::Error => "Error",
             TypeTag::TypeError => "TypeError",
-            TypeTag::ValueError => "ValueError",
             TypeTag::RangeError => "RangeError",
             TypeTag::SyntaxError => "SyntaxError",
             TypeTag::ReferenceError => "ReferenceError",

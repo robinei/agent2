@@ -481,7 +481,7 @@ fn await_rejection_without_try_escalates_unchanged() {
     vm.reject_promise(calls[0].promise, Value::String("down".into()))
         .unwrap();
     let err = vm.step(u64::MAX).unwrap_err();
-    assert_eq!(err.kind, ErrorKind::ValueError);
+    assert_eq!(err.kind, ErrorKind::UnhandledRejection);
     assert!(matches!(err.resume, ResumeMode::Resumable));
     assert_eq!(err.message, "down", "got: {}", err.message);
 }
@@ -1316,7 +1316,7 @@ fn every_error_a_program_can_catch_is_instanceof_error() {
         run_ret("try { null.y; } catch (e) { return e instanceof Error; }"),
         json!(true)
     );
-    // …including the non-JS kinds this dialect raises (`ValueError`):
+    // …including the subclasses, which chain to `Error.prototype`:
     assert_eq!(
         run_ret(r#"try { JSON.parse("{"); } catch (e) { return e instanceof Error; }"#),
         json!(true)
@@ -1514,8 +1514,8 @@ fn an_error_is_an_instance_of_its_own_class_and_of_error() {
         json!([true, true])
     );
     assert_eq!(
-        run_ret(r#"const E = ValueError; return [E("x") instanceof ValueError, `${E("x")}`];"#),
-        json!([true, "ValueError: x"])
+        run_ret(r#"const E = URIError; return [E("x") instanceof URIError, `${E("x")}`];"#),
+        json!([true, "URIError: x"])
     );
     // And thrown-then-caught, which is the shape that actually matters.
     assert_eq!(
@@ -1537,11 +1537,11 @@ fn the_classes_are_siblings_not_cousins() {
         json!(false)
     );
     assert_eq!(
-        run_ret(r#"return new ValueError("x") instanceof TypeError;"#),
+        run_ret(r#"return new SyntaxError("x") instanceof TypeError;"#),
         json!(false)
     );
     assert_eq!(
-        run_ret("try { null.y; } catch (e) { return e instanceof ValueError; }"),
+        run_ret("try { null.y; } catch (e) { return e instanceof RangeError; }"),
         json!(false)
     );
     // The base class is not an instance of its subclasses either — the
@@ -1627,20 +1627,48 @@ fn a_suppressed_error_carries_both_halves() {
     );
 }
 
+/// **The catalogue is exactly the nine standard classes.**
+///
+/// It held a tenth until 2026-09-25: `ValueError`, a Python name this
+/// dialect had adopted for "right type, impossible value". Nothing else in
+/// the language was invented, and a model writing `catch (e) { if (e
+/// instanceof ValueError) … }` had to be taught the name first — while the
+/// engine it already knows raises `TypeError` for a circular
+/// `JSON.stringify` and `RangeError` for a radix out of range, which is
+/// what this raises now.
+///
+/// The name is gone rather than deprecated, so a program that still writes
+/// it gets a `ReferenceError` naming it — the one answer that says what to
+/// write instead of quietly doing something else.
 #[test]
-fn value_error_is_a_class_though_it_is_not_a_js_name() {
-    // A deliberate dialect addition. `ValueError` is what this VM raises
-    // for "right type, impossible value", and it is the second commonest
-    // kind a program can catch — so leaving it classless would have made
-    // the likeliest error the one `instanceof` could not answer for.
-    assert_eq!(run_ret("return typeof ValueError;"), json!("function"));
-    assert_eq!(
-        run_ret(r#"return [new ValueError("x").name, `${new ValueError("x")}`];"#),
-        json!(["ValueError", "ValueError: x"])
-    );
-    assert_eq!(
-        run_ret(r#"return new ValueError("x").constructor === ValueError;"#),
-        json!(true)
+fn the_error_catalogue_is_exactly_the_nine_standard_classes() {
+    for name in [
+        "Error",
+        "AggregateError",
+        "EvalError",
+        "RangeError",
+        "ReferenceError",
+        "SuppressedError",
+        "SyntaxError",
+        "TypeError",
+        "URIError",
+    ] {
+        assert_eq!(
+            run_ret(&format!("return typeof {name};")),
+            json!("function"),
+            "{name} is not a global constructor"
+        );
+    }
+    // And the invented one is not a name at all.
+    let gone =
+        run_ret("try { return new ValueError(\"x\"); } catch (e) { return [e.name, e.message]; }");
+    assert_eq!(gone[0], json!("ReferenceError"), "{gone}");
+    assert!(
+        gone[1]
+            .as_str()
+            .unwrap()
+            .contains("ValueError is not defined"),
+        "the message names what to stop writing: {gone}"
     );
 }
 
@@ -1658,8 +1686,8 @@ fn a_subclass_changes_nothing_a_program_already_reads() {
         json!(["name", "message"])
     );
     assert_eq!(
-        run_ret(r#"return JSON.stringify(new ValueError("x"));"#),
-        json!(r#"{"name":"ValueError","message":"x"}"#)
+        run_ret(r#"return JSON.stringify(new SyntaxError("x"));"#),
+        json!(r#"{"name":"SyntaxError","message":"x"}"#)
     );
     assert_eq!(
         run_ret(r#"return `${new TypeError("m")}`;"#),
@@ -1678,12 +1706,11 @@ fn a_subclass_changes_nothing_a_program_already_reads() {
 #[test]
 fn every_class_prototype_is_empty() {
     // The prototypes carry no own properties — their methods are virtual
-    // rungs from the builtin registry — so six new prototypes add nothing
-    // to a `for-in` or an `Object.keys` anywhere.
+    // rungs from the builtin registry — so the subclass prototypes add
+    // nothing to a `for-in` or an `Object.keys` anywhere.
     for name in [
         "Error",
         "TypeError",
-        "ValueError",
         "RangeError",
         "SyntaxError",
         "ReferenceError",

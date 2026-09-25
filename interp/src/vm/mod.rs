@@ -876,13 +876,32 @@ pub enum ErrorKind {
     /// impossible value" and "our own heap is corrupt".
     BadPointer,
     TypeError,
-    ValueError,
     /// An uncaught program-level `throw` (no active `try` handler). Distinct
     /// from the VM's own failures: the *program* produced this error value
     /// deliberately, and the host's policy for it differs (show the LLM the
     /// program's own error, not a VM diagnostic). The thrown value is
     /// preserved in [`VMError::payload`]; the message carries a rendering.
     UncaughtException,
+    /// `await` on a rejected promise with no handler anywhere and no strand
+    /// to reject — the async half of [`Self::UncaughtException`], and like
+    /// it, **not a JS error class**.
+    ///
+    /// The `Await` arm reaches this only after `reachable_handler()` and
+    /// `in_strand()` have both said no, so `handlers` is empty and there is
+    /// no `catch` this could ever be delivered to. That is what makes it a
+    /// non-JS kind and not a lazy one: a program cannot observe the name,
+    /// only the host can, and the host renders `message` (the rejection
+    /// reason, written to be read) rather than the kind. Real JS has no
+    /// class here either — `await p` throws the rejection *value*, whatever
+    /// it is, and a class only appears because there is nobody left to
+    /// throw to.
+    ///
+    /// Unlike `UncaughtException` it stays `Resumable`: the promise operand
+    /// was popped, so the host may stand a value in for the rejection and
+    /// carry on. That difference is the whole reason it is not simply
+    /// folded into `UncaughtException`, whose `throw` owes the stack no
+    /// result slot.
+    UnhandledRejection,
     /// The root strand is blocked on a promise that can never settle: the
     /// ready queue, outbox, and in-flight host calls are all empty (7_ASYNC
     /// Tier 2). Only reachable via circular awaits among async calls — the
@@ -951,15 +970,15 @@ pub enum ErrorKind {
 /// |------|------|------|--------|
 /// | unary_num! / binary_num! / binary_int! / cmp_op! macros | TypeError | Resumable | ops popped before coercion |
 /// | Add (string concat path) | TypeError | Resumable | both ops popped before to_number |
-/// | BitNot, ToNum, TypeOf | TypeError/ValueError | Resumable | operand popped first |
+/// | BitNot, ToNum, TypeOf | TypeError | Resumable | operand popped first |
 /// | BitLhs / BitRhs / BitURhs (shift amount outside [0, 63]) | RangeError | Resumable | both ops popped first |
 /// | CallDyn non-callable | TypeError | Resumable | callable popped, then args dropped before failing (pop-first normalization) |
 /// | CallSpread non-callable / non-array args | TypeError | Resumable | callable+array popped first; dispatch same as CallDyn |
 /// | IndexGet (non-container, bad index, mid-codepoint) | TypeError/RangeError | Resumable | container+key popped first |
 /// | IndexSet (non-container, negative/OOB index) | TypeError/RangeError | Resumable | val+key+container popped first |
 /// | ObjHas / ObjDelete (non-object) | TypeError | Resumable | field+object popped first |
-/// | Builtin handlers (args truncated by `Builtin::call` epilogue on the error path) | TypeError/ValueError/RangeError/SyntaxError | Resumable | args truncated before error propagates |
-/// | JSON depth / unsupported type (JSON.stringify, to_json) | ValueError | Resumable | args popped by builtin before conversion |
+/// | Builtin handlers (args truncated by `Builtin::call` epilogue on the error path) | TypeError/RangeError/SyntaxError | Resumable | args truncated before error propagates |
+/// | JSON depth / unsupported type (JSON.stringify, to_json) | TypeError | Resumable | args popped by builtin before conversion |
 /// | JSON.parse (malformed text), RegExp (bad pattern or flag) | SyntaxError | Resumable | args popped by builtin before conversion |
 /// | ObjGet (non-object receiver) | TypeError | Resumable | receiver popped in the error arm (pop-first normalized) |
 /// | GetMethodOrProp (null/undefined receiver) | TypeError | Resumable | receiver popped in the error arm (pop-first normalized, same as ObjGet) |
@@ -967,7 +986,7 @@ pub enum ErrorKind {
 /// | ObjExtend (non-object src) | TypeError | Resumable | both src+obj popped first |
 /// | ArrExtend (non-array src) | TypeError | Resumable | both src+arr popped first |
 /// | ArrPush (non-array target) | TypeError | Resumable | both val+arr popped first |
-/// | Await (rejected promise, no handler, root strand) | ValueError | Resumable | promise popped before failing; host may substitute a value for the rejection (with a reachable handler the rejection value unwinds to `catch`; inside a resumed strand it rejects the strand's promise — neither reaches the host) |
+/// | Await (rejected promise, no handler, root strand) | UnhandledRejection | Resumable | promise popped before failing; host may substitute a value for the rejection (with a reachable handler the rejection value unwinds to `catch`; inside a resumed strand it rejects the strand's promise — neither reaches the host) |
 /// | **IncLocal** (non-numeric local) | TypeError | **NoResultSlot** | reads its local by peek, so there is no consumed slot to fill — but `x--` on a non-number is a language error, and `catch` sees it |
 /// | **Throw** (no handler) | UncaughtException | **NoResultSlot** | the operand was popped, but a `throw` owes the stack no result a substituted value could fill. Nominally catchable and never actually caught: it is *constructed* only after the handler search failed, so the same search in `step` fails again and it escalates. The thrown value rides in `VMError::payload` |
 /// | bad heap/cell/promise/continuation pointer (`get`/`get_mut` on arrays/objects/cells/closures/buffers), and an `Upval` marker reaching `typeof` or a property read | TypeError/BadPointer | **InvariantViolation** | corrupt heap — the VM is broken, not the program |
@@ -977,7 +996,7 @@ pub enum ErrorKind {
 /// | StackUnderflow, BadReturn, BadCall, BadAlloc, BadArg, BadLocal, BadPointer | — | InvariantViolation | compiler bug / host misuse |
 /// | Deadlock | — | InvariantViolation | circular awaits: every strand is parked and no settlement can arrive. Not a broken invariant, but it shares the bucket's one rule — a program must not be able to `catch` it and carry on, because there is nothing to carry on with |
 ///
-/// All 13 `ErrorKind`s are covered. (Fuel exhaustion is not an error:
+/// All 14 `ErrorKind`s are covered. (Fuel exhaustion is not an error:
 /// `step(fuel)` running dry yields `StepResult::OutOfFuel` — nothing
 /// consumed, call `step` again to continue.)
 #[derive(Debug, PartialEq)]

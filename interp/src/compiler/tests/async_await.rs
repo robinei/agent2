@@ -109,7 +109,7 @@ fn rejected_await_escalates_and_is_resumable() {
     vm.reject_promise(id, Value::String("tool exploded".into()))
         .unwrap();
     let err = vm.step(u64::MAX).unwrap_err();
-    assert_eq!(err.kind, ErrorKind::ValueError);
+    assert_eq!(err.kind, ErrorKind::UnhandledRejection);
     // The rejection string reaches the handler as itself: a tool's
     // failure is explained in the tool's own words, and wrapping it in
     // `rejected with string (…)` cost the end of every message longer
