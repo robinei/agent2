@@ -2228,7 +2228,12 @@ impl Runner {
                                 .expect("pending promise is settleable");
                         }
                         Err(msg) => {
-                            let val = Value::String(JsString::from(msg.as_str()));
+                            // The same `{ name, message }` a throw at a
+                            // call site gets — see `settle_err`. The two
+                            // paths differ in where the program is
+                            // waiting, never in what a failure looks
+                            // like when it arrives.
+                            let val = tool_error(vm, &msg);
                             vm.reject_promise(promise, val)
                                 .expect("pending promise is settleable");
                         }
@@ -3129,9 +3134,31 @@ impl Runner {
     /// it. An uncaught throw is left for the VM's next `step`, which
     /// reports it as the program's own trap — the same road any other
     /// uncaught throw takes.
+    ///
+    /// **`{ name, message }`, like every other error in this dialect.**
+    /// It was a bare string until 2026-09-25, and that made the one
+    /// error a program catches most often the only one it had to catch
+    /// differently. Measured four ways in one reply:
+    ///
+    /// ```text
+    /// a tool rejecting    typeof=string   name=undefined  `${e}`=the message
+    /// null.x              typeof=object   name=TypeError  `${e}`=[object Object]
+    /// throw new Error(…)  typeof=object   name=Error      `${e}`=[object Object]
+    /// JSON.parse("{")     typeof=object   name=ValueError `${e}`=[object Object]
+    /// ```
+    ///
+    /// So no `catch` block was right for both: `e.message` was
+    /// `undefined` for a tool failure, and `${e}` was `[object Object]`
+    /// for everything else. The card already says "a caught error is a
+    /// plain `{ name, message }`, so branch on `e.name`" — true of
+    /// three rows out of four, and false for the row that matters. This
+    /// makes the card true rather than making the card longer.
+    ///
+    /// `ToolError` because that is what nearly all of these are, and it
+    /// reads like the kinds the VM raises beside it.
     fn settle_err(&mut self, message: &str) {
         let vm = self.settling_vm();
-        let v = Value::String(JsString::from(message));
+        let v = tool_error(vm, message);
         vm.settle_throw(v).expect("a Settle is outstanding");
     }
 
@@ -3193,10 +3220,11 @@ impl Runner {
     /// the rejection is the program's to catch (6_LANGUAGE Part B), and
     /// only an uncaught one traps into a condition.
     fn reject_call(&mut self, promise: PromisePtr, message: &str) {
-        let v = Value::String(JsString::from(message));
-        self.running_vm()
-            .reject_promise(promise, v)
-            .expect("fresh promise");
+        // The third of the three places a call can fail, and the same
+        // `{ name, message }` as the other two — see `tool_error`.
+        let vm = self.running_vm();
+        let v = tool_error(vm, message);
+        vm.reject_promise(promise, v).expect("fresh promise");
     }
 
     /// Resolve a bare `ask`/`tell` address **before** the `Send` is
@@ -5332,6 +5360,21 @@ fn json_arg(vm: &mut VM, json: &serde_json::Value) -> Value {
 /// arguments do better still and refuse the call outright
 /// ([`args_as_json`]); this stays for the paths where there is nobody
 /// left to refuse to.
+/// A failed call, as the program catches it: `{ name, message }`, the
+/// shape every other error in this dialect has.
+///
+/// **One builder, because there are two paths and they disagreed.** A
+/// call the program `await`s rejects its promise; one it made through a
+/// settle-at-dispatch verb throws at the call site. Only where the
+/// program is waiting differs — what a failure *looks like* must not.
+fn tool_error(vm: &mut VM, message: &str) -> Value {
+    vm.json_to_stack_value(
+        &serde_json::json!({ "name": "ToolError", "message": message }),
+        0,
+    )
+    .expect("plain json")
+}
+
 fn value_json(vm: &VM, v: &Value) -> serde_json::Value {
     vm.stack_value_to_json(v, 0).unwrap_or_else(|_| {
         serde_json::Value::String(match v {
@@ -8924,7 +8967,7 @@ mod tests {
         let r = c.reply(
             "```js\nconst parsed = {};\n\
              try { await tools.write_file(\"out.py\", parsed.missing); }\n\
-             catch (e) { tell(`refused: ${e}`); }\n\
+             catch (e) { tell(`refused: ${e.name}: ${e.message}`); }\n\
              tell(\"ok\"); finish();\n```\n",
         );
         assert!(
@@ -8957,7 +9000,7 @@ mod tests {
     fn a_call_with_a_non_finite_number_is_refused_not_silently_dropped() {
         let mut c = Conversation::new();
         let r = c.reply(
-            "```js\nconst n = Number(\"    not a line number\");\n             try { await tools.read_file(\"f.rs\", Math.max(1, n - 5), n + 60); }\n             catch (e) { tell(`refused: ${e}`); }\n             tell(\"ok\"); finish();\n```\n",
+            "```js\nconst n = Number(\"    not a line number\");\n             try { await tools.read_file(\"f.rs\", Math.max(1, n - 5), n + 60); }\n             catch (e) { tell(`refused: ${e.name}: ${e.message}`); }\n             tell(\"ok\"); finish();\n```\n",
         );
         assert!(
             r.calls.is_empty(),
@@ -8977,7 +9020,7 @@ mod tests {
 
         // Infinity goes the same way, and says which it was.
         let r = c.reply(
-            "```js\ntry { await tools.read_file(\"f.rs\", 1 / 0, 9); }\n             catch (e) { tell(`refused: ${e}`); }\n             tell(\"ok\"); finish();\n```\n",
+            "```js\ntry { await tools.read_file(\"f.rs\", 1 / 0, 9); }\n             catch (e) { tell(`refused: ${e.name}: ${e.message}`); }\n             tell(\"ok\"); finish();\n```\n",
         );
         assert!(
             r.tells.iter().any(|t| t.contains("argument 2 is Infinity")),
@@ -9026,7 +9069,7 @@ mod tests {
 
         let src = format!(
             "try {{ await answer({}, \"q\", 1); history.note(\"unreachable\"); }} catch (e) {{ history.note(\
-             \"caught: \" + e); }}",
+             \"caught: \" + e.message); }}",
             question.as_u64()
         );
         let out = fork
@@ -9088,7 +9131,7 @@ mod tests {
         c.rejects("fetch", "host is down");
         let r = c.reply(
             "```js\ntry { history.note(await tools.fetch(\"a\")); }\n\
-             catch (e) { history.note(\"caught: \" + e); }\n```\n",
+             catch (e) { history.note(\"caught: \" + e.message); }\n```\n",
         );
 
         assert!(
@@ -10318,6 +10361,59 @@ mod tests {
         );
     }
 
+    /// **Every error a program catches has the same shape.**
+    ///
+    /// A tool rejecting used to throw a bare string while everything
+    /// else threw `{ name, message }`, so no `catch` block was right
+    /// for both. Measured four ways in one reply on 2026-09-25:
+    ///
+    /// ```text
+    /// a tool rejecting    typeof=string   name=undefined  `${e}`=the message
+    /// null.x              typeof=object   name=TypeError  `${e}`=[object Object]
+    /// throw new Error(…)  typeof=object   name=Error      `${e}`=[object Object]
+    /// JSON.parse("{")     typeof=object   name=ValueError `${e}`=[object Object]
+    /// ```
+    ///
+    /// The card already promised the second shape for all of them —
+    /// "a caught error is a plain `{ name, message }`, so branch on
+    /// `e.name`" — so this makes the card true rather than longer.
+    ///
+    /// **Three paths, one builder.** A call the program `await`s
+    /// rejects its promise; a settle-at-dispatch verb throws at the
+    /// call site; an argument refused before dispatch rejects a fresh
+    /// promise. Where the program waits differs; what a failure looks
+    /// like must not.
+    #[test]
+    fn a_failure_is_the_same_shape_whichever_way_the_call_was_made() {
+        let mut c = Conversation::new();
+        c.rejects("echo", "the host said no");
+        let said = c.reply("```js\nconst show = (t, e) => tell(`${t} ${typeof e} ${e.name} ${e.message}`);\ntry { await tools.echo(1); } catch (e) { show(\"awaited\", e); }\ntry { await tools.echo(undefined); } catch (e) { show(\"refused-arg\", e); }\ntry { await history.fetch(999999); } catch (e) { show(\"dispatch\", e); }\ntry { null.x; } catch (e) { show(\"js\", e); }\n```\n");
+        let told = said.tells.join("\n");
+        assert!(
+            told.contains("awaited object ToolError the host said no"),
+            "an awaited call that rejects: {told}"
+        );
+        assert!(
+            told.contains("refused-arg object ToolError"),
+            "an argument refused before dispatch: {told}"
+        );
+        assert!(
+            told.contains("dispatch object ToolError"),
+            "a settle-at-dispatch verb: {told}"
+        );
+        assert!(
+            told.contains("js object TypeError"),
+            "and the VM's own errors were already this shape: {told}"
+        );
+        // `undefined undefined` is what a missing name and message
+        // read as — the old string shape. The word itself appears in a
+        // message legitimately, so the test is on the pair.
+        assert!(
+            !told.contains("undefined undefined"),
+            "a name or message is missing on one of them: {told}"
+        );
+    }
+
     /// **An id from the reply being written is refused, because it is
     /// a guess.**
     ///
@@ -10338,7 +10434,7 @@ mod tests {
         let mut c = Conversation::new();
         c.answers("echo", serde_json::json!({ "out": "ECHOED" }));
         // The reply's own `Reply` event and everything after it.
-        let said = c.reply("```js\nconst a = await tools.echo(1);\ntry { await history.fetch(9999); } catch (e) { tell(`absent: ${e}`); }\ntry { const m = await history.fetch(4); tell(`got ${JSON.stringify(m)}`); } catch (e) { tell(`mine: ${e}`); }\n```\n");
+        let said = c.reply("```js\nconst a = await tools.echo(1);\ntry { await history.fetch(9999); } catch (e) { tell(`absent: ${e.message}`); }\ntry { const m = await history.fetch(4); tell(`got ${JSON.stringify(m)}`); } catch (e) { tell(`mine: ${e.message}`); }\n```\n");
         let told = said.tells.join(" | ");
         assert!(
             told.contains("absent:") && told.contains("no row #9999"),
@@ -11023,7 +11119,7 @@ mod tests {
         );
         c.reply(
             "```js\nconst rs = [await tools.read_file(\"a\"), await tools.read_file(\"b\")];\n\
-             try { history.keep(rs.map((r) => r.id)); } catch (e) { history.note(String(e)); }\n```\n",
+             try { history.keep(rs.map((r) => r.id)); } catch (e) { history.note(e.message); }\n```\n",
         );
         let said = c.document();
         assert!(

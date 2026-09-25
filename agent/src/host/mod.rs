@@ -3154,7 +3154,7 @@ mod tests {
         let script = vec![
             scripted_program(
                 r#"try { const r = await tools.big(); history.note(r); tell("done."); finish(); }
-                   catch (e) { history.note("rejected: " + e); tell("done."); finish(); }"#,
+                   catch (e) { history.note("rejected: " + e.message); tell("done."); finish(); }"#,
             ),
             scripted_text("done"),
         ];
@@ -5709,7 +5709,7 @@ mod tests {
                 "test agent",
                 vec![scripted_program(&format!(
                     r#"try {{ history.note(await ask({}, "hi")); }}
-                           catch (e) {{ history.note("refused: " + e); }}"#,
+                           catch (e) {{ history.note("refused: " + e.message); }}"#,
                     worker_id.as_u64()
                 ))],
             )])),
