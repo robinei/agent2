@@ -1281,8 +1281,9 @@ impl VM {
     ///
     /// **The one place that knows how an error is built.** Every value a
     /// program can `catch` comes through here — the errors the VM raises
-    /// (`error_to_thrown`), `new Error(…)`/`TypeError(…)` (`Instr::ErrNew`),
-    /// and the host's own failures (the harness's tool errors) — so
+    /// (`error_to_thrown`), `new Error(…)`/`TypeError(…)` (the registry's
+    /// constructor handlers), and the host's own failures (the harness's
+    /// tool errors) — so
     /// `e instanceof Error` and `` `${e}` `` cannot be true of one source and
     /// false of the next. Before this existed each source built its own plain
     /// object literal, and a caught error was `instanceof Error` nowhere.
@@ -1295,7 +1296,7 @@ impl VM {
         // sources at once: `error_to_thrown`'s `{:?}` of an `ErrorKind`
         // (only ever `TypeError`/`ValueError`/`ReferenceError` — the other
         // kinds are not resumable and end the program instead of becoming a
-        // value), the ctor name `Instr::ErrNew` carries from the compiler,
+        // value), the `TypeTag::name()` each constructor handler passes in,
         // and the harness's `"ToolError"`, which has no class and lands on
         // the base.
         let tag = crate::vm::instr::TypeTag::error_tag_for_name(&name);
@@ -1766,10 +1767,9 @@ impl VM {
 
     /// Resolve a bare name to a value at runtime — the fallback when the
     /// compiler does not statically recognize an identifier. Used by
-    /// [`Instr::PushName`]. Names in the builtin registry resolve directly;
-    /// error-constructor names (`TypeError`, …) resolve to the `Function`
-    /// constructor as a callable placeholder (the compiler's `new` path
-    /// handles them separately via `compile_error_ctor`); hardcoded globals
+    /// [`Instr::PushName`]. Names in the builtin registry resolve directly —
+    /// the error classes included, since each is an ordinary constructor row
+    /// now; hardcoded globals
     /// (`undefined`, `NaN`, `Infinity`) resolve to their literal values;
     /// everything else raises a `ReferenceError` whose message includes the
     /// name — preserving the name-level signal in the failure histogram.

@@ -121,16 +121,16 @@ impl super::Compiler {
             }
             ast::Expression::NewExpression(n) => {
                 if let ast::Expression::Identifier(id) = &n.callee {
-                    if super::is_error_ctor(id.name.as_str()) {
-                        return self.compile_error_ctor(id.name.as_str(), n);
-                    }
                     // Step 2a Part 2: native constructors (`new Map()`,
                     // `new Set()`, `new RegExp()`, `new Array()`, …) route
                     // through the generic `new` path: `compile_expr(callee)`
                     // emits `PushBuiltin(constructor)`, then `New` +
                     // `NewReturn` — `Instr::New`'s builtin-constructor arm
                     // folds the type's native construction. The dedicated
-                    // `compile_*_ctor` helpers are retired by this.
+                    // `compile_*_ctor` helpers are retired by this, the error
+                    // classes included: they have registry rows like every
+                    // other constructor, so there is nothing left for a
+                    // special case to add.
                     if Builtin::for_constructor(id.name.as_str()).is_some() {
                         return self.compile_new_call(n);
                     }
@@ -181,46 +181,6 @@ impl super::Compiler {
             ),
             other => self.error(other.span().into(), "unsupported expression"),
         }
-    }
-
-    /// `new Error(msg)` / `new TypeError(msg)` / …: build the `{ name,
-    /// message }` error object, linked to `Error.prototype` by
-    /// [`Instr::ErrNew`] so `e instanceof Error` holds. The message coerces
-    /// with ToString at construction (`new Error(123)` → `"123"`, as in JS);
-    /// absent → `""`. The *name* is the identifier that was written, so
-    /// `new TypeError("x").name` is `"TypeError"` even though all six share
-    /// one prototype.
-    pub(super) fn compile_error_ctor(&mut self, name: &str, n: &ast::NewExpression) {
-        let span = n.span.into();
-        if n.arguments.len() > 1 {
-            // JS's `{ cause }` options bag is out of scope; stay strict.
-            self.error(
-                span,
-                format!("`new {name}` takes at most one (message) argument"),
-            );
-            return;
-        }
-        match n.arguments.first() {
-            None => {
-                let empty = self.intern_string("");
-                self.emit(Instr::PushStr(empty), span);
-            }
-            Some(arg) => match arg.as_expression() {
-                Some(msg) => {
-                    self.compile_expr(msg);
-                    self.emit(Instr::ToStr, span);
-                }
-                None => {
-                    self.error(
-                        span,
-                        format!("spread arguments are not supported in `new {name}`"),
-                    );
-                    return;
-                }
-            },
-        }
-        let name_str = self.intern_string(name);
-        self.emit(Instr::ErrNew(name_str), span);
     }
 
     /// `new F(args)` for a user-defined function `F` (not a builtin ctor).

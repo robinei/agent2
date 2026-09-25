@@ -797,18 +797,6 @@ pub enum Instr {
     /// field 0's value is the first/deepest pushed.
     ObjNew(ThinVec<FieldName>), // [any, ...] -> obj
 
-    /// pops the (already `ToString`-coerced) message and pushes an **error
-    /// object**: `{ name, message }` whose `proto` is `Error.prototype`, with
-    /// the name carried in the instruction (`Error`, `TypeError`, … — always a
-    /// literal at the `new Error(…)` / `TypeError(…)` call site).
-    ///
-    /// Separate from `ObjNew` rather than a flag on it, because the proto link
-    /// is the *only* thing that distinguishes an error from the object literal
-    /// `{ name: "x", message: "y" }` — and that literal must keep answering
-    /// `false` to `instanceof Error` and `"[object Object]"` to `` `${…}` ``.
-    /// Deciding by shape at the instruction would make every two-field object
-    /// an error. str -> obj
-    ErrNew(FieldName),
     ObjGet(FieldName), // obj -> any
     /// Read property `name` off the receiver but **keep the receiver** below the
     /// result. Semantically identical to `ObjGet` (same own→proto walk, same

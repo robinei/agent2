@@ -396,7 +396,7 @@ pub(crate) struct Compiler {
 //  stmt.rs        — compile_program, compile_stmt, compile_var_decl
 //  control_flow.rs— compile_if/while/for/break/continue, emit_exit,
 //                   compile_try, compile_for_of/in, compile_switch
-//  expr.rs        — compile_expr, compile_identifier, error_ctor, …
+//  expr.rs        — compile_expr, compile_identifier, compile_new_call, …
 //  operators.rs   — compile_binary/unary, compile_delete, compile_logical
 //  literals.rs    — compile_array, compile_object, compile_template
 //  member.rs      — compile_static_member, compile_computed_member, …
@@ -411,30 +411,6 @@ pub(crate) struct Compiler {
 pub(crate) enum ConstVal {
     Float(f64),
     PosInt(u64),
-}
-
-/// The error constructor names recognized by `new` and by a plain call. Each
-/// lowers to [`Instr::ErrNew`], which writes the name and links the object to
-/// *that name's* prototype — so `new TypeError("x")` is `instanceof
-/// TypeError`, `instanceof Error`, and not `instanceof RangeError`, and
-/// stringifies as `"TypeError: x"`.
-///
-/// **This used to say there was one shared prototype and no hierarchy.** The
-/// classes are real now: [`TypeTag::ERRORS`](crate::vm::instr::TypeTag::ERRORS)
-/// is the list, each has a registry row and a prototype chaining to
-/// `Error.prototype`, and this function must agree with it — a name accepted
-/// here but absent there would compile to an `ErrNew` that falls back to the
-/// base class, so `new Foo("x") instanceof Foo` would be false with nothing
-/// said.
-///
-/// `ValueError` is in the list and is **not a JS name**: it is this dialect's
-/// own kind for "right type, impossible value", and the VM's second commonest
-/// raise. A model that writes `catch (e) { if (e instanceof ValueError) … }`
-/// against it gets an answer rather than a `ReferenceError`.
-fn is_error_ctor(name: &str) -> bool {
-    crate::vm::instr::TypeTag::ERRORS
-        .iter()
-        .any(|t| t.name() == name)
 }
 
 /// Build a flags string (e.g. `"gi"`) from an oxc [`RegExpFlags`] bitmask.

@@ -2159,19 +2159,6 @@ impl VM {
                     self.ip += 1;
                 }
 
-                Instr::ErrNew(name) => {
-                    let name = name.clone();
-                    let message = match self.pop()? {
-                        Value::String(s) => s,
-                        // The compiler emits `ToStr` before this, so anything
-                        // else is a bug in the emitter, not in the program.
-                        other => self.to_js_string(&other, 0),
-                    };
-                    let err = self.alloc_error(name, message);
-                    self.stack.push(err);
-                    self.ip += 1;
-                }
-
                 Instr::ObjGet(field) => {
                     // Stack-shape adapter: receiver (peeked) → pop, push val.
                     let key = Value::String(field.clone());

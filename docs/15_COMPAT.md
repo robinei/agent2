@@ -1593,13 +1593,15 @@ The ~79 net passes are largely error-constructor `typeof` checks: `TypeError`
 etc. now resolve to `FunctionCtor` (callable with `typeof === "function"`),
 which is enough to satisfy `assert.sameValue(typeof TypeError, "function")`.
 
-**Divergence (pinned):** because bare error-constructor names resolve to the
-generic `FunctionCtor` placeholder, `e instanceof TypeError` (and the other
-error types) tests against `Function`, not the concrete error type — so a
-positive `instanceof` against a *specific* error constructor is unreliable.
-`typeof` and direct construction (`new TypeError("m")`, `compile_error_ctor`)
-are faithful; only the `instanceof`-against-error-ctor path diverges. Resolve
-when error constructors gain real `TypeTag`s and prototype chains.
+**Divergence (pinned) — resolved 2026-09-25.** It read: because bare
+error-constructor names resolve to the generic `FunctionCtor` placeholder,
+`e instanceof TypeError` tests against `Function` rather than the concrete
+error type, so a positive `instanceof` against a *specific* error constructor
+is unreliable. The stated condition for resolving it — "when error
+constructors gain real `TypeTag`s and prototype chains" — is met: each class
+has its own tag, its own constructor row and a prototype chaining to
+`Error.prototype`, the `FunctionCtor` aliases are gone, and the dedicated
+`compile_error_ctor` construction path named here went with them.
 
 ### Why this is the right tradeoff
 

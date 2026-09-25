@@ -631,16 +631,21 @@ builtins! {
     // "right type, impossible value" raises JS has no name for, and it is the
     // VM's second commonest kind. Omitting it would have left the error a
     // program is likeliest to catch as the one with no class to test.
-    ErrorCtor,          BuiltinKind::Constructor { type_tag: TypeTag::Error },          "Error",          0, 1, error_ctor,           false, false, false, false, false, false, false, false, false, false;
-    TypeErrorCtor,      BuiltinKind::Constructor { type_tag: TypeTag::TypeError },      "TypeError",      0, 1, type_error_ctor,      false, false, false, false, false, false, false, false, false, false;
-    ValueErrorCtor,     BuiltinKind::Constructor { type_tag: TypeTag::ValueError },     "ValueError",     0, 1, value_error_ctor,     false, false, false, false, false, false, false, false, false, false;
-    RangeErrorCtor,     BuiltinKind::Constructor { type_tag: TypeTag::RangeError },     "RangeError",     0, 1, range_error_ctor,     false, false, false, false, false, false, false, false, false, false;
-    SyntaxErrorCtor,    BuiltinKind::Constructor { type_tag: TypeTag::SyntaxError },    "SyntaxError",    0, 1, syntax_error_ctor,    false, false, false, false, false, false, false, false, false, false;
-    ReferenceErrorCtor, BuiltinKind::Constructor { type_tag: TypeTag::ReferenceError }, "ReferenceError", 0, 1, reference_error_ctor, false, false, false, false, false, false, false, false, false, false;
-    EvalErrorCtor,      BuiltinKind::Constructor { type_tag: TypeTag::EvalError },      "EvalError",      0, 1, eval_error_ctor,      false, false, false, false, false, false, false, false, false, false;
+    ErrorCtor,          BuiltinKind::Constructor { type_tag: TypeTag::Error },          "Error",          0, 2, error_ctor,           false, false, false, false, false, false, false, false, false, false;
+    TypeErrorCtor,      BuiltinKind::Constructor { type_tag: TypeTag::TypeError },      "TypeError",      0, 2, type_error_ctor,      false, false, false, false, false, false, false, false, false, false;
+    ValueErrorCtor,     BuiltinKind::Constructor { type_tag: TypeTag::ValueError },     "ValueError",     0, 2, value_error_ctor,     false, false, false, false, false, false, false, false, false, false;
+    RangeErrorCtor,     BuiltinKind::Constructor { type_tag: TypeTag::RangeError },     "RangeError",     0, 2, range_error_ctor,     false, false, false, false, false, false, false, false, false, false;
+    SyntaxErrorCtor,    BuiltinKind::Constructor { type_tag: TypeTag::SyntaxError },    "SyntaxError",    0, 2, syntax_error_ctor,    false, false, false, false, false, false, false, false, false, false;
+    ReferenceErrorCtor, BuiltinKind::Constructor { type_tag: TypeTag::ReferenceError }, "ReferenceError", 0, 2, reference_error_ctor, false, false, false, false, false, false, false, false, false, false;
+    EvalErrorCtor,      BuiltinKind::Constructor { type_tag: TypeTag::EvalError },      "EvalError",      0, 2, eval_error_ctor,      false, false, false, false, false, false, false, false, false, false;
 
     // ── ArrayBuffer ──
-    ArrayBufferCtor,    BuiltinKind::Constructor { type_tag: TypeTag::ArrayBuffer },        "ArrayBuffer",        1, 1,      arraybuffer_ctor,      false, false, false, false, false, false, false, false, false, false;
+    // `0` minimum, not `1`: `new ArrayBuffer()` is a zero-length buffer in JS
+    // and `arraybuffer_ctor` has always built one (its `undefined → 0` arm).
+    // The row said `1, 1` and nothing checked it on the `new` path, so the
+    // bound was wrong and silent at once — it surfaced the moment `new` began
+    // reading these bounds.
+    ArrayBufferCtor,    BuiltinKind::Constructor { type_tag: TypeTag::ArrayBuffer },        "ArrayBuffer",        0, 1,      arraybuffer_ctor,      false, false, false, false, false, false, false, false, false, false;
     ArrayBufferIsView,  BuiltinKind::Namespace("ArrayBuffer"), "isView",                    1, 1,      arraybuffer_is_view,   false, false, false, false, false, false, false, false, false, false;
     ArrayBufferSlice,   BuiltinKind::Method, "slice",                                       2, 3,      arraybuffer_slice,     false, false, false, false, false, false, false, false, false, true;
 

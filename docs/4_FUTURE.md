@@ -110,6 +110,12 @@ prototype chaining to `Error.prototype` (§25.4b), so `e instanceof
 TypeError` works through the ordinary proto walk. `ValueError` is one of
 the classes — the JS-named-error-kinds note above is answered by giving
 this dialect's own name a class rather than by renaming its raise sites.
+The compiler special-form named above is gone too: `Instr::ErrNew` and
+`compile_error_ctor` are deleted, and `new Error(…)` does take the
+ordinary `New`/`NewReturn` path this note predicted — it reaches the
+registry row rather than a prelude class. The second argument came with
+it: `new Error("m", { cause: e })` sets `e.cause`, which the special-form
+could not represent and so refused.
 What prelude classes would still buy is a *user-written* subclass —
 `class AppError extends Error {}` — which falls out of Step 7b, not out
 of the builtin table.

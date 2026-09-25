@@ -826,28 +826,16 @@ impl super::Compiler {
                     span,
                 );
             }
-            name if super::is_error_ctor(name) => {
-                // `TypeError("msg")` / `Error("msg")` → create error object
-                // (same logic as `compile_error_ctor` for `new`).
-                if argv.len() > 1 {
-                    self.error(
-                        span,
-                        format!("`{name}` takes at most one (message) argument"),
-                    );
-                    return;
-                }
-                match argv.first() {
-                    None => {
-                        let empty = self.intern_string("");
-                        self.emit(Instr::PushStr(empty), span);
-                    }
-                    Some(msg) => {
-                        self.compile_expr(msg);
-                        self.emit(Instr::ToStr, span);
-                    }
-                }
-                let name_str = self.intern_string(name);
-                self.emit(Instr::ErrNew(name_str), span);
+            // Every remaining constructor called without `new`: the error
+            // classes (`TypeError("msg")` is legal JS, unlike `Map()`),
+            // `ArrayBuffer`, the typed arrays and `DataView`. Routing them
+            // through the registry row is what gives them their arity bounds
+            // — the error classes used to carry a hand-written "at most one
+            // (message) argument" check in the compiler, which was a second
+            // place for the bounds to be written and to drift from the row.
+            name if Builtin::for_constructor(name).is_some() => {
+                let b = Builtin::for_constructor(name).unwrap();
+                self.compile_builtin_call(b, None, argv, span, false);
             }
             _ => {
                 // Unknown global — compile as a dynamic call resolved at runtime.

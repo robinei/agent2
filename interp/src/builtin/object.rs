@@ -32,11 +32,11 @@ pub fn object_ctor(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     }
 }
 
-/// `Error(msg)` / `new Error(msg)` and one of these per error class — the
-/// constructor bodies, reached only when the class is called through a
-/// *value* (`const E = TypeError; E("x")`, or reflection). The compiler
-/// lowers a literal `new TypeError(…)` / `TypeError(…)` to
-/// [`crate::vm::instr::Instr::ErrNew`] instead.
+/// `Error(msg, options)` / `new Error(msg, options)` and one of these per
+/// error class — **the** constructor body for every entry point. `new
+/// TypeError(…)`, a bare `TypeError(…)`, and a call through a value
+/// (`const E = TypeError; E("x")`) all land here; there is no compiler
+/// shortcut past it any more.
 ///
 /// The `tag` is the class, and [`VM::alloc_error`] recovers it from the name
 /// — so a constructor and a VM raise of the same kind produce the same
@@ -47,13 +47,51 @@ pub fn object_ctor(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 /// than one function taking the name. Without them the global `TypeError`
 /// has no constructor to resolve to, and `e instanceof TypeError` is a
 /// `TypeError` about the right-hand side rather than an answer.
+///
+/// **The message coerces here, not in the compiler.** `new Error(123)` is
+/// `"123"` because of the `to_js_string` below; that used to be a `ToStr` the
+/// compiler emitted ahead of a dedicated instruction, and moving it here is
+/// what let the instruction go.
 fn error_construct(vm: &mut VM, args: Args, tag: TypeTag) -> Result<Value, VMError> {
     let message = match args.get(vm, 0) {
         // `new Error()` has no message, not the message `"undefined"`.
         Value::Undefined => JsString::from(""),
         other => vm.to_js_string(&other.clone(), 0),
     };
-    Ok(vm.alloc_error(JsString::from(tag.name()), message))
+    let cause = options_cause(vm, &args);
+    let err = vm.alloc_error(JsString::from(tag.name()), message);
+    if let (Value::Object(p), Some(cause)) = (&err, cause) {
+        vm.objects[*p as usize]
+            .map
+            .insert(JsString::from("cause"), cause);
+    }
+    Ok(err)
+}
+
+/// The `cause` of `new Error(msg, { cause })`, or `None` when there is no
+/// options bag or it carries no `cause` key.
+///
+/// **Present because the argument used to be a compile error.** `new
+/// Error("m", { cause: e })` is ordinary JS and the commonest reason anyone
+/// passes a second argument; the compiler rejected it outright, which was at
+/// least loud. Once the dedicated construction path went away there was
+/// nothing left to reject it *with* — and an options bag accepted and
+/// discarded would leave `e.cause` undefined with nothing said. So it is
+/// honoured instead.
+///
+/// Absence is `None` rather than `undefined`: `new Error("m")` must not grow
+/// a `cause` key, or `Object.keys(e)` and `JSON.stringify(e)` would report a
+/// field the program never set.
+fn options_cause(vm: &mut VM, args: &Args) -> Option<Value> {
+    let Value::Object(p) = args.get(vm, 1) else {
+        return None;
+    };
+    let p = *p;
+    vm.objects
+        .get(p as usize)?
+        .map
+        .get(&JsString::from("cause"))
+        .cloned()
 }
 
 macro_rules! error_ctor {

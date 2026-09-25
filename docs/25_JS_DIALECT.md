@@ -188,8 +188,9 @@ message carried nothing.
 The fix is the one this entry proposed: a `TypeTag::Error` row, so
 `Error.prototype` exists and is what every error links to. One VM
 helper (`VM::alloc_error`) builds all of them — the errors the VM
-raises, `new Error(…)`/`TypeError(…)` (`Instr::ErrNew`), and the
-harness's own tool errors — so no source can drift from the rest.
+raises, `new Error(…)`/`TypeError(…)` (the registry's constructor
+handlers), and the harness's own tool errors — so no source can drift
+from the rest.
 String coercion recognises an error *by that prototype link*, never by
 having a `name` and a `message`: `{ name: "x", message: "y" }` is still
 `[object Object]`, because a tool result with those two fields is a

@@ -164,10 +164,40 @@ fn new_error_coerces_message_to_string() {
 }
 
 #[test]
-fn new_error_rejects_extra_args() {
-    let errs = compile_errs(r#"throw new Error("m", { cause: 1 });"#);
+fn new_error_carries_its_cause() {
+    // **This used to be a compile error.** The dedicated construction path
+    // could only take a message, so `new Error("m", { cause: e })` — plain
+    // JS, and the only reason anyone passes a second argument — was refused
+    // outright. With that path gone the choice was to accept the bag and
+    // drop it, which would leave `e.cause` undefined with nothing said, or
+    // to honour it. It is honoured.
+    assert_eq!(
+        run_ret(r#"return new Error("m", { cause: 42 }).cause;"#),
+        json!(42)
+    );
+    // The bare-call form is legal JS for an error class and reaches the
+    // same constructor body, so it answers the same.
+    assert_eq!(
+        run_ret(r#"return TypeError("m", { cause: "why" }).cause;"#),
+        json!("why")
+    );
+    // No bag, no key: `Object.keys` must not report a field the program
+    // never set, and `JSON.stringify(e)` must not grow a `"cause": null`.
+    assert_eq!(
+        run_ret(r#"return Object.keys(new Error("m"));"#),
+        json!(["name", "message"])
+    );
+    // A bag without a `cause` is the same: an options object is not itself
+    // a cause.
+    assert_eq!(
+        run_ret(r#"return Object.keys(new Error("m", { other: 1 }));"#),
+        json!(["name", "message"])
+    );
+    // Three arguments is past the row's bound, and still refused — the
+    // bound now lives in the registry row, not in a check of its own.
+    let errs = compile_errs(r#"throw Error("m", {}, 3);"#);
     assert!(
-        errs.iter().any(|e| e.contains("at most one")),
+        errs.iter().any(|e| e.contains("`Error` expects 0 to 2")),
         "got: {errs:?}"
     );
 }
@@ -1425,8 +1455,9 @@ fn an_error_is_an_instance_of_its_own_class_and_of_error() {
         ),
         json!([true, true])
     );
-    // Constructed, with `new` and without, and through a value (which
-    // takes the registry row rather than the compiler's `ErrNew` path).
+    // Constructed, with `new` and without, and through a value. All three
+    // reach the same registry row now — there is no compiler shortcut left
+    // for the first two to take.
     assert_eq!(
         run_ret(
             r#"return [new RangeError("x") instanceof RangeError, new RangeError("x") instanceof Error];"#
