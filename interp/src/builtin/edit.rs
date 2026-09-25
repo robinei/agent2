@@ -1,3 +1,35 @@
+//! `Edit.*` — the text-surgery verbs, and the three names their failures
+//! carry.
+//!
+//! **These are not JS functions, but their errors land in a JS `catch`.**
+//! A program branches on `e.name`, so every refusal here has to pick one
+//! of the nine standard classes; there is no house class to fall back on,
+//! and inventing one was the mistake this replaced. The rule, in the order
+//! a call meets it:
+//!
+//! - **`TypeError`** — an argument is the wrong type. `edits` is not an
+//!   array, `edits[3].old` is not a string, `open` is not a string,
+//!   `lineNo` is not a number. Nothing about the *text* matters yet.
+//! - **`SyntaxError`** — the text is not well-formed as the source it was
+//!   handed to `extractBlock` as: unbalanced braces, an unterminated
+//!   string literal, an unterminated block comment. This is the one name
+//!   that changes the repair. A `RangeError` invites another index; a
+//!   `SyntaxError` says no index will work, because the brace scanner ran
+//!   off the end of a file that is truncated or is not C-family source.
+//! - **`RangeError`** — everything else: the arguments are the right
+//!   types and the call names a place or a shape the text does not have.
+//!   An index past the end, `start > end`, a `lineNo` below 1, an empty
+//!   pattern, a needle that matches three times instead of once, two
+//!   edits whose spans overlap, an edit that would indent a line twice
+//!   over.
+//!
+//! The last group is the widest, and deliberately so: `TypeError` must not
+//! become the bucket every refusal falls into, because a program that
+//! catches one has been told something false — the argument's type was
+//! fine. The spec's own precedent for "right type, unusable value" is
+//! `String.prototype.normalize("nope")`, which is a `RangeError` for a
+//! string argument whose *value* is not one the operation accepts.
+
 use indexmap::IndexMap;
 
 use crate::builtin::Args;
@@ -291,7 +323,7 @@ pub fn edit_replace_once(vm: &mut VM, args: Args) -> Result<Value, VMError> {
         if n != 1 {
             let shown = format!("{:?}", rx.compiled);
             let lines = lines_of(text, matches.iter().map(|m| m.range.start));
-            return Err(vm.fail(ErrorKind::ValueError, ambiguous(n, &shown, &lines)));
+            return Err(vm.fail(ErrorKind::RangeError, ambiguous(n, &shown, &lines)));
         }
         let m = &matches[0];
         let mut out = String::with_capacity(text.len());
@@ -304,7 +336,7 @@ pub fn edit_replace_once(vm: &mut VM, args: Args) -> Result<Value, VMError> {
         let old = old_s.as_str();
         if old.is_empty() {
             return Err(vm.fail(
-                ErrorKind::ValueError,
+                ErrorKind::RangeError,
                 "replaceOnce: empty pattern is not supported",
             ));
         }
@@ -312,12 +344,12 @@ pub fn edit_replace_once(vm: &mut VM, args: Args) -> Result<Value, VMError> {
         let n = indices.len();
         if n != 1 {
             let lines = lines_of(text, indices.iter().map(|(i, _)| *i));
-            return Err(vm.fail(ErrorKind::ValueError, ambiguous(n, old, &lines)));
+            return Err(vm.fail(ErrorKind::RangeError, ambiguous(n, old, &lines)));
         }
         let (pos, _) = indices[0];
         if let Some(why) = doubles_indentation(text, pos, old, replacement.as_str()) {
             return Err(vm.fail(
-                ErrorKind::ValueError,
+                ErrorKind::RangeError,
                 format!("replaceOnce: {why}").as_str(),
             ));
         }
@@ -364,7 +396,7 @@ pub fn edit_replace_all(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let old = old_s.as_str();
     if old.is_empty() {
         return Err(vm.fail(
-            ErrorKind::ValueError,
+            ErrorKind::RangeError,
             "replaceAll: empty pattern is not supported",
         ));
     }
@@ -377,7 +409,7 @@ pub fn edit_replace_all(vm: &mut VM, args: Args) -> Result<Value, VMError> {
         // decorator from several methods at once — which is exactly
         // the edit that orphans indentation, once per method.
         if let Some(why) = doubles_indentation(text, pos, old, replacement.as_str()) {
-            return Err(vm.fail(ErrorKind::ValueError, format!("replaceAll: {why}").as_str()));
+            return Err(vm.fail(ErrorKind::RangeError, format!("replaceAll: {why}").as_str()));
         }
         out.push_str(&text[last..pos]);
         out.push_str(replacement.as_str());
@@ -402,7 +434,7 @@ pub fn edit_count(vm: &mut VM, args: Args) -> Result<Value, VMError> {
         let needle_u = needle_s.as_units();
         if needle_u.is_empty() {
             return Err(vm.fail(
-                ErrorKind::ValueError,
+                ErrorKind::RangeError,
                 "count: empty needle is not supported",
             ));
         }
@@ -430,19 +462,19 @@ pub fn edit_extract_block(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let text_units = byte_to_unit(text, text.len());
     if head_unit >= text_units {
         return Err(vm.fail(
-            ErrorKind::ValueError,
+            ErrorKind::RangeError,
             format!("headIndex {head_unit} is past end of text (len {text_units})"),
         ));
     }
     let head = unit_to_byte(text, head_unit);
     let open = text[head..].find('{').map(|i| head + i).ok_or_else(|| {
         vm.fail(
-            ErrorKind::ValueError,
+            ErrorKind::RangeError,
             format!("no opening brace found at or after index {head_unit}"),
         )
     })?;
     let close =
-        balance_to(text, open, '{', '}').map_err(|msg| vm.fail(ErrorKind::ValueError, msg))?;
+        balance_to(text, open, '{', '}').map_err(|msg| vm.fail(ErrorKind::SyntaxError, msg))?;
     build_range_obj(vm, text, open, close)
 }
 
@@ -461,7 +493,7 @@ pub fn edit_extract_by_indent(vm: &mut VM, args: Args) -> Result<Value, VMError>
     let lines: Vec<&str> = text.split_inclusive('\n').collect();
     if line_idx >= lines.len() {
         return Err(vm.fail(
-            ErrorKind::ValueError,
+            ErrorKind::RangeError,
             format!(
                 "lineIndex {line_idx} is out of range ({} lines)",
                 lines.len()
@@ -525,7 +557,7 @@ pub fn edit_extract_enclosing(vm: &mut VM, args: Args) -> Result<Value, VMError>
     let text_units = byte_to_unit(text, text.len());
     if idx_unit >= text_units {
         return Err(vm.fail(
-            ErrorKind::ValueError,
+            ErrorKind::RangeError,
             format!("index {idx_unit} is past end of text (len {text_units})"),
         ));
     }
@@ -538,7 +570,7 @@ pub fn edit_extract_enclosing(vm: &mut VM, args: Args) -> Result<Value, VMError>
         .min_by_key(|(s, e)| e - s)
         .ok_or_else(|| {
             vm.fail(
-                ErrorKind::ValueError,
+                ErrorKind::RangeError,
                 format!(
                     "no enclosing `{open_ch}`…`{close_ch}` pair around index {idx_unit}{}",
                     block_hint(text, idx, open_ch, close_ch)
@@ -586,14 +618,14 @@ fn block_hint(text: &str, idx: usize, open_ch: char, close_ch: char) -> String {
 fn char_from_val(vm: &VM, val: &Value, label: &str) -> Result<char, VMError> {
     let s = vm
         .str_from(val)
-        .map_err(|_| vm.fail(ErrorKind::ValueError, format!("{label} must be a string")))?;
+        .map_err(|_| vm.fail(ErrorKind::TypeError, format!("{label} must be a string")))?;
     // One *code point*: `open`/`close` are delimiters like `(` or `{`, and a
     // surrogate pair is one character even though it is two units.
     let mut cps = crate::units::code_points(s);
     let first = cps.next();
     if first.is_none() || cps.next().is_some() {
         return Err(vm.fail(
-            ErrorKind::ValueError,
+            ErrorKind::RangeError,
             format!(
                 "{label} must be a single character, got {len} chars",
                 len = crate::units::code_points(s).count()
@@ -604,7 +636,7 @@ fn char_from_val(vm: &VM, val: &Value, label: &str) -> Result<char, VMError> {
         .expect("a code point slice is non-empty");
     char::from_u32(cp).ok_or_else(|| {
         vm.fail(
-            ErrorKind::ValueError,
+            ErrorKind::RangeError,
             format!("{label} must be a character, not an unpaired surrogate"),
         )
     })
@@ -749,7 +781,7 @@ pub fn edit_replace_lines(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let new_text = vm.to_js_string(args.get(vm, 3), 0).to_utf8_lossy();
 
     if start < 1 || end < 1 || start > end {
-        return Err(vm.fail(ErrorKind::ValueError, format!(
+        return Err(vm.fail(ErrorKind::RangeError, format!(
             "replaceLines: invalid range [{start}, {end}] — use 1-indexed inclusive, start ≤ end"
         )));
     }
@@ -757,7 +789,7 @@ pub fn edit_replace_lines(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let lines: Vec<&str> = text.split_inclusive('\n').collect();
     if end > lines.len() {
         return Err(vm.fail(
-            ErrorKind::ValueError,
+            ErrorKind::RangeError,
             format!("replaceLines: end {end} exceeds line count {}", lines.len()),
         ));
     }
@@ -785,7 +817,7 @@ pub fn edit_insert_at(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let new_text = vm.to_js_string(args.get(vm, 2), 0).to_utf8_lossy();
 
     if line_no < 1 {
-        return Err(vm.fail(ErrorKind::ValueError, "insertAt: lineNo must be >= 1"));
+        return Err(vm.fail(ErrorKind::RangeError, "insertAt: lineNo must be >= 1"));
     }
 
     let lines: Vec<&str> = text.split_inclusive('\n').collect();
@@ -797,7 +829,7 @@ pub fn edit_insert_at(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 
     if line_no > max_line {
         return Err(vm.fail(
-            ErrorKind::ValueError,
+            ErrorKind::RangeError,
             format!("insertAt: lineNo {line_no} is out of range (max {max_line})"),
         ));
     }
@@ -842,14 +874,14 @@ pub fn edit_apply_edits(vm: &mut VM, args: Args) -> Result<Value, VMError> {
         let old = old_s.as_str();
         if old.is_empty() {
             return Err(vm.fail(
-                ErrorKind::ValueError,
+                ErrorKind::RangeError,
                 format!("applyEdits: edit[{i}].old is empty"),
             ));
         }
         let matches: Vec<usize> = text.match_indices(old).map(|(p, _)| p).collect();
         if matches.len() != 1 {
             return Err(vm.fail(
-                ErrorKind::ValueError,
+                ErrorKind::RangeError,
                 format!(
                     "applyEdits edit[{i}]: {}",
                     match_count_error(
@@ -863,7 +895,7 @@ pub fn edit_apply_edits(vm: &mut VM, args: Args) -> Result<Value, VMError> {
         }
         if let Some(why) = doubles_indentation(text, matches[0], old, new_s) {
             return Err(vm.fail(
-                ErrorKind::ValueError,
+                ErrorKind::RangeError,
                 format!("applyEdits edit[{i}]: {why}").as_str(),
             ));
         }
@@ -880,7 +912,7 @@ pub fn edit_apply_edits(vm: &mut VM, args: Args) -> Result<Value, VMError> {
         let (i2, _, e2, _) = w[1];
         if e2 > s1 {
             return Err(vm.fail(
-                ErrorKind::ValueError,
+                ErrorKind::RangeError,
                 format!(
                     "applyEdits: overlapping edits at indices {i2} and {i1} — \
                      spans must be disjoint"
@@ -907,7 +939,7 @@ fn parse_edits<'a>(vm: &'a VM, val: &'a Value) -> Result<Vec<(String, String)>, 
         Value::Array(p) => *p as usize,
         _ => {
             return Err(vm.fail(
-                ErrorKind::ValueError,
+                ErrorKind::TypeError,
                 "applyEdits: edits must be an array of { old, new } objects",
             ));
         }
@@ -923,7 +955,7 @@ fn parse_edits<'a>(vm: &'a VM, val: &'a Value) -> Result<Vec<(String, String)>, 
             Value::Object(p) => *p as usize,
             _ => {
                 return Err(vm.fail(
-                    ErrorKind::ValueError,
+                    ErrorKind::TypeError,
                     format!(
                         "applyEdits: edits[{i}] must be an object {{ old, new }}, got {elem:?}"
                     ),
@@ -943,7 +975,7 @@ fn parse_edits<'a>(vm: &'a VM, val: &'a Value) -> Result<Vec<(String, String)>, 
             })
             .ok_or_else(|| {
                 vm.fail(
-                    ErrorKind::ValueError,
+                    ErrorKind::TypeError,
                     format!("applyEdits: edits[{i}].old must be a string"),
                 )
             })?;
@@ -956,7 +988,7 @@ fn parse_edits<'a>(vm: &'a VM, val: &'a Value) -> Result<Vec<(String, String)>, 
             })
             .ok_or_else(|| {
                 vm.fail(
-                    ErrorKind::ValueError,
+                    ErrorKind::TypeError,
                     format!("applyEdits: edits[{i}].new must be a string"),
                 )
             })?;
@@ -988,10 +1020,10 @@ fn build_range_obj(vm: &mut VM, text: &str, start: usize, end: usize) -> Result<
 fn as_non_neg_usize(vm: &VM, val: &Value, label: &str) -> Result<usize, VMError> {
     let n = val
         .as_f64()
-        .ok_or_else(|| vm.fail(ErrorKind::ValueError, format!("{label} must be a number")))?;
+        .ok_or_else(|| vm.fail(ErrorKind::TypeError, format!("{label} must be a number")))?;
     if n < 0.0 || n.fract() != 0.0 {
         return Err(vm.fail(
-            ErrorKind::ValueError,
+            ErrorKind::RangeError,
             format!("{label} must be a non-negative integer, got {n}"),
         ));
     }
@@ -1099,7 +1131,7 @@ mod match_count_tests {
         let err = crate::testutil::run_runtime_err(&format!(
             "Edit.replaceOnce({src:?}, '@skip(\"x\")\\n    def t(self):', '    def t(self):');"
         ));
-        assert_eq!(err.kind, crate::ErrorKind::ValueError);
+        assert_eq!(err.kind, crate::ErrorKind::RangeError);
         assert!(
             err.message.contains("indented twice over"),
             "says what would happen: {}",
@@ -1234,13 +1266,13 @@ mod tests {
     #[test]
     fn replace_once_zero_matches_errors() {
         let kind = testutil::run_err_kind("return Edit.replaceOnce('hello', 'x', 'y');");
-        assert_eq!(kind, ErrorKind::ValueError);
+        assert_eq!(kind, ErrorKind::RangeError);
     }
 
     #[test]
     fn replace_once_multiple_matches_errors() {
         let kind = testutil::run_err_kind("return Edit.replaceOnce('xaxbx', 'x', 'y');");
-        assert_eq!(kind, ErrorKind::ValueError);
+        assert_eq!(kind, ErrorKind::RangeError);
     }
 
     #[test]
@@ -1252,7 +1284,7 @@ mod tests {
     #[test]
     fn replace_once_regexp_multiple_errors() {
         let kind = testutil::run_err_kind("return Edit.replaceOnce('a1 b2 c3', /\\d/, 'num');");
-        assert_eq!(kind, ErrorKind::ValueError);
+        assert_eq!(kind, ErrorKind::RangeError);
     }
 
     // ── replaceAll ──────────────────────────────────────────────────────
@@ -1315,13 +1347,13 @@ mod tests {
     #[test]
     fn extract_block_no_brace_errors() {
         let kind = testutil::run_err_kind("return Edit.extractBlock('hello', 0);");
-        assert_eq!(kind, ErrorKind::ValueError);
+        assert_eq!(kind, ErrorKind::RangeError);
     }
 
     #[test]
     fn extract_block_unbalanced_errors() {
         let kind = testutil::run_err_kind("return Edit.extractBlock('{ open', 0);");
-        assert_eq!(kind, ErrorKind::ValueError);
+        assert_eq!(kind, ErrorKind::SyntaxError);
     }
 
     // ── extractByIndent ─────────────────────────────────────────────────
@@ -1341,7 +1373,7 @@ mod tests {
     #[test]
     fn extract_by_indent_out_of_range_errors() {
         let kind = testutil::run_err_kind("return Edit.extractByIndent('a\\nb\\n', 5);");
-        assert_eq!(kind, ErrorKind::ValueError);
+        assert_eq!(kind, ErrorKind::RangeError);
     }
 
     // ── extractEnclosing ────────────────────────────────────────────────
@@ -1360,7 +1392,7 @@ mod tests {
     #[test]
     fn extract_enclosing_no_pair_errors() {
         let kind = testutil::run_err_kind("return Edit.extractEnclosing('hello', 2, '{', '}');");
-        assert_eq!(kind, ErrorKind::ValueError);
+        assert_eq!(kind, ErrorKind::RangeError);
     }
 
     /// **The error names the verb the caller wanted.** A live run held
@@ -1377,7 +1409,7 @@ mod tests {
             "const text = 'mod m {}\\nfn compact(a: u32) -> u32 { a }\\n';
              return Edit.extractEnclosing(text, text.indexOf('fn compact('), '{', '}');",
         );
-        assert_eq!(err.kind, ErrorKind::ValueError);
+        assert_eq!(err.kind, ErrorKind::RangeError);
         assert!(
             err.message.contains("Edit.extractBlock(text, "),
             "the message does not name the verb that works: {}",
@@ -1415,13 +1447,13 @@ mod tests {
     #[test]
     fn replace_lines_invalid_range_errors() {
         let kind = testutil::run_err_kind("return Edit.replaceLines('a\\nb\\n', 3, 2, 'x');");
-        assert_eq!(kind, ErrorKind::ValueError);
+        assert_eq!(kind, ErrorKind::RangeError);
     }
 
     #[test]
     fn replace_lines_out_of_range_errors() {
         let kind = testutil::run_err_kind("return Edit.replaceLines('a\\nb\\n', 99, 99, 'x');");
-        assert_eq!(kind, ErrorKind::ValueError);
+        assert_eq!(kind, ErrorKind::RangeError);
     }
 
     // ── insertAt ────────────────────────────────────────────────────────
@@ -1447,7 +1479,7 @@ mod tests {
     #[test]
     fn insert_at_out_of_range_errors() {
         let kind = testutil::run_err_kind("return Edit.insertAt('a\\nb\\n', 5, 'x');");
-        assert_eq!(kind, ErrorKind::ValueError);
+        assert_eq!(kind, ErrorKind::RangeError);
     }
 
     // ── applyEdits ──────────────────────────────────────────────────────
@@ -1473,7 +1505,7 @@ mod tests {
     fn apply_edits_ambiguous_errors() {
         let kind =
             testutil::run_err_kind("return Edit.applyEdits('x x', [{ old: 'x', new: 'y' }]);");
-        assert_eq!(kind, ErrorKind::ValueError);
+        assert_eq!(kind, ErrorKind::RangeError);
     }
 
     #[test]
@@ -1482,7 +1514,7 @@ mod tests {
             "return Edit.applyEdits('hello world', \
              [{ old: 'hello', new: 'hi' }, { old: 'ello', new: 'i' }]);",
         );
-        assert_eq!(kind, ErrorKind::ValueError);
+        assert_eq!(kind, ErrorKind::RangeError);
     }
 
     // ── arity / lint parity ─────────────────────────────────────────────
