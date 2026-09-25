@@ -74,6 +74,7 @@ pub(crate) use map::map_ctor;
 pub(crate) use number::number_ctor;
 pub(crate) use number::number_to_fixed;
 pub(crate) use object::error_ctor;
+pub(crate) use object::eval_error_ctor;
 pub(crate) use object::obj_create;
 pub(crate) use object::obj_freeze;
 pub(crate) use object::obj_is_extensible;
@@ -82,6 +83,11 @@ pub(crate) use object::obj_is_sealed;
 pub(crate) use object::obj_prevent_extensions;
 pub(crate) use object::obj_seal;
 pub(crate) use object::object_ctor;
+pub(crate) use object::range_error_ctor;
+pub(crate) use object::reference_error_ctor;
+pub(crate) use object::syntax_error_ctor;
+pub(crate) use object::type_error_ctor;
+pub(crate) use object::value_error_ctor;
 pub(crate) use regexp::regexp_ctor;
 pub(crate) use set::set_ctor;
 pub(crate) use string::string_ctor;
@@ -614,12 +620,24 @@ builtins! {
     StringCtor,  BuiltinKind::Constructor { type_tag: TypeTag::String },  "String",  1, 1,      string_ctor,  false, false, false, false, false, false, false, false, false, false;
     BooleanCtor, BuiltinKind::Constructor { type_tag: TypeTag::Boolean }, "Boolean", 1, 1,      boolean_ctor, false, false, false, false, false, false, false, false, false, false;
     FunctionCtor,BuiltinKind::Constructor { type_tag: TypeTag::Function },"Function",0, VARARG, function_ctor, false, false, false, false, false, false, false, false, false, false;
-    // `Error` is a constructor row so that `Error.prototype` is the object
-    // every error links to — `e instanceof Error` walks to it. The subclass
-    // names (`TypeError`, …) are not rows: there is one error prototype, and
-    // giving them all the same one would answer `e instanceof TypeError` true
-    // for a `RangeError`.
-    ErrorCtor,   BuiltinKind::Constructor { type_tag: TypeTag::Error },   "Error",   0, 1,      error_ctor,   false, false, false, false, false, false, false, false, false, false;
+    // One row per error class, so the *global* name resolves to a constructor
+    // whose `.prototype` is that class's own — which is what `instanceof`
+    // walks to. Each subclass prototype chains to `Error.prototype`
+    // (`VM::prototype_for`), so a type error answers `instanceof TypeError`
+    // and `instanceof Error` both, and `instanceof RangeError` not at all.
+    // A single shared row could only ever give all six the same answer.
+    //
+    // `ValueError` is **not a JS name**: it is this dialect's own, for the
+    // "right type, impossible value" raises JS has no name for, and it is the
+    // VM's second commonest kind. Omitting it would have left the error a
+    // program is likeliest to catch as the one with no class to test.
+    ErrorCtor,          BuiltinKind::Constructor { type_tag: TypeTag::Error },          "Error",          0, 1, error_ctor,           false, false, false, false, false, false, false, false, false, false;
+    TypeErrorCtor,      BuiltinKind::Constructor { type_tag: TypeTag::TypeError },      "TypeError",      0, 1, type_error_ctor,      false, false, false, false, false, false, false, false, false, false;
+    ValueErrorCtor,     BuiltinKind::Constructor { type_tag: TypeTag::ValueError },     "ValueError",     0, 1, value_error_ctor,     false, false, false, false, false, false, false, false, false, false;
+    RangeErrorCtor,     BuiltinKind::Constructor { type_tag: TypeTag::RangeError },     "RangeError",     0, 1, range_error_ctor,     false, false, false, false, false, false, false, false, false, false;
+    SyntaxErrorCtor,    BuiltinKind::Constructor { type_tag: TypeTag::SyntaxError },    "SyntaxError",    0, 1, syntax_error_ctor,    false, false, false, false, false, false, false, false, false, false;
+    ReferenceErrorCtor, BuiltinKind::Constructor { type_tag: TypeTag::ReferenceError }, "ReferenceError", 0, 1, reference_error_ctor, false, false, false, false, false, false, false, false, false, false;
+    EvalErrorCtor,      BuiltinKind::Constructor { type_tag: TypeTag::EvalError },      "EvalError",      0, 1, eval_error_ctor,      false, false, false, false, false, false, false, false, false, false;
 
     // ── ArrayBuffer ──
     ArrayBufferCtor,    BuiltinKind::Constructor { type_tag: TypeTag::ArrayBuffer },        "ArrayBuffer",        1, 1,      arraybuffer_ctor,      false, false, false, false, false, false, false, false, false, false;

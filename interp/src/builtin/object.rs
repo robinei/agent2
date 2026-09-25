@@ -1,4 +1,5 @@
 use crate::builtin::Args;
+use crate::vm::instr::TypeTag;
 use crate::vm::{ErrorKind, IntegrityLevel, JsString, ObjData, VM, VMError, Value};
 use indexmap::IndexMap;
 use thin_vec::ThinVec;
@@ -31,23 +32,45 @@ pub fn object_ctor(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     }
 }
 
-/// `Error(msg)` / `new Error(msg)` — the constructor, reached only when
-/// `Error` is called through a *value* (`const E = Error; E("x")`, or
-/// `Reflect`-ish reflection). The compiler lowers a literal `new Error(…)` /
-/// `Error(…)` to [`crate::vm::instr::Instr::ErrNew`] instead, which is where
-/// the subclass names (`TypeError`, …) get their `name` from.
+/// `Error(msg)` / `new Error(msg)` and one of these per error class — the
+/// constructor bodies, reached only when the class is called through a
+/// *value* (`const E = TypeError; E("x")`, or reflection). The compiler
+/// lowers a literal `new TypeError(…)` / `TypeError(…)` to
+/// [`crate::vm::instr::Instr::ErrNew`] instead.
 ///
-/// Exists so `Error` can be a real constructor row rather than an alias for
-/// the `Function` constructor: that alias is what made `Error.prototype` the
-/// *function* prototype and `e instanceof Error` false for every error.
-pub fn error_ctor(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+/// The `tag` is the class, and [`VM::alloc_error`] recovers it from the name
+/// — so a constructor and a VM raise of the same kind produce the same
+/// prototype, and there is no second place for the two to disagree.
+///
+/// Each class needs a registry row of its own, and a row needs its own
+/// handler: that is the whole reason for the per-name wrappers below rather
+/// than one function taking the name. Without them the global `TypeError`
+/// has no constructor to resolve to, and `e instanceof TypeError` is a
+/// `TypeError` about the right-hand side rather than an answer.
+fn error_construct(vm: &mut VM, args: Args, tag: TypeTag) -> Result<Value, VMError> {
     let message = match args.get(vm, 0) {
         // `new Error()` has no message, not the message `"undefined"`.
         Value::Undefined => JsString::from(""),
         other => vm.to_js_string(&other.clone(), 0),
     };
-    Ok(vm.alloc_error(JsString::from("Error"), message))
+    Ok(vm.alloc_error(JsString::from(tag.name()), message))
 }
+
+macro_rules! error_ctor {
+    ($fn_name:ident, $tag:ident) => {
+        pub fn $fn_name(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+            error_construct(vm, args, TypeTag::$tag)
+        }
+    };
+}
+
+error_ctor!(error_ctor, Error);
+error_ctor!(type_error_ctor, TypeError);
+error_ctor!(value_error_ctor, ValueError);
+error_ctor!(range_error_ctor, RangeError);
+error_ctor!(syntax_error_ctor, SyntaxError);
+error_ctor!(reference_error_ctor, ReferenceError);
+error_ctor!(eval_error_ctor, EvalError);
 
 /// `Object.keys(obj)` → array of own enumerable string keys. Step 2e: reads
 /// the unified own-prop snapshot, so it also enumerates a **function's** user

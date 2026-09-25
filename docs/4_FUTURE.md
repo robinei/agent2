@@ -81,6 +81,16 @@ branches on `kind` yet. (Uncaught program throws already have their own
 `UncaughtException` kind, carrying the thrown value in `VMError::payload` —
 that split was structural, not cosmetic, and is done.)
 
+**Answered differently, 2026-09-25.** `ValueError` kept its name and
+gained a *class* instead (`docs/25_JS_DIALECT.md` §25.4b): it is the
+second commonest kind a program can catch, so it got a global
+constructor and a prototype alongside the JS-named ones rather than
+being split across `RangeError`/`SyntaxError`. A program can now branch
+on it with `instanceof` as well as `e.name`. Splitting the raise sites
+is still open on its own merits — a `JSON.parse` failure arguably *is*
+a `SyntaxError` — but it is now a question about which name fits each
+site, not about whether the name is usable.
+
 **Stdlib lang-items: move `Error`/`TypeError`/… into the prelude as classes
 (post-Phase-13).** Once Phase 13's `class` (Step 7) and `instanceof` (Step 8)
 land, the `new Error` compiler special-form (`compile_error_ctor` → bare
@@ -92,12 +102,17 @@ land, the `new Error` compiler special-form (`compile_error_ctor` → bare
 chain, and `class AppError extends Error {}` falls out of Step 7b. This subsumes
 the JS-named-error-kinds note above (the names become real subclasses).
 
-**Partly overtaken, 2026-09-25.** The `instanceof Error` half landed without
-prelude classes: `TypeTag::Error` gives errors a real `Error.prototype`, and
-`VM::alloc_error` is the single builder every source goes through (see
-`docs/25_JS_DIALECT.md` §25.4). What prelude classes would still buy is the
-*hierarchy* — `e instanceof TypeError`, and `class AppError extends Error {}`
-— which one shared prototype cannot express.
+**Mostly overtaken, 2026-09-25.** Both halves landed without prelude
+classes. `TypeTag::Error` gives errors a real `Error.prototype` and
+`VM::alloc_error` is the single builder every source goes through
+(§25.4); then each error *name* got its own `TypeTag`, constructor row and
+prototype chaining to `Error.prototype` (§25.4b), so `e instanceof
+TypeError` works through the ordinary proto walk. `ValueError` is one of
+the classes — the JS-named-error-kinds note above is answered by giving
+this dialect's own name a class rather than by renaming its raise sites.
+What prelude classes would still buy is a *user-written* subclass —
+`class AppError extends Error {}` — which falls out of Step 7b, not out
+of the builtin table.
 The link from library entity to VM-internal concept is a **lang-item**
 mechanism (cf. Rust `#[lang = "…"]`, Swift's underscored attributes, the JVM's
 well-known classes): a fixed table of slots (`Error`, `TypeError`, …) that the

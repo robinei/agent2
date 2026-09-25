@@ -904,9 +904,16 @@ together.
   Error instances were plain `Object`s with no `Error.prototype` link, so they
   could not be told from a `{name, message}` object. There is now a
   `TypeTag::Error` prototype that every error links to (`VM::alloc_error`), and
-  the link is also what string coercion reads to render `"TypeError: …"`. Still
-  unsupported: `instanceof TypeError`, since the six error names share the one
-  prototype.
+  the link is also what string coercion reads to render `"TypeError: …"`.
+  Later the same day the *classes* landed too (`docs/25_JS_DIALECT.md`
+  §25.4b): each name in `TypeTag::ERRORS` — `Error`, `TypeError`,
+  `ValueError`, `RangeError`, `SyntaxError`, `ReferenceError`, `EvalError` —
+  has a constructor row and a prototype chaining to `Error.prototype`, so
+  `e instanceof TypeError` is true of a type error, `e instanceof Error` is
+  true of it as well, and `e instanceof RangeError` is false. `ValueError`
+  is not a JS name; it is this dialect's own, and is included because it is
+  the second commonest kind the VM raises. Still unsupported: a
+  user-written `class AppError extends Error {}`, which needs Step 7b.
 - **`Object.getPrototypeOf(obj)`** — namespace builtin. Returns `obj`'s
   `[[Prototype]]` as `Value::Object(proto_ptr)`, or **`Value::Null`** when `proto`
   is `None` (plain objects have no proto here — a divergence from JS's

@@ -289,6 +289,13 @@ fn every_worked_example_compiles() {
 /// out of the card rather than restating it, so a row added to the
 /// card is a row this checks, and a row this cannot parse is a row the
 /// card has written in some shape a reader will not recognise either.
+///
+/// It is down to one row. The other was `e instanceof TypeError` →
+/// `false`, true while every error shared one `Error` prototype; the
+/// error classes are real as of 2026-09-25, so the row described a
+/// divergence that no longer exists and came out. A row that stops
+/// being true is deleted, not corrected to say the same thing more
+/// weakly — the table is for what a reader would otherwise get wrong.
 #[test]
 fn the_dialect_table_says_what_the_interpreter_does() {
     let card = active().text.clone();
@@ -304,7 +311,7 @@ fn the_dialect_table_says_what_the_interpreter_does() {
             Some((un(cells.first()?), un(cells.get(1)?)))
         })
         .collect();
-    assert_eq!(rows.len(), 2, "the table's rows parsed: {rows:?}");
+    assert_eq!(rows.len(), 1, "the table's rows parsed: {rows:?}");
 
     for (expr, expected) in rows {
         // `e` is the card's own word for a caught error, and one row is
@@ -346,7 +353,7 @@ fn every_promise_above_the_tools_is_named_as_one() {
         .split_once("## What you can call")
         .expect("the declaration block")
         .1
-        .split_once("## Two places")
+        .split_once("## One place")
         .expect("and its end")
         .0;
     let promised: Vec<&str> = decls
@@ -1020,7 +1027,7 @@ mod tests {
         // `card()` shows up as a diff review must look at, not a byte
         // count that silently drifts. Comparing full text (not just a
         // hash) so the diff itself is legible in a failure message.
-        const EXPECTED_LEN: usize = 25570;
+        const EXPECTED_LEN: usize = 25394;
         assert_eq!(
             card().len(),
             EXPECTED_LEN,

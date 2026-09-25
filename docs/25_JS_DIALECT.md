@@ -200,11 +200,61 @@ Gate, met: `try { null.x } catch (e) { return e instanceof Error }` is
 subclass machinery was added. test262 moved 14 tests Fail → Pass (6 of
 them `Error/prototype/toString`) and none the other way.
 
-What is **not** closed: there is one error prototype, not one per name,
-so `e instanceof TypeError` is `false` — including for a `TypeError`.
-That is the card's remaining dialect row, and `e.name` is still the way
-to tell errors apart. Closing it is the prelude-classes plan in
-`docs/4_FUTURE.md`.
+## 25.4b — the error *classes* — **done, 2026-09-25**
+
+25.4 left one prototype for every name, so `e instanceof TypeError` was
+`false` — including of a `TypeError`. A program that wanted to treat a
+bad value differently from a bad type had `e.name` and nothing else,
+and the one thing `instanceof` could tell it was that an error was an
+error.
+
+Each name is now its own class: a `TypeTag`, a constructor row, and a
+prototype chaining to `Error.prototype`, which chains to
+`Object.prototype`. That two-rung chain is the hierarchy — a type error
+is `instanceof TypeError` and `instanceof Error` both, and `instanceof
+RangeError` not at all. `TypeTag::ERRORS` is the one list; the registry
+rows, `VM::alloc_error`'s name → class mapping and the compiler's
+`is_error_ctor` all read it, so a name cannot get a global without also
+getting the prototype that answers for it.
+
+**`ValueError` is in the set, and is not a JS name.** It is this
+dialect's own kind for "right type, impossible value" (`JSON.parse` of a
+truncated document, an out-of-range index), and of the three kinds a
+program can actually catch — `fail()` raises only `TypeError`,
+`ValueError` and `ReferenceError` resumably; everything else ends the
+program — it is the second commonest, 164 raise sites against 243 for
+`TypeError`. Omitting it would have left the error a program is
+likeliest to catch as the one with no class to test for, which is the
+opposite of the point. It is a deliberate dialect addition, with a
+global constructor like the rest.
+
+`ToolError` deliberately gets no class. It is the harness's concept
+(`agent/src/machine.rs`), and `interp` should not learn the name of
+something the harness invented; it stays `instanceof Error` and
+branchable on `e.name`, which is what `alloc_error`'s default arm is
+for.
+
+Gate, met: each source is `instanceof` its own class and `Error`; a
+`TypeError` is not a `RangeError`; `` `${e}` `` is still `name:
+message`; `{ name, message }` is still `[object Object]`;
+`Object.keys(err)` is still `["name","message"]`; every class prototype
+is empty.
+
+test262 moved **996 Fail → Pass** and **6 Pass → Fail** (8388 → 9378
+pass). The 996 are `assert.throws(TypeError, …)` and its siblings:
+`assert.throws` compares `thrown.constructor !== expectedErrorConstructor`
+by *identity*, so while every error's `.constructor` was `Error` it
+matched only `assert.throws(Error, …)`. The 6 are the same identity
+check losing a false pass — each is a test for a feature this dialect
+does not have (`Array.prototype.forEach.call`,
+`Map.prototype.getOrInsertComputed`, `Number.prototype.toLocaleString`),
+which raises `TypeError: cannot call a undefined as a function`, and
+which `assert.throws(Error, …)` used to accept because *every* error's
+constructor was `Error`. They passed while testing nothing; they now
+fail for the reason they should always have failed.
+
+The card's second dialect row is gone with this — there is no
+divergence left to warn about — leaving one (`1 < "2"`).
 
 ## 25.5 — Nothing built stays unmentioned
 

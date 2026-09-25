@@ -1369,10 +1369,16 @@ fn error_is_a_constructor_not_the_function_constructor() {
         run_ret(r#"return new Error("x").constructor.name;"#),
         json!("Error")
     );
+    // A type error's immediate prototype is `TypeError.prototype`, which
+    // chains to `Error.prototype` — the rung that carries the hierarchy.
     assert_eq!(
         run_ret(
-            "try { null.y; } catch (e) { return Object.getPrototypeOf(e) === Error.prototype; }"
+            "try { null.y; } catch (e) { return Object.getPrototypeOf(e) === TypeError.prototype; }"
         ),
+        json!(true)
+    );
+    assert_eq!(
+        run_ret("return Object.getPrototypeOf(TypeError.prototype) === Error.prototype;"),
         json!(true)
     );
     // Called through a value (not the compiler's literal-name fast path),
@@ -1385,4 +1391,174 @@ fn error_is_a_constructor_not_the_function_constructor() {
         run_ret(r#"const E = Error; return `${E("x")}`;"#),
         json!("Error: x")
     );
+}
+
+// ── the error classes ────────────────────────────────────────────────
+//
+// Added 2026-09-25, the day after every error became an `Error`. That
+// change gave them all *one* prototype, so `e instanceof TypeError` was
+// false even of a type error: a program that wanted to handle a bad
+// value differently from a bad type had nothing to branch on but
+// `e.name`. Each test below fails with the single shared prototype.
+
+#[test]
+fn an_error_is_an_instance_of_its_own_class_and_of_error() {
+    // A VM raise, and the class it names:
+    assert_eq!(
+        run_ret(
+            "try { null.y; } catch (e) { return [e instanceof TypeError, e instanceof Error]; }"
+        ),
+        json!([true, true])
+    );
+    // `ValueError` is this dialect's own kind, and the second commonest
+    // one the VM raises — `JSON.parse` of a truncated document is one.
+    assert_eq!(
+        run_ret(
+            r#"try { JSON.parse("{"); } catch (e) { return [e.name, e instanceof ValueError, e instanceof Error]; }"#
+        ),
+        json!(["ValueError", true, true])
+    );
+    // A `ReferenceError` from an undeclared name, the third resumable kind.
+    assert_eq!(
+        run_ret(
+            "try { nope(); } catch (e) { return [e instanceof ReferenceError, e instanceof Error]; }"
+        ),
+        json!([true, true])
+    );
+    // Constructed, with `new` and without, and through a value (which
+    // takes the registry row rather than the compiler's `ErrNew` path).
+    assert_eq!(
+        run_ret(
+            r#"return [new RangeError("x") instanceof RangeError, new RangeError("x") instanceof Error];"#
+        ),
+        json!([true, true])
+    );
+    assert_eq!(
+        run_ret(
+            r#"return [SyntaxError("x") instanceof SyntaxError, EvalError("x") instanceof EvalError];"#
+        ),
+        json!([true, true])
+    );
+    assert_eq!(
+        run_ret(r#"const E = ValueError; return [E("x") instanceof ValueError, `${E("x")}`];"#),
+        json!([true, "ValueError: x"])
+    );
+    // And thrown-then-caught, which is the shape that actually matters.
+    assert_eq!(
+        run_ret(
+            r#"try { throw new RangeError("x"); } catch (e) { return e instanceof RangeError; }"#
+        ),
+        json!(true)
+    );
+}
+
+#[test]
+fn the_classes_are_siblings_not_cousins() {
+    // **The assertion the whole change is for.** One shared prototype
+    // could only answer every `instanceof` the same way; if these were
+    // true, branching per class would take the first arm every time and
+    // a program handling `RangeError` would swallow type errors with it.
+    assert_eq!(
+        run_ret(r#"return new TypeError("x") instanceof RangeError;"#),
+        json!(false)
+    );
+    assert_eq!(
+        run_ret(r#"return new ValueError("x") instanceof TypeError;"#),
+        json!(false)
+    );
+    assert_eq!(
+        run_ret("try { null.y; } catch (e) { return e instanceof ValueError; }"),
+        json!(false)
+    );
+    // The base class is not an instance of its subclasses either — the
+    // chain runs one way.
+    assert_eq!(
+        run_ret(r#"return new Error("x") instanceof TypeError;"#),
+        json!(false)
+    );
+}
+
+#[test]
+fn value_error_is_a_class_though_it_is_not_a_js_name() {
+    // A deliberate dialect addition. `ValueError` is what this VM raises
+    // for "right type, impossible value", and it is the second commonest
+    // kind a program can catch — so leaving it classless would have made
+    // the likeliest error the one `instanceof` could not answer for.
+    assert_eq!(run_ret("return typeof ValueError;"), json!("function"));
+    assert_eq!(
+        run_ret(r#"return [new ValueError("x").name, `${new ValueError("x")}`];"#),
+        json!(["ValueError", "ValueError: x"])
+    );
+    assert_eq!(
+        run_ret(r#"return new ValueError("x").constructor === ValueError;"#),
+        json!(true)
+    );
+}
+
+#[test]
+fn a_subclass_changes_nothing_a_program_already_reads() {
+    // `e.name` is the idiom in use (82 reads across the reply corpus,
+    // against two `instanceof`s). The classes are added *beside* it —
+    // every one of these answered the same way before the change.
+    assert_eq!(
+        run_ret("try { null.y; } catch (e) { return e.name; }"),
+        json!("TypeError")
+    );
+    assert_eq!(
+        run_ret(r#"return Object.keys(new RangeError("x"));"#),
+        json!(["name", "message"])
+    );
+    assert_eq!(
+        run_ret(r#"return JSON.stringify(new ValueError("x"));"#),
+        json!(r#"{"name":"ValueError","message":"x"}"#)
+    );
+    assert_eq!(
+        run_ret(r#"return `${new TypeError("m")}`;"#),
+        json!("TypeError: m")
+    );
+    // The shape is still not what makes an error: a record with the same
+    // two fields is a record.
+    assert_eq!(
+        run_ret(
+            r#"return [({ name: "TypeError", message: "y" }) instanceof TypeError, `${{ name: "TypeError", message: "y" }}`];"#
+        ),
+        json!([false, "[object Object]"])
+    );
+}
+
+#[test]
+fn every_class_prototype_is_empty() {
+    // The prototypes carry no own properties — their methods are virtual
+    // rungs from the builtin registry — so six new prototypes add nothing
+    // to a `for-in` or an `Object.keys` anywhere.
+    for name in [
+        "Error",
+        "TypeError",
+        "ValueError",
+        "RangeError",
+        "SyntaxError",
+        "ReferenceError",
+        "EvalError",
+    ] {
+        assert_eq!(
+            run_ret(&format!("return Object.keys({name}.prototype);")),
+            json!([]),
+            "{name}.prototype has own keys"
+        );
+        // …and each one is a rung below `Error.prototype`, which is a rung
+        // below `Object.prototype`. That two-rung chain is the hierarchy.
+        let expected = if name == "Error" { "Object" } else { "Error" };
+        assert_eq!(
+            run_ret(&format!(
+                "return Object.getPrototypeOf({name}.prototype) === {expected}.prototype;"
+            )),
+            json!(true),
+            "{name}.prototype does not chain to {expected}.prototype"
+        );
+        assert_eq!(
+            run_ret(&format!(r#"return new {name}("x") instanceof Object;"#)),
+            json!(true),
+            "a {name} is not an Object"
+        );
+    }
 }

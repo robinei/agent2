@@ -413,24 +413,28 @@ pub(crate) enum ConstVal {
     PosInt(u64),
 }
 
-/// The standard error constructor names recognized by `new` and by a plain
-/// call. Each lowers to [`Instr::ErrNew`], which builds `{ name, message }`
-/// linked to the one `Error.prototype` — so every one of them is `instanceof
-/// Error` and stringifies as `"TypeError: …"`.
+/// The error constructor names recognized by `new` and by a plain call. Each
+/// lowers to [`Instr::ErrNew`], which writes the name and links the object to
+/// *that name's* prototype — so `new TypeError("x")` is `instanceof
+/// TypeError`, `instanceof Error`, and not `instanceof RangeError`, and
+/// stringifies as `"TypeError: x"`.
 ///
-/// **This used to say there were no error prototypes at all.** A caught error
-/// was a bare object literal, so `catch (e) { if (e instanceof Error) … }` —
-/// which is what defensive JavaScript looks like everywhere else — took the
-/// wrong branch without a word, and `` `${e}` `` logged `[object Object]`
-/// instead of the message. There is still no error *class hierarchy*: the six
-/// names differ only in the `name` field they write, so `e instanceof
-/// TypeError` is not a question this dialect can answer and `e.name` remains
-/// the way to tell one error from another.
+/// **This used to say there was one shared prototype and no hierarchy.** The
+/// classes are real now: [`TypeTag::ERRORS`](crate::vm::instr::TypeTag::ERRORS)
+/// is the list, each has a registry row and a prototype chaining to
+/// `Error.prototype`, and this function must agree with it — a name accepted
+/// here but absent there would compile to an `ErrNew` that falls back to the
+/// base class, so `new Foo("x") instanceof Foo` would be false with nothing
+/// said.
+///
+/// `ValueError` is in the list and is **not a JS name**: it is this dialect's
+/// own kind for "right type, impossible value", and the VM's second commonest
+/// raise. A model that writes `catch (e) { if (e instanceof ValueError) … }`
+/// against it gets an answer rather than a `ReferenceError`.
 fn is_error_ctor(name: &str) -> bool {
-    matches!(
-        name,
-        "Error" | "TypeError" | "RangeError" | "SyntaxError" | "ReferenceError" | "EvalError"
-    )
+    crate::vm::instr::TypeTag::ERRORS
+        .iter()
+        .any(|t| t.name() == name)
 }
 
 /// Build a flags string (e.g. `"gi"`) from an oxc [`RegExpFlags`] bitmask.

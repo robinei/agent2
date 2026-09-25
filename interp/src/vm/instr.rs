@@ -170,6 +170,28 @@ pub enum TypeTag {
     /// Added last so the existing tags keep their discriminants (the
     /// prototype side table is indexed by `tag as usize`).
     Error,
+    // The error *subclasses*. Each is its own tag purely so it gets its own
+    // prototype in the side table: `TypeError.prototype` chains to
+    // `Error.prototype` (see `VM::prototype_for`), which is what makes
+    // `e instanceof TypeError` true of a type error, `e instanceof Error`
+    // true of it as well, and `e instanceof RangeError` false — siblings,
+    // not cousins. One shared prototype could only answer all three the
+    // same way, and a program that branches per kind would have taken the
+    // first arm every time.
+    //
+    // Appended, again, so the tags above keep their discriminants.
+    TypeError,
+    /// **Not a JS error name — a deliberate addition to this dialect.** The
+    /// VM raises `ValueError` more than any other kind except `TypeError`
+    /// (164 sites against 243), for the "right type, impossible value" cases
+    /// JS has no name for. Leaving it out would have left the *commonest*
+    /// catchable error the one with no class to test for, which is the
+    /// opposite of the point.
+    ValueError,
+    RangeError,
+    SyntaxError,
+    ReferenceError,
+    EvalError,
 }
 
 impl TypeTag {
@@ -177,7 +199,7 @@ impl TypeTag {
     /// "what type tags exist" — iterate this instead of hand-listing variants
     /// or mapping side-table indices back to tags by literal number (which
     /// silently breaks if the enum is reordered). `COUNT` is derived from it.
-    pub const ALL: [TypeTag; 23] = [
+    pub const ALL: [TypeTag; 29] = [
         TypeTag::Array,
         TypeTag::Object,
         TypeTag::Map,
@@ -201,10 +223,68 @@ impl TypeTag {
         TypeTag::BigUint64Array,
         TypeTag::DataView,
         TypeTag::Error,
+        TypeTag::TypeError,
+        TypeTag::ValueError,
+        TypeTag::RangeError,
+        TypeTag::SyntaxError,
+        TypeTag::ReferenceError,
+        TypeTag::EvalError,
     ];
 
     /// Number of variants — sizes the prototype side table.
     pub const COUNT: usize = Self::ALL.len();
+
+    /// Every error class, base first. The single source of truth for "what
+    /// error names have a class": the registry's constructor rows, the
+    /// `name` → tag mapping in [`crate::vm::VM::alloc_error`], and the
+    /// prototype chaining in [`crate::vm::VM::prototype_for`] all read it,
+    /// so a name cannot get a global constructor without also getting the
+    /// prototype that makes `instanceof` answer for it.
+    ///
+    /// `Error` is first because the rest chain to it — and because
+    /// [`Self::error_tag_for_name`] scans this list, so `Error`'s own lookup
+    /// is the one that costs least.
+    pub const ERRORS: [TypeTag; 7] = [
+        TypeTag::Error,
+        TypeTag::TypeError,
+        TypeTag::ValueError,
+        TypeTag::RangeError,
+        TypeTag::SyntaxError,
+        TypeTag::ReferenceError,
+        TypeTag::EvalError,
+    ];
+
+    /// Is this tag one of the error classes (base or subclass)?
+    pub const fn is_error(self) -> bool {
+        matches!(
+            self,
+            TypeTag::Error
+                | TypeTag::TypeError
+                | TypeTag::ValueError
+                | TypeTag::RangeError
+                | TypeTag::SyntaxError
+                | TypeTag::ReferenceError
+                | TypeTag::EvalError
+        )
+    }
+
+    /// The class for an error's `name` field, defaulting to `Error`.
+    ///
+    /// **The default is not a fallback nobody hits**, though it is a narrower
+    /// job than it looks. Of the VM's own kinds only `TypeError`,
+    /// `ValueError` and `ReferenceError` are raised resumably (see
+    /// `VM::fail`'s match on `ResumeMode`) — the rest are invariant
+    /// violations that end the program rather than becoming a value, so they
+    /// never reach here. What does reach the default is the harness's
+    /// `"ToolError"`, a harness concept `interp` should not learn the name
+    /// of: it stays `instanceof Error`, catchable and branchable on
+    /// `e.name`, with no global to test it against.
+    pub fn error_tag_for_name(name: &(impl crate::js_string::NameEq + ?Sized)) -> TypeTag {
+        match Self::ERRORS.into_iter().find(|t| name.name_eq(t.name())) {
+            Some(tag) => tag,
+            None => TypeTag::Error,
+        }
+    }
 
     /// The JS constructor name for this type (`Array`, `Object`, …). The
     /// `BuiltinKind::Constructor { type_tag }` rows use this to derive their
@@ -236,6 +316,12 @@ impl TypeTag {
             TypeTag::BigUint64Array => "BigUint64Array",
             TypeTag::DataView => "DataView",
             TypeTag::Error => "Error",
+            TypeTag::TypeError => "TypeError",
+            TypeTag::ValueError => "ValueError",
+            TypeTag::RangeError => "RangeError",
+            TypeTag::SyntaxError => "SyntaxError",
+            TypeTag::ReferenceError => "ReferenceError",
+            TypeTag::EvalError => "EvalError",
         }
     }
 

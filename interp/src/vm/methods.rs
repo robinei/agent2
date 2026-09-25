@@ -1291,13 +1291,21 @@ impl VM {
     /// `["name", "message"]` and `JSON.stringify(e)` still round-trips);
     /// only the proto link marks it as an error.
     pub fn alloc_error(&mut self, name: JsString, message: JsString) -> Value {
+        // The `name` picks the class, so this one mapping serves all three
+        // sources at once: `error_to_thrown`'s `{:?}` of an `ErrorKind`
+        // (only ever `TypeError`/`ValueError`/`ReferenceError` — the other
+        // kinds are not resumable and end the program instead of becoming a
+        // value), the ctor name `Instr::ErrNew` carries from the compiler,
+        // and the harness's `"ToolError"`, which has no class and lands on
+        // the base.
+        let tag = crate::vm::instr::TypeTag::error_tag_for_name(&name);
         let mut map = IndexMap::new();
         map.insert(JsString::from("name"), Value::String(name));
         map.insert(JsString::from("message"), Value::String(message));
         // Compute `addr` AFTER `prototype_for` — it pushes to `self.objects`
         // when the prototype is not yet materialized, which would make an
         // earlier `addr` stale (the same trap `alloc_object` documents).
-        let proto = self.prototype_for(crate::vm::instr::TypeTag::Error).ok();
+        let proto = self.prototype_for(tag).ok();
         let addr = self.objects.len() as ObjectPtr;
         self.objects.push(ObjData {
             proto,
@@ -1648,10 +1656,24 @@ impl VM {
         // Object.prototype is the root: proto = None. Every other prototype
         // chains to it, so allocate it first (recursively, but the recursion
         // bottoms out immediately at the Object arm).
-        let proto = if matches!(tag, crate::vm::instr::TypeTag::Object) {
-            None
-        } else {
-            Some(self.prototype_for(crate::vm::instr::TypeTag::Object)?)
+        //
+        // The error subclasses are the one two-rung chain: `TypeError.prototype`
+        // → `Error.prototype` → `Object.prototype`. That middle rung is the
+        // whole error hierarchy — it is why a type error is `instanceof
+        // TypeError` *and* `instanceof Error` while not being `instanceof
+        // RangeError`. Chaining them straight to `Object.prototype` like
+        // everything else would have made `e instanceof Error` false for
+        // every error but a bare one, which is the silent wrong branch the
+        // `Error` prototype was added to close.
+        let proto = match tag {
+            crate::vm::instr::TypeTag::Object => None,
+            // `Error` itself is not a subclass of itself: it takes the
+            // ordinary `Object.prototype` rung, and the recursion below
+            // bottoms out there rather than looping.
+            t if t.is_error() && !matches!(t, crate::vm::instr::TypeTag::Error) => {
+                Some(self.prototype_for(crate::vm::instr::TypeTag::Error)?)
+            }
+            _ => Some(self.prototype_for(crate::vm::instr::TypeTag::Object)?),
         };
         let ptr = self.objects.len() as ObjectPtr;
         self.objects.push(ObjData {
@@ -1755,24 +1777,17 @@ impl VM {
         if let Some(b) = crate::builtin::Builtin::for_constructor(name) {
             return Ok(Value::Builtin(b));
         }
-        // `Error` itself is a real constructor row (`Builtin::ErrorCtor`) and
-        // resolved above, so `Error.prototype` is the prototype every error
-        // object links to and `e instanceof Error` walks to it. The *subclass*
-        // names below are still callable placeholders: there is one error
-        // prototype, so resolving `TypeError` to it would make every error
-        // `instanceof TypeError` — a wrong answer in place of today's
-        // uniformly-false one. They keep `typeof TypeError === "function"`
-        // (test262 checks it) while construction goes through the compiler's
-        // `new` path, and `e.name` stays the way to tell errors apart.
+        // Every error class — `Error` and each subclass — is a real
+        // constructor row, so all of them resolve above and each carries its
+        // own `.prototype`. They used to be listed here as aliases for the
+        // `Function` constructor, which kept `typeof TypeError === "function"`
+        // true (test262 checks it) at the price of making `e instanceof
+        // TypeError` walk to `Function.prototype` and miss. Nothing is left
+        // to alias.
         crate::match_wide!(name => {
             "undefined" => Ok(Value::Undefined),
             "NaN" => Ok(Value::Float(f64::NAN)),
             "Infinity" => Ok(Value::Float(f64::INFINITY)),
-            "TypeError" => Ok(Value::Builtin(crate::builtin::Builtin::FunctionCtor)),
-            "ReferenceError" => Ok(Value::Builtin(crate::builtin::Builtin::FunctionCtor)),
-            "SyntaxError" => Ok(Value::Builtin(crate::builtin::Builtin::FunctionCtor)),
-            "RangeError" => Ok(Value::Builtin(crate::builtin::Builtin::FunctionCtor)),
-            "EvalError" => Ok(Value::Builtin(crate::builtin::Builtin::FunctionCtor)),
             _ => Err(self.fail(
                 crate::vm::ErrorKind::ReferenceError,
                 format!("{name} is not defined"),
@@ -2010,7 +2025,19 @@ impl VM {
                 crate::builtin::biguint64array_ctor(self, args)?
             }
             crate::vm::instr::TypeTag::DataView => crate::builtin::dataview_ctor(self, args)?,
+            // Every error class shares one construction body; the class is
+            // the tag, which `alloc_error` recovers from the name it writes.
             crate::vm::instr::TypeTag::Error => crate::builtin::error_ctor(self, args)?,
+            crate::vm::instr::TypeTag::TypeError => crate::builtin::type_error_ctor(self, args)?,
+            crate::vm::instr::TypeTag::ValueError => crate::builtin::value_error_ctor(self, args)?,
+            crate::vm::instr::TypeTag::RangeError => crate::builtin::range_error_ctor(self, args)?,
+            crate::vm::instr::TypeTag::SyntaxError => {
+                crate::builtin::syntax_error_ctor(self, args)?
+            }
+            crate::vm::instr::TypeTag::ReferenceError => {
+                crate::builtin::reference_error_ctor(self, args)?
+            }
+            crate::vm::instr::TypeTag::EvalError => crate::builtin::eval_error_ctor(self, args)?,
         };
         self.stack.truncate(base);
         self.stack.push(result);
