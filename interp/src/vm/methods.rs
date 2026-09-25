@@ -104,23 +104,49 @@ impl VM {
         }
     }
 
-    /// Like `fail` but always sets `NotResumable`. For sites that error
-    /// before consuming all instruction operands (peek-style checks) and for
-    /// invariant violations (bad heap/cell pointers) where `fail`'s per-kind
-    /// default would wrongly mark the error resumable. See the Step 3 audit
-    /// table at `ResumeMode`.
-    pub fn fail_not_resumable(&self, kind: ErrorKind, msg: impl Into<String>) -> VMError {
+    /// The VM is broken: a dangling heap pointer, bytecode the compiler
+    /// should not have emitted, a host API called out of order. Neither
+    /// resumable nor catchable.
+    ///
+    /// **`kind` is a label here, not a classification.** Many of these sites
+    /// say `TypeError` or `ValueError` because that is what they said before
+    /// there was anywhere else to put them, and it does not matter: an
+    /// `InvariantViolation` never becomes a JS value, so no program ever
+    /// reads the name. What matters is that it does not reach a `catch` —
+    /// `fail`'s per-kind default would make a `ValueError` resumable *and*
+    /// catchable, and a program that swallowed a corrupt-heap report would
+    /// carry on over the wreckage.
+    pub fn fail_invariant(&self, kind: ErrorKind, msg: impl Into<String>) -> VMError {
         VMError {
             kind,
             ip: self.ip,
             message: msg.into(),
-            resume: ResumeMode::NotResumable,
+            resume: ResumeMode::InvariantViolation,
+            payload: None,
+        }
+    }
+
+    /// A language error the host cannot resume, because the failed
+    /// instruction consumed nothing and so owes the stack no result — but
+    /// an ordinary error to the *program*, which may `catch` it.
+    ///
+    /// The whole population is `IncLocal` (`x++`/`x--`), which reads its
+    /// local by peek, and `Throw` with no handler, which owes a statement
+    /// no value. Both were `NotResumable` and therefore uncatchable, and
+    /// for `IncLocal` that meant `try { x--; } catch (e) {}` around a
+    /// non-number died uncaught.
+    pub fn fail_no_result_slot(&self, kind: ErrorKind, msg: impl Into<String>) -> VMError {
+        VMError {
+            kind,
+            ip: self.ip,
+            message: msg.into(),
+            resume: ResumeMode::NoResultSlot,
             payload: None,
         }
     }
 
     /// Construct an error at the current instruction pointer. Every runtime
-    /// error site goes through this (or `fail_not_resumable` / the static
+    /// error site goes through this (or `fail_invariant` / the static
     /// `VMError::fail_at`) so `ip` and `resume` are captured consistently.
     /// A type error that says what it wanted and what it got.
     ///
@@ -153,28 +179,27 @@ impl VM {
             | ErrorKind::BadCall
             | ErrorKind::BadAlloc
             | ErrorKind::BadArg
-            | ErrorKind::BadLocal => ResumeMode::NotResumable,
-            // TypeError / ValueError: most sites pop operands first (macros,
-            // take_args, check_arity!). Default to PushValueThenContinue;
-            // specific sites that error before popping override below.
+            | ErrorKind::BadLocal => ResumeMode::InvariantViolation,
+            // The language kinds: most sites pop their operands first
+            // (macros, take_args, check_arity!), so the default is
+            // resumable. A site that errors before popping overrides with
+            // `fail_no_result_slot`, and a corrupt-heap check with
+            // `fail_invariant` — the kind alone cannot tell them apart,
+            // which is why those two constructors exist.
             ErrorKind::TypeError
             | ErrorKind::ValueError
             | ErrorKind::ReferenceError
-            // `RangeError`/`SyntaxError` were `ValueError` until they were
-            // split out, and they are raised from the same sites by the
-            // same macros — so they keep the same default. A kind that is
-            // catchable and a kind that is resumable have to be listed
-            // together here while one match answers both questions.
             | ErrorKind::RangeError
-            | ErrorKind::SyntaxError => {
-                ResumeMode::PushValueThenContinue
-            }
+            | ErrorKind::SyntaxError => ResumeMode::Resumable,
             // An escaped program-level throw: the operand was consumed, but
-            // a `throw` has no result slot a substituted value could fill.
-            ErrorKind::UncaughtException => ResumeMode::NotResumable,
+            // a `throw` owes the stack no result a substituted value could
+            // fill. Catchable in principle and never caught in fact — it is
+            // built only once the handler search has already failed.
+            ErrorKind::UncaughtException => ResumeMode::NoResultSlot,
             // Circular awaits: every strand is parked, so there is no
-            // execution state a substituted value could resume.
-            ErrorKind::Deadlock => ResumeMode::NotResumable,
+            // execution state a substituted value could resume — and none
+            // for a `catch` to continue into either.
+            ErrorKind::Deadlock => ResumeMode::InvariantViolation,
         };
         VMError {
             kind,
@@ -239,7 +264,7 @@ impl VM {
     /// because pushing there would corrupt the frame it landed in.
     pub fn push_settled(&mut self, value: Value) -> Result<(), VMError> {
         if !self.settling {
-            return Err(self.fail_not_resumable(
+            return Err(self.fail_invariant(
                 ErrorKind::BadArg,
                 "push_settled without an outstanding Settle",
             ));
@@ -271,7 +296,7 @@ impl VM {
     /// throw ends the program before another instruction runs.
     pub fn settle_throw(&mut self, errval: Value) -> Result<ThrowOutcome, VMError> {
         if !self.settling {
-            return Err(self.fail_not_resumable(
+            return Err(self.fail_invariant(
                 ErrorKind::BadArg,
                 "settle_throw without an outstanding Settle",
             ));
@@ -391,16 +416,19 @@ impl VM {
         format!("uncaught exception: {}", self.preview(value))
     }
 
-    /// Apply the resume fixup for a PushValueThenContinue error:
-    /// push `value`, advance ip past the failed instruction.
-    /// Errors if this error's resume mode is not `PushValueThenContinue`.
+    /// Apply the resume fixup for a [`ResumeMode::Resumable`] error: push
+    /// `value`, advance ip past the failed instruction.
+    ///
+    /// Errors for the other two modes, and for different reasons — a
+    /// `NoResultSlot` error has nowhere to put the value, an
+    /// `InvariantViolation` has nothing trustworthy to continue on.
     pub fn resume_with(&mut self, e: &VMError, value: Value) -> Result<(), VMError> {
-        if !matches!(e.resume, ResumeMode::PushValueThenContinue) {
+        if !e.resume.is_resumable() {
             return Err(self.fail(
                 ErrorKind::BadArg,
                 format!(
-                    "cannot resume: error {:?} is not PushValueThenContinue",
-                    e.kind
+                    "cannot resume: error {:?} is {:?}, not Resumable",
+                    e.kind, e.resume
                 ),
             ));
         }
@@ -801,22 +829,21 @@ impl VM {
             PromiseState::Resolved(v) => ResumePayload::Resolved(v.clone()),
             PromiseState::Rejected(v) => ResumePayload::Rejected(v.clone()),
             PromiseState::Pending { .. } => {
-                return Err(self
-                    .fail_not_resumable(ErrorKind::BadArg, "cannot settle a promise to Pending"));
+                return Err(
+                    self.fail_invariant(ErrorKind::BadArg, "cannot settle a promise to Pending")
+                );
             }
         };
         match self.promises.get(id as usize) {
             Some(PromiseState::Pending { .. }) => {}
             Some(_) => {
-                return Err(self.fail_not_resumable(
+                return Err(self.fail_invariant(
                     ErrorKind::BadArg,
                     format!("promise {id} is already settled"),
                 ));
             }
             None => {
-                return Err(
-                    self.fail_not_resumable(ErrorKind::BadArg, format!("bad promise id {id}"))
-                );
+                return Err(self.fail_invariant(ErrorKind::BadArg, format!("bad promise id {id}")));
             }
         }
         let old = std::mem::replace(&mut self.promises[id as usize], settled);
@@ -896,7 +923,7 @@ impl VM {
                 Ok(())
             }
             Completion::Resumed(_) => self.schedule(),
-            Completion::Normal => Err(self.fail_not_resumable(
+            Completion::Normal => Err(self.fail_invariant(
                 ErrorKind::BadReturn,
                 "async exit from a frame that owns no promise",
             )),
@@ -929,7 +956,7 @@ impl VM {
         };
         let (promise, exit_as) = match entered_as {
             Completion::Normal => {
-                return Err(self.fail_not_resumable(
+                return Err(self.fail_invariant(
                     ErrorKind::BadReturn,
                     "cannot suspend a frame that is not async",
                 ));
@@ -996,7 +1023,7 @@ impl VM {
             Some(PromiseState::Pending { waiters }) => waiters.push(cont_id),
             _ => {
                 return Err(
-                    self.fail_not_resumable(ErrorKind::ValueError, "bad awaited promise pointer")
+                    self.fail_invariant(ErrorKind::ValueError, "bad awaited promise pointer")
                 );
             }
         }
@@ -1032,10 +1059,8 @@ impl VM {
                         continue 'next;
                     }
                     None => {
-                        return Err(self.fail_not_resumable(
-                            ErrorKind::ValueError,
-                            "bad adopted promise pointer",
-                        ));
+                        return Err(self
+                            .fail_invariant(ErrorKind::ValueError, "bad adopted promise pointer"));
                     }
                 }
             }
@@ -1044,10 +1069,7 @@ impl VM {
                 .get_mut(id as usize)
                 .and_then(Option::take)
                 .ok_or_else(|| {
-                    self.fail_not_resumable(
-                        ErrorKind::ValueError,
-                        format!("bad continuation id {id}"),
-                    )
+                    self.fail_invariant(ErrorKind::ValueError, format!("bad continuation id {id}"))
                 })?;
             // A rejection arriving at a frame with no handler around its
             // await needs no frame materialization: the rejection
@@ -1121,9 +1143,7 @@ impl VM {
     /// region or a caller this throw must not reach.
     pub(super) fn reject_strand(&mut self, errval: Value) -> Result<(), VMError> {
         let Some(base) = self.strand_base() else {
-            return Err(
-                self.fail_not_resumable(ErrorKind::BadReturn, "reject_strand outside a strand")
-            );
+            return Err(self.fail_invariant(ErrorKind::BadReturn, "reject_strand outside a strand"));
         };
         let (completion, return_addr, prev_fp, reclaim_below) = {
             let f = &self.callstack[base];
@@ -1391,9 +1411,10 @@ impl VM {
     ) -> Result<Value, VMError> {
         let mut cur = obj_ptr;
         for _depth in 0..MAX_PROTO_DEPTH {
-            let obj = self.objects.get(cur as usize).ok_or_else(|| {
-                self.fail_not_resumable(ErrorKind::TypeError, "bad object pointer")
-            })?;
+            let obj = self
+                .objects
+                .get(cur as usize)
+                .ok_or_else(|| self.fail_invariant(ErrorKind::TypeError, "bad object pointer"))?;
             if let Some(v) = obj.map.get(field) {
                 return Ok(v.clone());
             }
@@ -1427,7 +1448,7 @@ impl VM {
                 Some(p) if p == target => return Ok(true),
                 Some(p) => {
                     let obj = self.objects.get(p as usize).ok_or_else(|| {
-                        self.fail_not_resumable(ErrorKind::TypeError, "bad object pointer")
+                        self.fail_invariant(ErrorKind::TypeError, "bad object pointer")
                     })?;
                     cur = obj.proto;
                 }
@@ -1849,7 +1870,7 @@ impl VM {
                 let arr = self
                     .arrays
                     .get(*p as usize)
-                    .ok_or_else(|| self.fail(ErrorKind::ValueError, "value error"))?;
+                    .ok_or_else(|| self.fail_invariant(ErrorKind::ValueError, "value error"))?;
                 Ok(Some(arr.iter().cloned().collect()))
             }
             Value::String(s) => Ok(Some(
@@ -1861,7 +1882,7 @@ impl VM {
                 let set = self
                     .sets
                     .get(*p as usize)
-                    .ok_or_else(|| self.fail(ErrorKind::ValueError, "value error"))?;
+                    .ok_or_else(|| self.fail_invariant(ErrorKind::ValueError, "value error"))?;
                 Ok(Some(set.iter().map(|k| k.0.clone()).collect()))
             }
             Value::Map(p) => {
@@ -1869,7 +1890,7 @@ impl VM {
                     let map = self
                         .maps
                         .get(*p as usize)
-                        .ok_or_else(|| self.fail(ErrorKind::ValueError, "value error"))?;
+                        .ok_or_else(|| self.fail_invariant(ErrorKind::ValueError, "value error"))?;
                     map.iter().map(|(k, v)| (k.0.clone(), v.clone())).collect()
                 };
                 let mut out = Vec::with_capacity(pairs.len());
@@ -1910,7 +1931,7 @@ impl VM {
                 let pair = self
                     .arrays
                     .get(pair_ptr as usize)
-                    .ok_or_else(|| self.fail(ErrorKind::ValueError, "value error"))?;
+                    .ok_or_else(|| self.fail_invariant(ErrorKind::ValueError, "value error"))?;
                 if pair.len() < 2 {
                     continue;
                 }
@@ -2337,7 +2358,13 @@ impl VM {
             // at those parent sites below); reaching here means it is the root
             // value, where JS.stringify returns the JS value `undefined` — no
             // JSON — so we surface an error rather than inventing one.
-            Value::Undefined => return Err(self.fail(ErrorKind::ValueError, "value error")),
+            Value::Undefined => {
+                return Err(self.fail(
+                    ErrorKind::ValueError,
+                    "cannot serialize undefined to JSON (it has no JSON form; \
+                     JSON.stringify returns undefined for it in JS)",
+                ));
+            }
             Value::Float(n) => {
                 // Preserve integer formatting when possible (f64-only VM
                 // internals, but JSON consumers care about int vs float).
@@ -2363,7 +2390,7 @@ impl VM {
                 let arr = self
                     .arrays
                     .get(*p as usize)
-                    .ok_or_else(|| self.fail(ErrorKind::ValueError, "value error"))?;
+                    .ok_or_else(|| self.fail_invariant(ErrorKind::ValueError, "value error"))?;
                 serde_json::Value::Array(
                     arr.iter()
                         .map(|v| match v {
@@ -2378,7 +2405,7 @@ impl VM {
                 let obj = self
                     .objects
                     .get(*p as usize)
-                    .ok_or_else(|| self.fail(ErrorKind::ValueError, "value error"))?;
+                    .ok_or_else(|| self.fail_invariant(ErrorKind::ValueError, "value error"))?;
                 // JSON boundary (guardrail 2): builtin prototypes and
                 // namespaces (Step 2a Part 2: `Math`, `JSON`) are reflective
                 // artifacts with no JSON form, unlike a user
@@ -2410,7 +2437,7 @@ impl VM {
                 let map = self
                     .maps
                     .get(*p as usize)
-                    .ok_or_else(|| self.fail(ErrorKind::ValueError, "value error"))?;
+                    .ok_or_else(|| self.fail_invariant(ErrorKind::ValueError, "value error"))?;
                 let entries: Result<Vec<_>, _> = map
                     .iter()
                     .map(|(k, v)| {
@@ -2425,7 +2452,7 @@ impl VM {
                 let set = self
                     .sets
                     .get(*p as usize)
-                    .ok_or_else(|| self.fail(ErrorKind::ValueError, "value error"))?;
+                    .ok_or_else(|| self.fail_invariant(ErrorKind::ValueError, "value error"))?;
                 let entries: Result<Vec<_>, _> = set
                     .iter()
                     .map(|k| self.stack_value_to_json(&k.0, depth + 1))
@@ -2606,16 +2633,20 @@ impl VM {
     }
 
     /// Execute until an effect, completion, or error. A *catchable* error —
-    /// a `TypeError`/`ValueError` whose operands were fully consumed
-    /// (`PushValueThenContinue`, the Phase 3 pop-first invariant) — raised
+    /// anything but an [`ResumeMode::InvariantViolation`] — raised
     /// while a *reachable* `try` handler is active is materialized as a
     /// `{ name, message }` error object and unwound to the handler instead
     /// of escalating (6_LANGUAGE Part B). Inside a resumed strand with no
     /// reachable handler, the same error rejects the strand's promise
     /// (7_ASYNC Tier 2) — an async call's failure is its promise's
     /// rejection, never an unwind into the parked code below. Everything
-    /// else (`NotResumable` invariant errors) escalates as before, so a
-    /// program cannot trap its own kill switch. `raise` is unaffected: it
+    /// else — the invariant violations, where the VM is broken or there is
+    /// no execution left — escalates, so a program cannot trap its own kill
+    /// switch. The gate is deliberately *not* `is_resumable()`: whether the
+    /// failed instruction consumed its operands is the host's concern, and
+    /// `unwind_to_handler` truncates the stack to the `try`'s snapshot
+    /// regardless. While the two shared an answer, `try { x--; }` on a
+    /// non-number died uncaught. `raise` is unaffected: it
     /// yields `StepResult::Raise` (an `Ok`), never an error, so no `try`
     /// can swallow it.
     ///
@@ -2627,7 +2658,7 @@ impl VM {
     pub fn step(&mut self, mut fuel: u64) -> Result<StepResult, VMError> {
         loop {
             match self.dispatch(&mut fuel) {
-                Err(e) if matches!(e.resume, ResumeMode::PushValueThenContinue) => {
+                Err(e) if e.resume.is_catchable() => {
                     if self.reachable_handler() {
                         let thrown = self.error_to_thrown(&e);
                         self.unwind_to_handler(thrown);

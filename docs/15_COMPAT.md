@@ -1240,7 +1240,7 @@ that they are not implicitly assumed pure anywhere else.)
 `ObjSet`/`IndexSet` are already impure (heap writes); no change needed there.
 
 **ResumeMode.** The adapter instructions do not directly raise new resumable
-errors. A getter/setter that raises a `PushValueThenContinue` error surfaces
+errors. A getter/setter that raises a `Resumable` error surfaces
 from within the getter/setter's call frame and is handled by the existing
 try-catch machinery — no change to the adapters' own error classification.
 
@@ -1546,8 +1546,8 @@ monolithic `semantic error` bucket obscured *which* names were the problem.
   the first line of the error message (e.g. `"runtime: ReferenceError (Symbol
   is not defined)"`), keeping each unresolved name as a distinct histogram
   bucket.
-- **New `ErrorKind::ReferenceError`**: a proper VM error kind (resumable via
-  `PushValueThenContinue`) that maps to JS's `ReferenceError`.
+- **New `ErrorKind::ReferenceError`**: a proper VM error kind (resumable,
+  `ResumeMode::Resumable`) that maps to JS's `ReferenceError`.
 
 ### After — rebaseline histogram (2026-06-19)
 

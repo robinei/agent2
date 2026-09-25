@@ -34,7 +34,7 @@ pub fn set_has(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let set = vm
         .sets
         .get(set_ptr as usize)
-        .ok_or_else(|| vm.fail(ErrorKind::ValueError, "value error"))?;
+        .ok_or_else(|| vm.fail_invariant(ErrorKind::ValueError, "value error"))?;
     Ok(Value::Bool(set.contains(&MapKey(value))))
 }
 
@@ -66,7 +66,7 @@ pub fn set_values(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let set = vm
         .sets
         .get(set_ptr as usize)
-        .ok_or_else(|| vm.fail(ErrorKind::ValueError, "value error"))?;
+        .ok_or_else(|| vm.fail_invariant(ErrorKind::ValueError, "value error"))?;
     let values: ThinVec<Value> = set.iter().map(|k| k.0.clone()).collect();
     Ok(vm.alloc_array(values))
 }

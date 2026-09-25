@@ -222,7 +222,7 @@ fn new_non_error_still_rejected() {
 fn uncaught_throw_escalates_as_uncaught_exception() {
     let err = run_runtime_err(r#"throw new Error("boom");"#);
     assert_eq!(err.kind, ErrorKind::UncaughtException);
-    assert!(matches!(err.resume, ResumeMode::NotResumable));
+    assert!(!err.resume.is_resumable());
     assert!(
         err.message.contains("uncaught Error: boom"),
         "got: {}",
@@ -290,11 +290,36 @@ fn coercion_type_error_caught() {
 }
 
 #[test]
-fn not_resumable_error_is_not_catchable() {
-    // A NotResumable error must escalate even inside `try`. `++` on a
-    // non-numeric local errors via IncLocal's peek (NotResumable).
-    let err = run_runtime_err(r#"let x = {}; try { x++; } catch (e) { return "caught"; }"#);
-    assert!(matches!(err.resume, ResumeMode::NotResumable));
+fn a_decrement_of_a_non_number_is_catchable() {
+    // **This used to die uncaught.** `IncLocal` reads its local by peek, so
+    // nothing was consumed and the host has no slot to push a substituted
+    // value into — a true fact about the *stack*, which one enum turned
+    // into "no `catch` may see it" as well. `unwind_to_handler` truncates
+    // the stack to the `try`'s own snapshot, so what the failed instruction
+    // popped was never catching's business.
+    assert_eq!(
+        run_ret(
+            r#"let x = {}; try { x++; } catch (e) { return "caught"; } return "fell through";"#
+        ),
+        json!("caught")
+    );
+    assert_eq!(
+        run_ret(r#"let x = {}; try { x--; } catch (e) { return e.name; }"#),
+        json!("TypeError")
+    );
+    // The message survives the trip — it is the half a program acts on.
+    assert_eq!(
+        run_ret(
+            r#"let x = {}; try { x--; } catch (e) { return e.message.indexOf("decrement") >= 0; }"#
+        ),
+        json!(true)
+    );
+    // Still not *resumable*: there is no slot for a substituted value, and
+    // that question has its own answer now.
+    let err = run_runtime_err(r#"let x = {}; x++;"#);
+    assert!(matches!(err.resume, ResumeMode::NoResultSlot));
+    assert!(!err.resume.is_resumable());
+    assert!(err.resume.is_catchable());
 }
 
 // ── the uncatchable set ──────────────────────────────────────────────
@@ -457,7 +482,7 @@ fn await_rejection_without_try_escalates_unchanged() {
         .unwrap();
     let err = vm.step(u64::MAX).unwrap_err();
     assert_eq!(err.kind, ErrorKind::ValueError);
-    assert!(matches!(err.resume, ResumeMode::PushValueThenContinue));
+    assert!(matches!(err.resume, ResumeMode::Resumable));
     assert_eq!(err.message, "down", "got: {}", err.message);
 }
 

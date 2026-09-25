@@ -1684,7 +1684,7 @@ fn await_non_promise_passes_through() {
 #[test]
 fn await_rejected_escalates_resumably() {
     // A rejected promise escalates through the Phase 3 path: the promise is
-    // consumed and the error is PushValueThenContinue-resumable, so the host
+    // consumed and the error is Resumable, so the host
     // may substitute a value for the rejection.
     let mut vm = VM::new(vec![Invoke("f".into(), 0), Await, Return(1)]);
     let id = match vm.step(u64::MAX).unwrap() {
@@ -1695,7 +1695,7 @@ fn await_rejected_escalates_resumably() {
     let err = vm.step(u64::MAX).unwrap_err();
     assert_eq!(err.kind, ErrorKind::ValueError);
     assert_eq!(err.message, "boom", "got: {}", err.message);
-    assert!(matches!(err.resume, ResumeMode::PushValueThenContinue));
+    assert!(matches!(err.resume, ResumeMode::Resumable));
     vm.resume_with(&err, n(7.0)).unwrap();
     match vm.step(u64::MAX).unwrap() {
         StepResult::Done { value, .. } => assert_eq!(value, n(7.0)),
@@ -2594,7 +2594,7 @@ fn resume_with_push_value_then_continue() {
         }
     };
     assert!(matches!(err.kind, ErrorKind::TypeError));
-    assert!(matches!(err.resume, ResumeMode::PushValueThenContinue));
+    assert!(matches!(err.resume, ResumeMode::Resumable));
     // Feed 0.0 as the subtraction result; program should complete with 0.
     vm.resume_with(&err, Value::Float(0.0)).unwrap();
     match vm.step(u64::MAX).unwrap() {
@@ -2629,14 +2629,19 @@ fn out_of_fuel_slices_resume() {
 
 #[test]
 fn resume_with_not_resumable_errors() {
-    // A bad local index is an invariant violation: NotResumable. resume_with
-    // must fail.
+    // A bad local index is an invariant violation: the compiler emitted
+    // bytecode that cannot be right, so neither `resume_with` nor a `catch`
+    // may have it.
     let mut vm = VM::new(vec![GetLocal(3)]);
     let err = vm.step(u64::MAX).unwrap_err();
     assert!(matches!(err.kind, ErrorKind::BadLocal));
-    assert!(matches!(err.resume, ResumeMode::NotResumable));
+    assert!(matches!(err.resume, ResumeMode::InvariantViolation));
+    assert!(!err.resume.is_catchable());
     let result = vm.resume_with(&err, Value::Null);
-    assert!(result.is_err(), "resume_with on NotResumable should error");
+    assert!(
+        result.is_err(),
+        "resume_with on an InvariantViolation should error"
+    );
     assert!(matches!(result.unwrap_err().kind, ErrorKind::BadArg));
 }
 
@@ -2644,7 +2649,7 @@ fn resume_with_not_resumable_errors() {
 fn try_exit_without_handler_is_bad_arg() {
     let err = run_err(vec![TryExit]);
     assert!(matches!(err.kind, ErrorKind::BadArg));
-    assert!(matches!(err.resume, ResumeMode::NotResumable));
+    assert!(matches!(err.resume, ResumeMode::InvariantViolation));
 }
 
 #[test]
@@ -2659,7 +2664,11 @@ fn try_enter_throw_unwinds_to_handler() {
 fn throw_without_handler_is_uncaught_exception() {
     let err = run_err(vec![ps("boom"), Throw]);
     assert!(matches!(err.kind, ErrorKind::UncaughtException));
-    assert!(matches!(err.resume, ResumeMode::NotResumable));
+    // `NoResultSlot`: a `throw` owes the stack no result, so there is
+    // nowhere to push a substituted value. It reads as catchable and is
+    // never caught — it is only built once the handler search has failed.
+    assert!(matches!(err.resume, ResumeMode::NoResultSlot));
+    assert!(!err.resume.is_resumable());
     assert!(
         err.message.contains("uncaught exception"),
         "got: {}",
@@ -2680,14 +2689,14 @@ fn try_exit_after_clean_body_pops_handler() {
 #[test]
 fn objget_non_object_pops_receiver_and_resumes() {
     // Pop-first normalization: ObjGet on null consumes the receiver, so the
-    // error is PushValueThenContinue and resume_with works unchanged.
+    // error is Resumable and resume_with works unchanged.
     // Step 2b: primitive receivers (number/string/bool) now resolve via
     // their type prototype and return `undefined` on a miss — only
     // null/undefined throw.
     let mut vm = VM::new(vec![PushNull, ObjGet("foo".into())]);
     let err = vm.step(u64::MAX).unwrap_err();
     assert!(matches!(err.kind, ErrorKind::TypeError));
-    assert!(matches!(err.resume, ResumeMode::PushValueThenContinue));
+    assert!(matches!(err.resume, ResumeMode::Resumable));
     assert_eq!(vm.stack.len(), 0, "receiver consumed before the error");
     vm.resume_with(&err, Value::Null).unwrap();
     match vm.step(u64::MAX).unwrap() {
@@ -2700,7 +2709,7 @@ fn objget_non_object_pops_receiver_and_resumes() {
 #[test]
 fn objset_non_object_pops_operands_and_resumes() {
     // ObjSet pops the value, then (in the error arm) the receiver: both
-    // operands consumed → PushValueThenContinue.
+    // operands consumed → Resumable.
     let mut vm = VM::new(vec![
         PushPosInt(1),
         PushPosInt(2),
@@ -2708,7 +2717,7 @@ fn objset_non_object_pops_operands_and_resumes() {
     ]);
     let err = vm.step(u64::MAX).unwrap_err();
     assert!(matches!(err.kind, ErrorKind::TypeError));
-    assert!(matches!(err.resume, ResumeMode::PushValueThenContinue));
+    assert!(matches!(err.resume, ResumeMode::Resumable));
     assert_eq!(vm.stack.len(), 0, "value and receiver both consumed");
     vm.resume_with(&err, Value::Null).unwrap();
     match vm.step(u64::MAX).unwrap() {
@@ -2719,7 +2728,7 @@ fn objset_non_object_pops_operands_and_resumes() {
 
 #[test]
 fn push_value_then_continue_pop_first_invariant() {
-    // Verify the invariant: after a PushValueThenContinue error, the stack
+    // Verify the invariant: after a Resumable error, the stack
     // has the instruction's operands consumed, so resume_with just pushes
     // and continues without additional fixup.
     let mut vm = VM::new(vec![
@@ -2735,7 +2744,7 @@ fn push_value_then_continue_pop_first_invariant() {
             Ok(_) => {}
         }
     };
-    assert!(matches!(err.resume, ResumeMode::PushValueThenContinue));
+    assert!(matches!(err.resume, ResumeMode::Resumable));
     // After the error, the failed operand was consumed — only 42 remains.
     assert_eq!(vm.stack.len(), 1);
     // resume_with pushes a replacement and advances ip past BitNot.
@@ -2908,7 +2917,7 @@ fn message_calldyn_non_callable_and_resume() {
         err.message
     );
     assert!(
-        matches!(err.resume, ResumeMode::PushValueThenContinue),
+        matches!(err.resume, ResumeMode::Resumable),
         "got {:?}",
         err.resume
     );
@@ -2929,9 +2938,11 @@ fn message_builtin_error_includes_builtin_name() {
 }
 
 #[test]
-fn bad_object_pointer_is_not_resumable() {
-    // A dangling heap pointer is an invariant violation: NotResumable even
-    // though the kind is TypeError.
+fn bad_object_pointer_is_neither_resumable_nor_catchable() {
+    // A dangling heap pointer is an invariant violation. The `kind` says
+    // `TypeError` — a label left over from when there was nowhere else to
+    // put it — and it must not be believed: the VM is broken, not the
+    // program.
     let err = run_err(vec![
         PushObject(99), // no such object
         ps("k"),
@@ -2939,8 +2950,27 @@ fn bad_object_pointer_is_not_resumable() {
     ]);
     assert_eq!(err.kind, ErrorKind::TypeError);
     assert!(
-        matches!(err.resume, ResumeMode::NotResumable),
+        matches!(err.resume, ResumeMode::InvariantViolation),
         "bad pointer must not be resumable, got {:?}",
+        err.resume
+    );
+
+    // **And a `try` around it must not swallow it.** The same bytecode
+    // inside a handler still escalates: a program that could `catch` a
+    // corrupt-heap report would carry on over the wreckage, turning a
+    // debuggable crash into a wrong answer.
+    let err = run_err(vec![
+        TryEnter(3),
+        PushObject(99),
+        ps("k"),
+        ObjHas,
+        TryExit,
+        Return(0),
+    ]);
+    assert_eq!(err.kind, ErrorKind::TypeError);
+    assert!(
+        !err.resume.is_catchable(),
+        "a corrupt-heap report must not be catchable, got {:?}",
         err.resume
     );
 }
@@ -2953,7 +2983,7 @@ fn raise_with_two_payloads_is_bad_arg() {
     let err = vm.step(u64::MAX).unwrap_err();
     assert_eq!(err.kind, ErrorKind::BadArg);
     assert!(
-        matches!(err.resume, ResumeMode::NotResumable),
+        matches!(err.resume, ResumeMode::InvariantViolation),
         "got {:?}",
         err.resume
     );

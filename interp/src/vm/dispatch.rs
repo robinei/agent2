@@ -181,7 +181,7 @@ impl VM {
                 let idx = idx as usize;
                 let (length, kind, buf_ptr, byte_off) = {
                     let view = self.typed_arrays.get(ptr as usize).ok_or_else(|| {
-                        self.fail_not_resumable(ErrorKind::TypeError, "bad typed array pointer")
+                        self.fail_invariant(ErrorKind::TypeError, "bad typed array pointer")
                     })?;
                     if idx >= view.length() as usize {
                         return Ok(Value::Undefined);
@@ -195,7 +195,7 @@ impl VM {
                 };
                 let _ = length;
                 let buf = self.buffers.get(buf_ptr as usize).ok_or_else(|| {
-                    self.fail_not_resumable(ErrorKind::TypeError, "bad buffer pointer")
+                    self.fail_invariant(ErrorKind::TypeError, "bad buffer pointer")
                 })?;
                 return Ok(crate::builtin::ta_decode_bytes(kind, &buf[byte_off..]));
             }
@@ -213,7 +213,7 @@ impl VM {
             match receiver {
                 Value::Array(p) => {
                     let arr = self.arrays.get(*p as usize).ok_or_else(|| {
-                        self.fail_not_resumable(ErrorKind::TypeError, "bad array pointer")
+                        self.fail_invariant(ErrorKind::TypeError, "bad array pointer")
                     })?;
                     return Ok(arr.get(idx).cloned().unwrap_or(Value::Undefined));
                 }
@@ -294,7 +294,7 @@ impl VM {
                 }
                 if field.eq_str("name") || field.eq_str("length") {
                     let c = self.closures.get(*ptr as usize).ok_or_else(|| {
-                        self.fail_not_resumable(ErrorKind::TypeError, "bad closure pointer")
+                        self.fail_invariant(ErrorKind::TypeError, "bad closure pointer")
                     })?;
                     if field.eq_str("name") {
                         return Ok(Value::String(JsString::from("")));
@@ -303,7 +303,7 @@ impl VM {
                 }
                 // Inline own-property bag (Step 2e).
                 let c = self.closures.get(*ptr as usize).ok_or_else(|| {
-                    self.fail_not_resumable(ErrorKind::TypeError, "bad closure pointer")
+                    self.fail_invariant(ErrorKind::TypeError, "bad closure pointer")
                 })?;
                 if let Some(ref bag) = c.props
                     && let Some(v) = bag.get(field)
@@ -526,7 +526,7 @@ impl VM {
                     let udx = idx as usize;
                     let (length, kind, buf_ptr, byte_off, old_val) = {
                         let view = self.typed_arrays.get(ptr as usize).ok_or_else(|| {
-                            self.fail_not_resumable(ErrorKind::TypeError, "bad typed array pointer")
+                            self.fail_invariant(ErrorKind::TypeError, "bad typed array pointer")
                         })?;
                         if udx < view.length() as usize {
                             let boff =
@@ -534,7 +534,7 @@ impl VM {
                             let old = if matches!(mode, SetMode::Old) {
                                 let buf =
                                     self.buffers.get(view.buffer as usize).ok_or_else(|| {
-                                        self.fail_not_resumable(
+                                        self.fail_invariant(
                                             ErrorKind::TypeError,
                                             "bad buffer pointer",
                                         )
@@ -653,7 +653,7 @@ impl VM {
                         Some(o) => o,
                         _ => {
                             return Err(
-                                self.fail_not_resumable(ErrorKind::TypeError, "bad object pointer")
+                                self.fail_invariant(ErrorKind::TypeError, "bad object pointer")
                             );
                         }
                     };
@@ -1430,7 +1430,7 @@ impl VM {
                             .last_mut()
                             .and_then(|f| f.new_obj.take())
                             .ok_or_else(|| {
-                                self.fail_not_resumable(
+                                self.fail_invariant(
                                     ErrorKind::BadReturn,
                                     "NewReturn: no new_obj on caller frame",
                                 )
@@ -1735,7 +1735,9 @@ impl VM {
                         Value::Upval(c) => self
                             .cells
                             .get(*c as usize)
-                            .ok_or_else(|| self.fail(ErrorKind::ValueError, "bad cell pointer"))?
+                            .ok_or_else(|| {
+                                self.fail_invariant(ErrorKind::ValueError, "bad cell pointer")
+                            })?
                             .clone(),
                         other => other.clone(),
                     };
@@ -1802,7 +1804,7 @@ impl VM {
                             .cells
                             .get(*c as usize)
                             .ok_or_else(|| {
-                                self.fail_not_resumable(ErrorKind::ValueError, "bad cell pointer")
+                                self.fail_invariant(ErrorKind::ValueError, "bad cell pointer")
                             })?
                             .clone(),
                         other => other.clone(),
@@ -1825,12 +1827,19 @@ impl VM {
                             .cells
                             .get(*c as usize)
                             .ok_or_else(|| {
-                                self.fail_not_resumable(ErrorKind::ValueError, "bad cell pointer")
+                                self.fail_invariant(ErrorKind::ValueError, "bad cell pointer")
                             })?
                             .clone(),
                         other => other.clone(),
                     };
-                    // NotResumable: reads local by peek (no stack pop), so operand not consumed.
+                    // `NoResultSlot`, not `InvariantViolation`: this reads
+                    // its local by peek, so nothing was consumed and the
+                    // host has no slot to push a substituted value into —
+                    // but `x--` on a non-number is an ordinary `TypeError`
+                    // and `catch` must see it. While one variant answered
+                    // both questions, `try { x--; } catch (e) {}` around a
+                    // non-number died with an UNCAUGHT TypeError instead of
+                    // running the handler two characters away.
                     let old_num = old.to_number().ok_or_else(|| {
                         let op = if *p < 0.0 { "increment" } else { "decrement" };
                         let operand = self.describe_operand(&old);
@@ -1838,7 +1847,7 @@ impl VM {
                             Some(name) => format!("cannot {op} `{name}`: {operand}"),
                             None => format!("cannot {op} {operand}"),
                         };
-                        self.fail_not_resumable(ErrorKind::TypeError, msg)
+                        self.fail_no_result_slot(ErrorKind::TypeError, msg)
                     })?;
                     // Compute new value: subtract p (p = -1 for ++, p = 1 for --).
                     let new_num = old_num - *p;
@@ -2588,20 +2597,25 @@ impl VM {
                             self.arrays
                                 .get(p as usize)
                                 .ok_or_else(|| {
-                                    self.fail(ErrorKind::ValueError, "bad array pointer")
+                                    self.fail_invariant(ErrorKind::ValueError, "bad array pointer")
                                 })?
                                 .len() as f64,
                         ),
                         Value::TypedArray(p) => {
                             let view = self.typed_arrays.get(p as usize).ok_or_else(|| {
-                                self.fail(ErrorKind::ValueError, "bad typed array pointer")
+                                self.fail_invariant(
+                                    ErrorKind::ValueError,
+                                    "bad typed array pointer",
+                                )
                             })?;
                             Value::Float(view.length() as f64)
                         }
                         Value::Object(p) => self
                             .objects
                             .get(p as usize)
-                            .ok_or_else(|| self.fail(ErrorKind::ValueError, "bad object pointer"))?
+                            .ok_or_else(|| {
+                                self.fail_invariant(ErrorKind::ValueError, "bad object pointer")
+                            })?
                             .map
                             .get(keys::LENGTH)
                             .cloned()
@@ -2664,19 +2678,25 @@ impl VM {
                         Value::Map(p) => Value::Float(
                             self.maps
                                 .get(p as usize)
-                                .ok_or_else(|| self.fail(ErrorKind::ValueError, "bad map pointer"))?
+                                .ok_or_else(|| {
+                                    self.fail_invariant(ErrorKind::ValueError, "bad map pointer")
+                                })?
                                 .len() as f64,
                         ),
                         Value::Set(p) => Value::Float(
                             self.sets
                                 .get(p as usize)
-                                .ok_or_else(|| self.fail(ErrorKind::ValueError, "bad set pointer"))?
+                                .ok_or_else(|| {
+                                    self.fail_invariant(ErrorKind::ValueError, "bad set pointer")
+                                })?
                                 .len() as f64,
                         ),
                         Value::Object(p) => self
                             .objects
                             .get(p as usize)
-                            .ok_or_else(|| self.fail(ErrorKind::ValueError, "bad object pointer"))?
+                            .ok_or_else(|| {
+                                self.fail_invariant(ErrorKind::ValueError, "bad object pointer")
+                            })?
                             .map
                             .get(keys::SIZE)
                             .cloned()
@@ -2847,7 +2867,7 @@ impl VM {
                         }
                     };
                     let state = self.promises.get(id as usize).ok_or_else(|| {
-                        self.fail_not_resumable(ErrorKind::ValueError, "bad promise pointer")
+                        self.fail_invariant(ErrorKind::ValueError, "bad promise pointer")
                     })?;
                     match state {
                         PromiseState::Resolved(v) => {
@@ -2906,7 +2926,7 @@ impl VM {
                             // Escalate via the Phase 3 path: pop the operand
                             // first (pop-first invariant), then fail resumably —
                             // the host may substitute a value for the rejection
-                            // (`PushValueThenContinue`).
+                            // (`ResumeMode::Resumable`).
                             // A string rejection **is** the message. Every
                             // host tool that fails rejects with one, written
                             // to be read by the model, and `preview` cuts
@@ -3059,7 +3079,8 @@ impl VM {
                 }
 
                 Instr::TryExit => {
-                    // An unmatched TryExit is a compiler bug (NotResumable).
+                    // An unmatched TryExit is a compiler bug: neither
+                    // resumable nor catchable.
                     if self.handlers.pop().is_none() {
                         return Err(
                             self.fail(ErrorKind::BadArg, "TryExit without an active handler")
@@ -3082,10 +3103,13 @@ impl VM {
                         self.reject_strand(value)?;
                         continue;
                     }
-                    // NotResumable (via `fail`'s kind classification):
+                    // `NoResultSlot` (via `fail`'s kind classification):
                     // the operand was consumed, but a `throw` has no
                     // result slot — pushing a replacement value would
-                    // corrupt the statement-level stack. The thrown
+                    // corrupt the statement-level stack. It reads as
+                    // catchable and is never caught: both searches above
+                    // have already failed, so `step` repeats them and
+                    // escalates. The thrown
                     // value rides along in `payload` so the host gets
                     // the program's own error structurally, not just a
                     // rendering.

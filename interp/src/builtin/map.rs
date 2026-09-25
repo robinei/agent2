@@ -22,7 +22,7 @@ pub fn map_get(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let map = vm
         .maps
         .get(map_ptr as usize)
-        .ok_or_else(|| vm.fail(ErrorKind::ValueError, "value error"))?;
+        .ok_or_else(|| vm.fail_invariant(ErrorKind::ValueError, "value error"))?;
     Ok(map.get(&MapKey(key)).cloned().unwrap_or(Value::Undefined))
 }
 
@@ -45,7 +45,7 @@ pub fn map_has(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let map = vm
         .maps
         .get(map_ptr as usize)
-        .ok_or_else(|| vm.fail(ErrorKind::ValueError, "value error"))?;
+        .ok_or_else(|| vm.fail_invariant(ErrorKind::ValueError, "value error"))?;
     Ok(Value::Bool(map.contains_key(&MapKey(key))))
 }
 
@@ -77,7 +77,7 @@ pub fn map_keys(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let map = vm
         .maps
         .get(map_ptr as usize)
-        .ok_or_else(|| vm.fail(ErrorKind::ValueError, "value error"))?;
+        .ok_or_else(|| vm.fail_invariant(ErrorKind::ValueError, "value error"))?;
     let keys: ThinVec<Value> = map.keys().map(|k| k.0.clone()).collect();
     Ok(vm.alloc_array(keys))
 }
@@ -87,7 +87,7 @@ pub fn map_values(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let map = vm
         .maps
         .get(map_ptr as usize)
-        .ok_or_else(|| vm.fail(ErrorKind::ValueError, "value error"))?;
+        .ok_or_else(|| vm.fail_invariant(ErrorKind::ValueError, "value error"))?;
     let values: ThinVec<Value> = map.values().cloned().collect();
     Ok(vm.alloc_array(values))
 }
@@ -98,7 +98,7 @@ pub fn map_entries(vm: &mut VM, args: Args) -> Result<Value, VMError> {
         let map = vm
             .maps
             .get(map_ptr as usize)
-            .ok_or_else(|| vm.fail(ErrorKind::ValueError, "value error"))?;
+            .ok_or_else(|| vm.fail_invariant(ErrorKind::ValueError, "value error"))?;
         map.iter().map(|(k, v)| (k.0.clone(), v.clone())).collect()
     };
     let mut result: ThinVec<Value> = ThinVec::with_capacity(pairs.len());
@@ -143,7 +143,7 @@ pub fn map_set_keys(vm: &mut VM, args: Args) -> Result<Value, VMError> {
             let set = vm
                 .sets
                 .get(*p as usize)
-                .ok_or_else(|| vm.fail(ErrorKind::ValueError, "value error"))?;
+                .ok_or_else(|| vm.fail_invariant(ErrorKind::ValueError, "value error"))?;
             let values: ThinVec<Value> = set.iter().map(|k| k.0.clone()).collect();
             Ok(vm.alloc_array(values))
         }
@@ -167,7 +167,7 @@ pub fn map_set_entries(vm: &mut VM, args: Args) -> Result<Value, VMError> {
             let set = vm
                 .sets
                 .get(*p as usize)
-                .ok_or_else(|| vm.fail(ErrorKind::ValueError, "value error"))?;
+                .ok_or_else(|| vm.fail_invariant(ErrorKind::ValueError, "value error"))?;
             let values: ThinVec<Value> = set.iter().map(|k| k.0.clone()).collect();
             let mut result: ThinVec<Value> = ThinVec::with_capacity(values.len());
             for v in values {

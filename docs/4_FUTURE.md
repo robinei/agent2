@@ -73,7 +73,7 @@ already matches. When a transcript shows a program actually branching on
 `e.name` (rather than inspecting `e.message` or catching blindly), split the
 catchable `ValueError` sites into JS-named kinds — `RangeError`,
 `SyntaxError`, keeping `ValueError` or an `Internal` kind for the
-corrupt-pointer invariant sites that are `NotResumable` anyway — or, more
+corrupt-pointer invariant sites that are uncatchable anyway — or, more
 cheaply, map kinds to JS names per-site in `error_to_thrown`. Until that
 evidence exists the coarse kinds stand: the message carries the
 specificity, `ResumeMode` carries the actionability, and nothing host-side

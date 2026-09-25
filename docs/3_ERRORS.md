@@ -86,6 +86,15 @@ Mechanics:
 
 ## Step 3: Resume classification
 
+> **Superseded in part, 2026-09-25 (§25.4c).** This step is written as if
+> resumability were one question. It is two — may the *host* substitute a
+> value, and may a JS `catch` see the error — and `VM::step` came to use
+> this one enum for both. `ResumeMode` now has three variants
+> (`Resumable`, `NoResultSlot`, `InvariantViolation`); the peek-style
+> sites this step classifies `NotResumable` for stack reasons are
+> `NoResultSlot`, and they are catchable. `RetrySameInstr` below was never
+> built: fuel exhaustion is a `StepResult`, not an error.
+
 Add to the error:
 
 ```rust

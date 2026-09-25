@@ -898,59 +898,113 @@ pub enum ErrorKind {
     SyntaxError,
 }
 
-/// Whether the host can resume from this error by feeding a value (see
-/// `VM::resume_with`).
+/// Two independent questions about a failed instruction, which used to be
+/// one.
+///
+/// 1. **May the host substitute a value and carry on?** (`VM::resume_with`.)
+/// 2. **May a JS `catch` see it?** (`VM::step`'s unwind.)
+///
+/// One two-variant enum answered both, and the conflation had a measured
+/// consequence:
+///
+/// ```js
+/// let x = {};
+/// try { x--; } catch (e) { /* never ran */ }   // died with UNCAUGHT TypeError
+/// ```
+///
+/// `IncLocal` reads its local by peek rather than popping it, so there is no
+/// consumed operand slot for a substituted value to fill — a *stack* fact,
+/// and a true one. It was therefore `NotResumable`, and because one variant
+/// answered both questions, also uncatchable. But `unwind_to_handler`
+/// truncates the stack to the `try`'s own snapshot, so **what the failed
+/// instruction did or did not pop has no bearing on catching at all**. A
+/// decrement of a non-number is an ordinary `TypeError`, and ordinary
+/// defensive JavaScript could not catch it.
 ///
 /// # Pop-first invariant
 ///
-/// A `PushValueThenContinue` error has its instruction's operands
-/// consumed before the error propagates out of `step()`, so
-/// `resume_with` needs no per-instruction stack fixup — it just pushes
-/// the replacement value and advances ip.
+/// A [`Resumable`](ResumeMode::Resumable) error has its instruction's
+/// operands consumed before the error propagates out of `step()`, so
+/// `resume_with` needs no per-instruction stack fixup — it just pushes the
+/// replacement value and advances ip.
 ///
 /// # Classification audit (instruction/site → mode → why)
 ///
 /// | Site | Kind | Mode | Reason |
 /// |------|------|------|--------|
-/// | unary_num! / binary_num! / binary_int! / cmp_op! macros | TypeError | PushValueThenContinue | ops popped before coercion |
-/// | Add (string concat path) | TypeError | PushValueThenContinue | both ops popped before to_number |
-/// | BitNot, ToNum, TypeOf | TypeError/ValueError | PushValueThenContinue | operand popped first |
-/// | CallDyn non-callable | TypeError | PushValueThenContinue | callable popped, then args dropped before failing (pop-first normalization) |
-/// | CallSpread non-callable / non-array args | TypeError | PushValueThenContinue | callable+array popped first; dispatch same as CallDyn |
-/// | IndexGet (non-container, bad index, mid-codepoint) | TypeError/ValueError | PushValueThenContinue | container+key popped first |
-/// | IndexSet (non-container, negative/OOB index) | TypeError/ValueError | PushValueThenContinue | val+key+container popped first |
-/// | ObjHas / ObjDelete (non-object) | TypeError | PushValueThenContinue | field+object popped first |
-/// | Builtin handlers (args truncated by `Builtin::call` epilogue on the error path) | TypeError/ValueError | PushValueThenContinue | args truncated before error propagates |
-/// | JSON depth / unsupported type (JSON.stringify, to_json) | ValueError | PushValueThenContinue | args popped by builtin before conversion |
-/// | ObjGet (non-object receiver) | TypeError | PushValueThenContinue | receiver popped in the error arm (pop-first normalized) |
-/// | GetMethodOrProp (null/undefined receiver) | TypeError | PushValueThenContinue | receiver popped in the error arm (pop-first normalized, same as ObjGet) |
-/// | ObjSet (non-object receiver) | TypeError | PushValueThenContinue | value popped, then receiver popped in the error arm (pop-first normalized) |
-/// | **ObjExtend** (non-object src) | TypeError | PushValueThenContinue | both src+obj popped first |
-/// | **ArrExtend** (non-array src) | TypeError | PushValueThenContinue | both src+arr popped first |
-/// | **ArrPush** (non-array target) | TypeError | PushValueThenContinue | both val+arr popped first |
-/// | Await (rejected promise, no handler, root strand) | ValueError | PushValueThenContinue | promise popped before failing; host may substitute a value for the rejection (with a reachable handler the rejection value unwinds to `catch`; inside a resumed strand it rejects the strand's promise — neither reaches the host) |
-/// | Await (bad promise pointer) | ValueError | **NotResumable** | corrupt heap = invariant violation |
-/// | **IncLocal** (non-numeric local) | TypeError | **NotResumable** | reads local by peek (no stack consumption) |
-/// | bad heap/cell pointer (`get`/`get_mut` on arrays/objects/cells/closures) | TypeError/ValueError | **NotResumable** | corrupt heap = invariant violation; some sites also have no result slot (SetLocal) |
-/// | Raise with argc > 1 | BadArg | NotResumable | instruction contract violated (compiler emits 0 or 1) |
-/// | Throw (no handler) | UncaughtException | **NotResumable** | operand popped, but a `throw` has no result slot a substituted value could fill; the thrown value is preserved in `VMError::payload` |
-/// | TryEnter (bad handler address) | BadCall | NotResumable | invariant violation / compiler bug |
-/// | TryExit (empty handler stack) | BadArg | NotResumable | unmatched TryExit = compiler bug |
-/// | StackUnderflow, BadReturn, BadCall, BadAlloc, BadArg, BadLocal | — | NotResumable | invariant violation / compiler bug |
-/// | Deadlock | — | NotResumable | circular awaits: every strand is parked and no settlement can arrive; there is no execution state a value could resume |
+/// | unary_num! / binary_num! / binary_int! / cmp_op! macros | TypeError | Resumable | ops popped before coercion |
+/// | Add (string concat path) | TypeError | Resumable | both ops popped before to_number |
+/// | BitNot, ToNum, TypeOf | TypeError/ValueError | Resumable | operand popped first |
+/// | BitLhs / BitRhs / BitURhs (shift amount outside [0, 63]) | RangeError | Resumable | both ops popped first |
+/// | CallDyn non-callable | TypeError | Resumable | callable popped, then args dropped before failing (pop-first normalization) |
+/// | CallSpread non-callable / non-array args | TypeError | Resumable | callable+array popped first; dispatch same as CallDyn |
+/// | IndexGet (non-container, bad index, mid-codepoint) | TypeError/RangeError | Resumable | container+key popped first |
+/// | IndexSet (non-container, negative/OOB index) | TypeError/RangeError | Resumable | val+key+container popped first |
+/// | ObjHas / ObjDelete (non-object) | TypeError | Resumable | field+object popped first |
+/// | Builtin handlers (args truncated by `Builtin::call` epilogue on the error path) | TypeError/ValueError/RangeError/SyntaxError | Resumable | args truncated before error propagates |
+/// | JSON depth / unsupported type (JSON.stringify, to_json) | ValueError | Resumable | args popped by builtin before conversion |
+/// | JSON.parse (malformed text), RegExp (bad pattern or flag) | SyntaxError | Resumable | args popped by builtin before conversion |
+/// | ObjGet (non-object receiver) | TypeError | Resumable | receiver popped in the error arm (pop-first normalized) |
+/// | GetMethodOrProp (null/undefined receiver) | TypeError | Resumable | receiver popped in the error arm (pop-first normalized, same as ObjGet) |
+/// | ObjSet (non-object receiver) | TypeError | Resumable | value popped, then receiver popped in the error arm (pop-first normalized) |
+/// | ObjExtend (non-object src) | TypeError | Resumable | both src+obj popped first |
+/// | ArrExtend (non-array src) | TypeError | Resumable | both src+arr popped first |
+/// | ArrPush (non-array target) | TypeError | Resumable | both val+arr popped first |
+/// | Await (rejected promise, no handler, root strand) | ValueError | Resumable | promise popped before failing; host may substitute a value for the rejection (with a reachable handler the rejection value unwinds to `catch`; inside a resumed strand it rejects the strand's promise — neither reaches the host) |
+/// | **IncLocal** (non-numeric local) | TypeError | **NoResultSlot** | reads its local by peek, so there is no consumed slot to fill — but `x--` on a non-number is a language error, and `catch` sees it |
+/// | **Throw** (no handler) | UncaughtException | **NoResultSlot** | the operand was popped, but a `throw` owes the stack no result a substituted value could fill. Nominally catchable and never actually caught: it is *constructed* only after the handler search failed, so the same search in `step` fails again and it escalates. The thrown value rides in `VMError::payload` |
+/// | bad heap/cell/promise/continuation pointer (`get`/`get_mut` on arrays/objects/cells/closures/buffers) | TypeError/ValueError | **InvariantViolation** | corrupt heap — the VM is broken, not the program |
+/// | Raise with argc > 1 | BadArg | InvariantViolation | instruction contract violated (compiler emits 0 or 1) |
+/// | TryEnter (bad handler address) | BadCall | InvariantViolation | compiler bug |
+/// | TryExit (empty handler stack) | BadArg | InvariantViolation | unmatched TryExit = compiler bug |
+/// | StackUnderflow, BadReturn, BadCall, BadAlloc, BadArg, BadLocal | — | InvariantViolation | compiler bug / host misuse |
+/// | Deadlock | — | InvariantViolation | circular awaits: every strand is parked and no settlement can arrive. Not a broken invariant, but it shares the bucket's one rule — a program must not be able to `catch` it and carry on, because there is nothing to carry on with |
 ///
-/// All 10 `ErrorKind`s are covered. (Fuel exhaustion is not an error:
+/// All 12 `ErrorKind`s are covered. (Fuel exhaustion is not an error:
 /// `step(fuel)` running dry yields `StepResult::OutOfFuel` — nothing
-/// consumed, call `step` again to continue.) The bolded sites are the
-/// TypeError/ValueError sites that error before full operand consumption
-/// (or, for bad pointers, mid-mutation) and therefore must not be resumed.
-#[derive(Debug)]
+/// consumed, call `step` again to continue.)
+#[derive(Debug, PartialEq)]
 pub enum ResumeMode {
-    /// Internal invariant broken (compiler bug / host misuse). Never resume.
-    NotResumable,
     /// The failed instruction's operands were consumed; pushing a
-    /// replacement result and advancing ip resumes as if it succeeded.
-    PushValueThenContinue,
+    /// replacement result and advancing ip resumes as if it succeeded. A
+    /// reachable `catch` may have it instead.
+    Resumable,
+    /// A language error the host cannot hand a value to, because the failed
+    /// instruction left no slot for one — but an ordinary error as far as
+    /// the *program* is concerned, so `catch` sees it.
+    ///
+    /// **The variant this split exists for.** `x--` on a non-number is the
+    /// case: a plain `TypeError` that was uncatchable for a reason about
+    /// the operand stack, which `unwind_to_handler` does not consult.
+    NoResultSlot,
+    /// Errors a `catch` must never see and the host must never resume.
+    ///
+    /// Mostly a broken internal invariant — a dangling heap pointer, a
+    /// stack underflow, bytecode the compiler should not have emitted. A
+    /// program must not be able to swallow "the compiler emitted bad
+    /// bytecode" and keep running on the wreckage; that is a debuggable
+    /// crash wearing a `catch` block. `Deadlock` shares the bucket without
+    /// being an invariant violation: nothing is wrong with the VM, there is
+    /// simply no execution left to resume or to catch with.
+    InvariantViolation,
+}
+
+impl ResumeMode {
+    /// May the host substitute a value and continue? Only when the failed
+    /// instruction consumed its operands and owes the stack a result.
+    pub fn is_resumable(&self) -> bool {
+        matches!(self, ResumeMode::Resumable)
+    }
+
+    /// May a JS `catch` see this error?
+    ///
+    /// Deliberately *not* `is_resumable()`. `unwind_to_handler` truncates
+    /// the stack to the `try`'s snapshot, so whether the failed instruction
+    /// popped its operands is none of catching's business — the two
+    /// questions only ever shared an answer by accident.
+    pub fn is_catchable(&self) -> bool {
+        !matches!(self, ResumeMode::InvariantViolation)
+    }
 }
 
 #[derive(Debug)]
@@ -967,10 +1021,12 @@ pub struct VMError {
 }
 
 impl VMError {
-    /// Construct a `NotResumable` error at a given ip without borrowing the
+    /// Construct an `InvariantViolation` error at a given ip without
+    /// borrowing the
     /// VM, for sites where a mutable borrow is already active (e.g. inside
     /// `ok_or_else` on a `get_mut`). Every such site is a bad heap/cell
-    /// pointer — an invariant violation — so this is always `NotResumable`;
+    /// pointer — the VM is broken, not the program — so the error is
+    /// neither resumable nor catchable;
     /// resumable errors must go through `VM::fail`, which can see the
     /// stack state the pop-first invariant depends on.
     pub fn fail_at(ip: CodeAddr, kind: ErrorKind, msg: impl Into<String>) -> Self {
@@ -978,7 +1034,7 @@ impl VMError {
             kind,
             ip,
             message: msg.into(),
-            resume: ResumeMode::NotResumable,
+            resume: ResumeMode::InvariantViolation,
             payload: None,
         }
     }

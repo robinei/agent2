@@ -809,8 +809,8 @@ pub enum Instr {
     /// `throw expr`: pop the thrown value and unwind to the innermost handler
     /// (see `TryEnter`). With no active handler the throw escalates as an
     /// `UncaughtException` at the `step()` boundary, with the thrown value
-    /// preserved in `VMError::payload` — NotResumable, because a `throw` has
-    /// no result slot a substituted value could fill.
+    /// preserved in `VMError::payload` — `NoResultSlot`, because a `throw`
+    /// has no result slot a substituted value could fill.
     Throw, // any -> ()
 
     /// build a closure over the listed local slots of the current frame and push

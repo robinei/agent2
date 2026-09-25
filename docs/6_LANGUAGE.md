@@ -119,8 +119,9 @@ Locked design decisions:
 2. **Catchable:** explicit `throw`; runtime errors Phase 3 classified as
    resumable (TypeError/ValueError class); tool-call failures the host
    chooses to throw in. **Not catchable:** `OutOfFuel`, the memory budget,
-   and `NotResumable` internal errors — a buggy retry loop must not trap
-   its own kill switch. These continue to surface as `Err` from `step()`.
+   and `InvariantViolation` internal errors — a buggy retry loop must not
+   trap its own kill switch. (A language error with no slot for a resumed
+   value, `NoResultSlot`, *is* catchable: see §25.4c.) These continue to surface as `Err` from `step()`.
 3. **Error values are plain objects** `{ name, message }`, JSON-shaped like
    everything else. A caught VM error materializes with `name` from the
    error kind and `message` = the Phase 3 rendered diagnostic (line/col +
@@ -178,10 +179,15 @@ on the open choices and deltas:
   `TryEnter` as a two-way branch (catch label reachable) and threads/
   backpatches its operand; all `pe_*` tables exclude the new instructions
   by construction (allow-lists).
-- Catchability is exactly the Phase 3 `PushValueThenContinue` class. To
-  make `try { x.foo }` on null/undefined useful, `ObjGet`/`ObjSet`'s
+- Catchability *was* exactly the Phase 3 `PushValueThenContinue` class,
+  and should never have been (corrected 2026-09-25, §25.4c). To make
+  `try { x.foo }` on null/undefined useful, `ObjGet`/`ObjSet`'s
   non-object error arms were pop-first-normalized (they were peek-style
-  `NotResumable`); the audit table was updated.
+  `NotResumable`) — a real fix that treated the symptom. The remaining
+  peek-style site, `IncLocal`, could not be normalized the same way, so
+  `try { x--; } catch (e) {}` on a non-number went on dying uncaught
+  until `ResumeMode` was split three ways. Catchable is now `mode !=
+  InvariantViolation`; resumable stays `mode == Resumable`.
 - `await` of a rejected promise inside `try` delivers the **raw rejection
   value** to `catch` (JS semantics), not a wrapped `{name, message}`; the
   no-handler escalation path is byte-for-byte unchanged.
@@ -190,9 +196,12 @@ on the open choices and deltas:
   this error value deliberately, and the host's policy differs from a VM
   failure. The thrown value is preserved structurally in
   `VMError::payload`; the message carries the `uncaught …` rendering.
-- `new Error(msg)` plus `TypeError`/`RangeError`/`SyntaxError`/
-  `ReferenceError`/`EvalError` are special-cased; message coerces ToString
-  at construction; a second argument (`{cause}`) is a compile error.
+- `new Error(msg)` plus its nine sibling classes were special-cased in
+  the compiler (`Instr::ErrNew`); since 2026-09-25 they are ordinary
+  registry constructor rows and the instruction is deleted. The message
+  still coerces ToString at construction — in the constructor handler
+  now, not the compiler — and the second argument, `{ cause }`, is
+  honoured rather than refused.
 - The compiler tracks per-function `try` depth and emits the balancing
   `TryExit`s when `break`/`continue`/`return` jump out of a `try` block,
   so a frame never leaves stale handlers behind.

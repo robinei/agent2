@@ -148,7 +148,7 @@ pub(crate) fn arraybuffer_slice(vm: &mut VM, args: Args) -> Result<Value, VMErro
     let buf = vm
         .buffers
         .get(buf_ptr as usize)
-        .ok_or_else(|| vm.fail(ErrorKind::ValueError, "bad ArrayBuffer pointer"))?;
+        .ok_or_else(|| vm.fail_invariant(ErrorKind::ValueError, "bad ArrayBuffer pointer"))?;
     let total = buf.len() as u32;
     let begin = clamp_index(args.get(vm, 1), total);
     let end = if args.argc >= 3 {
@@ -249,20 +249,20 @@ fn typed_array_ctor_impl(vm: &mut VM, args: Args, kind: TypedArrayKind) -> Resul
         }
 
         &Value::TypedArray(src_ptr) => {
-            let (src_len, src_kind, src_buf_ptr, src_byte_offset) =
-                match vm.typed_arrays.get(src_ptr as usize) {
-                    Some(v) => (
-                        v.length() as usize,
-                        v.kind,
-                        v.buffer,
-                        v.byte_offset as usize,
-                    ),
-                    None => {
-                        return Err(
-                            vm.fail_not_resumable(ErrorKind::TypeError, "bad typed array pointer")
-                        );
-                    }
-                };
+            let (src_len, src_kind, src_buf_ptr, src_byte_offset) = match vm
+                .typed_arrays
+                .get(src_ptr as usize)
+            {
+                Some(v) => (
+                    v.length() as usize,
+                    v.kind,
+                    v.buffer,
+                    v.byte_offset as usize,
+                ),
+                None => {
+                    return Err(vm.fail_invariant(ErrorKind::TypeError, "bad typed array pointer"));
+                }
+            };
             let elem_size = kind.element_size() as usize;
             let src_elem_size = src_kind.element_size() as usize;
             let mut buf = vec![0u8; src_len * elem_size];
@@ -436,7 +436,7 @@ pub(crate) fn dataview_ctor(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let buf_len = vm
         .buffers
         .get(buf_ptr as usize)
-        .ok_or_else(|| vm.fail(ErrorKind::TypeError, "bad ArrayBuffer pointer"))?
+        .ok_or_else(|| vm.fail_invariant(ErrorKind::TypeError, "bad ArrayBuffer pointer"))?
         .len();
     let byte_offset = match args.get(vm, 1) {
         Value::Undefined => 0usize,
@@ -484,7 +484,7 @@ fn dv_receiver(vm: &VM, args: &Args) -> Result<(BufferPtr, usize, usize), VMErro
     let dv = vm
         .data_views
         .get(ptr as usize)
-        .ok_or_else(|| vm.fail(ErrorKind::TypeError, "bad DataView pointer"))?;
+        .ok_or_else(|| vm.fail_invariant(ErrorKind::TypeError, "bad DataView pointer"))?;
     Ok((dv.buffer, dv.byte_offset as usize, dv.byte_length as usize))
 }
 
@@ -526,7 +526,7 @@ macro_rules! dv_get {
             let buf = vm
                 .buffers
                 .get(buf_ptr as usize)
-                .ok_or_else(|| vm.fail(ErrorKind::TypeError, "bad buffer pointer"))?;
+                .ok_or_else(|| vm.fail_invariant(ErrorKind::TypeError, "bad buffer pointer"))?;
             let bytes: [u8; $size] = buf[abs..abs + $size].try_into().unwrap();
             let le = dv_little_endian(&args, vm, 2);
             let raw = if le { $from_le(bytes) } else { $from_be(bytes) };
@@ -741,7 +741,7 @@ macro_rules! ta_view {
         let view = $vm
             .typed_arrays
             .get($ta_ptr as usize)
-            .ok_or_else(|| $vm.fail(ErrorKind::TypeError, "bad typed array pointer"))?;
+            .ok_or_else(|| $vm.fail_invariant(ErrorKind::TypeError, "bad typed array pointer"))?;
         let elem_size = view.kind.element_size() as usize;
         (
             view.length() as usize,

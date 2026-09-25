@@ -76,7 +76,8 @@ after Tier 1.
    gather loop) when Tier 1 lands.
 2. **`Await` is a re-executing instruction (no continuation capture for the
    main strand).** Resolved → push value, advance. Rejected → throw (6B) or
-   escalate via the Phase 3 path (`PushValueThenContinue`-resumable).
+   escalate via the Phase 3 path (`ResumeMode::Resumable`, renamed from
+   `PushValueThenContinue` in §25.4c).
    Pending → `StepResult::Pending { calls: <drained outbox> }` with `ip`
    unchanged (`RetrySameInstr` shape); host calls
    `vm.resolve_promise(id, value)` / `vm.reject_promise(id, errval)` for at

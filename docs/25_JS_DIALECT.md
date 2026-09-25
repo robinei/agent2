@@ -287,6 +287,72 @@ fail for the reason they should always have failed.
 The card's second dialect row is gone with this — there is no
 divergence left to warn about — leaving one (`1 < "2"`).
 
+## 25.4c — catchable and resumable are different questions — **done, 2026-09-25**
+
+```js
+let x = {};
+try { x--; } catch (e) { /* never ran */ }   // died with UNCAUGHT TypeError
+```
+
+Two characters away from the error, a handler that did not run. The
+cause was one enum answering two questions.
+
+`ResumeMode` documented itself as being about stack hygiene:
+`PushValueThenContinue` meant "the failed instruction's operands were
+consumed, so pushing a replacement result and advancing ip resumes as if
+it succeeded". That is the host's `raise`/`resume` concern and nothing
+else. But `VM::step` reused the same flag as the gate for
+`unwind_to_handler` — that is, for whether a JS `catch` ever sees the
+error at all.
+
+`IncLocal` (`x++`, `x--`) reads its local by *peek*. Nothing is
+consumed, so there is genuinely no slot for a substituted value, so it
+was `NotResumable` — and therefore uncatchable. The stack reason is
+true; the catchability conclusion does not follow from it.
+`unwind_to_handler` runs `self.stack.truncate(h.stack_len)`: it resets
+the stack to the `try`'s own baseline, so **what the failed instruction
+did or did not pop has no bearing on catching**. The justification did
+not survive contact with the code.
+
+The enum was already two things in one variant, as its own audit table
+admitted — "no result slot" (`IncLocal`) beside "invariant violation"
+(a dangling heap pointer). It is three now:
+
+| | host may substitute a value? | JS `catch` sees it? |
+|---|---|---|
+| `Resumable` | yes | yes |
+| `NoResultSlot` | no | **yes** |
+| `InvariantViolation` | no | no |
+
+Resumable is `mode == Resumable`; catchable is `mode !=
+InvariantViolation`. Two predicates over one enum, each asked by exactly
+one caller: `resume_with` and `step`.
+
+`NoResultSlot` has two tenants: `IncLocal`, and an uncaught `Throw`
+(which owes a statement no value). The second is nominally catchable and
+never actually caught — it is only *constructed* after the handler
+search has already failed, so the same search in `step` fails again and
+it escalates unchanged.
+
+`InvariantViolation` holds what a program must never swallow: a
+dangling heap pointer, a stack underflow, bytecode the compiler should
+not have emitted, and `Deadlock`. The first three are the VM being
+broken, and a `catch` that hid one would turn a debuggable crash into a
+wrong answer. `Deadlock` is not a broken invariant — nothing is wrong —
+but it shares the one rule, because every strand is parked and there is
+nothing to carry on with.
+
+The corrupt-pointer checks §25.4b left behind moved here: 37 sites that
+said `vm.fail(ErrorKind::ValueError, "bad object pointer")` and were
+therefore resumable *and* catchable now go through `fail_invariant`.
+Their `ErrorKind` is unchanged and no longer means anything — an
+`InvariantViolation` never becomes a JS value, so no program reads the
+name.
+
+Gate, met: `try { x--; } catch (e) { … }` catches, and reports
+`e.name === "TypeError"` with the message intact; the same bytecode that
+reads a dangling object pointer still escalates from inside a `try`.
+
 ## 25.5 — Nothing built stays unmentioned
 
 The standing fix for the `Edit` class of failure, and the most valuable

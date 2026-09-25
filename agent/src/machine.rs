@@ -741,7 +741,7 @@ enum ResumeWith {
     /// `raise(name, payload)` — resume via `VM::resume_raise`.
     Raise,
     /// Trapped VM error — resume via `VM::resume_with` when the error
-    /// is `PushValueThenContinue`.
+    /// is `Resumable`.
     Trapped(VMError),
     /// A post arrived and the run suspended at its next fuel slice (rule
     /// B). The VM is simply **parked between slices** — nothing asked for
@@ -2039,13 +2039,18 @@ impl Runner {
                 run.vm.resume_raise(v);
             }
             ResumeWith::Trapped(e) => match e.resume {
-                ResumeMode::PushValueThenContinue => {
+                ResumeMode::Resumable => {
                     let v = json_arg(&mut run.vm, &value);
                     run.vm
                         .resume_with(e, v)
                         .expect("resume audited as resumable by the host");
                 }
-                ResumeMode::NotResumable => {
+                // The host asks `is_resumable()` before offering a resume,
+                // so reaching either of these means the host offered one it
+                // had no business offering. A `NoResultSlot` trap is a
+                // perfectly ordinary error — it simply has no slot to push
+                // a value into.
+                ResumeMode::NoResultSlot | ResumeMode::InvariantViolation => {
                     panic!(
                         "Runner::resume called on a not-resumable trap — a host bookkeeping bug"
                     );
@@ -4012,7 +4017,7 @@ impl Runner {
                 let cause = Handback::Trapped {
                     kind: format!("{:?}", e.kind),
                     message: e.message.clone(),
-                    resumable: matches!(e.resume, ResumeMode::PushValueThenContinue),
+                    resumable: e.resume.is_resumable(),
                 };
                 (cause, site, ResumeWith::Trapped(e))
             }

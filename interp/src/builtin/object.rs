@@ -466,7 +466,7 @@ pub fn obj_is_frozen(vm: &mut VM, args: Args) -> Result<Value, VMError> {
             let obj = vm
                 .objects
                 .get(*p as usize)
-                .ok_or_else(|| vm.fail(ErrorKind::TypeError, "bad object pointer"))?;
+                .ok_or_else(|| vm.fail_invariant(ErrorKind::TypeError, "bad object pointer"))?;
             Ok(Value::Bool(obj.integrity == IntegrityLevel::Frozen))
         }
         _ => Ok(Value::Bool(false)),
@@ -511,7 +511,7 @@ pub fn obj_is_sealed(vm: &mut VM, args: Args) -> Result<Value, VMError> {
             let obj = vm
                 .objects
                 .get(*p as usize)
-                .ok_or_else(|| vm.fail(ErrorKind::TypeError, "bad object pointer"))?;
+                .ok_or_else(|| vm.fail_invariant(ErrorKind::TypeError, "bad object pointer"))?;
             Ok(Value::Bool(matches!(
                 obj.integrity,
                 IntegrityLevel::Sealed | IntegrityLevel::Frozen
@@ -558,7 +558,7 @@ pub fn obj_is_extensible(vm: &mut VM, args: Args) -> Result<Value, VMError> {
             let obj = vm
                 .objects
                 .get(*p as usize)
-                .ok_or_else(|| vm.fail(ErrorKind::TypeError, "bad object pointer"))?;
+                .ok_or_else(|| vm.fail_invariant(ErrorKind::TypeError, "bad object pointer"))?;
             Ok(Value::Bool(obj.integrity == IntegrityLevel::Extensible))
         }
         _ => Ok(Value::Bool(false)),

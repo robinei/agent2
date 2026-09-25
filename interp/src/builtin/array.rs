@@ -49,14 +49,14 @@ pub fn array_from(vm: &mut VM, args: Args) -> Result<Value, VMError> {
             let arr = vm
                 .arrays
                 .get(*p as usize)
-                .ok_or_else(|| vm.fail(ErrorKind::ValueError, "value error"))?;
+                .ok_or_else(|| vm.fail_invariant(ErrorKind::ValueError, "value error"))?;
             Ok(vm.alloc_array(arr.clone()))
         }
         Value::Object(p) => {
             let obj = vm
                 .objects
                 .get(*p as usize)
-                .ok_or_else(|| vm.fail(ErrorKind::ValueError, "value error"))?;
+                .ok_or_else(|| vm.fail_invariant(ErrorKind::ValueError, "value error"))?;
             let len = obj
                 .map
                 .get(keys::LENGTH)
@@ -281,7 +281,7 @@ pub fn flatten_into(
             let nested = vm
                 .arrays
                 .get(*p as usize)
-                .ok_or_else(|| vm.fail(ErrorKind::TypeError, "bad array pointer"))?;
+                .ok_or_else(|| vm.fail_invariant(ErrorKind::TypeError, "bad array pointer"))?;
             flatten_into(vm, nested, depth - 1, out)?;
             continue;
         }

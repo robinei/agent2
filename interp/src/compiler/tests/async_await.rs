@@ -116,7 +116,7 @@ fn rejected_await_escalates_and_is_resumable() {
     // than 42 bytes.
     assert_eq!(err.message, "tool exploded", "got: {}", err.message);
     // Phase 3 path: the host substitutes a value and execution continues.
-    assert!(matches!(err.resume, ResumeMode::PushValueThenContinue));
+    assert!(matches!(err.resume, ResumeMode::Resumable));
     vm.resume_with(&err, Value::PosInt(0)).unwrap();
     match vm.step(u64::MAX).unwrap() {
         StepResult::Done { value, .. } => assert_eq!(value, Value::PosInt(0)),
@@ -842,7 +842,10 @@ fn circular_await_is_deadlock_error() {
     vm.resolve_promise(calls[0].promise, Value::Null).unwrap();
     let err = vm.step(u64::MAX).unwrap_err();
     assert_eq!(err.kind, ErrorKind::Deadlock);
-    assert!(matches!(err.resume, ResumeMode::NotResumable));
+    // Not a broken invariant, but it shares the bucket's rule: every
+    // strand is parked, so there is nothing to resume into and nothing for
+    // a `catch` to carry on with.
+    assert!(matches!(err.resume, ResumeMode::InvariantViolation));
     assert!(
         err.message.contains("circular await"),
         "got: {}",
