@@ -277,7 +277,7 @@ fn every_worked_example_compiles() {
 
 /// **The dialect table is true of the interpreter it describes.**
 ///
-/// The card names three places this language answers differently from
+/// The card names the places this language answers differently from
 /// JS, each as a literal expression and a literal result. They are the
 /// only claims in the card a reader is invited to rely on without
 /// trying them, and nothing connected them to the interpreter — the
@@ -1020,7 +1020,7 @@ mod tests {
         // `card()` shows up as a diff review must look at, not a byte
         // count that silently drifts. Comparing full text (not just a
         // hash) so the diff itself is legible in a failure message.
-        const EXPECTED_LEN: usize = 25501;
+        const EXPECTED_LEN: usize = 25570;
         assert_eq!(
             card().len(),
             EXPECTED_LEN,

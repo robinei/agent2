@@ -73,6 +73,7 @@ pub(crate) use function::function_ctor;
 pub(crate) use map::map_ctor;
 pub(crate) use number::number_ctor;
 pub(crate) use number::number_to_fixed;
+pub(crate) use object::error_ctor;
 pub(crate) use object::obj_create;
 pub(crate) use object::obj_freeze;
 pub(crate) use object::obj_is_extensible;
@@ -613,6 +614,12 @@ builtins! {
     StringCtor,  BuiltinKind::Constructor { type_tag: TypeTag::String },  "String",  1, 1,      string_ctor,  false, false, false, false, false, false, false, false, false, false;
     BooleanCtor, BuiltinKind::Constructor { type_tag: TypeTag::Boolean }, "Boolean", 1, 1,      boolean_ctor, false, false, false, false, false, false, false, false, false, false;
     FunctionCtor,BuiltinKind::Constructor { type_tag: TypeTag::Function },"Function",0, VARARG, function_ctor, false, false, false, false, false, false, false, false, false, false;
+    // `Error` is a constructor row so that `Error.prototype` is the object
+    // every error links to — `e instanceof Error` walks to it. The subclass
+    // names (`TypeError`, …) are not rows: there is one error prototype, and
+    // giving them all the same one would answer `e instanceof TypeError` true
+    // for a `RangeError`.
+    ErrorCtor,   BuiltinKind::Constructor { type_tag: TypeTag::Error },   "Error",   0, 1,      error_ctor,   false, false, false, false, false, false, false, false, false, false;
 
     // ── ArrayBuffer ──
     ArrayBufferCtor,    BuiltinKind::Constructor { type_tag: TypeTag::ArrayBuffer },        "ArrayBuffer",        1, 1,      arraybuffer_ctor,      false, false, false, false, false, false, false, false, false, false;

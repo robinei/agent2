@@ -900,9 +900,13 @@ together.
     `false`) via the capped `resolve_proto_chain`: `true` iff that `ObjectPtr`
     appears. (`InstanceOf` instruction, `pe_*` pure, `ResumeMode`.)
 
-  Divergence: `instanceof Error` is unsupported — Error instances are plain
-  `Object`s here with no distinct tag or `Error.prototype` link, so they can't be
-  told from a `{name, message}` object.
+  Divergence (**closed 2026-09-25**): `instanceof Error` was unsupported —
+  Error instances were plain `Object`s with no `Error.prototype` link, so they
+  could not be told from a `{name, message}` object. There is now a
+  `TypeTag::Error` prototype that every error links to (`VM::alloc_error`), and
+  the link is also what string coercion reads to render `"TypeError: …"`. Still
+  unsupported: `instanceof TypeError`, since the six error names share the one
+  prototype.
 - **`Object.getPrototypeOf(obj)`** — namespace builtin. Returns `obj`'s
   `[[Prototype]]` as `Value::Object(proto_ptr)`, or **`Value::Null`** when `proto`
   is `None` (plain objects have no proto here — a divergence from JS's
@@ -990,8 +994,9 @@ one-off bolt-ons.
 - **`instanceof` covers builtin types and user callables** (Step 8).
   `x instanceof Array`/`Object`/`Map`/`Set`/`RegExp`/`Function` is a value-tag
   check; `x instanceof F` for a user function / class / `Bound` walks the proto
-  chain. Only **`instanceof Error` is unsupported** — Error instances are plain
-  `Object`s with no distinct tag or `Error.prototype` link.
+  chain. `instanceof Error` joined them on 2026-09-25 (`TypeTag::Error`); the
+  per-name forms (`instanceof TypeError`) remain unsupported, because the six
+  error names share one prototype and differ only in the `name` they write.
 - **Prototype reflection is partial** (Step 8). `Object.getPrototypeOf` returns
   `null` for a plain object (no `Object.prototype`); `getPrototypeOf` on a
   primitive is a `TypeError` (no wrapper coercion); a cyclic `setPrototypeOf` is

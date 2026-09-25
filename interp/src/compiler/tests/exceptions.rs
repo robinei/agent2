@@ -1245,3 +1245,144 @@ fn an_unawaited_async_iife_is_refused_with_the_way_round_it() {
     // And an un-awaited *call* stays legal — that is how `tell` works.
     crate::compile("tell(\"hi\");").expect("an unawaited call is the documented way");
 }
+
+// ── errors are Errors ────────────────────────────────────────────────
+//
+// Added 2026-09-25. Before it, `catch (e) { if (e instanceof Error) … }`
+// took the wrong branch for *every* error a program could catch, and
+// `` `${e}` `` logged `[object Object]` — so a model that wrote the
+// defensive JavaScript it had written everywhere else got a silent miss
+// and an unreadable log line. Each test below fails on the old dialect.
+
+#[test]
+fn every_error_a_program_can_catch_is_instanceof_error() {
+    // Three sources, one prototype. The VM's own raise:
+    assert_eq!(
+        run_ret("try { null.y; } catch (e) { return e instanceof Error; }"),
+        json!(true)
+    );
+    // …including the non-JS kinds this dialect raises (`ValueError`):
+    assert_eq!(
+        run_ret(r#"try { JSON.parse("{"); } catch (e) { return e instanceof Error; }"#),
+        json!(true)
+    );
+    // A constructed error, with `new` and without:
+    assert_eq!(
+        run_ret(r#"return new Error("x") instanceof Error;"#),
+        json!(true)
+    );
+    assert_eq!(
+        run_ret(r#"return TypeError("x") instanceof Error;"#),
+        json!(true)
+    );
+    assert_eq!(
+        run_ret(r#"return new RangeError("x") instanceof Error;"#),
+        json!(true)
+    );
+    // And one that was thrown and caught, which is the shape that matters.
+    assert_eq!(
+        run_ret(r#"try { throw new TypeError("x"); } catch (e) { return e instanceof Error; }"#),
+        json!(true)
+    );
+    // An error is still an object: the chain reaches `Object.prototype`.
+    assert_eq!(
+        run_ret(r#"return new Error("x") instanceof Object;"#),
+        json!(true)
+    );
+}
+
+#[test]
+fn an_error_stringifies_as_name_colon_message() {
+    // `Error.prototype.toString`'s three cases, through both coercions a
+    // program actually writes.
+    assert_eq!(
+        run_ret(r#"return `${new TypeError("bad input")}`;"#),
+        json!("TypeError: bad input")
+    );
+    assert_eq!(
+        run_ret(r#"return "" + new TypeError("bad input");"#),
+        json!("TypeError: bad input")
+    );
+    assert_eq!(run_ret(r#"return String(new Error(""));"#), json!("Error"));
+    assert_eq!(run_ret(r#"return `${new Error()}`;"#), json!("Error"));
+    // A VM-raised error carries its rendered diagnostic as the message, so
+    // the coercion must at least lead with the kind and the cause.
+    let s = run_ret("try { null.y; } catch (e) { return `${e}`; }");
+    let s = s.as_str().expect("a string").to_owned();
+    assert!(
+        s.starts_with("TypeError: ") && s.contains("cannot read property 'y' on null"),
+        "got {s}"
+    );
+}
+
+#[test]
+fn an_ordinary_object_that_looks_like_an_error_is_not_one() {
+    // **The rule duck-typing would break.** An error is recognized by its
+    // prototype, never by having a `name` and a `message` — a tool result
+    // with those two fields is a record, and a program that formats it
+    // must still see `[object Object]`, not a sentence.
+    assert_eq!(
+        run_ret(r#"return `${{ name: "x", message: "y" }}`;"#),
+        json!("[object Object]")
+    );
+    assert_eq!(
+        run_ret(r#"return ({ name: "x", message: "y" }) instanceof Error;"#),
+        json!(false)
+    );
+    // Nor is a bare object, which has no fields to be mistaken for either.
+    assert_eq!(run_ret("return `${{}}`;"), json!("[object Object]"));
+    assert_eq!(run_ret("return ({}) instanceof Error;"), json!(false));
+}
+
+#[test]
+fn an_error_is_still_a_two_field_object() {
+    // The proto link is the only thing added: the fields stay own and
+    // enumerable, so `Object.keys`, `JSON.stringify` and the `e.name`
+    // branch the card recommends all behave as before.
+    assert_eq!(
+        run_ret(r#"return Object.keys(new TypeError("x"));"#),
+        json!(["name", "message"])
+    );
+    assert_eq!(
+        run_ret(r#"return JSON.stringify(new TypeError("x"));"#),
+        json!(r#"{"name":"TypeError","message":"x"}"#)
+    );
+    assert_eq!(
+        run_ret("try { null.y; } catch (e) { return e.name; }"),
+        json!("TypeError")
+    );
+    // The prototype itself stays empty — its methods are virtual rungs, so
+    // nothing new shows up in a `for-in` over an error.
+    assert_eq!(run_ret("return Object.keys(Error.prototype);"), json!([]));
+}
+
+#[test]
+fn error_is_a_constructor_not_the_function_constructor() {
+    // `Error` used to resolve to `Builtin::FunctionCtor`, which is why
+    // `instanceof` walked to `Function.prototype` and missed.
+    assert_eq!(run_ret("return typeof Error;"), json!("function"));
+    assert_eq!(
+        run_ret(r#"return new Error("x").constructor === Error;"#),
+        json!(true)
+    );
+    assert_eq!(
+        run_ret(r#"return new Error("x").constructor.name;"#),
+        json!("Error")
+    );
+    assert_eq!(
+        run_ret(
+            "try { null.y; } catch (e) { return Object.getPrototypeOf(e) === Error.prototype; }"
+        ),
+        json!(true)
+    );
+    // Called through a value (not the compiler's literal-name fast path),
+    // `Error` still builds an error.
+    assert_eq!(
+        run_ret(r#"const E = Error; return E("x") instanceof Error;"#),
+        json!(true)
+    );
+    assert_eq!(
+        run_ret(r#"const E = Error; return `${E("x")}`;"#),
+        json!("Error: x")
+    );
+}

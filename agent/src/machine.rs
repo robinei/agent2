@@ -29,7 +29,9 @@
 use std::collections::HashMap;
 use std::io;
 
-use interp::{InvokeCall, PromisePtr, ResumeMode, SettleCall, StepResult, VM, VMError, Value};
+use interp::{
+    InvokeCall, JsString, PromisePtr, ResumeMode, SettleCall, StepResult, VM, VMError, Value,
+};
 
 use crate::host::ProgramStatus;
 use crate::report::{Artifact, ArtifactState, arg_preview, preview};
@@ -5366,11 +5368,12 @@ fn json_arg(vm: &mut VM, json: &serde_json::Value) -> Value {
 /// settle-at-dispatch verb throws at the call site. Only where the
 /// program is waiting differs — what a failure *looks like* must not.
 fn tool_error(vm: &mut VM, message: &str) -> Value {
-    vm.json_to_stack_value(
-        &serde_json::json!({ "name": "ToolError", "message": message }),
-        0,
-    )
-    .expect("plain json")
+    // Built by the VM's own error allocator, not as JSON: a tool failure is
+    // caught by the same `catch (e)` as a `TypeError` the interpreter raised,
+    // so it has to be `instanceof Error` and stringify as
+    // `"ToolError: <message>"` exactly like one. Building it as a plain
+    // `{ name, message }` object here is what made it neither.
+    vm.alloc_error(JsString::from("ToolError"), JsString::from(message))
 }
 
 fn value_json(vm: &VM, v: &Value) -> serde_json::Value {
@@ -10373,8 +10376,10 @@ mod tests {
     /// ```
     ///
     /// The card already promised the second shape for all of them —
-    /// "a caught error is a plain `{ name, message }`, so branch on
-    /// `e.name`" — so this makes the card true rather than longer.
+    /// it said a caught error is `{ name, message }`, to be branched on
+    /// by `e.name` — so this makes the card true rather than longer.
+    /// (The `` `${e}` `` column is now the message, not `[object
+    /// Object]`; see the test below.)
     ///
     /// **Three paths, one builder.** A call the program `await`s
     /// rejects its promise; a settle-at-dispatch verb throws at the
@@ -10409,6 +10414,47 @@ mod tests {
         assert!(
             !told.contains("undefined undefined"),
             "a name or message is missing on one of them: {told}"
+        );
+    }
+
+    /// **A tool failure is an `Error`, like every other failure.**
+    ///
+    /// The companion to the test above: same shape is not enough if the
+    /// shape is not an error. `catch (e) { if (e instanceof Error) … }`
+    /// is what defensive JavaScript looks like, and a tool error built
+    /// as a plain object answered `false` to it while a `TypeError` the
+    /// interpreter raised answered `false` too — so the branch was dead
+    /// either way and nothing said so. `${e}` logged `[object Object]`,
+    /// which is the message a reader needs replaced by no message at
+    /// all.
+    ///
+    /// Asserted here rather than only in `interp` because the harness
+    /// builds this one itself: it is the one error source outside the
+    /// interpreter, and the one that could drift away from the rest.
+    #[test]
+    fn a_tool_failure_is_an_error_and_says_so_when_printed() {
+        let mut c = Conversation::new();
+        c.rejects("echo", "the host said no");
+        let said = c.reply(
+            r#"```js
+try { await tools.echo(1); } catch (e) { tell(`tool ${e instanceof Error} ${e}`); }
+try { null.x; } catch (e) { tell(`js ${e instanceof Error}`); }
+tell(`plain ${({ name: "x", message: "y" }) instanceof Error}`);
+```
+"#,
+        );
+        let told = said.tells.join("\n");
+        assert!(
+            told.contains("tool true ToolError: the host said no"),
+            "a tool failure is an Error and prints as one: {told}"
+        );
+        assert!(
+            told.contains("js true"),
+            "so is one the interpreter raised: {told}"
+        );
+        assert!(
+            told.contains("plain false"),
+            "and an ordinary object that happens to have the two fields is not: {told}"
         );
     }
 

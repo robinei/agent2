@@ -836,8 +836,6 @@ impl super::Compiler {
                     );
                     return;
                 }
-                let name_str = self.intern_string(name);
-                self.emit(Instr::PushStr(name_str), span);
                 match argv.first() {
                     None => {
                         let empty = self.intern_string("");
@@ -848,16 +846,8 @@ impl super::Compiler {
                         self.emit(Instr::ToStr, span);
                     }
                 }
-                self.emit(
-                    Instr::ObjNew(
-                        vec![
-                            crate::vm::JsString::from("name"),
-                            crate::vm::JsString::from("message"),
-                        ]
-                        .into(),
-                    ),
-                    span,
-                );
+                let name_str = self.intern_string(name);
+                self.emit(Instr::ErrNew(name_str), span);
             }
             _ => {
                 // Unknown global — compile as a dynamic call resolved at runtime.

@@ -176,19 +176,35 @@ is `"[]"`, not `"{}"`. Both silent, both far less likely to be reached
 than 25.2. Recorded, not scheduled — do them if 25.2 lands and the
 same treatment is obviously right.
 
-## 25.4 — `instanceof Error`
+## 25.4 — `instanceof Error` — **done, 2026-09-25**
 
-A caught runtime error materialises as a plain `{ name, message }`, so
-`e instanceof Error` is `false` and `catch (e) { if (e instanceof
-Error) … }` — which is ordinary defensive JavaScript — takes the wrong
-branch silently. Currently a card line. Cheapest real fix is to give
-those objects an `Error.prototype` link so `instanceof` walks to it;
-`Object.getPrototypeOf` already returns real prototypes for every other
-value, so the machinery exists.
+A caught runtime error materialised as a plain `{ name, message }`, so
+`e instanceof Error` was `false` and `catch (e) { if (e instanceof
+Error) … }` — which is ordinary defensive JavaScript — took the wrong
+branch silently. `` `${e}` `` was `[object Object]`, which is the
+second half of the same silence: the log line that should carry the
+message carried nothing.
 
-Gate: `try { null.x } catch (e) { return e instanceof Error }` is
-`true`, `e.name` is unchanged, and no new `Error` subclass machinery is
-implied.
+The fix is the one this entry proposed: a `TypeTag::Error` row, so
+`Error.prototype` exists and is what every error links to. One VM
+helper (`VM::alloc_error`) builds all of them — the errors the VM
+raises, `new Error(…)`/`TypeError(…)` (`Instr::ErrNew`), and the
+harness's own tool errors — so no source can drift from the rest.
+String coercion recognises an error *by that prototype link*, never by
+having a `name` and a `message`: `{ name: "x", message: "y" }` is still
+`[object Object]`, because a tool result with those two fields is a
+record, not an error.
+
+Gate, met: `try { null.x } catch (e) { return e instanceof Error }` is
+`true`; `e.name` and `Object.keys(e)` are unchanged; no `Error`
+subclass machinery was added. test262 moved 14 tests Fail → Pass (6 of
+them `Error/prototype/toString`) and none the other way.
+
+What is **not** closed: there is one error prototype, not one per name,
+so `e instanceof TypeError` is `false` — including for a `TypeError`.
+That is the card's remaining dialect row, and `e.name` is still the way
+to tell errors apart. Closing it is the prelude-classes plan in
+`docs/4_FUTURE.md`.
 
 ## 25.5 — Nothing built stays unmentioned
 

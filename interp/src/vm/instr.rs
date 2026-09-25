@@ -161,6 +161,15 @@ pub enum TypeTag {
     BigInt64Array,
     BigUint64Array,
     DataView,
+    /// `Error` — the prototype every catchable value in this dialect hangs
+    /// off. Unlike the tags above it there is no distinct *representation*:
+    /// an error is a `Value::Object` whose `proto` is this tag's prototype,
+    /// carrying its own `name` and `message`. That link is the whole point —
+    /// without it `catch (e) { if (e instanceof Error) … }`, which is
+    /// ordinary defensive JavaScript, took the wrong branch in silence.
+    /// Added last so the existing tags keep their discriminants (the
+    /// prototype side table is indexed by `tag as usize`).
+    Error,
 }
 
 impl TypeTag {
@@ -168,7 +177,7 @@ impl TypeTag {
     /// "what type tags exist" — iterate this instead of hand-listing variants
     /// or mapping side-table indices back to tags by literal number (which
     /// silently breaks if the enum is reordered). `COUNT` is derived from it.
-    pub const ALL: [TypeTag; 22] = [
+    pub const ALL: [TypeTag; 23] = [
         TypeTag::Array,
         TypeTag::Object,
         TypeTag::Map,
@@ -191,6 +200,7 @@ impl TypeTag {
         TypeTag::BigInt64Array,
         TypeTag::BigUint64Array,
         TypeTag::DataView,
+        TypeTag::Error,
     ];
 
     /// Number of variants — sizes the prototype side table.
@@ -225,6 +235,7 @@ impl TypeTag {
             TypeTag::BigInt64Array => "BigInt64Array",
             TypeTag::BigUint64Array => "BigUint64Array",
             TypeTag::DataView => "DataView",
+            TypeTag::Error => "Error",
         }
     }
 
@@ -699,6 +710,19 @@ pub enum Instr {
     /// object with each field set to its corresponding value. Left-to-right:
     /// field 0's value is the first/deepest pushed.
     ObjNew(ThinVec<FieldName>), // [any, ...] -> obj
+
+    /// pops the (already `ToString`-coerced) message and pushes an **error
+    /// object**: `{ name, message }` whose `proto` is `Error.prototype`, with
+    /// the name carried in the instruction (`Error`, `TypeError`, … — always a
+    /// literal at the `new Error(…)` / `TypeError(…)` call site).
+    ///
+    /// Separate from `ObjNew` rather than a flag on it, because the proto link
+    /// is the *only* thing that distinguishes an error from the object literal
+    /// `{ name: "x", message: "y" }` — and that literal must keep answering
+    /// `false` to `instanceof Error` and `"[object Object]"` to `` `${…}` ``.
+    /// Deciding by shape at the instruction would make every two-field object
+    /// an error. str -> obj
+    ErrNew(FieldName),
     ObjGet(FieldName), // obj -> any
     /// Read property `name` off the receiver but **keep the receiver** below the
     /// result. Semantically identical to `ObjGet` (same own→proto walk, same

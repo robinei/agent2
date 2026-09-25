@@ -89,9 +89,15 @@ land, the `new Error` compiler special-form (`compile_error_ctor` → bare
 `class Error { constructor(message){ this.name="Error"; this.message=message } }`,
 `class TypeError extends Error {…}`, etc. `new Error(...)` then takes the normal
 `New`/`NewReturn` path, `e instanceof Error`/`TypeError` works via the proto
-chain, and `class AppError extends Error {}` falls out of Step 7b. This closes
-the **`instanceof Error`** gap (the one divergence Step 8 leaves) and subsumes
+chain, and `class AppError extends Error {}` falls out of Step 7b. This subsumes
 the JS-named-error-kinds note above (the names become real subclasses).
+
+**Partly overtaken, 2026-09-25.** The `instanceof Error` half landed without
+prelude classes: `TypeTag::Error` gives errors a real `Error.prototype`, and
+`VM::alloc_error` is the single builder every source goes through (see
+`docs/25_JS_DIALECT.md` §25.4). What prelude classes would still buy is the
+*hierarchy* — `e instanceof TypeError`, and `class AppError extends Error {}`
+— which one shared prototype cannot express.
 The link from library entity to VM-internal concept is a **lang-item**
 mechanism (cf. Rust `#[lang = "…"]`, Swift's underscored attributes, the JVM's
 well-known classes): a fixed table of slots (`Error`, `TypeError`, …) that the

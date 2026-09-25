@@ -3,7 +3,7 @@ use oxc_span::GetSpan;
 
 use crate::builtin::Builtin;
 use crate::span::Span;
-use crate::vm::{Instr, JsString, Value};
+use crate::vm::{Instr, Value};
 
 impl super::Compiler {
     /// Every expression leaves exactly one value on the stack (the
@@ -184,8 +184,12 @@ impl super::Compiler {
     }
 
     /// `new Error(msg)` / `new TypeError(msg)` / …: build the `{ name,
-    /// message }` error object. The message coerces with ToString at
-    /// construction (`new Error(123)` → `"123"`, as in JS); absent → `""`.
+    /// message }` error object, linked to `Error.prototype` by
+    /// [`Instr::ErrNew`] so `e instanceof Error` holds. The message coerces
+    /// with ToString at construction (`new Error(123)` → `"123"`, as in JS);
+    /// absent → `""`. The *name* is the identifier that was written, so
+    /// `new TypeError("x").name` is `"TypeError"` even though all six share
+    /// one prototype.
     pub(super) fn compile_error_ctor(&mut self, name: &str, n: &ast::NewExpression) {
         let span = n.span.into();
         if n.arguments.len() > 1 {
@@ -196,8 +200,6 @@ impl super::Compiler {
             );
             return;
         }
-        let name_str = self.intern_string(name);
-        self.emit(Instr::PushStr(name_str), span);
         match n.arguments.first() {
             None => {
                 let empty = self.intern_string("");
@@ -217,10 +219,8 @@ impl super::Compiler {
                 }
             },
         }
-        self.emit(
-            Instr::ObjNew(vec![JsString::from("name"), JsString::from("message")].into()),
-            span,
-        );
+        let name_str = self.intern_string(name);
+        self.emit(Instr::ErrNew(name_str), span);
     }
 
     /// `new F(args)` for a user-defined function `F` (not a builtin ctor).

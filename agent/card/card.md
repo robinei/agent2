@@ -206,4 +206,4 @@ Everything else that differs stops the block and says what to write instead, so 
 | you write | you get | |
 |---|---|---|
 | `1 < "2"` | `false` | `<` `>` `<=` `>=` do not coerce across types, so a number parsed out of a tool's output is a string until you write `Number(x)` |
-| `e instanceof Error` | `false` | a caught error is a plain `{ name, message }`, so branch on `e.name` |
+| `e instanceof TypeError` | `false` | every error shares one `Error` prototype (`e instanceof Error` is true), so there is no per-name class to test — branch on `e.name` |

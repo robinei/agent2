@@ -9,6 +9,26 @@ use crate::diag::Diagnostic;
 /// exist to say what to write instead.
 const UNCAUGHT_MESSAGE_MAX_BYTES: usize = 2048;
 
+/// How far a `[[Prototype]]` walk goes before giving up. A cap, not a limit
+/// anyone should reach: it exists so a malformed chain (a cycle built by a
+/// bad `Object.setPrototypeOf`) ends a property read instead of hanging the
+/// VM.
+const MAX_PROTO_DEPTH: u32 = 100;
+
+/// JS `Error.prototype.toString`: `name`, `": "`, `message` — dropping the
+/// separator when either half is empty, so a nameless error renders as its
+/// message alone and a messageless one as its bare name.
+///
+/// Spelled out here rather than in the formatter because both string writers
+/// need it and neither can call into JS to run a `toString`.
+fn error_to_string(name: &str, message: &str) -> String {
+    match (name.is_empty(), message.is_empty()) {
+        (true, _) => message.to_owned(),
+        (false, true) => name.to_owned(),
+        (false, false) => format!("{name}: {message}"),
+    }
+}
+
 /// Whether a value is an *object* for `instanceof` purposes (Step 2b). JS
 /// `instanceof` spec: "If Type(relObj) is not Object, return false." The
 /// "object" types are the heap/structural types (Object/Array/Map/Set/
@@ -294,35 +314,21 @@ impl VM {
         }
     }
 
-    /// Materialize a catchable VM error as the plain `{ name, message }`
-    /// object a `catch` binding receives: `name` from the error kind,
-    /// `message` the fully rendered diagnostic (line/col + source line).
+    /// Materialize a catchable VM error as the `{ name, message }` object a
+    /// `catch` binding receives: `name` from the error kind, `message` the
+    /// fully rendered diagnostic (line/col + source line). Built by
+    /// [`Self::alloc_error`], so a `TypeError` the VM raised is `instanceof
+    /// Error` exactly like one the program wrote itself.
     pub(super) fn error_to_thrown(&mut self, e: &VMError) -> Value {
-        let mut obj = IndexMap::new();
-        obj.insert(
-            JsString::from("name"),
-            Value::String(JsString::from(format!("{:?}", e.kind).as_str())),
-        );
-        obj.insert(
-            JsString::from("message"),
-            Value::String(JsString::from(self.render_error(e).as_str())),
-        );
-        self.alloc_object(obj)
+        let name = JsString::from(format!("{:?}", e.kind).as_str());
+        let message = JsString::from(self.render_error(e).as_str());
+        self.alloc_error(name, message)
     }
 
     /// The `{ name: "TypeError", message }` object a promise-chaining cycle
     /// rejects with (the scheduler-side mirror of the `Await` cycle check).
     fn cycle_error_value(&mut self, msg: &str) -> Value {
-        let mut obj = IndexMap::new();
-        obj.insert(
-            JsString::from("name"),
-            Value::String(JsString::from("TypeError")),
-        );
-        obj.insert(
-            JsString::from("message"),
-            Value::String(JsString::from(msg)),
-        );
-        self.alloc_object(obj)
+        self.alloc_error(JsString::from("TypeError"), JsString::from(msg))
     }
 
     /// Render an uncaught thrown value: an `{ name, message }` error object
@@ -1270,6 +1276,86 @@ impl VM {
         Value::Object(addr)
     }
 
+    /// Allocate an error object: `{ name, message }` linked to
+    /// `Error.prototype`.
+    ///
+    /// **The one place that knows how an error is built.** Every value a
+    /// program can `catch` comes through here — the errors the VM raises
+    /// (`error_to_thrown`), `new Error(…)`/`TypeError(…)` (`Instr::ErrNew`),
+    /// and the host's own failures (the harness's tool errors) — so
+    /// `e instanceof Error` and `` `${e}` `` cannot be true of one source and
+    /// false of the next. Before this existed each source built its own plain
+    /// object literal, and a caught error was `instanceof Error` nowhere.
+    ///
+    /// The two fields are own properties (so `Object.keys(e)` is
+    /// `["name", "message"]` and `JSON.stringify(e)` still round-trips);
+    /// only the proto link marks it as an error.
+    pub fn alloc_error(&mut self, name: JsString, message: JsString) -> Value {
+        let mut map = IndexMap::new();
+        map.insert(JsString::from("name"), Value::String(name));
+        map.insert(JsString::from("message"), Value::String(message));
+        // Compute `addr` AFTER `prototype_for` — it pushes to `self.objects`
+        // when the prototype is not yet materialized, which would make an
+        // earlier `addr` stale (the same trap `alloc_object` documents).
+        let proto = self.prototype_for(crate::vm::instr::TypeTag::Error).ok();
+        let addr = self.objects.len() as ObjectPtr;
+        self.objects.push(ObjData {
+            proto,
+            map,
+            ..Default::default()
+        });
+        Value::Object(addr)
+    }
+
+    /// The `name` and `message` of an error object, or `None` for anything
+    /// that is not one — where "is one" means *its prototype chain reaches
+    /// `Error.prototype`*, never its shape. String coercion asks this, so
+    /// `` `${e}` `` is `"TypeError: cannot read property 'x' on null"` while
+    /// the ordinary object literal `{ name: "x", message: "y" }` stays
+    /// `"[object Object]"`: duck-typing here would quietly reclassify every
+    /// two-field record a program happens to build.
+    ///
+    /// **Takes `&self` and never allocates**: `prototype_ptr` peeks at the
+    /// side table instead of materializing `Error.prototype`, so a program
+    /// that never made an error answers `None` after one lookup — which is
+    /// what lets `write_js_units`, which cannot call back into JS, do this at
+    /// all.
+    ///
+    /// The fallbacks are `Error.prototype`'s own defaults in JS: an absent
+    /// `name` reads as `"Error"`, an absent `message` as `""`.
+    fn error_parts(&self, val: &Value, depth: usize) -> Option<(JsString, JsString)> {
+        let Value::Object(p) = val else {
+            return None;
+        };
+        let err_proto = self.prototype_ptr(crate::vm::instr::TypeTag::Error)?;
+        let obj = self.objects.get(*p as usize)?;
+        let mut cur = obj.proto;
+        // Same depth cap as `resolve_proto_chain`: a malformed chain must not
+        // hang the formatter.
+        let mut found = false;
+        for _ in 0..MAX_PROTO_DEPTH {
+            match cur {
+                Some(ptr) if ptr == err_proto => {
+                    found = true;
+                    break;
+                }
+                Some(ptr) => cur = self.objects.get(ptr as usize).and_then(|o| o.proto),
+                None => break,
+            }
+        }
+        if !found {
+            return None;
+        }
+        let field = |key: &[u16], default: &str| -> JsString {
+            match obj.map.get(key) {
+                Some(Value::String(s)) => s.clone(),
+                None | Some(Value::Undefined) => JsString::from(default),
+                Some(other) => self.to_js_string(other, depth + 1),
+            }
+        };
+        Some((field(keys::NAME, "Error"), field(keys::MESSAGE, "")))
+    }
+
     /// Walk own `map` → `proto` chain → `Undefined`. Own hit returns
     /// immediately; `proto: None` returns `Undefined` with one branch and
     /// never enters the loop. A depth cap guards against malformed cycles.
@@ -1285,7 +1371,6 @@ impl VM {
         obj_ptr: ObjectPtr,
         field: &JsString,
     ) -> Result<Value, VMError> {
-        const MAX_PROTO_DEPTH: u32 = 100;
         let mut cur = obj_ptr;
         for _depth in 0..MAX_PROTO_DEPTH {
             let obj = self.objects.get(cur as usize).ok_or_else(|| {
@@ -1318,7 +1403,6 @@ impl VM {
         start: ObjectPtr,
         target: ObjectPtr,
     ) -> Result<bool, VMError> {
-        const MAX_PROTO_DEPTH: u32 = 100;
         let mut cur = Some(start);
         for _ in 0..MAX_PROTO_DEPTH {
             match cur {
@@ -1671,15 +1755,19 @@ impl VM {
         if let Some(b) = crate::builtin::Builtin::for_constructor(name) {
             return Ok(Value::Builtin(b));
         }
-        // error constructors: used by test262 for typeof checks, instanceof,
-        // and error-type comparison. The compiler's `new` path handles
-        // construction; here we provide a callable identity so
-        // `typeof TypeError` returns "function".
+        // `Error` itself is a real constructor row (`Builtin::ErrorCtor`) and
+        // resolved above, so `Error.prototype` is the prototype every error
+        // object links to and `e instanceof Error` walks to it. The *subclass*
+        // names below are still callable placeholders: there is one error
+        // prototype, so resolving `TypeError` to it would make every error
+        // `instanceof TypeError` — a wrong answer in place of today's
+        // uniformly-false one. They keep `typeof TypeError === "function"`
+        // (test262 checks it) while construction goes through the compiler's
+        // `new` path, and `e.name` stays the way to tell errors apart.
         crate::match_wide!(name => {
             "undefined" => Ok(Value::Undefined),
             "NaN" => Ok(Value::Float(f64::NAN)),
             "Infinity" => Ok(Value::Float(f64::INFINITY)),
-            "Error" => Ok(Value::Builtin(crate::builtin::Builtin::FunctionCtor)),
             "TypeError" => Ok(Value::Builtin(crate::builtin::Builtin::FunctionCtor)),
             "ReferenceError" => Ok(Value::Builtin(crate::builtin::Builtin::FunctionCtor)),
             "SyntaxError" => Ok(Value::Builtin(crate::builtin::Builtin::FunctionCtor)),
@@ -1922,6 +2010,7 @@ impl VM {
                 crate::builtin::biguint64array_ctor(self, args)?
             }
             crate::vm::instr::TypeTag::DataView => crate::builtin::dataview_ctor(self, args)?,
+            crate::vm::instr::TypeTag::Error => crate::builtin::error_ctor(self, args)?,
         };
         self.stack.truncate(base);
         self.stack.push(result);
@@ -1980,7 +2069,13 @@ impl VM {
                     }
                 }
             }
-            Value::Object(_) => buf.push_str("[object Object]"),
+            Value::Object(_) => match self.error_parts(val, depth) {
+                Some((name, message)) => {
+                    let (name, message) = (name.to_utf8_lossy(), message.to_utf8_lossy());
+                    buf.push_str(&error_to_string(&name, &message));
+                }
+                None => buf.push_str("[object Object]"),
+            },
             Value::Promise(_) => buf.push_str("[object Promise]"),
             Value::RegExp(r) => {
                 buf.push('/');
@@ -2009,9 +2104,10 @@ impl VM {
     /// `write_js_string`, but appending code units.
     ///
     /// **The string cases memcpy and everything else is formatted then
-    /// widened.** Every leaf but a string, a regexp source and an array
-    /// element renders as ASCII (`"undefined"`, a number, `[object Object]`),
-    /// so the widening is a byte-to-unit map over a handful of characters.
+    /// widened.** Every leaf but a string, a regexp source, an error's
+    /// `name`/`message` and an array element renders as ASCII
+    /// (`"undefined"`, a number, `[object Object]`), so the widening is a
+    /// byte-to-unit map over a handful of characters.
     /// Routing the string cases through UTF-8 instead would put a transcode
     /// on both sides of every `+`.
     pub(super) fn write_js_units(&self, val: &Value, depth: usize, buf: &mut Vec<u16>) {
@@ -2039,6 +2135,24 @@ impl VM {
                 buf.push(b'/' as u16);
                 buf.extend_from_slice(r.flags.as_units());
             }
+            // An error renders from its own `name`/`message`, which are
+            // `JsString`s: append their units rather than letting the `other`
+            // arm below widen them back from UTF-8, which would mangle any
+            // lone surrogate a tool put in a message.
+            Value::Object(_) => match self.error_parts(val, depth) {
+                Some((name, message)) => {
+                    let (name, message) = (name.as_units(), message.as_units());
+                    if !name.is_empty() {
+                        buf.extend_from_slice(name);
+                        if !message.is_empty() {
+                            buf.push(b':' as u16);
+                            buf.push(b' ' as u16);
+                        }
+                    }
+                    buf.extend_from_slice(message);
+                }
+                None => buf.extend(crate::units::from_str("[object Object]")),
+            },
             other => {
                 let mut tmp = String::new();
                 self.write_js_string(other, depth, &mut tmp);

@@ -31,6 +31,24 @@ pub fn object_ctor(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     }
 }
 
+/// `Error(msg)` / `new Error(msg)` — the constructor, reached only when
+/// `Error` is called through a *value* (`const E = Error; E("x")`, or
+/// `Reflect`-ish reflection). The compiler lowers a literal `new Error(…)` /
+/// `Error(…)` to [`crate::vm::instr::Instr::ErrNew`] instead, which is where
+/// the subclass names (`TypeError`, …) get their `name` from.
+///
+/// Exists so `Error` can be a real constructor row rather than an alias for
+/// the `Function` constructor: that alias is what made `Error.prototype` the
+/// *function* prototype and `e instanceof Error` false for every error.
+pub fn error_ctor(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    let message = match args.get(vm, 0) {
+        // `new Error()` has no message, not the message `"undefined"`.
+        Value::Undefined => JsString::from(""),
+        other => vm.to_js_string(&other.clone(), 0),
+    };
+    Ok(vm.alloc_error(JsString::from("Error"), message))
+}
+
 /// `Object.keys(obj)` → array of own enumerable string keys. Step 2e: reads
 /// the unified own-prop snapshot, so it also enumerates a **function's** user
 /// **What it was handed, because it is nearly always `undefined`.**

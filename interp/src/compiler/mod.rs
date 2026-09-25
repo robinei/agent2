@@ -413,9 +413,19 @@ pub(crate) enum ConstVal {
     PosInt(u64),
 }
 
-/// The standard error constructor names recognized by `new` (6B decision 3):
-/// each builds a plain `{ name, message }` object — there are no error
-/// classes, prototypes, or `instanceof`.
+/// The standard error constructor names recognized by `new` and by a plain
+/// call. Each lowers to [`Instr::ErrNew`], which builds `{ name, message }`
+/// linked to the one `Error.prototype` — so every one of them is `instanceof
+/// Error` and stringifies as `"TypeError: …"`.
+///
+/// **This used to say there were no error prototypes at all.** A caught error
+/// was a bare object literal, so `catch (e) { if (e instanceof Error) … }` —
+/// which is what defensive JavaScript looks like everywhere else — took the
+/// wrong branch without a word, and `` `${e}` `` logged `[object Object]`
+/// instead of the message. There is still no error *class hierarchy*: the six
+/// names differ only in the `name` field they write, so `e instanceof
+/// TypeError` is not a question this dialect can answer and `e.name` remains
+/// the way to tell one error from another.
 fn is_error_ctor(name: &str) -> bool {
     matches!(
         name,
