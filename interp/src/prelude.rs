@@ -38,50 +38,50 @@ struct Hof {
 const HOFS: &[Hof] = &[
     Hof {
         method: "map",
-        source: "function __map(a, f) {\n  const r = [];\n  for (let i = 0; i < a.length; i++) { r.push(f(a[i], i, a)); }\n  return r;\n}",
+        source: "function __map(a, f) {\n  let n = a.length;\n  if (typeof n === 'string' || typeof n === 'boolean') { n = Number(n); }\n  if (typeof n !== 'number' || !(n > 0)) { n = 0; }\n  const r = [];\n  for (let i = 0; i < n; i++) { r.push(f(a[i], i, a)); }\n  return r;\n}",
     },
     Hof {
         method: "filter",
-        source: "function __filter(a, f) {\n  const r = [];\n  for (let i = 0; i < a.length; i++) { const v = a[i]; if (f(v, i, a)) { r.push(v); } }\n  return r;\n}",
+        source: "function __filter(a, f) {\n  let n = a.length;\n  if (typeof n === 'string' || typeof n === 'boolean') { n = Number(n); }\n  if (typeof n !== 'number' || !(n > 0)) { n = 0; }\n  const r = [];\n  for (let i = 0; i < n; i++) { const v = a[i]; if (f(v, i, a)) { r.push(v); } }\n  return r;\n}",
     },
     Hof {
         method: "forEach",
-        source: "function __forEach(a, f) {\n  if (Map.isMap(a)) {\n    const e = a.entries();\n    for (let i = 0; i < e.length; i++) { f(e[i][1], e[i][0], a); }\n  } else if (Set.isSet(a)) {\n    const v = a.values();\n    for (let i = 0; i < v.length; i++) { f(v[i], v[i], a); }\n  } else {\n    for (let i = 0; i < a.length; i++) { f(a[i], i, a); }\n  }\n  return undefined;\n}",
+        source: "function __forEach(a, f) {\n  if (Map.isMap(a)) {\n    const e = a.entries();\n    for (let i = 0; i < e.length; i++) { f(e[i][1], e[i][0], a); }\n  } else if (Set.isSet(a)) {\n    const v = a.values();\n    for (let i = 0; i < v.length; i++) { f(v[i], v[i], a); }\n  } else {\n    let n = a.length;\n    if (typeof n === 'string' || typeof n === 'boolean') { n = Number(n); }\n    if (typeof n !== 'number' || !(n > 0)) { n = 0; }\n    for (let i = 0; i < n; i++) { f(a[i], i, a); }\n  }\n  return undefined;\n}",
     },
     Hof {
         method: "some",
-        source: "function __some(a, f) {\n  for (let i = 0; i < a.length; i++) { if (f(a[i], i, a)) { return true; } }\n  return false;\n}",
+        source: "function __some(a, f) {\n  let n = a.length;\n  if (typeof n === 'string' || typeof n === 'boolean') { n = Number(n); }\n  if (typeof n !== 'number' || !(n > 0)) { n = 0; }\n  for (let i = 0; i < n; i++) { if (f(a[i], i, a)) { return true; } }\n  return false;\n}",
     },
     Hof {
         method: "every",
-        source: "function __every(a, f) {\n  for (let i = 0; i < a.length; i++) { if (!f(a[i], i, a)) { return false; } }\n  return true;\n}",
+        source: "function __every(a, f) {\n  let n = a.length;\n  if (typeof n === 'string' || typeof n === 'boolean') { n = Number(n); }\n  if (typeof n !== 'number' || !(n > 0)) { n = 0; }\n  for (let i = 0; i < n; i++) { if (!f(a[i], i, a)) { return false; } }\n  return true;\n}",
     },
     Hof {
         method: "find",
-        source: "function __find(a, f) {\n  for (let i = 0; i < a.length; i++) { const v = a[i]; if (f(v, i, a)) { return v; } }\n  return undefined;\n}",
+        source: "function __find(a, f) {\n  let n = a.length;\n  if (typeof n === 'string' || typeof n === 'boolean') { n = Number(n); }\n  if (typeof n !== 'number' || !(n > 0)) { n = 0; }\n  for (let i = 0; i < n; i++) { const v = a[i]; if (f(v, i, a)) { return v; } }\n  return undefined;\n}",
     },
     Hof {
         method: "findIndex",
-        source: "function __findIndex(a, f) {\n  for (let i = 0; i < a.length; i++) { if (f(a[i], i, a)) { return i; } }\n  return -1;\n}",
+        source: "function __findIndex(a, f) {\n  let n = a.length;\n  if (typeof n === 'string' || typeof n === 'boolean') { n = Number(n); }\n  if (typeof n !== 'number' || !(n > 0)) { n = 0; }\n  for (let i = 0; i < n; i++) { if (f(a[i], i, a)) { return i; } }\n  return -1;\n}",
     },
     Hof {
         // Two forms: `reduce(f, init)` -> `__reduce`; `reduce(f)` (no initial
         // value, seed with element 0) -> `__reduce1`. The call site picks by
         // argument count.
         method: "reduce",
-        source: "function __reduce(a, f, acc) {\n  for (let i = 0; i < a.length; i++) { acc = f(acc, a[i], i, a); }\n  return acc;\n}\nfunction __reduce1(a, f) {\n  let acc = a[0];\n  for (let i = 1; i < a.length; i++) { acc = f(acc, a[i], i, a); }\n  return acc;\n}",
+        source: "function __reduce(a, f, acc) {\n  let n = a.length;\n  if (typeof n === 'string' || typeof n === 'boolean') { n = Number(n); }\n  if (typeof n !== 'number' || !(n > 0)) { n = 0; }\n  for (let i = 0; i < n; i++) { acc = f(acc, a[i], i, a); }\n  return acc;\n}\nfunction __reduce1(a, f) {\n  let n = a.length;\n  if (typeof n === 'string' || typeof n === 'boolean') { n = Number(n); }\n  if (typeof n !== 'number' || !(n > 0)) { n = 0; }\n  let acc = a[0];\n  for (let i = 1; i < n; i++) { acc = f(acc, a[i], i, a); }\n  return acc;\n}",
     },
     Hof {
         method: "flatMap",
-        source: "function __flatMap(a, f) {\n  const r = [];\n  for (let i = 0; i < a.length; i++) { const v = f(a[i], i, a); for (let j = 0; j < v.length; j++) { r.push(v[j]); } }\n  return r;\n}",
+        source: "function __flatMap(a, f) {\n  let n = a.length;\n  if (typeof n === 'string' || typeof n === 'boolean') { n = Number(n); }\n  if (typeof n !== 'number' || !(n > 0)) { n = 0; }\n  const r = [];\n  for (let i = 0; i < n; i++) { const v = f(a[i], i, a); if (Array.isArray(v)) { for (let j = 0; j < v.length; j++) { r.push(v[j]); } } else { r.push(v); } }\n  return r;\n}",
     },
     Hof {
         method: "findLast",
-        source: "function __findLast(a, f) {\n  for (let i = a.length - 1; i >= 0; i--) { const v = a[i]; if (f(v, i, a)) { return v; } }\n  return undefined;\n}",
+        source: "function __findLast(a, f) {\n  let n = a.length;\n  if (typeof n === 'string' || typeof n === 'boolean') { n = Number(n); }\n  if (typeof n !== 'number' || !(n > 0)) { n = 0; }\n  for (let i = n - 1; i >= 0; i--) { const v = a[i]; if (f(v, i, a)) { return v; } }\n  return undefined;\n}",
     },
     Hof {
         method: "findLastIndex",
-        source: "function __findLastIndex(a, f) {\n  for (let i = a.length - 1; i >= 0; i--) { if (f(a[i], i, a)) { return i; } }\n  return -1;\n}",
+        source: "function __findLastIndex(a, f) {\n  let n = a.length;\n  if (typeof n === 'string' || typeof n === 'boolean') { n = Number(n); }\n  if (typeof n !== 'number' || !(n > 0)) { n = 0; }\n  for (let i = n - 1; i >= 0; i--) { if (f(a[i], i, a)) { return i; } }\n  return -1;\n}",
     },
     Hof {
         // `Array.from(x, f)`: convert with the one-argument builtin,
@@ -100,7 +100,7 @@ const HOFS: &[Hof] = &[
     },
     Hof {
         method: "sort",
-        source: "function __sort(a, f) {\n  for (let i = 1; i < a.length; i++) {\n    const key = a[i];\n    let j = i - 1;\n    while (j >= 0 && f(a[j], key) > 0) { a[j + 1] = a[j]; j--; }\n    a[j + 1] = key;\n  }\n  return a;\n}\nfunction __sortDefault(a) {\n  for (let i = 1; i < a.length; i++) {\n    const key = a[i];\n    let j = i - 1;\n    while (j >= 0 && String(a[j]) > String(key)) { a[j + 1] = a[j]; j--; }\n    a[j + 1] = key;\n  }\n  return a;\n}",
+        source: "function __sort(a, f) {\n  let n = a.length;\n  if (typeof n === 'string' || typeof n === 'boolean') { n = Number(n); }\n  if (typeof n !== 'number' || !(n > 0)) { n = 0; }\n  for (let i = 1; i < n; i++) {\n    const key = a[i];\n    let j = i - 1;\n    while (j >= 0 && f(a[j], key) > 0) { a[j + 1] = a[j]; j--; }\n    a[j + 1] = key;\n  }\n  return a;\n}\nfunction __sortDefault(a) {\n  let n = a.length;\n  if (typeof n === 'string' || typeof n === 'boolean') { n = Number(n); }\n  if (typeof n !== 'number' || !(n > 0)) { n = 0; }\n  for (let i = 1; i < n; i++) {\n    const key = a[i];\n    let j = i - 1;\n    while (j >= 0 && String(a[j]) > String(key)) { a[j + 1] = a[j]; j--; }\n    a[j + 1] = key;\n  }\n  return a;\n}",
     },
 ];
 

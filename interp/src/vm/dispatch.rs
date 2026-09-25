@@ -1096,14 +1096,46 @@ impl VM {
         }
 
         /// Pop rhs then lhs, compare with self.compare(), push Bool.
+        ///
+        /// **A mixed-type comparison raises rather than answering
+        /// `false`.** `<` `>` `<=` `>=` do not coerce here, so `1 <
+        /// "2"` has no true answer — and every program in this harness
+        /// parses numbers out of command output, where a number is a
+        /// string until something says `Number(x)`. Answering `false`
+        /// let `if (count > 10)` take the wrong branch silently and
+        /// forever, with no error anywhere: 25_JS_DIALECT §25.2 calls
+        /// it the most dangerous entry on its list because it is both
+        /// silent and easy to reach. A card line was tried first and
+        /// is the weakest of the two fixes prose can buy.
+        ///
+        /// So this diverges *further* from JS in order to diverge more
+        /// safely — the trade the dialect already makes for `Edit.*`
+        /// and for `ToPrimitive`, which is refused rather than guessed
+        /// at. The card line comes out with this.
+        ///
+        /// **`NaN` is not a type error.** `compare` answers `None` for
+        /// two different reasons: operands of kinds that cannot be
+        /// ordered, and `partial_cmp` on a `NaN` whose operands are
+        /// both perfectly good numbers. `NaN < 1` is `false` in JS and
+        /// stays `false` here; only a kind mismatch raises.
         macro_rules! cmp_op {
             ($cmp:tt $expected:ident) => {{
                 let rhs = self.pop()?;
                 let lhs = self.pop()?;
-                let result = lhs
-                    .compare(&rhs)
-                    .map(|ord| ord $cmp std::cmp::Ordering::$expected)
-                    .unwrap_or(false);
+                let result = match lhs.compare(&rhs) {
+                    Some(ord) => ord $cmp std::cmp::Ordering::$expected,
+                    None if lhs.is_number() && rhs.is_number() => false,
+                    None => {
+                        let msg = format!(
+                            "cannot compare {} with {}: `<` `>` `<=` `>=` do not coerce \
+                             across types here. A number read out of a tool's output is \
+                             a string until you write Number(x).",
+                            self.describe_operand(&lhs),
+                            self.describe_operand(&rhs)
+                        );
+                        return Err(self.fail(ErrorKind::TypeError, msg));
+                    }
+                };
                 self.stack.push(Value::Bool(result));
                 self.ip += 1;
             }};

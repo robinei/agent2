@@ -199,10 +199,3 @@ declare namespace Edit {
 
 **`await` works at the top level of a block**, and is the only way to settle a promise. `tools.*` below are this session's capabilities and are all async; of everything above, only `ask` and `choose` are — the two that wait on somebody.
 
-## One place this dialect answers differently
-
-Everything else that differs stops the block and says what to write instead, so it is not listed here.
-
-| you write | you get | |
-|---|---|---|
-| `1 < "2"` | `false` | `<` `>` `<=` `>=` do not coerce across types, so a number parsed out of a tool's output is a string until you write `Number(x)` |

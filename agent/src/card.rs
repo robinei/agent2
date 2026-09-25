@@ -277,28 +277,37 @@ fn every_worked_example_compiles() {
 
 /// **The dialect table is true of the interpreter it describes.**
 ///
-/// The card names the places this language answers differently from
-/// JS, each as a literal expression and a literal result. They are the
-/// only claims in the card a reader is invited to rely on without
-/// trying them, and nothing connected them to the interpreter — the
-/// behaviours are pinned in `interp`'s own tests, but under their own
-/// names, so a change there would leave the card asserting something
-/// false in every prompt.
+/// **The card claims no dialect divergences, and this is what keeps
+/// that honest.**
 ///
-/// This runs the left column and checks the right. It reads the table
-/// out of the card rather than restating it, so a row added to the
-/// card is a row this checks, and a row this cannot parse is a row the
-/// card has written in some shape a reader will not recognise either.
+/// There used to be a table: a literal expression and a literal
+/// result, the only claims in the card a reader was invited to rely on
+/// without trying them. Nothing connected it to the interpreter, so a
+/// change here would have left the card asserting something false in
+/// every prompt. This ran the left column and checked the right.
 ///
-/// It is down to one row. The other was `e instanceof TypeError` →
-/// `false`, true while every error shared one `Error` prototype; the
-/// error classes are real as of 2026-09-25, so the row described a
-/// divergence that no longer exists and came out. A row that stops
-/// being true is deleted, not corrected to say the same thing more
-/// weakly — the table is for what a reader would otherwise get wrong.
+/// It is empty now, and that is the point rather than an accident.
+/// `e instanceof TypeError` went when the error classes became real
+/// (2026-09-25). `1 < "2"` → `false` went when a mixed-type comparison
+/// started raising a `TypeError` instead of answering silently — the
+/// table's own preamble said "everything else that differs stops the
+/// block and says what to write instead, so it is not listed here",
+/// and that sentence had come to cover its last row.
+///
+/// **So this asserts the absence, not just the count.** A parser that
+/// quietly stopped matching would also report zero rows, and a guard
+/// that cannot tell "nothing to check" from "I have stopped looking"
+/// is the shape that passes while covering nothing. The heading is
+/// checked directly; if a row ever comes back, the loop below runs it.
 #[test]
 fn the_dialect_table_says_what_the_interpreter_does() {
     let card = active().text.clone();
+    assert!(
+        !card.contains("this dialect answers differently"),
+        "the card has grown a divergence table again — every row must be \
+         runnable and true, which the loop below does, but the heading's \
+         return needs a deliberate look first"
+    );
     let rows: Vec<(String, String)> = card
         .lines()
         .skip_while(|l| !l.starts_with("| you write "))
@@ -311,12 +320,11 @@ fn the_dialect_table_says_what_the_interpreter_does() {
             Some((un(cells.first()?), un(cells.get(1)?)))
         })
         .collect();
-    assert_eq!(rows.len(), 1, "the table's rows parsed: {rows:?}");
 
     for (expr, expected) in rows {
-        // `e` is the card's own word for a caught error, and one row is
-        // about exactly that. Binding it here is what makes the row
-        // runnable without restating it.
+        // `e` is the card's own word for a caught error. Binding it
+        // here is what made a row about one runnable without restating
+        // it.
         let src =
             format!("let e; try {{ null.x; }} catch (err) {{ e = err; }} return String({expr});");
         let prog = interp::compile(&src)
@@ -353,8 +361,14 @@ fn every_promise_above_the_tools_is_named_as_one() {
         .split_once("## What you can call")
         .expect("the declaration block")
         .1
-        .split_once("## One place")
-        .expect("and its end")
+        // **The sentence this test is about is the boundary.** It used
+        // to split on `## One place`, the dialect-divergence heading —
+        // which went when the last divergence stopped being silent, and
+        // took this test's end marker with it. The `await` sentence is
+        // what the declarations are being checked *against*, so it is
+        // the honest place for them to stop.
+        .split_once("**`await` works")
+        .expect("the sentence teaching await, which ends the declarations")
         .0;
     let promised: Vec<&str> = decls
         .lines()
@@ -1027,7 +1041,7 @@ mod tests {
         // `card()` shows up as a diff review must look at, not a byte
         // count that silently drifts. Comparing full text (not just a
         // hash) so the diff itself is legible in a failure message.
-        const EXPECTED_LEN: usize = 25394;
+        const EXPECTED_LEN: usize = 25049;
         assert_eq!(
             card().len(),
             EXPECTED_LEN,

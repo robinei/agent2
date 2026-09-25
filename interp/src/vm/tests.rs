@@ -671,8 +671,14 @@ fn ordering() {
         run(vec![PushFloat(2.0), PushFloat(2.0), GtEq]),
         vec![b(true)]
     );
-    // Incomparable types → false
-    assert_eq!(run(vec![PushFloat(1.0), PushNull, Lt]), vec![b(false)]);
+    // Incomparable kinds raise — see `relational_non_coercion`. JS
+    // would coerce `null` to 0 and answer `false`; agreeing by
+    // coincidence is still a silent answer to a question with no
+    // meaning.
+    assert!(matches!(
+        run_err(vec![PushFloat(1.0), PushNull, Lt]).kind,
+        ErrorKind::TypeError
+    ));
 }
 
 #[test]
@@ -1548,15 +1554,24 @@ fn undefined_strict_equality() {
     assert_eq!(run(vec![PushNull, PushUndefined, Neq]), vec![b(true)]);
 }
 
+/// **Comparing `undefined` raises**, where JS coerces it to `NaN` and
+/// answers `false`.
+///
+/// This is the widest case of §25.2's rule and probably the commonest
+/// one in practice: `undefined` on one side of `<` is a field that is
+/// not there, and `if (r.count > 10)` against a missing `count` took
+/// the false branch silently. JS is wrong here in the way that costs a
+/// reader an afternoon, so the dialect refuses instead.
 #[test]
 fn undefined_is_not_comparable() {
-    // Relational ops on undefined are all false (compare() yields None),
-    // matching JS `undefined < 1 === false`, `undefined >= undefined === false`.
-    assert_eq!(run(vec![PushUndefined, PushFloat(1.0), Lt]), vec![b(false)]);
-    assert_eq!(
-        run(vec![PushUndefined, PushUndefined, GtEq]),
-        vec![b(false)]
-    );
+    assert!(matches!(
+        run_err(vec![PushUndefined, PushFloat(1.0), Lt]).kind,
+        ErrorKind::TypeError
+    ));
+    assert!(matches!(
+        run_err(vec![PushUndefined, PushUndefined, GtEq]).kind,
+        ErrorKind::TypeError
+    ));
 }
 
 #[test]
@@ -2284,17 +2299,61 @@ fn out_of_fuel_stops_infinite_loop() {
 
 // ── relational non-coercion (JS divergence) ─────────────────────
 
+/// **A cross-type comparison raises rather than answering `false`.**
+///
+/// It answered `false` until 2026-09-25, which is the wrong answer
+/// given silently: every program in this harness parses numbers out of
+/// command output, and a number read out of stdout is a string until
+/// something says `Number(x)`, so `if (count > 10)` took the wrong
+/// branch forever with no error anywhere. `25_JS_DIALECT` §25.2 filed
+/// it as the most dangerous entry on its list and recommended exactly
+/// this: diverge *further* from JS in order to diverge more safely.
 #[test]
 fn relational_non_coercion() {
-    // Cross-type comparisons return false without coercion.
-    // String vs number: "2" > 1 → false.
+    // String vs number, and number vs string.
+    assert!(matches!(
+        run_err(vec![ps("2"), PushFloat(1.0), Gt]).kind,
+        ErrorKind::TypeError
+    ));
+    assert!(matches!(
+        run_err(vec![PushFloat(1.0), ps("2"), Lt]).kind,
+        ErrorKind::TypeError
+    ));
+    // The message names both operands, because which one is the string
+    // is the whole repair.
+    let msg = run_err(vec![PushFloat(1.0), ps("2"), Lt]).message;
+    assert!(
+        msg.contains("a number (1)") && msg.contains("a string (\"2\")"),
+        "got: {msg}"
+    );
+    // Same-type comparisons are untouched — this is about coercion, not
+    // about comparing.
+    assert_eq!(run(vec![ps("a"), ps("b"), Lt]), vec![Value::Bool(true)]);
     assert_eq!(
-        run(vec![ps("2"), PushFloat(1.0), Gt]),
+        run(vec![PushFloat(1.0), PushFloat(2.0), Lt]),
+        vec![Value::Bool(true)]
+    );
+}
+
+/// **`NaN` is not a type error.** `Value::compare` answers `None` for
+/// two unrelated reasons — operands of kinds that cannot be ordered,
+/// and `partial_cmp` on a `NaN` whose operands are both perfectly good
+/// numbers. Only the first raises: `NaN < 1` is `false` in JS and is
+/// `false` here, and a comparison guard written the ordinary way must
+/// not start throwing.
+#[test]
+fn nan_compares_false_rather_than_raising() {
+    let nan = f64::NAN;
+    assert_eq!(
+        run(vec![PushFloat(nan), PushFloat(1.0), Lt]),
         vec![Value::Bool(false)]
     );
-    // Number vs string: 1 < "2" → false.
     assert_eq!(
-        run(vec![PushFloat(1.0), ps("2"), Lt]),
+        run(vec![PushFloat(1.0), PushFloat(nan), Gt]),
+        vec![Value::Bool(false)]
+    );
+    assert_eq!(
+        run(vec![PushFloat(nan), PushFloat(nan), GtEq]),
         vec![Value::Bool(false)]
     );
 }
@@ -4130,4 +4189,15 @@ fn primitive_method_no_boxing_alloc() {
         new_objects <= 2,
         "primitive method call allocated {new_objects} objects (expected ≤2 for prototypes, no boxing)"
     );
+}
+
+#[test]
+fn scratch_number_of_object() {
+    for src in [
+        "try { return String(Number({ toString: function () { return '0'; } })); } catch (e) { return 'THROWS ' + e.name + ': ' + e.message; }",
+        "try { return String(Number(null)) + '|' + String(Number(undefined)) + '|' + String(Number('3')); } catch (e) { return 'THROWS ' + e.name; }",
+        "try { return String(Number({})); } catch (e) { return 'THROWS ' + e.name + ': ' + e.message; }",
+    ] {
+        println!("PROBE => {:?}", crate::testutil::run_ret(src));
+    }
 }

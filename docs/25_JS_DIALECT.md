@@ -143,9 +143,9 @@ Gate for B: `cargo test -p interp`, `cargo run -p conformance` with the
 expectations file updated in the same commit, and
 `"aéb".length === 3`.
 
-## 25.2 — Relational operators do not coerce
+## 25.2 — Relational operators do not coerce — **done, 2026-09-25**
 
-`1 < "2"` is `false`. `"10" > 9` is `false`. Every program here parses
+`1 < "2"` *was* `false`. `"10" > 9` *was* `false`. Every program here parses
 numbers out of command output, and a number parsed out of stdout is a
 string until something says `Number(x)` — so `if (count > 10)` against
 an unconverted value silently takes the wrong branch, forever, with no
@@ -163,11 +163,34 @@ Two ways to stop it being silent:
   editing helpers", and `ToPrimitive` is already refused rather than
   guessed at. Then the card line comes back out.
 
-Open decision. Recommendation: make it loud.
+Made loud. A relational comparison across two different kinds raises
+`TypeError` naming both operands — `cannot compare a number (1) with a
+string ("2")` — and the card line is gone. `NaN` still compares `false`
+against any number, because `Value::compare` returns `None` for two
+reasons and only the kind mismatch is an error.
 
-Gate: `1 < "2"` raises `TypeError` naming both operand types;
-`"a" < "b"` and `1 < 2` are untouched; `cargo test -p interp` and the
-conformance expectations updated in the same commit.
+The scope is every cross-kind comparison, not just string-vs-number:
+that is what the section title claims, and `undefined > 2` in a loop
+over a sparse array is the same silent-wrong-branch failure as the
+one that motivated the entry.
+
+Price: **43 conformance tests**, 9,650 → 9,607. Forty of them are the
+coercion tests themselves (`language/expressions/{less,greater}-than`
+and the `-or-equal` pair, plus `relational/S9.1_A1_T4`), which now fail
+honestly and cannot be recovered without undoing the decision. The
+other three are incidental — `undefined` reaching a comparison through
+gaps that predate this change.
+
+Widening it also found a real bug of our own. Every prelude
+higher-order helper looped `for (let i = 0; i < a.length; i++)` with no
+`ToLength` on the receiver's `length`, so `f.length = null` gave
+`0 < null → false` and the loop was skipped by luck — two bugs
+cancelling. Twenty-eight tests turned on that, and once the comparison
+raised, the trap fired *inside the prelude*: a caret under
+`i < a.length` in source the model never wrote, advising `Number(x)`.
+The helpers now hoist a coerced length once, and the coercion cannot
+itself throw (`Number({})` is refused in this dialect, which would have
+moved the leak rather than closed it).
 
 ## 25.3 — `==` against objects, and other quiet falses
 
