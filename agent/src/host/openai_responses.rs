@@ -332,6 +332,10 @@ impl LlmClient for OpenAiResponses {
             chunk,
         )
     }
+
+    fn model(&self) -> &str {
+        &self.model
+    }
 }
 
 #[cfg(test)]

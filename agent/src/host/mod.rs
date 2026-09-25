@@ -418,7 +418,12 @@ impl Session {
     ) -> io::Result<Self> {
         if tree.events.is_empty() {
             let emitted = tree.id_counter;
-            let state = Runner::new_root(&mut tree, charter, &crate::card::full_card(&registry))?;
+            let state = Runner::new_root(
+                &mut tree,
+                charter,
+                &crate::card::full_card(&registry),
+                llm.model(),
+            )?;
             Self::assemble(tree, state, registry, llm, events, emitted)
         } else {
             let leaf = pick_resume_leaf(&tree)?;
@@ -1262,7 +1267,15 @@ impl Session {
             Some(allowed) => crate::card::full_card(&self.registry.narrowed(allowed)),
             None => crate::card::full_card(&self.registry),
         };
-        let mut child = Runner::new_agent(&mut self.tree, at, name, charter, tools, &card)?;
+        let mut child = Runner::new_agent(
+            &mut self.tree,
+            at,
+            name,
+            charter,
+            tools,
+            &card,
+            self.llm.model(),
+        )?;
         child.set_attached(self.attached);
         let branch = child.branch_id();
         self.states.insert(branch, child);
@@ -1828,7 +1841,15 @@ impl Session {
             Some(allowed) => crate::card::full_card(&self.registry.narrowed(allowed)),
             None => crate::card::full_card(&self.registry),
         };
-        let mut child = Runner::new_agent(&mut self.tree, call, name, charter, tools, &card)?;
+        let mut child = Runner::new_agent(
+            &mut self.tree,
+            call,
+            name,
+            charter,
+            tools,
+            &card,
+            self.llm.model(),
+        )?;
         child.set_attached(self.attached);
         let child_id = child.agent_id();
         self.states.insert(child.branch_id(), child);
@@ -2419,6 +2440,7 @@ fn leaf_summary(tree: &Tree, leaf: EventId) -> String {
         },
         EventPayload::Handback { how, .. } => format!("Handback: {}", cause_label(how)),
         EventPayload::Rename { name } => format!("Rename: {name}"),
+        EventPayload::Model { name } => format!("Model: {name}"),
         EventPayload::Console { lines } => format!("Console: {} lines", lines.len()),
         EventPayload::ReplyEnd { how, usage, .. } => {
             format!("ReplyEnd: {how:?}, {} out", usage.completion)
@@ -2805,6 +2827,7 @@ mod tests {
                 EventPayload::ReplyEnd { .. } => "ReplyEnd",
                 EventPayload::Compaction { .. } => "Compaction",
                 EventPayload::Rename { .. } => "Rename",
+                EventPayload::Model { .. } => "Model",
                 EventPayload::Note { .. } => "Note",
                 EventPayload::Compacted { .. } => "Compacted",
             });
@@ -2958,6 +2981,10 @@ mod tests {
         ) -> Result<LlmTurn, String> {
             self.seen.lock().unwrap().push(request.clone());
             self.inner.complete(request, cancel, chunk)
+        }
+
+        fn model(&self) -> &str {
+            self.inner.model()
         }
     }
 
@@ -4098,7 +4125,7 @@ mod tests {
     fn tree_with_open_root() -> Tree {
         let mut tree = Tree::new(None);
         let mut spine = tree
-            .start_agent(None, None, "root", None, "", Vec::new())
+            .start_agent(None, None, "root", None, "", "scripted", Vec::new())
             .unwrap();
         tree.append(&mut spine, user("q")).unwrap();
         assistant(&mut tree, &mut spine, "a1");
@@ -4578,7 +4605,15 @@ mod tests {
         // outcome).
         let mut tree = Tree::new(None);
         let mut spine = tree
-            .start_agent(None, None, "you are an agent", None, "", Vec::new())
+            .start_agent(
+                None,
+                None,
+                "you are an agent",
+                None,
+                "",
+                "scripted",
+                Vec::new(),
+            )
             .unwrap();
         tree.append(
             &mut spine,
@@ -4698,7 +4733,7 @@ mod tests {
     fn a_fully_answered_log_opens_idle() {
         let mut tree = Tree::new(None);
         let mut spine = tree
-            .start_agent(None, None, "root", None, "", Vec::new())
+            .start_agent(None, None, "root", None, "", "scripted", Vec::new())
             .unwrap();
         let question = tree.append(&mut spine, user("q")).unwrap();
         assistant(&mut tree, &mut spine, "done");
@@ -5168,6 +5203,7 @@ mod tests {
                 "test agent",
                 None,
                 "test agent",
+                "scripted",
                 Vec::new(),
             )
             .unwrap();
@@ -5189,6 +5225,7 @@ mod tests {
                 "worker",
                 None,
                 "worker",
+                "scripted",
                 Vec::new(),
             )
             .unwrap();
@@ -5318,6 +5355,10 @@ mod tests {
                 json!("answer"),
                 json!(value)
             )))
+        }
+
+        fn model(&self) -> &str {
+            self.inner.model()
         }
     }
 
@@ -5678,7 +5719,15 @@ mod tests {
     fn ambiguous_agent_id_is_refused() {
         let mut tree = Tree::new(None);
         let mut root = tree
-            .start_agent(None, None, "test agent", None, "test agent", Vec::new())
+            .start_agent(
+                None,
+                None,
+                "test agent",
+                None,
+                "test agent",
+                "scripted",
+                Vec::new(),
+            )
             .unwrap();
         let spawn = tree
             .append(
@@ -5692,7 +5741,15 @@ mod tests {
             )
             .unwrap();
         let worker = tree
-            .start_agent(Some(spawn), None, "worker", None, "worker", Vec::new())
+            .start_agent(
+                Some(spawn),
+                None,
+                "worker",
+                None,
+                "worker",
+                "scripted",
+                Vec::new(),
+            )
             .unwrap();
         let mut sidebar = tree.fork(worker.leaf_id).unwrap();
         tree.append(&mut sidebar, EventPayload::Fork { name: None })
@@ -7035,7 +7092,7 @@ mod tests {
     fn exchange_log(keep: u64) -> Tree {
         let mut tree = Tree::new(None);
         let mut root = tree
-            .start_agent(None, None, "root", None, "root", Vec::new())
+            .start_agent(None, None, "root", None, "root", "scripted", Vec::new())
             .unwrap();
         let step = |tree: &mut Tree, n: u64| -> bool { tree.id_counter < keep && n <= keep };
         if !step(&mut tree, 2) {
@@ -7069,6 +7126,7 @@ mod tests {
                 "worker",
                 None,
                 "worker",
+                "scripted",
                 Vec::new(),
             )
             .unwrap();
@@ -7323,7 +7381,7 @@ mod tests {
     fn crash_after_return_completes_the_run() {
         let mut tree = Tree::new(None);
         let mut root = tree
-            .start_agent(None, None, "root", None, "root", Vec::new())
+            .start_agent(None, None, "root", None, "root", "scripted", Vec::new())
             .unwrap();
         tree.append(&mut root, user("go")).unwrap();
         let reply = tree.append(&mut root, EventPayload::Restart).unwrap();
@@ -7402,7 +7460,7 @@ mod tests {
     fn user_owed_answer_survives() {
         let mut tree = Tree::new(None);
         let mut root = tree
-            .start_agent(None, None, "root", None, "root", Vec::new())
+            .start_agent(None, None, "root", None, "root", "scripted", Vec::new())
             .unwrap();
         tree.append(&mut root, user("go")).unwrap();
         tree.append(

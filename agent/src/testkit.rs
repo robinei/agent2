@@ -431,7 +431,7 @@ impl Conversation {
 
     pub fn with_charter(charter: &str) -> Self {
         let mut tree = Tree::new(None);
-        let runner = Runner::new_root(&mut tree, charter, "").expect("a root runner");
+        let runner = Runner::new_root(&mut tree, charter, "", "scripted").expect("a root runner");
         Self::around(tree, runner)
     }
 
@@ -1046,7 +1046,15 @@ impl Conversation {
         };
         let spine = self
             .tree
-            .start_agent(Some(call), name, charter, None, "SYSTEM", Vec::new())
+            .start_agent(
+                Some(call),
+                name,
+                charter,
+                None,
+                "SYSTEM",
+                "scripted",
+                Vec::new(),
+            )
             .expect("an Agent event at the child's root");
         spine.leaf_id
     }
@@ -1423,6 +1431,7 @@ fn kind_of(p: &EventPayload) -> &'static str {
         EventPayload::Note { .. } => "Note",
         EventPayload::Compacted { .. } => "Compacted",
         EventPayload::Rename { .. } => "Rename",
+        EventPayload::Model { .. } => "Model",
     }
 }
 

@@ -2036,7 +2036,7 @@ mod tests {
     fn fixture(source: &str, outcome: EventPayload) -> (Tree, crate::types::EventId) {
         let mut tree = Tree::new(None);
         let mut spine = tree
-            .start_agent(None, None, "root", None, "SYSTEM", Vec::new())
+            .start_agent(None, None, "root", None, "SYSTEM", "scripted", Vec::new())
             .unwrap();
         tree.append(
             &mut spine,
@@ -2075,7 +2075,7 @@ mod tests {
     fn a_reply_that_ran_and_then_failed_to_compile_says_what_ran() {
         let mut tree = Tree::new(None);
         let mut spine = tree
-            .start_agent(None, None, "root", None, "SYSTEM", Vec::new())
+            .start_agent(None, None, "root", None, "SYSTEM", "scripted", Vec::new())
             .unwrap();
         let reply = tree.append(&mut spine, EventPayload::Reply).unwrap();
         tree.append(
@@ -2151,7 +2151,7 @@ mod tests {
     fn a_variable_from_a_finished_reply_is_named_as_such() {
         let mut tree = Tree::new(None);
         let mut spine = tree
-            .start_agent(None, None, "root", None, "SYSTEM", Vec::new())
+            .start_agent(None, None, "root", None, "SYSTEM", "scripted", Vec::new())
             .unwrap();
         // The reply that bound it, then the one that reached for it.
         let first = tree.append(&mut spine, EventPayload::Reply).unwrap();
@@ -2386,7 +2386,7 @@ mod tests {
         let big = "x".repeat(600);
         let mut tree = Tree::new(None);
         let mut spine = tree
-            .start_agent(None, None, "root", None, "SYSTEM", Vec::new())
+            .start_agent(None, None, "root", None, "SYSTEM", "scripted", Vec::new())
             .unwrap();
         let reply = tree.append(&mut spine, EventPayload::Reply).unwrap();
         tree.append(
@@ -2559,7 +2559,7 @@ mod tests {
     fn reports_partition_the_artifacts_they_list() {
         let mut tree = Tree::new(None);
         let mut spine = tree
-            .start_agent(None, None, "agent", None, "", Vec::new())
+            .start_agent(None, None, "agent", None, "", "scripted", Vec::new())
             .unwrap();
         let mut ids = Vec::new();
         let mut outcomes = Vec::new();
@@ -3376,7 +3376,7 @@ mod tests {
     fn derived_label_has_no_id_or_author_decoration() {
         let mut tree = Tree::new(None);
         let mut spine = tree
-            .start_agent(None, None, "root", None, "SYSTEM", Vec::new())
+            .start_agent(None, None, "root", None, "SYSTEM", "scripted", Vec::new())
             .unwrap();
         tree.append(
             &mut spine,

@@ -318,6 +318,10 @@ impl LlmClient for OpenAiCompletions {
         }
         Err("every attempt failed".into())
     }
+
+    fn model(&self) -> &str {
+        &self.model
+    }
 }
 
 /// **A ceiling on one whole completion**, body included — ureq's

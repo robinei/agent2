@@ -1203,13 +1203,18 @@ impl Runner {
     ) -> io::Result<Self> {
         let charter = charter.into();
         let system = assemble_system(card, &charter);
-        let spine = tree.start_agent(None, None, charter, None, system, Vec::new())?;
+        let spine = tree.start_agent(None, None, charter, None, system, "scripted", Vec::new())?;
         let mut state = Self::with_spine(tree, spine);
         state.dialect_card = card.to_owned();
         Ok(state)
     }
 
-    pub fn new_root(tree: &mut Tree, charter: impl Into<String>, card: &str) -> io::Result<Self> {
+    pub fn new_root(
+        tree: &mut Tree,
+        charter: impl Into<String>,
+        card: &str,
+        model: &str,
+    ) -> io::Result<Self> {
         let charter = charter.into();
         let system = assemble_system(card, &charter);
         let spine = tree.start_agent(
@@ -1218,6 +1223,7 @@ impl Runner {
             charter,
             None,
             system,
+            model,
             crate::card::seed_exemplars().to_vec(),
         )?;
         let mut state = Self::with_spine(tree, spine);
@@ -1238,6 +1244,9 @@ impl Runner {
     /// `Post` naming the `Send` that dispatched it. So a bare `spawn(...)`
     /// leaves an idle agent with nothing open, which is exactly what the
     /// driving rule wants: nothing to say, no request.
+    // `card` and `model` are both host-side facts and the rest is the
+    // agent's own identity; bundling them would hide which is which.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_agent(
         tree: &mut Tree,
         call_site: EventId,
@@ -1245,6 +1254,7 @@ impl Runner {
         charter: impl Into<String>,
         tools: Option<Vec<String>>,
         card: &str,
+        model: &str,
     ) -> io::Result<Self> {
         let charter = charter.into();
         let system = assemble_system(card, &charter);
@@ -1254,6 +1264,7 @@ impl Runner {
             charter,
             tools,
             system,
+            model,
             crate::card::seed_exemplars().to_vec(),
         )?;
         let mut state = Self::with_spine(tree, spine);
@@ -4395,6 +4406,37 @@ impl Runner {
     /// the variable leaked into whichever other test happened to be
     /// running: `compaction_does_not_fire_while_already_compacting`
     /// failed about one run in three.
+    /// The window this conversation's own log says it runs against.
+    ///
+    /// The model in force here is the last [`Model`] event at or after
+    /// the agent root, else the root's own — the same resolution a
+    /// branch's name gets from `Rename`, and for the same reason: a
+    /// session can switch model, and rendering a past request has to
+    /// answer with the model *that* request went to.
+    ///
+    /// `Usage::window` is the better source and is tried first, but it
+    /// exists only once a reply has completed. This covers the opening
+    /// request of a run, which is the one `agent document` used to
+    /// render in bytes while the live trigger was silent.
+    ///
+    /// [`Model`]: crate::types::EventPayload::Model
+    fn logged_model_window(&self, tree: &Tree) -> Option<usize> {
+        let path = tree.path_events(self.spine.leaf_id);
+        let root = path
+            .iter()
+            .rposition(|e| matches!(e.payload, EventPayload::Agent { .. }))?;
+        let mut model = match &path[root].payload {
+            EventPayload::Agent { model, .. } => model.as_str(),
+            _ => return None,
+        };
+        for event in &path[root..] {
+            if let EventPayload::Model { name } = &event.payload {
+                model = name.as_str();
+            }
+        }
+        crate::host::provider::context_window(model)
+    }
+
     fn fullness(
         &self,
         tree: &Tree,
@@ -4407,6 +4449,13 @@ impl Runner {
         // count and the window the last request actually carried —
         // which is why `Usage` records both. Without the second half,
         // rendering a past request had to guess, and guessed in bytes.
+        // **The log before the environment.** `configured` is read from
+        // whichever process is rendering, which for `agent document` is
+        // whoever opened the file rather than the run that wrote it. The
+        // agent root snapshotted its model for this: a log opened with
+        // no `AGENT2_MODEL` set still knows what it was talking to, and
+        // answers in the same unit the live trigger used.
+        let configured = configured.or_else(|| self.logged_model_window(tree));
         let (context, counted) = match (configured, self.next_prompt_floor) {
             (Some(context), Counted::Floor(tokens)) => (Some(context), Some(tokens)),
             (window, Counted::Never) => match self.logged_usage(tree) {
@@ -4751,6 +4800,7 @@ impl Runner {
         // conversation: the copy down here is not a second row, it is
         // this request's own end matter.
         lines.extend(self.peeked_block(tree));
+        lines.extend(self.gone_block(tree));
         let open = self.open();
         if !open.is_empty() {
             let shown = open.len().min(OPEN_NOTE_MAX_IDS);
@@ -4952,6 +5002,102 @@ impl Runner {
         // consequence to be worked out.
         let mut out =
             vec!["### peeked — read these in this reply; they are gone from the next\n".to_owned()];
+        out.extend(rows);
+        out.push(String::new());
+        out
+    }
+
+    /// The peeks that expired at *this* turn boundary: shown to the
+    /// last reply, not shown to this one.
+    ///
+    /// **Absence is not a message.** `peeked_block` says what is in
+    /// front of you and never what has just left, so a row whose peek
+    /// has been spent renders exactly like a row that was never peeked
+    /// at all — the id, the shape, the byte count. The only way to tell
+    /// them apart is to replay your own replies and work out which turn
+    /// each `history.peek` was written in.
+    ///
+    /// A run on 2026-09-25 did exactly that and paid for it. Asked to
+    /// un-skip the tests that pass, it peeked `test_shipping.py`, spent
+    /// the next reply reading something else, and arrived at the reply
+    /// that had to edit the file with the content one turn gone. That
+    /// reply's reasoning ran to 35,160 bytes — 10,353 completion
+    /// tokens, 97% of the whole run's output — and said "peek" 47
+    /// times, "Wait" 35 and "Hmm" 22, still arguing with itself about
+    /// where the bytes went at byte 33,797 of 35,160. It never settled
+    /// it. It recovered by giving up on reading and computing blind
+    /// through `history.fetch`, which is the right move and a dear one.
+    ///
+    /// Naming the row costs a line and removes the inference. Bounded
+    /// to the boundary just crossed: this is the moment the absence is
+    /// surprising, it cannot grow with the conversation, and a row
+    /// wanted five turns later is still `fetch`-able.
+    fn gone_block(&self, tree: &Tree) -> Vec<String> {
+        let path = tree.path_events(self.spine.leaf_id);
+        let replies: Vec<EventId> = path
+            .iter()
+            .filter(|e| matches!(e.payload, EventPayload::Reply | EventPayload::Restart))
+            .map(|e| e.id)
+            .collect();
+        // Needs a reply to have expired *past*: with one or none, no
+        // peek has been spent yet.
+        let Some(&last) = replies.last() else {
+            return Vec::new();
+        };
+        let previous = replies.iter().rev().nth(1).copied();
+        let newest = last_renders(&path);
+        let compacted = tree.compacted_lookup(self.spine.leaf_id);
+        // **Peeked again is not gone.** A reply that re-peeks a row
+        // leaves the old render sitting inside the boundary below while
+        // the new one rides the block above, and the row would be
+        // announced as both in front of you and not shown any more.
+        let live: std::collections::HashSet<EventId> = path
+            .iter()
+            .filter(|e| e.id > last)
+            .filter_map(|e| match &e.payload {
+                EventPayload::Render { of, .. } => Some(*of),
+                _ => None,
+            })
+            .collect();
+        let mut rows: Vec<String> = Vec::new();
+        for event in &path {
+            let EventPayload::Render { of, mode, .. } = &event.payload else {
+                continue;
+            };
+            if live.contains(of) {
+                continue;
+            }
+            // Shown to the last reply, and gone for this one. A row
+            // whose newest word is a `keep` is not gone — it writes
+            // itself out up where its id is.
+            if *mode != crate::types::RenderMode::Peeked
+                || newest
+                    .get(of)
+                    .is_none_or(|(m, _)| *m != crate::types::RenderMode::Peeked)
+                || event.id > last
+                || previous.is_some_and(|p| event.id < p)
+            {
+                continue;
+            }
+            let target: Vec<&Event> = path.iter().copied().filter(|e| e.id == *of).collect();
+            let mut drawn = menu_rows(&target, 0, &compacted, &path);
+            rows.push(match drawn.pop() {
+                Some(a) => crate::report::render_row(&a),
+                None => format!("- `[{}]`", of.as_u64()),
+            });
+        }
+        if rows.is_empty() {
+            return Vec::new();
+        }
+        let mut out = vec![
+            // One line, recovery included: this block is on every turn
+            // that spent a peek, so its own overhead is the thing to
+            // keep down. `fetch` is named beside `peek` because the
+            // run that needed this reached for `fetch` in the end and
+            // was right to.
+            "### gone — peeked for your last reply, not shown now; `history.peek(id)` to see one again, `history.fetch(id)` to compute on it\n"
+                .to_owned(),
+        ];
         out.extend(rows);
         out.push(String::new());
         out
@@ -6904,7 +7050,7 @@ mod tests {
     /// this replaced could not manage either (see `document::Transport`).
     fn setup_under() -> (Tree, Runner) {
         let mut tree = Tree::new(None);
-        let state = Runner::new_root(&mut tree, "you are a test agent", "").unwrap();
+        let state = Runner::new_root(&mut tree, "you are a test agent", "", "scripted").unwrap();
         (tree, state)
     }
 
@@ -6978,7 +7124,8 @@ mod tests {
                 }),
             )
             .unwrap();
-        let mut child = Runner::new_agent(tree, spawn, None, charter, None, "").unwrap();
+        let mut child =
+            Runner::new_agent(tree, spawn, None, charter, None, "", "scripted").unwrap();
         let (_, out) = ask(tree, asker, &mut child, charter, input);
         (child, out)
     }
@@ -7149,6 +7296,7 @@ mod tests {
                 EventPayload::Result { .. } => "Result",
                 EventPayload::Console { .. } => "Console",
                 EventPayload::Rename { .. } => "Rename",
+                EventPayload::Model { .. } => "Model",
                 EventPayload::Note { .. } => "Note",
                 EventPayload::Compacted { .. } => "Compacted",
             })
@@ -7602,10 +7750,18 @@ mod tests {
         // `ask("#16", ...)`, and was refused.
         let mut tree = Tree::new(None);
         let root = tree
-            .start_agent(None, None, "root", None, "card", Vec::new())
+            .start_agent(None, None, "root", None, "card", "scripted", Vec::new())
             .unwrap();
         let child = tree
-            .start_agent(Some(root.leaf_id), None, "worker", None, "card", Vec::new())
+            .start_agent(
+                Some(root.leaf_id),
+                None,
+                "worker",
+                None,
+                "card",
+                "scripted",
+                Vec::new(),
+            )
             .unwrap();
         let id = child.leaf_id.as_u64();
         let state = Runner::with_spine(&tree, root);
@@ -7632,11 +7788,19 @@ mod tests {
         // documented pattern could not work.
         let mut tree = Tree::new(None);
         let root = tree
-            .start_agent(None, None, "root", None, "card", Vec::new())
+            .start_agent(None, None, "root", None, "card", "scripted", Vec::new())
             .unwrap();
         let root_agent = root.leaf_id;
         let child = tree
-            .start_agent(Some(root_agent), None, "worker", None, "card", Vec::new())
+            .start_agent(
+                Some(root_agent),
+                None,
+                "worker",
+                None,
+                "card",
+                "scripted",
+                Vec::new(),
+            )
             .unwrap();
         let agent_id = child.leaf_id;
         let state = Runner::with_spine(&tree, root);
@@ -7745,7 +7909,7 @@ mod tests {
     #[test]
     fn bare_tell_and_ask_dispatch_to_send() {
         let mut tree = Tree::new(None);
-        let mut root = Runner::new_root(&mut tree, "root", "").unwrap();
+        let mut root = Runner::new_root(&mut tree, "root", "", "scripted").unwrap();
         let (mut child, out) =
             spawn_and_ask(&mut tree, &mut root, "child", serde_json::Value::Null);
         drain(&mut root, &mut tree, out);
@@ -9059,7 +9223,7 @@ mod tests {
     #[test]
     fn answer_on_an_unowned_pre_fork_post_is_rejected_in_program() {
         let mut tree = Tree::new(None);
-        let mut original = Runner::new_root(&mut tree, "root", "").unwrap();
+        let mut original = Runner::new_root(&mut tree, "root", "", "scripted").unwrap();
         user_post(&mut original, &mut tree, "which one?");
         let question = original.open()[0];
 
@@ -9189,7 +9353,7 @@ mod tests {
     #[test]
     fn large_input_previews_in_context_and_binds_whole() {
         let mut tree = Tree::new(None);
-        let mut root = Runner::new_root(&mut tree, "root", "").unwrap();
+        let mut root = Runner::new_root(&mut tree, "root", "", "scripted").unwrap();
         let big = "z".repeat(9_000);
         let (mut child, _out) = spawn_and_ask(
             &mut tree,
@@ -9284,7 +9448,7 @@ mod tests {
     #[test]
     fn fork_is_born_idle() {
         let mut tree = Tree::new(None);
-        let mut original = Runner::new_root(&mut tree, "root", "").unwrap();
+        let mut original = Runner::new_root(&mut tree, "root", "", "scripted").unwrap();
         user_post(&mut original, &mut tree, "hello");
         let mut spine = tree.fork(original.spine.leaf_id).unwrap();
         let fork_root = spine.leaf_id;
@@ -10154,6 +10318,104 @@ mod tests {
             (crate::types::RenderMode::Peeked, "from 2".to_owned()),
             "the lambda ran, was given the whole object, and its result was stored"
         );
+    }
+
+    /// **A spent peek says so, and only for the turn it was spent.**
+    ///
+    /// `peeked_block` says what is in front of you and never what has
+    /// just left, so a row whose peek is spent renders exactly like one
+    /// that was never peeked — the id, the shape, the byte count — and
+    /// the only way to tell them apart is to replay your own replies.
+    /// A run on 2026-09-25 spent 10,353 completion tokens, 97% of its
+    /// whole output, doing that replay in reasoning and never settling
+    /// it: "peek" 47 times, still arguing at byte 33,797 of 35,160.
+    ///
+    /// Checked against the rendered document, because the tail is the
+    /// only place the model can see any of this — and scoped past the
+    /// preamble, since the worked examples now demonstrate the block
+    /// and carry their own.
+    #[test]
+    fn a_spent_peek_is_named_once_and_then_let_go() {
+        let real = |d: &str| {
+            let at = d.find(crate::document::REAL_HEADING).unwrap_or(0);
+            d[at..].to_owned()
+        };
+
+        let mut c = Conversation::new();
+        c.answers("peeked", serde_json::json!({ "out": "PEEKED-VALUE" }));
+        c.reply("```js\nhistory.peek(await tools.peeked());\n```\n");
+
+        // While it is live it is in the peeked block, and nothing is gone.
+        let now = real(&c.document());
+        assert!(now.contains("PEEKED-VALUE"), "the peek is live: {now}");
+        assert!(!now.contains("### gone"), "nothing has expired yet: {now}");
+
+        // The reply after it spends it: the bytes go, the row is named.
+        c.reply("Done.\n");
+        let after = real(&c.document());
+        assert!(!after.contains("PEEKED-VALUE"), "the bytes went: {after}");
+        assert!(after.contains("### gone"), "and the row says so: {after}");
+        assert!(
+            after.contains("peeked("),
+            "naming the call, which is what makes it findable: {after}"
+        );
+
+        // One turn only. It is a notice about a boundary just crossed,
+        // not a list that grows with the conversation.
+        c.reply("Still done.\n");
+        let later = real(&c.document());
+        assert!(!later.contains("### gone"), "it does not linger: {later}");
+
+        // **Peeked again is not gone.** The old render is still sitting
+        // inside the boundary below the new one, so without the guard
+        // the same row is announced as both in front of you and not
+        // shown any more.
+        c.reply("```js\nhistory.peek(await tools.peeked());\n```\n");
+        let again = real(&c.document());
+        assert!(again.contains("PEEKED-VALUE"), "live again: {again}");
+        assert!(
+            !again.contains("### gone"),
+            "and not also reported gone: {again}"
+        );
+    }
+
+    /// **The log knows which model it was talking to, and a switch is
+    /// an event.**
+    ///
+    /// `Usage::window` covers every reply but the first, because usage
+    /// arrives at the end of a stream. The root's snapshot covers that
+    /// one, and a `Model` event covers a session that changes model
+    /// mid-run — the same birth-value-plus-change-event shape `name`
+    /// and `Rename` already use, and for the same reason: a birth
+    /// field alone would be a claim about every later reply that
+    /// nothing had checked.
+    #[test]
+    fn the_window_comes_from_the_log_not_the_environment() {
+        let mut tree = Tree::new(None);
+        let mut state = Runner::new_root(&mut tree, "root", "", "deepseek-v4").unwrap();
+        assert_eq!(
+            state.logged_model_window(&tree),
+            Some(1_048_576),
+            "the root's own snapshot, with no environment consulted"
+        );
+
+        tree.append(
+            &mut state.spine,
+            EventPayload::Model {
+                name: "Qwen3.8-27B".to_owned(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            state.logged_model_window(&tree),
+            Some(65_536),
+            "the last Model at or after the root wins"
+        );
+
+        // A model the table has never heard of is not a window.
+        let mut other = Tree::new(None);
+        let unknown = Runner::new_root(&mut other, "root", "", "scripted").unwrap();
+        assert_eq!(unknown.logged_model_window(&other), None);
     }
 
     /// **The whole claim, end to end: `keep` stays and `peek` goes.**

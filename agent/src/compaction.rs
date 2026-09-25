@@ -356,7 +356,7 @@ mod tests {
     fn sample_branch() -> (Tree, Spine, EventId, EventId) {
         let mut tree = Tree::new(None);
         let mut spine = tree
-            .start_agent(None, None, "root", None, "CARD", Vec::new())
+            .start_agent(None, None, "root", None, "CARD", "scripted", Vec::new())
             .unwrap();
         tree.append(
             &mut spine,
@@ -404,7 +404,7 @@ mod tests {
     fn branch_with_a_report() -> (Tree, Spine, EventId, EventId) {
         let mut tree = Tree::new(None);
         let mut spine = tree
-            .start_agent(None, None, "root", None, "CARD", Vec::new())
+            .start_agent(None, None, "root", None, "CARD", "scripted", Vec::new())
             .unwrap();
         tree.append(
             &mut spine,
@@ -894,7 +894,7 @@ mod tests {
     fn branch_with_three_blocks() -> (Tree, Spine, [EventId; 3]) {
         let mut tree = Tree::new(None);
         let mut spine = tree
-            .start_agent(None, None, "root", None, "CARD", Vec::new())
+            .start_agent(None, None, "root", None, "CARD", "scripted", Vec::new())
             .unwrap();
         tree.append(
             &mut spine,

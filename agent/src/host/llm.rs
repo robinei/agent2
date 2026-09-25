@@ -70,6 +70,13 @@ pub trait LlmClient: Send + Sync {
         cancel: &Cancel,
         chunk: &mut dyn FnMut(LlmChunk),
     ) -> Result<LlmTurn, String>;
+
+    /// What this client is talking to, for the log's own record.
+    ///
+    /// No default: a client that will not say is a log that cannot
+    /// reproduce its own request, and the scripted clients have an
+    /// honest answer (`"scripted"`) rather than an absent one.
+    fn model(&self) -> &str;
 }
 
 /// Scripted client: pops canned assistant turns in order. Each turn's
@@ -305,6 +312,10 @@ impl LlmClient for RoutedLlm {
             }
         })
     }
+
+    fn model(&self) -> &str {
+        "scripted"
+    }
 }
 
 impl LlmClient for ScriptedLlm {
@@ -330,6 +341,10 @@ impl LlmClient for ScriptedLlm {
             chunk(LlmChunk::Text(message.source.clone()));
         }
         Ok(message)
+    }
+
+    fn model(&self) -> &str {
+        "scripted"
     }
 }
 
@@ -436,6 +451,10 @@ impl<T: LlmClient + ?Sized> LlmClient for Arc<T> {
     ) -> Result<LlmTurn, String> {
         (**self).complete(request, cancel, chunk)
     }
+
+    fn model(&self) -> &str {
+        (**self).model()
+    }
 }
 
 #[cfg(test)]
@@ -464,5 +483,9 @@ impl LlmClient for HoldingLlm {
             return Err("cancelled".into());
         }
         self.inner.complete(request, cancel, chunk)
+    }
+
+    fn model(&self) -> &str {
+        self.inner.model()
     }
 }

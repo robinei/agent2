@@ -267,6 +267,10 @@ impl Tree {
     /// **from this root** rather than from an event on its parent's
     /// branch — which is what makes the root agent, with no `Spawn`
     /// above it, not a special case. `None` means "everything".
+    // One more than clippy's taste: `model` joins `system` and
+    // `exemplars` as a snapshot the log takes at birth, and the
+    // three are only a struct if the log grows a reason for one.
+    #[allow(clippy::too_many_arguments)]
     pub fn start_agent(
         &mut self,
         parent_id: Option<EventId>,
@@ -274,6 +278,7 @@ impl Tree {
         charter: impl Into<String>,
         tools: Option<Vec<String>>,
         system: impl Into<String>,
+        model: impl Into<String>,
         exemplars: Vec<Exemplar>,
     ) -> io::Result<Spine> {
         match parent_id {
@@ -289,6 +294,7 @@ impl Tree {
             charter: charter.into(),
             tools,
             system: system.into(),
+            model: model.into(),
             exemplars,
         };
         let id = self.log_event(parent_id, payload)?;
@@ -505,6 +511,7 @@ impl Tree {
             // Accounting: it changes nothing a later turn can see.
             | EventPayload::ReplyEnd { .. }
             | EventPayload::Rename { .. }
+            | EventPayload::Model { .. }
             | EventPayload::Note { .. }
             | EventPayload::Compacted { .. }
             // A reply, its parts, its end, a restart and a compaction
@@ -1268,7 +1275,8 @@ mod tests {
         let (agent, leaf);
         {
             let mut tree = open()?;
-            let mut spine = tree.start_agent(None, None, "root", None, "", Vec::new())?;
+            let mut spine =
+                tree.start_agent(None, None, "root", None, "", "scripted", Vec::new())?;
             agent = spine.leaf_id; // the Agent id is the agent id
             let [reply, cell] = assistant_msg("console.log('hi'); history.note(42);");
             let rid = tree.append(&mut spine, reply)?;
@@ -1344,7 +1352,7 @@ mod tests {
     fn program_status_survives_reopen() -> io::Result<()> {
         use crate::host::ProgramStatus;
         let mut tree = Tree::new(None);
-        let mut spine = tree.start_agent(None, None, "root", None, "", Vec::new())?;
+        let mut spine = tree.start_agent(None, None, "root", None, "", "scripted", Vec::new())?;
         let agent = spine.leaf_id;
         let [reply, cell] = assistant_msg("raise('x');");
         let raiser = tree.append(&mut spine, reply)?;
@@ -1395,7 +1403,8 @@ mod tests {
         assert_eq!(progs[1].status(), ProgramStatus::Completed);
 
         // A compile failure never ran, so it is Failed, not Suspended.
-        let mut other = tree.start_agent(Some(agent), None, "child", None, "", Vec::new())?;
+        let mut other =
+            tree.start_agent(Some(agent), None, "child", None, "", "scripted", Vec::new())?;
         let [reply, cell] = assistant_msg("let = ;");
         let broken = tree.append(&mut other, reply)?;
         tree.append(&mut other, cell)?;
@@ -1423,7 +1432,7 @@ mod tests {
     #[test]
     fn test_bootstrap_root_agent() -> io::Result<()> {
         let mut tree = Tree::new(None);
-        let spine = tree.start_agent(None, None, "hello", None, "", Vec::new())?;
+        let spine = tree.start_agent(None, None, "hello", None, "", "scripted", Vec::new())?;
         assert_eq!(spine.leaf_id.as_u64(), 1);
         assert!(tree.events[&spine.leaf_id].is_root());
         assert_eq!(spine.contexts.len(), 1);
@@ -1435,15 +1444,15 @@ mod tests {
     #[should_panic(expected = "root Agent on a non-empty tree")]
     fn test_second_root_agent_panics() {
         let mut tree = Tree::new(None);
-        tree.start_agent(None, None, "root", None, "", Vec::new())
+        tree.start_agent(None, None, "root", None, "", "scripted", Vec::new())
             .unwrap();
-        let _ = tree.start_agent(None, None, "another root", None, "", Vec::new());
+        let _ = tree.start_agent(None, None, "another root", None, "", "scripted", Vec::new());
     }
 
     #[test]
     fn test_linear_conversation() -> io::Result<()> {
         let mut tree = Tree::new(None);
-        let mut spine = tree.start_agent(None, None, "root", None, "", Vec::new())?;
+        let mut spine = tree.start_agent(None, None, "root", None, "", "scripted", Vec::new())?;
         tree.append(&mut spine, user_msg("hello"))?;
         let [reply, cell] = assistant_msg("hi there");
         tree.append(&mut spine, reply)?;
@@ -1463,7 +1472,7 @@ mod tests {
     fn test_append_agent_root_panics() {
         let mut tree = Tree::new(None);
         let mut spine = tree
-            .start_agent(None, None, "root", None, "", Vec::new())
+            .start_agent(None, None, "root", None, "", "scripted", Vec::new())
             .unwrap();
         let _ = tree.append(
             &mut spine,
@@ -1472,6 +1481,7 @@ mod tests {
                 charter: "child".into(),
                 tools: None,
                 system: String::new(),
+                model: "scripted".to_owned(),
                 exemplars: Vec::new(),
             },
         );
@@ -1484,7 +1494,7 @@ mod tests {
     #[test]
     fn an_answer_closes_a_post_not_the_branch() -> io::Result<()> {
         let mut tree = Tree::new(None);
-        let mut spine = tree.start_agent(None, None, "root", None, "", Vec::new())?;
+        let mut spine = tree.start_agent(None, None, "root", None, "", "scripted", Vec::new())?;
         let question = tree.append(&mut spine, user_msg("q"))?;
         assert_eq!(spine.context().open, [question]);
 
@@ -1515,7 +1525,7 @@ mod tests {
     #[test]
     fn a_tell_opens_nothing() -> io::Result<()> {
         let mut tree = Tree::new(None);
-        let mut spine = tree.start_agent(None, None, "root", None, "", Vec::new())?;
+        let mut spine = tree.start_agent(None, None, "root", None, "", "scripted", Vec::new())?;
         tree.append(
             &mut spine,
             EventPayload::Post {
@@ -1541,7 +1551,7 @@ mod tests {
     #[test]
     fn fork_does_not_owe_prefork_posts() -> io::Result<()> {
         let mut tree = Tree::new(None);
-        let mut spine = tree.start_agent(None, None, "root", None, "", Vec::new())?;
+        let mut spine = tree.start_agent(None, None, "root", None, "", "scripted", Vec::new())?;
         let question = tree.append(&mut spine, user_msg("which file?"))?;
         assert_eq!(spine.context().open, [question]);
 
@@ -1575,7 +1585,7 @@ mod tests {
     #[test]
     fn test_calls_and_program_result_are_artifacts_not_messages() -> io::Result<()> {
         let mut tree = Tree::new(None);
-        let mut spine = tree.start_agent(None, None, "root", None, "", Vec::new())?;
+        let mut spine = tree.start_agent(None, None, "root", None, "", "scripted", Vec::new())?;
         let call_id = tree.append(
             &mut spine,
             EventPayload::Call(Call::Invoke {
@@ -1628,14 +1638,21 @@ mod tests {
     /// Caller spine + child agent branched at a call-site event, appends
     /// interleaved between the two spines.
     fn build_branched_tree(tree: &mut Tree) -> io::Result<(Spine, Spine)> {
-        let mut caller = tree.start_agent(None, None, "root", None, "", Vec::new())?;
+        let mut caller = tree.start_agent(None, None, "root", None, "", "scripted", Vec::new())?;
         tree.append(&mut caller, user_msg("m1"))?;
         let [reply, cell] = assistant_msg("spawning");
         let call_site = tree.append(&mut caller, reply)?;
         tree.append(&mut caller, cell)?;
 
-        let mut child =
-            tree.start_agent(Some(call_site), None, "child prompt", None, "", Vec::new())?;
+        let mut child = tree.start_agent(
+            Some(call_site),
+            None,
+            "child prompt",
+            None,
+            "",
+            "scripted",
+            Vec::new(),
+        )?;
         // The first question is a `Post`, and it carries the caller's
         // machine-bound `input`.
         tree.append(
@@ -1705,11 +1722,19 @@ mod tests {
         // caller activity after the call site, the call-site event is
         // still the caller's resumable leaf.
         let mut tree = Tree::new(None);
-        let mut caller = tree.start_agent(None, None, "root", None, "", Vec::new())?;
+        let mut caller = tree.start_agent(None, None, "root", None, "", "scripted", Vec::new())?;
         let [reply, cell] = assistant_msg("spawning");
         let call_site = tree.append(&mut caller, reply)?;
         tree.append(&mut caller, cell)?;
-        let child = tree.start_agent(Some(call_site), None, "child", None, "", Vec::new())?;
+        let child = tree.start_agent(
+            Some(call_site),
+            None,
+            "child",
+            None,
+            "",
+            "scripted",
+            Vec::new(),
+        )?;
 
         let mut leaves: Vec<EventId> = tree.list_leaves().into_iter().map(|(id, _)| id).collect();
         leaves.sort_by_key(|id| id.as_u64());
@@ -1725,7 +1750,7 @@ mod tests {
     #[test]
     fn test_fork_mid_spine_diverges_leaving_original_intact() -> io::Result<()> {
         let mut tree = Tree::new(None);
-        let mut spine = tree.start_agent(None, None, "root", None, "", Vec::new())?;
+        let mut spine = tree.start_agent(None, None, "root", None, "", "scripted", Vec::new())?;
         tree.append(&mut spine, user_msg("q"))?;
         let [reply, cell] = assistant_msg("first answer");
         let fork_point = tree.append(&mut spine, reply)?;
@@ -1757,7 +1782,7 @@ mod tests {
     #[test]
     fn test_fork_from_an_answered_leaf_is_fine() -> io::Result<()> {
         let mut tree = Tree::new(None);
-        let mut spine = tree.start_agent(None, None, "root", None, "", Vec::new())?;
+        let mut spine = tree.start_agent(None, None, "root", None, "", "scripted", Vec::new())?;
         let question = tree.append(&mut spine, user_msg("q"))?;
         let [reply, cell] = assistant_msg("done");
         tree.append(&mut spine, reply)?;
@@ -1806,7 +1831,8 @@ mod tests {
 
         {
             let mut tree = open()?;
-            let mut spine = tree.start_agent(None, None, "root", None, "", Vec::new())?;
+            let mut spine =
+                tree.start_agent(None, None, "root", None, "", "scripted", Vec::new())?;
             tree.append(&mut spine, user_msg("go"))?;
             let [reply, cell] = assistant_msg("history.note(1);");
             let rid = tree.append(&mut spine, reply)?;
@@ -1856,7 +1882,8 @@ mod tests {
     #[test]
     fn fanned_body_is_stored_once() -> io::Result<()> {
         let mut tree = Tree::new(None);
-        let mut caller = tree.start_agent(None, None, "orchestrator", None, "", Vec::new())?;
+        let mut caller =
+            tree.start_agent(None, None, "orchestrator", None, "", "scripted", Vec::new())?;
         let plan = "P".repeat(4096);
         let send = tree.append(
             &mut caller,
@@ -1875,7 +1902,8 @@ mod tests {
         // Three workers, each delivered the *same* body by reference.
         let mut workers = Vec::new();
         for _ in 0..3 {
-            let mut w = tree.start_agent(Some(send), None, "worker", None, "", Vec::new())?;
+            let mut w =
+                tree.start_agent(Some(send), None, "worker", None, "", "scripted", Vec::new())?;
             tree.append(
                 &mut w,
                 EventPayload::Post {
@@ -1920,7 +1948,8 @@ mod tests {
                 .truncate(false)
                 .open(&path)?;
             let mut tree = Tree::open(file)?;
-            let mut spine = tree.start_agent(None, None, "root", None, "", Vec::new())?;
+            let mut spine =
+                tree.start_agent(None, None, "root", None, "", "scripted", Vec::new())?;
             leaf = tree.append(
                 &mut spine,
                 EventPayload::Post {
@@ -1951,7 +1980,7 @@ mod tests {
     #[test]
     fn a_rename_names_the_branch() -> io::Result<()> {
         let mut tree = Tree::new(None);
-        let mut spine = tree.start_agent(None, None, "root", None, "", Vec::new())?;
+        let mut spine = tree.start_agent(None, None, "root", None, "", "scripted", Vec::new())?;
         tree.append(&mut spine, user_msg("hi"))?;
         tree.append(
             &mut spine,
@@ -1973,8 +2002,15 @@ mod tests {
     fn rename_folds_from_the_branch_root() -> io::Result<()> {
         let mut tree = Tree::new(None);
         // A root that was born named.
-        let mut spine =
-            tree.start_agent(None, Some("at birth".into()), "root", None, "", Vec::new())?;
+        let mut spine = tree.start_agent(
+            None,
+            Some("at birth".into()),
+            "root",
+            None,
+            "",
+            "scripted",
+            Vec::new(),
+        )?;
         assert_eq!(tree.branch_name(spine.leaf_id).as_deref(), Some("at birth"));
 
         let fork_point = tree.append(&mut spine, user_msg("q"))?;
@@ -2013,7 +2049,7 @@ mod tests {
     #[test]
     fn an_unnamed_branch_has_no_name() -> io::Result<()> {
         let mut tree = Tree::new(None);
-        let mut spine = tree.start_agent(None, None, "root", None, "", Vec::new())?;
+        let mut spine = tree.start_agent(None, None, "root", None, "", "scripted", Vec::new())?;
         tree.append(&mut spine, user_msg("hello"))?;
 
         let leaves = tree.list_leaves();
@@ -2096,7 +2132,8 @@ mod tests {
                 .truncate(false)
                 .open(&path)?;
             let mut tree = Tree::open(file)?;
-            let mut spine = tree.start_agent(None, None, "root", None, "", Vec::new())?;
+            let mut spine =
+                tree.start_agent(None, None, "root", None, "", "scripted", Vec::new())?;
             tree.append(&mut spine, user_msg("first msg"))?;
         }
 
@@ -2144,7 +2181,7 @@ mod tests {
         let mut tree = Tree::open(file)?;
         assert!(tree.list_leaves().is_empty());
 
-        let spine = tree.start_agent(None, None, "first", None, "", Vec::new())?;
+        let spine = tree.start_agent(None, None, "first", None, "", "scripted", Vec::new())?;
         assert_eq!(spine.contexts.len(), 1);
         assert_eq!(spine.context().charter, "first");
         Ok(())
@@ -2167,7 +2204,8 @@ mod tests {
         let file = NamedTempFile::new()?;
         {
             let mut tree = Tree::open(file.reopen()?)?;
-            let mut spine = tree.start_agent(None, None, "root", None, "", Vec::new())?;
+            let mut spine =
+                tree.start_agent(None, None, "root", None, "", "scripted", Vec::new())?;
             tree.append(&mut spine, user_msg("hi"))?;
             tree.sync()?;
         }

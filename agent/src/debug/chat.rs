@@ -790,7 +790,7 @@ impl ChatState {
             }
             // A rename is a record: it changes the navigator, never the
             // transcript, and never wakes the branch.
-            EventPayload::Rename { .. } => {}
+            EventPayload::Rename { .. } | EventPayload::Model { .. } => {}
             // The reply's own text, arriving piece by piece.
             //
             // **Only the cells.** A prose segment reaches this pane as
@@ -1756,6 +1756,7 @@ mod tests {
                 charter: "p".into(),
                 tools: None,
                 system: String::new(),
+                model: "scripted".to_owned(),
                 exemplars: Vec::new(),
             },
         ));
@@ -1799,6 +1800,7 @@ mod tests {
                 charter: "p".into(),
                 tools: None,
                 system: String::new(),
+                model: "scripted".to_owned(),
                 exemplars: Vec::new(),
             },
         ));
@@ -1837,6 +1839,7 @@ mod tests {
                 charter: "p".into(),
                 tools: None,
                 system: String::new(),
+                model: "scripted".to_owned(),
                 exemplars: Vec::new(),
             },
         ));
@@ -1889,6 +1892,7 @@ mod tests {
                 charter: "p".into(),
                 tools: None,
                 system: String::new(),
+                model: "scripted".to_owned(),
                 exemplars: Vec::new(),
             },
         ));
@@ -2194,6 +2198,7 @@ mod tests {
                 charter: "be helpful".into(),
                 tools: None,
                 system: String::new(),
+                model: "scripted".to_owned(),
                 exemplars: Vec::new(),
             },
         ));
@@ -2261,6 +2266,7 @@ mod tests {
                 charter: "p".into(),
                 tools: None,
                 system: String::new(),
+                model: "scripted".to_owned(),
                 exemplars: Vec::new(),
             },
         ));
@@ -2433,6 +2439,7 @@ mod tests {
                 charter: "p".into(),
                 tools: None,
                 system: String::new(),
+                model: "scripted".to_owned(),
                 exemplars: Vec::new(),
             },
         ));
@@ -2466,6 +2473,7 @@ mod tests {
                 charter: "p".into(),
                 tools: None,
                 system: String::new(),
+                model: "scripted".to_owned(),
                 exemplars: Vec::new(),
             },
         ));
@@ -2534,6 +2542,7 @@ mod tests {
                 charter: "root".into(),
                 tools: None,
                 system: "ROOT SYSTEM PROMPT".into(),
+                model: "scripted".to_owned(),
                 exemplars: Vec::new(),
             },
         ));
@@ -2549,6 +2558,7 @@ mod tests {
                 charter: "child".into(),
                 tools: None,
                 system: "CHILD SYSTEM PROMPT".into(),
+                model: "scripted".to_owned(),
                 exemplars: Vec::new(),
             },
         ));
@@ -2586,6 +2596,7 @@ mod tests {
                 charter: "root".into(),
                 tools: None,
                 system: "SYS".into(),
+                model: "scripted".to_owned(),
                 exemplars: Vec::new(),
             },
         ));
@@ -2685,6 +2696,7 @@ mod tests {
                 charter: "p".into(),
                 tools: None,
                 system: String::new(),
+                model: "scripted".to_owned(),
                 exemplars: Vec::new(),
             },
         ));
@@ -2745,6 +2757,7 @@ mod tests {
                 charter: "p".into(),
                 tools: None,
                 system: String::new(),
+                model: "scripted".to_owned(),
                 exemplars: Vec::new(),
             },
         ));
@@ -2818,6 +2831,7 @@ mod tests {
                 charter: "p".into(),
                 tools: None,
                 system: String::new(),
+                model: "scripted".to_owned(),
                 exemplars: Vec::new(),
             },
         )

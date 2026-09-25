@@ -25,6 +25,10 @@ It completed.
 
 ## RIGHT NOW
 
+### gone — peeked for your last reply, not shown now; `history.peek(id)` to see one again, `history.fetch(id)` to compute on it
+
+- `[107]` `replace_file("CONF.json", "{ \"retries\": 5 }\n", "v1")` → ok, {version, diff, id}, 58 bytes
+
 - 47 rows, #6–#146. history.fetch(id) for any of them; a report lists only what is new.
 - No client is attached; an ask() stays open until someone answers it.
 - Your reply is markdown and reaches the person as written. Only a ```js block runs; ```text and unfenced code do nothing.

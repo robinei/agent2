@@ -1062,6 +1062,7 @@ fn print_session_event(event: &SessionEvent) {
                     println!("{head} handback at {site}: {how:?}");
                 }
                 EventPayload::Rename { name } => println!("{head} rename: {name}"),
+                EventPayload::Model { name } => println!("{head} model: {name}"),
                 EventPayload::Console { lines } => {
                     println!("{head} console: {} lines", lines.len());
                 }
@@ -1132,6 +1133,10 @@ impl host::LlmClient for ArcLlm {
     ) -> Result<machine::LlmTurn, String> {
         self.0.complete(request, cancel, chunk)
     }
+
+    fn model(&self) -> &str {
+        self.0.model()
+    }
 }
 
 #[cfg(test)]
@@ -1162,7 +1167,7 @@ mod turn_target_tests {
     fn a_turn_beside_resume_lands_on_the_resumed_branch() {
         let mut tree = types::Tree::new(None);
         let mut spine = tree
-            .start_agent(None, None, "root", None, "", Vec::new())
+            .start_agent(None, None, "root", None, "", "scripted", Vec::new())
             .unwrap();
         let at = tree.append(&mut spine, post("q")).unwrap();
         let conversation = tree.branch_of(at).expect("the root branch");

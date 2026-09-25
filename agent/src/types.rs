@@ -277,6 +277,35 @@ pub enum EventPayload {
         tools: Option<Vec<String>>,
         /// The assembled system prompt, snapshotted at creation.
         system: String,
+        /// The model this agent was born talking to, snapshotted for
+        /// the same reason `system` is: **the log has to reproduce its
+        /// own request without the environment.**
+        ///
+        /// `Usage::window` already records the window a *completed*
+        /// request was measured against, which covers every reply but
+        /// the first — usage arrives at the end of a stream, so the
+        /// opening request of a run has none. Rendering that one reply
+        /// fell back to the byte budget and answered in a different
+        /// unit from the live trigger: the same "instrument contradicts
+        /// the request" failure `Usage::window` was added to end,
+        /// surviving in the one place it could not reach.
+        ///
+        /// The model in force at a point is the last [`Model`] **at or
+        /// after this root**, else this — the same shape as `name` and
+        /// [`Rename`] above it, and for the same reason: a birth value
+        /// alone cannot say that something changed later.
+        ///
+        /// Not optional: every agent talks to something, and a
+        /// scripted client names itself rather than leaving this
+        /// blank, so "an agent with no model" is not a state this type
+        /// can hold. `#[serde(default)]` is for logs written before
+        /// the field existed, which deserialize to `""` and fall back
+        /// to `Usage::window` exactly as they did.
+        ///
+        /// [`Model`]: EventPayload::Model
+        /// [`Rename`]: EventPayload::Rename
+        #[serde(default)]
+        model: String,
         /// The worked examples, snapshotted at creation for the same
         /// reason `system` is — **and they were not, until it turned
         /// out that half a snapshot protects nothing.**
@@ -352,6 +381,22 @@ pub enum EventPayload {
     /// its forks alone — which is what you want when a fork was named for
     /// how it differs.
     Rename { name: String },
+
+    /// This branch talks to this model from here on. Parent: the owning
+    /// branch's spine. Renders to chat: **no** — like a `Rename` it is a
+    /// record, so switching model never wakes a branch.
+    ///
+    /// The model in force at a point is the last `Model` **at or after
+    /// the agent root**, else that root's `model`. Per-*path*, so a fork
+    /// that switches leaves its original alone — which is the whole
+    /// point when the fork exists to try another model.
+    ///
+    /// Separate from the root's snapshot because a session can change
+    /// model mid-run, and a birth field would then be a claim about
+    /// every later reply that nothing had checked. Rendering a past
+    /// request has to answer with the model that request actually went
+    /// to, not the one the conversation started on.
+    Model { name: String },
 
     /// Structural event; one per compaction operation. Parent: the owning
     /// agent's spine. Renders to chat: replaces its target's row — `of`

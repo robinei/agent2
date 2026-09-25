@@ -1702,7 +1702,15 @@ mod tests {
             assistant: "tell(\"ok\"); finish();".into(),
         }];
         let mut spine = tree
-            .start_agent(None, None, "root", None, "CARD OF THE DAY", snapshotted)
+            .start_agent(
+                None,
+                None,
+                "root",
+                None,
+                "CARD OF THE DAY",
+                "scripted",
+                snapshotted,
+            )
             .unwrap();
         tree.append(
             &mut spine,
@@ -1803,7 +1811,7 @@ mod tests {
         ] {
             let mut tree = Tree::new(None);
             let mut spine = tree
-                .start_agent(None, None, "root", None, "CARD", Vec::new())
+                .start_agent(None, None, "root", None, "CARD", "scripted", Vec::new())
                 .unwrap();
             tree.append(&mut spine, user_post("hello")).unwrap();
             let reply = tree.append(&mut spine, EventPayload::Reply).unwrap();
@@ -1848,7 +1856,7 @@ mod tests {
     fn a_completed_program_renders_card_user_assistant_user() {
         let mut tree = Tree::new(None);
         let mut spine = tree
-            .start_agent(None, None, "root", None, "CARD", Vec::new())
+            .start_agent(None, None, "root", None, "CARD", "scripted", Vec::new())
             .unwrap();
         tree.append(&mut spine, user_post("hello")).unwrap();
         append_turn(&mut tree, &mut spine, "tell('hi'); history.note(1);");
@@ -1925,7 +1933,7 @@ mod tests {
     fn a_deliberation_renders_like_any_other_program() {
         let mut tree = Tree::new(None);
         let mut spine = tree
-            .start_agent(None, None, "root", None, "CARD", Vec::new())
+            .start_agent(None, None, "root", None, "CARD", "scripted", Vec::new())
             .unwrap();
         tree.append(&mut spine, user_post("go")).unwrap();
         append_turn(&mut tree, &mut spine, "raise('x');");
@@ -2010,7 +2018,7 @@ mod tests {
     fn a_trap_hides_neither_itself_nor_the_programs_after_it() {
         let mut tree = Tree::new(None);
         let mut spine = tree
-            .start_agent(None, None, "root", None, "CARD", Vec::new())
+            .start_agent(None, None, "root", None, "CARD", "scripted", Vec::new())
             .unwrap();
         tree.append(&mut spine, user_post("go")).unwrap();
         append_turn(&mut tree, &mut spine, "Edit.applyEdits(fmt.content, []);");
@@ -2093,7 +2101,7 @@ mod tests {
 
         let mut tree = Tree::new(None);
         let mut spine = tree
-            .start_agent(None, None, "root", None, "CARD", Vec::new())
+            .start_agent(None, None, "root", None, "CARD", "scripted", Vec::new())
             .unwrap();
         tree.append(&mut spine, user_post("go")).unwrap();
         append_turn(&mut tree, &mut spine, src);
@@ -2286,7 +2294,7 @@ mod tests {
         let src = "tell(\"ok\");\n";
         let mut tree = Tree::new(None);
         let mut spine = tree
-            .start_agent(None, None, "root", None, "CARD", Vec::new())
+            .start_agent(None, None, "root", None, "CARD", "scripted", Vec::new())
             .unwrap();
         tree.append(&mut spine, user_post("go")).unwrap();
         append_turn(&mut tree, &mut spine, src);
@@ -2329,7 +2337,7 @@ mod tests {
     fn incoming_and_outgoing_rows_are_symmetric() {
         let mut tree = Tree::new(None);
         let mut spine = tree
-            .start_agent(None, None, "root", None, "CARD", Vec::new())
+            .start_agent(None, None, "root", None, "CARD", "scripted", Vec::new())
             .unwrap();
         // Incoming, expecting a reply.
         tree.append(
@@ -2406,7 +2414,7 @@ mod tests {
         let end = fenced(src).find(");").unwrap() + 1;
         let mut tree = Tree::new(None);
         let mut spine = tree
-            .start_agent(None, None, "root", None, "CARD", Vec::new())
+            .start_agent(None, None, "root", None, "CARD", "scripted", Vec::new())
             .unwrap();
         tree.append(&mut spine, user_post("go")).unwrap();
         append_turn(&mut tree, &mut spine, src);
@@ -2465,7 +2473,7 @@ mod tests {
     fn a_replaced_entry_is_marked_as_standing_in_for_more() {
         let mut tree = Tree::new(None);
         let mut spine = tree
-            .start_agent(None, None, "root", None, "CARD", Vec::new())
+            .start_agent(None, None, "root", None, "CARD", "scripted", Vec::new())
             .unwrap();
         tree.append(&mut spine, user_post("go")).unwrap();
         let note = tree
@@ -2517,7 +2525,7 @@ mod tests {
         let build = |text: Option<String>| {
             let mut tree = Tree::new(None);
             let mut spine = tree
-                .start_agent(None, None, "root", None, "CARD", Vec::new())
+                .start_agent(None, None, "root", None, "CARD", "scripted", Vec::new())
                 .unwrap();
             tree.append(&mut spine, user_post("go")).unwrap();
             let program = append_turn(&mut tree, &mut spine, "1 + 1;");
@@ -2583,7 +2591,7 @@ mod tests {
     fn sample_document() -> Document {
         let mut tree = Tree::new(None);
         let mut spine = tree
-            .start_agent(None, None, "root", None, "CARD", Vec::new())
+            .start_agent(None, None, "root", None, "CARD", "scripted", Vec::new())
             .unwrap();
         tree.append(&mut spine, user_post("hello")).unwrap();
         append_turn(&mut tree, &mut spine, "tell('hi'); history.note(1);");
