@@ -866,10 +866,29 @@ fn run_session_headless(
         if real && !driven {
             return Err("a real headless session needs --turn <text>".into());
         }
-        // Presence is per-request and honest about its limit: a headless
-        // run with a queued turn has someone waiting on the other end; one
-        // without does not, and its agents are told so.
-        session.set_attached(nav.turn.is_some());
+        // **Nobody is attached to a one-shot run, whoever started it.**
+        // This said `nav.turn.is_some()` — a queued turn means someone
+        // is waiting on the other end — and that is true of a person
+        // watching and false of every driver, which is what actually
+        // runs this shape. The process exits the moment the branch
+        // settles, so an `ask()` here can never be answered in this
+        // session: answering means a *new* process, which arrives after
+        // the VM is gone and lands as a settlement nobody was waiting
+        // for. `--stdin` is the mode where someone really is typing,
+        // and it sets this itself.
+        //
+        // Live on 2026-09-25: `dead-code-sweep` did careful work — a
+        // scratch copy, every allow stripped, `cargo check` as the
+        // judge — then asked which way to take one judgement call. The
+        // tail had told it "a client is attached; an ask() may be
+        // answered promptly". The suite scored the run as a failure,
+        // because the edit it was holding back never happened.
+        //
+        // The two mistakes are not the same size. Claiming presence
+        // that is not there parks a run and kills it; denying presence
+        // that is there costs a reply handed back in prose, which the
+        // person then reads.
+        session.set_attached(false);
         queue_nav(&session, &nav);
         session.run()
     } else {
