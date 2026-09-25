@@ -1834,7 +1834,7 @@ impl VM {
     /// last case worked by accident once `Array` did, but the other two
     /// didn't). Returns `Ok(None)` when `arg` is none of these; the caller
     /// turns that into a `TypeError` naming the constructor.
-    fn iterable_elements(&mut self, arg: &Value) -> Result<Option<Vec<Value>>, VMError> {
+    pub(crate) fn iterable_elements(&mut self, arg: &Value) -> Result<Option<Vec<Value>>, VMError> {
         match arg {
             Value::Array(p) => {
                 let arr = self
@@ -2038,6 +2038,16 @@ impl VM {
                 crate::builtin::reference_error_ctor(self, args)?
             }
             crate::vm::instr::TypeTag::EvalError => crate::builtin::eval_error_ctor(self, args)?,
+            crate::vm::instr::TypeTag::URIError => crate::builtin::uri_error_ctor(self, args)?,
+            // The two that do not share the one-message body: their extra
+            // own properties (`errors`; `error`/`suppressed`) are the reason
+            // the class exists at all.
+            crate::vm::instr::TypeTag::AggregateError => {
+                crate::builtin::aggregate_error_ctor(self, args)?
+            }
+            crate::vm::instr::TypeTag::SuppressedError => {
+                crate::builtin::suppressed_error_ctor(self, args)?
+            }
         };
         self.stack.truncate(base);
         self.stack.push(result);

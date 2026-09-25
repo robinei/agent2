@@ -73,6 +73,7 @@ pub(crate) use function::function_ctor;
 pub(crate) use map::map_ctor;
 pub(crate) use number::number_ctor;
 pub(crate) use number::number_to_fixed;
+pub(crate) use object::aggregate_error_ctor;
 pub(crate) use object::error_ctor;
 pub(crate) use object::eval_error_ctor;
 pub(crate) use object::obj_create;
@@ -85,8 +86,10 @@ pub(crate) use object::obj_seal;
 pub(crate) use object::object_ctor;
 pub(crate) use object::range_error_ctor;
 pub(crate) use object::reference_error_ctor;
+pub(crate) use object::suppressed_error_ctor;
 pub(crate) use object::syntax_error_ctor;
 pub(crate) use object::type_error_ctor;
+pub(crate) use object::uri_error_ctor;
 pub(crate) use object::value_error_ctor;
 pub(crate) use regexp::regexp_ctor;
 pub(crate) use set::set_ctor;
@@ -638,6 +641,15 @@ builtins! {
     SyntaxErrorCtor,    BuiltinKind::Constructor { type_tag: TypeTag::SyntaxError },    "SyntaxError",    0, 2, syntax_error_ctor,    false, false, false, false, false, false, false, false, false, false;
     ReferenceErrorCtor, BuiltinKind::Constructor { type_tag: TypeTag::ReferenceError }, "ReferenceError", 0, 2, reference_error_ctor, false, false, false, false, false, false, false, false, false, false;
     EvalErrorCtor,      BuiltinKind::Constructor { type_tag: TypeTag::EvalError },      "EvalError",      0, 2, eval_error_ctor,      false, false, false, false, false, false, false, false, false, false;
+    URIErrorCtor,       BuiltinKind::Constructor { type_tag: TypeTag::URIError },       "URIError",       0, 2, uri_error_ctor,       false, false, false, false, false, false, false, false, false, false;
+    // The two error classes whose first argument is not a message, so they
+    // cannot share the `error_ctor!` body. `AggregateError` takes the
+    // iterable first (`1` minimum: an aggregate of nothing is a mistake, and
+    // JS agrees — its `length` is 2 but `errors` is required);
+    // `SuppressedError` takes the pair it exists to carry. The trailing slot
+    // in each is the `{ cause }` bag, as for every class above.
+    AggregateErrorCtor,  BuiltinKind::Constructor { type_tag: TypeTag::AggregateError },  "AggregateError",  1, 3, aggregate_error_ctor,  false, false, false, false, false, false, false, false, false, false;
+    SuppressedErrorCtor, BuiltinKind::Constructor { type_tag: TypeTag::SuppressedError }, "SuppressedError", 0, 4, suppressed_error_ctor, false, false, false, false, false, false, false, false, false, false;
 
     // ── ArrayBuffer ──
     // `0` minimum, not `1`: `new ArrayBuffer()` is a zero-length buffer in JS

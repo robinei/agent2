@@ -1510,6 +1510,81 @@ fn the_classes_are_siblings_not_cousins() {
 }
 
 #[test]
+fn the_classes_nothing_raises_are_still_real_classes() {
+    // `URIError`, `AggregateError` and `SuppressedError` have no producer
+    // in this runtime — no `encodeURI`, `Promise.any` is a compile error,
+    // and there is no `using`. They are declared for the program's own
+    // `throw`, so the thing to check is that a thrown one behaves like any
+    // other error rather than dying as an undeclared name.
+    assert_eq!(
+        run_ret(
+            r#"try { throw new URIError("bad escape"); }
+               catch (e) { return [e.name, e.message, e instanceof URIError, e instanceof Error]; }"#
+        ),
+        json!(["URIError", "bad escape", true, true])
+    );
+    assert_eq!(
+        run_ret(r#"return `${new URIError("bad escape")}`;"#),
+        json!("URIError: bad escape")
+    );
+    // Siblings, like the rest: a program branching on one must not catch
+    // the other.
+    assert_eq!(
+        run_ret(r#"return new URIError("x") instanceof TypeError;"#),
+        json!(false)
+    );
+}
+
+#[test]
+fn an_aggregate_error_carries_its_errors_as_an_array() {
+    // **The reason it is not faked.** Code that catches an
+    // `AggregateError` is code that reads `e.errors`; a class that took
+    // the iterable and dropped it would fail precisely where it is used.
+    assert_eq!(
+        run_ret(
+            r#"const e = new AggregateError([new TypeError("a"), new RangeError("b")], "all failed");
+               return [e.name, e.message, e.errors.length, e.errors[1].name];"#
+        ),
+        json!(["AggregateError", "all failed", 2, "RangeError"])
+    );
+    // `.errors` is a real array, not the argument passed through: a Set
+    // works, as it does for `new Set(x)`/`new Map(x)`, and comes back
+    // indexable.
+    assert_eq!(
+        run_ret(
+            r#"const e = new AggregateError(new Set(["x", "y"]));
+               return [Array.isArray(e.errors), e.errors[0], e.message];"#
+        ),
+        json!([true, "x", ""])
+    );
+    // A value nothing can iterate names what it got rather than yielding
+    // an empty `.errors` that reads as "no failures".
+    assert_eq!(
+        run_err_kind(r#"throw new AggregateError(7, "m");"#),
+        ErrorKind::TypeError
+    );
+}
+
+#[test]
+fn a_suppressed_error_carries_both_halves() {
+    // The class exists for the pair: `.error` won, `.suppressed` was
+    // displaced by it. Either one missing and it is not a SuppressedError.
+    assert_eq!(
+        run_ret(
+            r#"const e = new SuppressedError(new TypeError("dispose"), new RangeError("body"), "m");
+               return [e.name, e.message, e.error.name, e.suppressed.name];"#
+        ),
+        json!(["SuppressedError", "m", "TypeError", "RangeError"])
+    );
+    // Both keys exist even with no arguments — an absent half is
+    // `undefined`, not a missing property.
+    assert_eq!(
+        run_ret(r#"return Object.keys(new SuppressedError());"#),
+        json!(["name", "message", "error", "suppressed"])
+    );
+}
+
+#[test]
 fn value_error_is_a_class_though_it_is_not_a_js_name() {
     // A deliberate dialect addition. `ValueError` is what this VM raises
     // for "right type, impossible value", and it is the second commonest

@@ -192,6 +192,22 @@ pub enum TypeTag {
     SyntaxError,
     ReferenceError,
     EvalError,
+    /// The three classes **nothing in this runtime raises**, and that is not
+    /// an oversight to be fixed by finding somewhere to throw them.
+    ///
+    /// There is no `encodeURI`/`decodeURI` to raise a `URIError`;
+    /// `Promise.any`, the only producer of an `AggregateError`, is a compile
+    /// error (`compiler/call.rs`); and `using`/`DisposableStack`, the only
+    /// producers of a `SuppressedError`, do not exist. They are declared
+    /// because a *program* may throw them: a model writing `throw new
+    /// URIError(…)` in its own decoder, or catching one from a library it
+    /// pasted, must get a class and not a `ReferenceError` about the name.
+    /// The constructors are spec-shaped for the same reason — a faked
+    /// `AggregateError` without an `.errors` array is worse than none, since
+    /// the code that reads `e.errors` is the code that catches it.
+    AggregateError,
+    URIError,
+    SuppressedError,
 }
 
 impl TypeTag {
@@ -199,7 +215,7 @@ impl TypeTag {
     /// "what type tags exist" — iterate this instead of hand-listing variants
     /// or mapping side-table indices back to tags by literal number (which
     /// silently breaks if the enum is reordered). `COUNT` is derived from it.
-    pub const ALL: [TypeTag; 29] = [
+    pub const ALL: [TypeTag; 32] = [
         TypeTag::Array,
         TypeTag::Object,
         TypeTag::Map,
@@ -229,6 +245,9 @@ impl TypeTag {
         TypeTag::SyntaxError,
         TypeTag::ReferenceError,
         TypeTag::EvalError,
+        TypeTag::AggregateError,
+        TypeTag::URIError,
+        TypeTag::SuppressedError,
     ];
 
     /// Number of variants — sizes the prototype side table.
@@ -244,7 +263,7 @@ impl TypeTag {
     /// `Error` is first because the rest chain to it — and because
     /// [`Self::error_tag_for_name`] scans this list, so `Error`'s own lookup
     /// is the one that costs least.
-    pub const ERRORS: [TypeTag; 7] = [
+    pub const ERRORS: [TypeTag; 10] = [
         TypeTag::Error,
         TypeTag::TypeError,
         TypeTag::ValueError,
@@ -252,6 +271,9 @@ impl TypeTag {
         TypeTag::SyntaxError,
         TypeTag::ReferenceError,
         TypeTag::EvalError,
+        TypeTag::AggregateError,
+        TypeTag::URIError,
+        TypeTag::SuppressedError,
     ];
 
     /// Is this tag one of the error classes (base or subclass)?
@@ -265,6 +287,9 @@ impl TypeTag {
                 | TypeTag::SyntaxError
                 | TypeTag::ReferenceError
                 | TypeTag::EvalError
+                | TypeTag::AggregateError
+                | TypeTag::URIError
+                | TypeTag::SuppressedError
         )
     }
 
@@ -322,6 +347,9 @@ impl TypeTag {
             TypeTag::SyntaxError => "SyntaxError",
             TypeTag::ReferenceError => "ReferenceError",
             TypeTag::EvalError => "EvalError",
+            TypeTag::AggregateError => "AggregateError",
+            TypeTag::URIError => "URIError",
+            TypeTag::SuppressedError => "SuppressedError",
         }
     }
 

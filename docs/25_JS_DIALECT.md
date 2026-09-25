@@ -214,9 +214,23 @@ prototype chaining to `Error.prototype`, which chains to
 `Object.prototype`. That two-rung chain is the hierarchy — a type error
 is `instanceof TypeError` and `instanceof Error` both, and `instanceof
 RangeError` not at all. `TypeTag::ERRORS` is the one list; the registry
-rows, `VM::alloc_error`'s name → class mapping and the compiler's
-`is_error_ctor` all read it, so a name cannot get a global without also
-getting the prototype that answers for it.
+rows and `VM::alloc_error`'s name → class mapping both read it, so a
+name cannot get a global without also getting the prototype that
+answers for it.
+
+**Three of the ten have no producer in this runtime, and that is the
+point.** `URIError` needs an `encodeURI`/`decodeURI` there is none of;
+`AggregateError` needs `Promise.any`, which is a compile error;
+`SuppressedError` needs `using`/`DisposableStack`, which do not exist.
+They are declared for the *program's* own `throw` — a model writing
+`throw new URIError(…)` in a decoder it wrote, or catching one from
+pasted library code, should get a class rather than a `ReferenceError`
+about the name. Their constructors are spec-shaped for the same reason:
+`new AggregateError(errors, message)` materializes `.errors` as a real
+array (through the same `iterable_elements` that serves `new Set(x)`),
+and `new SuppressedError(error, suppressed, message)` sets both halves
+of the pair, because the code that catches one of these is the code
+that reads those fields.
 
 **`ValueError` is in the set, and is not a JS name.** It is this
 dialect's own kind for "right type, impossible value" (`JSON.parse` of a

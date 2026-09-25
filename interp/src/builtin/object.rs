@@ -53,19 +53,36 @@ pub fn object_ctor(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 /// compiler emitted ahead of a dedicated instruction, and moving it here is
 /// what let the instruction go.
 fn error_construct(vm: &mut VM, args: Args, tag: TypeTag) -> Result<Value, VMError> {
-    let message = match args.get(vm, 0) {
-        // `new Error()` has no message, not the message `"undefined"`.
+    let message = message_arg(vm, &args, 0);
+    let cause = options_cause(vm, &args, 1);
+    let err = vm.alloc_error(JsString::from(tag.name()), message);
+    set_own(vm, &err, "cause", cause);
+    Ok(err)
+}
+
+/// The message argument at `i`, ToString-coerced.
+///
+/// Absent is `""`, not `"undefined"`: `new Error()` in JS has an empty
+/// message, and a program that prints `` `${e}` `` would otherwise read
+/// `"Error: undefined"` and go looking for the undefined thing.
+fn message_arg(vm: &mut VM, args: &Args, i: usize) -> JsString {
+    match args.get(vm, i) {
         Value::Undefined => JsString::from(""),
         other => vm.to_js_string(&other.clone(), 0),
-    };
-    let cause = options_cause(vm, &args);
-    let err = vm.alloc_error(JsString::from(tag.name()), message);
-    if let (Value::Object(p), Some(cause)) = (&err, cause) {
+    }
+}
+
+/// Give `err` an own property, or leave it alone when `value` is `None`.
+///
+/// `None` and `Some(Value::Undefined)` are deliberately different: the
+/// absent case must not create the key at all, or `Object.keys(e)` and
+/// `JSON.stringify(e)` would report a field the program never set.
+fn set_own(vm: &mut VM, err: &Value, key: &str, value: Option<Value>) {
+    if let (Value::Object(p), Some(value)) = (err, value) {
         vm.objects[*p as usize]
             .map
-            .insert(JsString::from("cause"), cause);
+            .insert(JsString::from(key), value);
     }
-    Ok(err)
 }
 
 /// The `cause` of `new Error(msg, { cause })`, or `None` when there is no
@@ -82,8 +99,8 @@ fn error_construct(vm: &mut VM, args: Args, tag: TypeTag) -> Result<Value, VMErr
 /// Absence is `None` rather than `undefined`: `new Error("m")` must not grow
 /// a `cause` key, or `Object.keys(e)` and `JSON.stringify(e)` would report a
 /// field the program never set.
-fn options_cause(vm: &mut VM, args: &Args) -> Option<Value> {
-    let Value::Object(p) = args.get(vm, 1) else {
+fn options_cause(vm: &mut VM, args: &Args, i: usize) -> Option<Value> {
+    let Value::Object(p) = args.get(vm, i) else {
         return None;
     };
     let p = *p;
@@ -109,6 +126,63 @@ error_ctor!(range_error_ctor, RangeError);
 error_ctor!(syntax_error_ctor, SyntaxError);
 error_ctor!(reference_error_ctor, ReferenceError);
 error_ctor!(eval_error_ctor, EvalError);
+error_ctor!(uri_error_ctor, URIError);
+
+/// `new AggregateError(errors, message, options)` — the one error class
+/// whose first argument is not the message.
+///
+/// **Nothing in this runtime throws it.** `Promise.any`, its only producer in
+/// JS, is a compile error here. It exists so a program's own
+/// `throw new AggregateError(failures, "all attempts failed")` works, which
+/// is why the `errors` argument is built for real rather than ignored: the
+/// code that catches an `AggregateError` is precisely the code that reads
+/// `e.errors`, so a class that accepted the iterable and dropped it would
+/// fail exactly where it is used.
+///
+/// `errors` becomes a plain `Array` own property — materialized eagerly
+/// through the same `iterable_elements` that `new Set(x)`/`new Map(x)` use,
+/// so an argument those two accept works here too. A value none of them can
+/// iterate is a `TypeError` naming what it got, not an empty `.errors`.
+pub fn aggregate_error_ctor(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    let errors = args.get(vm, 0).clone();
+    let Some(elements) = vm.iterable_elements(&errors)? else {
+        let what = vm.describe_operand(&errors);
+        return Err(vm.fail(
+            ErrorKind::TypeError,
+            format!("`AggregateError` needs an iterable of errors; got {what}").as_str(),
+        ));
+    };
+    let message = message_arg(vm, &args, 1);
+    let cause = options_cause(vm, &args, 2);
+    let errors = vm.alloc_array(elements.into());
+    let err = vm.alloc_error(JsString::from(TypeTag::AggregateError.name()), message);
+    set_own(vm, &err, "errors", Some(errors));
+    set_own(vm, &err, "cause", cause);
+    Ok(err)
+}
+
+/// `new SuppressedError(error, suppressed, message, options)` — the error
+/// raised when disposing a resource throws while another error is already
+/// propagating, so the two must travel together.
+///
+/// **Nothing in this runtime throws it**: `using` and `DisposableStack`, its
+/// only producers in JS, do not exist here. Declared so a program can throw
+/// and catch its own, and shaped correctly because the whole point of the
+/// class is the pair it carries — `.error` (the one that won) and
+/// `.suppressed` (the one it displaced). Both are set unconditionally, even
+/// when `undefined`, because a `SuppressedError` missing either half is not
+/// one.
+pub fn suppressed_error_ctor(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    let error = args.get(vm, 0).clone();
+    let suppressed = args.get(vm, 1).clone();
+    let message = message_arg(vm, &args, 2);
+    let cause = options_cause(vm, &args, 3);
+    let err = vm.alloc_error(JsString::from(TypeTag::SuppressedError.name()), message);
+    set_own(vm, &err, "error", Some(error));
+    set_own(vm, &err, "suppressed", Some(suppressed));
+    set_own(vm, &err, "cause", cause);
+    Ok(err)
+}
 
 /// `Object.keys(obj)` → array of own enumerable string keys. Step 2e: reads
 /// the unified own-prop snapshot, so it also enumerates a **function's** user
