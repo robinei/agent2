@@ -629,6 +629,21 @@ impl VM {
     /// Read-only views of the live call frames, outermost (root) first.
     /// Parked async continuations are not on the callstack and do not
     /// appear; this is the running strand's stack.
+    /// Each live frame's **return address**, innermost first — where
+    /// execution resumes in the caller once that frame returns.
+    ///
+    /// **This is how a failure inside the runtime gets a position in
+    /// the caller's source.** A builtin raising from a helper the
+    /// prelude calls — `String.prototype.replace` reaching
+    /// `__replaceStr` — reports an `ip` inside the prelude, which is
+    /// nobody's code: the host rebases it against the reply and gets
+    /// zero, so the diagnostic points at no line at all. Walking out
+    /// through these finds the first address that *is* in the caller's
+    /// own text, which is the line they can act on.
+    pub fn frame_return_addrs(&self) -> Vec<u32> {
+        self.callstack.iter().rev().map(|f| f.return_addr).collect()
+    }
+
     pub fn frames(&self) -> Vec<FrameView<'_>> {
         let n = self.callstack.len();
         // fp chain: the top frame's base is `self.fp`; each frame stores

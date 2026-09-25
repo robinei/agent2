@@ -245,6 +245,12 @@ impl Notebook {
     /// The one subtraction that survives is the prelude's: the VM's
     /// buffer is the prelude and then the reply, and only the reply is
     /// anything the model wrote.
+    /// Where the reply's own coordinates start: past the primed
+    /// prelude. A span below this is inside the harness's own JS.
+    pub fn base(&self) -> usize {
+        self.base
+    }
+
     pub fn rebase_site(&self, raw: u32) -> u32 {
         (raw as usize).saturating_sub(self.base) as u32
     }

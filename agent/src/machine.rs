@@ -3431,6 +3431,33 @@ impl Runner {
         let Some(event) = segment.iter().find(|e| e.id.as_u64() == id) else {
             return Err(format!("no row #{id} in this agent"));
         };
+        // **A row from the reply being written has no id yet**, so any
+        // number naming one is a guess at something else. The card says
+        // this in as many words, and until now the harness did not
+        // enforce it: every id after the open `Reply` belongs to work
+        // this reply is still doing, and the event space is dense, so a
+        // guess *lands* — on a `Console`, on one of the reply's own
+        // `Part`s — and comes back as a plausible value with none of
+        // the fields the caller expected.
+        //
+        // Live on 2026-09-25 (`skipped-tests`): two `read_file` results
+        // were bound in one cell, and the next cell fetched ids 43 and
+        // 47 for them. 43 was the previous reply's console (an empty
+        // array) and 47 was the fetching cell's own source. `t.content`
+        // was then `undefined`, and the run died four steps later
+        // inside a regex replace, with nothing pointing back here.
+        // Only while a program is running: that is when there *is* a
+        // reply being written. `agent document`, the transcript and the
+        // test accessors read rows between replies, when the newest
+        // reply is finished history like any other.
+        if matches!(self.phase, Phase::Running(_)) && id >= self.reply_id.as_u64() {
+            return Err(format!(
+                "row #{id} belongs to the reply you are writing, which has no ids yet — \
+                 they are assigned when the reply lands, so this one names something else. \
+                 What this reply has instead is its variables: a later block reads what an \
+                 earlier one bound, because the blocks share one scope."
+            ));
+        }
         match &event.payload {
             EventPayload::Result { outcome, .. } => outcome_json(outcome),
             EventPayload::Call(_) => match settlement_of(&segment, event.id) {
@@ -3927,7 +3954,33 @@ impl Runner {
                 )
             }
             SuspendCause::Trapped(e) => {
-                let site = span_at(&run.vm, e.ip as usize);
+                // **A trap inside the runtime still gets a line in the
+                // reply.** `String.prototype.replace` is prelude JS
+                // that calls the `__replaceStr` builtin, so a bad
+                // argument raises with an `ip` inside the prelude —
+                // nobody's code. Rebased against the reply that is
+                // zero, and the report points at no line at all: a
+                // live `skipped-tests` run on 2026-09-25 died on
+                // `expected a string, got undefined` with `site: 0`
+                // and a stack of `<unknown>`, giving the model nothing
+                // to look at.
+                //
+                // So when the raising instruction is not in the reply,
+                // walk out through the frames' return addresses to the
+                // first one that is. That is the caller's own line —
+                // the `.replace(…)` they wrote — which is the thing
+                // they can act on.
+                let base = run.notebook.as_ref().map_or(0, |nb| nb.base()) as u32;
+                let mut site = span_at(&run.vm, e.ip as usize);
+                if site < base {
+                    site = run
+                        .vm
+                        .frame_return_addrs()
+                        .into_iter()
+                        .map(|ret| span_at(&run.vm, ret as usize))
+                        .find(|span| *span >= base)
+                        .unwrap_or(site);
+                }
                 let cause = Handback::Trapped {
                     kind: format!("{:?}", e.kind),
                     message: e.message.clone(),
@@ -10235,6 +10288,72 @@ mod tests {
         assert!(!spent.contains("ECHOED"), "then not at all: {spent}");
     }
 
+    /// **A trap inside the runtime points at the line that called it.**
+    ///
+    /// `String.prototype.replace` is prelude JS that reaches the
+    /// `__replaceStr` builtin, so a bad argument raises with an `ip`
+    /// inside the prelude — nobody's code. Rebased against the reply
+    /// that is zero, and the report pointed at no line at all: the
+    /// `skipped-tests` eval on 2026-09-25 died on `expected a string,
+    /// got undefined` with `site: 0` and a stack of `<unknown>`, and
+    /// the model had nothing to look at.
+    #[test]
+    fn a_trap_inside_the_runtime_points_at_the_line_that_called_it() {
+        let mut c = Conversation::new();
+        let said =
+            c.reply("```js\nconst t = {};\nconst probe = t.content.replace(/x/g, \"y\");\n```\n");
+        let Ending::Trapped { message, site } = &said.ended else {
+            panic!("expected a trap, got {:?}", said.ended);
+        };
+        assert!(
+            *site > 0,
+            "the trap points at no line in the reply: {message}"
+        );
+        // And it is the caller's line, not somewhere in the prelude:
+        // the reply is short, so any in-reply offset is within it.
+        let source: usize = said.cells.iter().map(String::len).sum::<usize>() + 64;
+        assert!(
+            (*site as usize) < source,
+            "site {site} is past the end of a {source}-byte reply — still a prelude offset"
+        );
+    }
+
+    /// **An id from the reply being written is refused, because it is
+    /// a guess.**
+    ///
+    /// The card says rows from this reply have no ids yet, and until
+    /// 2026-09-25 nothing enforced it. The event space is dense, so a
+    /// guess does not miss — it *lands*, on a `Console`, or on one of
+    /// the reply's own `Part`s, and comes back as a plausible value
+    /// with none of the fields the caller wanted.
+    ///
+    /// Live in the `skipped-tests` eval: one cell bound two
+    /// `read_file` results, the next cell fetched ids 43 and 47 for
+    /// them. 43 was the previous reply's console — an empty array — and
+    /// 47 was the fetching cell's own source. `t.content` was
+    /// `undefined`, and the run died four steps later inside a regex
+    /// replace with nothing pointing back at the fetch.
+    #[test]
+    fn an_id_from_the_reply_being_written_is_refused_not_guessed_at() {
+        let mut c = Conversation::new();
+        c.answers("echo", serde_json::json!({ "out": "ECHOED" }));
+        // The reply's own `Reply` event and everything after it.
+        let said = c.reply("```js\nconst a = await tools.echo(1);\ntry { await history.fetch(9999); } catch (e) { tell(`absent: ${e}`); }\ntry { const m = await history.fetch(4); tell(`got ${JSON.stringify(m)}`); } catch (e) { tell(`mine: ${e}`); }\n```\n");
+        let told = said.tells.join(" | ");
+        assert!(
+            told.contains("absent:") && told.contains("no row #9999"),
+            "an id that is nowhere says so, rather than being called mine: {told}"
+        );
+        assert!(
+            told.contains("mine:") && told.contains("belongs to the reply you are writing"),
+            "and an id from this reply is refused with the reason the card gives: {told}"
+        );
+        assert!(
+            !told.contains("got "),
+            "it never comes back as a value: {told}"
+        );
+    }
+
     /// **A projection is applied to the row's value, however the row
     /// was named.**
     ///
@@ -10249,7 +10368,25 @@ mod tests {
     fn a_projection_is_given_the_rows_value_even_when_the_row_is_named_by_id() {
         let mut c = Conversation::new();
         c.answers("echo", serde_json::json!({ "out": "ECHOED" }));
-        c.reply("```js\nawait tools.echo(1);\nhistory.keep(4, (v) => v.out);\n```\n");
+        // **Off the menu, which is a row from a reply that is over** —
+        // the shape the live failure had. An id from the reply being
+        // written is refused now (`fetch_history`), and naming one here
+        // would have tested the refusal instead of the projection.
+        c.reply("```js\nawait tools.echo(1);\n```\n");
+        let call = c
+            .tree()
+            .events
+            .values()
+            .find_map(|e| match &e.payload {
+                EventPayload::Call(Call::Invoke { name, .. }) if name == "echo" => {
+                    Some(e.id.as_u64())
+                }
+                _ => None,
+            })
+            .expect("the echo call is on the record");
+        c.reply(&format!(
+            "```js\nhistory.keep({call}, (v) => v.out);\n```\n"
+        ));
 
         let doc = c.document();
         let row = doc
