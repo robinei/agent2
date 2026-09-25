@@ -2297,41 +2297,66 @@ fn out_of_fuel_stops_infinite_loop() {
     assert!(matches!(vm.step(5).unwrap(), StepResult::OutOfFuel));
 }
 
-// ── relational non-coercion (JS divergence) ─────────────────────
+// ── relational coercion (and where it stops) ────────────────────
 
-/// **A cross-type comparison raises rather than answering `false`.**
+/// **A string against a number coerces, exactly as JS does.**
 ///
-/// It answered `false` until 2026-09-25, which is the wrong answer
-/// given silently: every program in this harness parses numbers out of
-/// command output, and a number read out of stdout is a string until
-/// something says `Number(x)`, so `if (count > 10)` took the wrong
-/// branch forever with no error anywhere. `25_JS_DIALECT` §25.2 filed
-/// it as the most dangerous entry on its list and recommended exactly
-/// this: diverge *further* from JS in order to diverge more safely.
+/// This answered `false` until 2026-09-25 and then raised until later
+/// the same day, and both were wrong. `25_JS_DIALECT` §25.2 argued that
+/// a number read out of stdout is a string, so `if (count > 10)` takes
+/// the wrong branch silently — but that is only true of a dialect that
+/// has already stopped coercing. Real JS runs `ToNumber` on the string
+/// and gets it right, and the hazard it was written about lives in
+/// `"50" > "9"`, where *both* sides are strings and neither JS nor this
+/// dialect can help.
 #[test]
-fn relational_non_coercion() {
-    // String vs number, and number vs string.
-    assert!(matches!(
-        run_err(vec![ps("2"), PushFloat(1.0), Gt]).kind,
-        ErrorKind::TypeError
-    ));
-    assert!(matches!(
-        run_err(vec![PushFloat(1.0), ps("2"), Lt]).kind,
-        ErrorKind::TypeError
-    ));
-    // The message names both operands, because which one is the string
-    // is the whole repair.
-    let msg = run_err(vec![PushFloat(1.0), ps("2"), Lt]).message;
-    assert!(
-        msg.contains("a number (1)") && msg.contains("a string (\"2\")"),
-        "got: {msg}"
+fn a_string_against_a_number_coerces_like_js() {
+    assert_eq!(
+        run(vec![PushFloat(1.0), ps("2"), Lt]),
+        vec![Value::Bool(true)]
     );
-    // Same-type comparisons are untouched — this is about coercion, not
-    // about comparing.
+    assert_eq!(
+        run(vec![ps("50"), PushFloat(9.0), Gt]),
+        vec![Value::Bool(true)]
+    );
+    // An unparseable string is NaN, and every relational operator on a
+    // NaN is false — again the JS answer, not a refusal.
+    assert_eq!(
+        run(vec![ps("abc"), PushFloat(1.0), Gt]),
+        vec![Value::Bool(false)]
+    );
+    // Two strings order as text. `"50" > "9"` is false in every engine.
+    assert_eq!(run(vec![ps("50"), ps("9"), Gt]), vec![Value::Bool(false)]);
     assert_eq!(run(vec![ps("a"), ps("b"), Lt]), vec![Value::Bool(true)]);
     assert_eq!(
         run(vec![PushFloat(1.0), PushFloat(2.0), Lt]),
         vec![Value::Bool(true)]
+    );
+}
+
+/// **Where JS invents a number, this raises instead.**
+///
+/// `undefined > 2` is `false` in JS because `ToNumber(undefined)` is
+/// `NaN`; `null < 1` is `true` because `ToNumber(null)` is `0`. Both
+/// turn a value that is not there into a comparison that works, which
+/// is the failure §25.2 was actually about. Refusing keeps the property
+/// that matters: this dialect never computes a *different* answer than
+/// JS, it only declines to answer.
+#[test]
+fn a_non_number_non_string_operand_raises() {
+    for code in [
+        vec![PushUndefined, PushFloat(2.0), Gt],
+        vec![PushNull, PushFloat(1.0), Lt],
+        vec![PushBool(true), PushFloat(2.0), Lt],
+    ] {
+        assert!(matches!(run_err(code).kind, ErrorKind::TypeError));
+    }
+    // The message names both operands, because which one is missing is
+    // the whole repair.
+    let msg = run_err(vec![PushUndefined, PushFloat(1.0), Lt]).message;
+    assert!(
+        msg.contains("undefined") && msg.contains("a number (1)"),
+        "got: {msg}"
     );
 }
 
@@ -4200,4 +4225,75 @@ fn scratch_number_of_object() {
     ] {
         println!("PROBE => {:?}", crate::testutil::run_ret(src));
     }
+}
+
+// ── ToNumber on strings ─────────────────────────────────────────
+
+/// **`Number("0x10")` is 16, and `Number("inf")` is `NaN`.**
+///
+/// This went through Rust's `str::parse::<f64>`, whose accepted grammar
+/// is not JS's `StringNumericLiteral` in either direction: it rejects
+/// the radix forms, and it accepts `inf`, `infinity` and `nan` in any
+/// case. The second is the worse half — `Number("inf")` was `Infinity`
+/// here and is `NaN` in every engine, so this was a wrong answer rather
+/// than a refusal, in `Number()`, in arithmetic and in `==` alike.
+#[test]
+fn string_to_number_follows_the_js_grammar() {
+    let cases: &[(&str, f64)] = &[
+        ("0x10", 16.0),
+        ("0X1f", 31.0),
+        ("0o17", 15.0),
+        ("0b101", 5.0),
+        ("1e3", 1000.0),
+        ("  12  ", 12.0),
+        ("", 0.0),
+        ("Infinity", f64::INFINITY),
+        ("-Infinity", f64::NEG_INFINITY),
+    ];
+    for (src, want) in cases {
+        let got = crate::vm::value::js_str_to_number(&src.encode_utf16().collect::<Vec<u16>>());
+        assert_eq!(got, *want, "Number({src:?})");
+    }
+    // Everything JS answers NaN for, including the spellings Rust's own
+    // parser would have taken, and a signed radix form (no sign is
+    // allowed on those).
+    for src in [
+        "inf", "infinity", "INF", "nan", "NaN", "abc", "0x", "-0x10", "12px",
+    ] {
+        let got = crate::vm::value::js_str_to_number(&src.encode_utf16().collect::<Vec<u16>>());
+        assert!(got.is_nan(), "Number({src:?}) = {got}, want NaN");
+    }
+}
+
+/// **The `Number` constants are all present.** Five were missing —
+/// `NaN`, `POSITIVE_INFINITY`, `NEGATIVE_INFINITY`, `MAX_VALUE`,
+/// `MIN_VALUE` — and nothing caught it, because `Number.NaN < 0` read
+/// as `undefined < 0`, which answered `false`, which is also the
+/// correct answer. 38 test262 relational tests passed on that
+/// coincidence until the comparison started raising.
+#[test]
+fn number_carries_its_constants() {
+    assert_eq!(testutil::run_ret("return Number.MAX_VALUE;"), f64::MAX);
+    assert_eq!(testutil::run_ret("return Number.MIN_VALUE;"), 5e-324);
+    assert_eq!(
+        testutil::run_ret("return String(Number.NaN);"),
+        serde_json::json!("NaN")
+    );
+    assert_eq!(
+        testutil::run_ret("return String(Number.POSITIVE_INFINITY);"),
+        serde_json::json!("Infinity")
+    );
+    assert_eq!(
+        testutil::run_ret("return String(Number.NEGATIVE_INFINITY);"),
+        serde_json::json!("-Infinity")
+    );
+    assert_eq!(
+        testutil::run_ret("return Number.MIN_SAFE_INTEGER;"),
+        serde_json::json!(-9007199254740991i64)
+    );
+    // And the comparison that was reading them as `undefined`.
+    assert_eq!(
+        testutil::run_ret("return Number.NaN < 0;"),
+        serde_json::json!(false)
+    );
 }

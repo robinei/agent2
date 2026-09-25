@@ -143,54 +143,96 @@ Gate for B: `cargo test -p interp`, `cargo run -p conformance` with the
 expectations file updated in the same commit, and
 `"aéb".length === 3`.
 
-## 25.2 — Relational operators do not coerce — **done, 2026-09-25**
+## 25.2 — Relational operators coerce where JS is right — **done, 2026-09-25**
 
-`1 < "2"` *was* `false`. `"10" > 9` *was* `false`. Every program here parses
-numbers out of command output, and a number parsed out of stdout is a
-string until something says `Number(x)` — so `if (count > 10)` against
-an unconverted value silently takes the wrong branch, forever, with no
-error anywhere. This is the most dangerous entry on the list: it is
-both silent and near-certain to be hit.
+`1 < "2"` is `true`, as it is everywhere else. It was `false` here until
+2026-09-25, then raised for part of that day, and both were wrong.
 
-Two ways to stop it being silent:
+**The entry's own argument was false.** It read: every program here parses
+numbers out of command output, a number parsed out of stdout is a string
+until something says `Number(x)`, so `if (count > 10)` against an
+unconverted value silently takes the wrong branch. Checked against an
+engine, it is not:
 
-- **Card line** (done, `c4f0e6f`). Cheapest, and the weakest: prose
-  lost to prose three times on 2026-09-16 alone.
-- **Make it loud.** A mixed-type relational comparison becomes a
-  `TypeError` rather than `false`. This diverges *further* from JS in
-  order to diverge more safely, which is the trade this dialect already
-  makes everywhere else — `Edit.*` is documented as "fail-loud pure
-  editing helpers", and `ToPrimitive` is already refused rather than
-  guessed at. Then the card line comes back out.
+```
+"5" > 10   => false      "50" > 10  => true       (node, and now here)
+```
 
-Made loud. A relational comparison across two different kinds raises
-`TypeError` naming both operands — `cannot compare a number (1) with a
-string ("2")` — and the card line is gone. `NaN` still compares `false`
-against any number, because `Value::compare` returns `None` for two
-reasons and only the kind mismatch is an error.
+JS runs `ToNumber` on the string and gets both right. The silent wrong
+branch existed only because *this dialect* had already stopped coercing —
+the entry described a hazard its own divergence created, and then used it
+to argue for more of the same. Making it raise caught the two cases JS
+handles correctly and cost 43 conformance tests for it.
 
-The scope is every cross-kind comparison, not just string-vs-number:
-that is what the section title claims, and `undefined > 2` in a loop
-over a sparse array is the same silent-wrong-branch failure as the
-one that motivated the entry.
+**The hazard it should have been about is still there, and nothing here
+fixes it.** If a program parses *two* numbers out of stdout — the commoner
+shape, not the rarer one — both sides are strings, so JS compares them as
+text:
 
-Price: **43 conformance tests**, 9,650 → 9,607. Forty of them are the
-coercion tests themselves (`language/expressions/{less,greater}-than`
-and the `-or-equal` pair, plus `relational/S9.1_A1_T4`), which now fail
-honestly and cannot be recovered without undoing the decision. The
-other three are incidental — `undefined` reaching a comparison through
-gaps that predate this change.
+```
+"50" > "9"  => false     "10" < "9"  => true      (node, and here)
+```
 
-Widening it also found a real bug of our own. Every prelude
-higher-order helper looped `for (let i = 0; i < a.length; i++)` with no
-`ToLength` on the receiver's `length`, so `f.length = null` gave
-`0 < null → false` and the loop was skipped by luck — two bugs
-cancelling. Twenty-eight tests turned on that, and once the comparison
-raised, the trap fired *inside the prelude*: a caret under
-`i < a.length` in source the model never wrote, advising `Number(x)`.
-The helpers now hoist a coerced length once, and the coercion cannot
-itself throw (`Number({})` is refused in this dialect, which would have
-moved the leak rather than closed it).
+No engine helps, and neither does this dialect. Raising when both sides
+are numeric-looking strings would catch it, but `__sortDefault` compares
+`String(a) > String(b)`, so `[10, 9, 100].sort()` would start throwing —
+JS's lexicographic default sort is surprising but defined. Fixing it
+properly needs the prelude to use a comparison that does not raise, which
+is a mechanism added rather than removed. Open, and deliberately not taken.
+
+### What it does now
+
+Numbers and strings compare as JS compares them, including `NaN` making
+every operator false and an unparseable string reaching a number through
+`NaN`. Every other operand kind raises `TypeError` naming both sides:
+
+| | JS | here |
+|---|---|---|
+| `1 < "2"`, `"50" > 9`, `"abc" > 1` | `true`, `true`, `false` | same |
+| `"50" > "9"`, `NaN < 1` | `false`, `false` | same |
+| `undefined > 2` | `false` (`ToNumber` → `NaN`) | **raises** |
+| `null < 1`, `false < 1` | `true` (`ToNumber` → `0`) | **raises** |
+| `[] < 1`, `[2] < 3`, `({}) < 1` | answers via `ToPrimitive` | **raises** |
+
+The rule is one line: **coerce where JS is right, refuse where JS invents
+a number.** `undefined` and `null` reaching a comparison is a value that
+is not there — a missing key, a sparse hole, a regex that did not match —
+and turning it into `NaN` or `0` makes the comparison work.
+
+This keeps the property worth having, which is stronger than
+compatibility: **this dialect never computes a different answer than JS,
+it only declines to answer.** Every divergence above is answer → raise, so
+a program that runs to completion computes what node computes. That
+property is checkable, and checking it is what found the two bugs below.
+
+### What checking it found
+
+- **`str::parse::<f64>` is not `StringNumericLiteral`.** It rejects the
+  radix forms (`Number("0x10")` was `NaN`, should be 16) and accepts
+  `inf`, `infinity` and `nan` in any case (`Number("inf")` was `Infinity`,
+  is `NaN` in every engine). The second is the worse half: a wrong answer,
+  not a refusal, reached through `Number()`, arithmetic and `==` alike.
+- **Five `Number` constants were missing** — `NaN`, `POSITIVE_INFINITY`,
+  `NEGATIVE_INFINITY`, `MAX_VALUE`, `MIN_VALUE`. Invisible while a
+  cross-kind comparison answered `false`, because `Number.NaN < 0` read as
+  `undefined < 0`, which is `false`, which is also the right answer. 38
+  test262 relational tests were passing on that coincidence.
+- **No prelude helper ran `ToLength` on `length`.** Every higher-order
+  helper looped `for (let i = 0; i < a.length; i++)`, so `f.length = null`
+  gave `0 < null → false` and the loop was skipped by luck — two bugs
+  cancelling, 28 tests resting on it. Once the comparison raised, the trap
+  fired *inside the prelude*: a caret under `i < a.length` in source the
+  model never wrote, advising `Number(x)`. The helpers now hoist a coerced
+  length once, and that coercion cannot itself throw — `Number({})` is
+  refused here, which would have moved the leak rather than closed it.
+
+**Net: 9,650 → 9,741 conformance, +91.** 116 gained, 25 lost. The 25 are
+the relational `A3.1_T*` tests, which exercise exactly the boolean / null /
+undefined / object coercion this refuses, plus four incidental.
+
+Still open, found on the way: `String(Number.MAX_VALUE)` prints 309 digits
+where JS prints `1.7976931348623157e+308`. `js_number_to_string` never
+switches to exponential form, which JS does at exponent ≥ 21 or ≤ -7.
 
 ## 25.3 — `==` against objects, and other quiet falses
 

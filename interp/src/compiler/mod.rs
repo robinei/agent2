@@ -450,6 +450,19 @@ fn namespace_constant(ns: &str, member: &str) -> Option<ConstVal> {
         ("Math", "E") => Some(ConstVal::Float(std::f64::consts::E)),
         ("Number", "MAX_SAFE_INTEGER") => Some(ConstVal::PosInt(9007199254740991)),
         ("Number", "EPSILON") => Some(ConstVal::Float(f64::EPSILON)),
+        // The rest of the `Number` constants. Their absence was invisible
+        // while a cross-kind comparison answered `false`: `Number.NaN < 0`
+        // read as `undefined < 0`, which is `false`, which is also the
+        // right answer — so 38 test262 relational tests passed on a
+        // coincidence. Once the comparison started raising, they named it.
+        ("Number", "MIN_SAFE_INTEGER") => Some(ConstVal::Float(-9007199254740991.0)),
+        ("Number", "NaN") => Some(ConstVal::Float(f64::NAN)),
+        ("Number", "POSITIVE_INFINITY") => Some(ConstVal::Float(f64::INFINITY)),
+        ("Number", "NEGATIVE_INFINITY") => Some(ConstVal::Float(f64::NEG_INFINITY)),
+        ("Number", "MAX_VALUE") => Some(ConstVal::Float(f64::MAX)),
+        // Not `f64::MIN_POSITIVE`, which is the smallest *normal* double
+        // (~2.2e-308). JS names the smallest denormal.
+        ("Number", "MIN_VALUE") => Some(ConstVal::Float(5e-324)),
         _ => None,
     }
 }

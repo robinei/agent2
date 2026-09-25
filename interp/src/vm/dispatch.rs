@@ -25,6 +25,13 @@ fn await_hint(v: &Value) -> &'static str {
 /// helpers — so anything else is the missing-`await` misuse this hint
 /// was written for (`tools.f(x).field` instead of `(await
 /// tools.f(x)).field`).
+/// The operand kinds `<` `>` `<=` `>=` accept. Numbers and strings are
+/// where JS's relational coercion is right; everything else is where it
+/// silently invents a number, so it is refused instead.
+fn is_num_or_str(v: &Value) -> bool {
+    v.is_number() || matches!(v, Value::String(_))
+}
+
 fn promise_property_error(name: &str) -> String {
     match name {
         // Reachable only by taking the method without calling it:
@@ -1123,13 +1130,37 @@ impl VM {
                 let rhs = self.pop()?;
                 let lhs = self.pop()?;
                 let result = match lhs.compare(&rhs) {
+                    // Number against number and string against string, both
+                    // exact: integers keep their full 64-bit range here
+                    // rather than going through `f64`, and strings order by
+                    // code unit. These are the JS answers already.
                     Some(ord) => ord $cmp std::cmp::Ordering::$expected,
+                    // `compare` says None for two different reasons. This is
+                    // the first: a NaN, where every relational operator is
+                    // false in JS and here.
                     None if lhs.is_number() && rhs.is_number() => false,
+                    // A string against a number — the one mixed pair JS gets
+                    // right. `ToNumber` the string and compare numerically,
+                    // so `"50" > 9` is true. An unparseable string lands on
+                    // NaN and every operator is false, as in JS.
+                    None if is_num_or_str(&lhs) && is_num_or_str(&rhs) => {
+                        let a = lhs.to_number().unwrap_or(f64::NAN);
+                        let b = rhs.to_number().unwrap_or(f64::NAN);
+                        match a.partial_cmp(&b) {
+                            Some(ord) => ord $cmp std::cmp::Ordering::$expected,
+                            None => false,
+                        }
+                    }
+                    // Everything else: JS would answer, by turning the
+                    // operand into a number first. That is where it gets it
+                    // wrong, so this is the one place we refuse.
                     None => {
                         let msg = format!(
-                            "cannot compare {} with {}: `<` `>` `<=` `>=` do not coerce \
-                             across types here. A number read out of a tool's output is \
-                             a string until you write Number(x).",
+                            "cannot compare {} with {}: `<` `>` `<=` `>=` take numbers \
+                             and strings. JS coerces anything else to a number and \
+                             answers — undefined becomes NaN, null and false become 0 \
+                             — which turns a value that is not there into a comparison \
+                             that works.",
                             self.describe_operand(&lhs),
                             self.describe_operand(&rhs)
                         );

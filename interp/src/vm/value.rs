@@ -553,5 +553,44 @@ pub(crate) fn js_str_to_number(units: &[u16]) -> f64 {
         return f64::NAN;
     }
     let s: String = t.iter().map(|&u| u as u8 as char).collect();
+
+    // Radix forms. `StringNumericLiteral` allows no sign on these, so
+    // `Number("-0x10")` is NaN — the decimal path below rejects it on the
+    // `x`. Rust's own parser does not accept them at all.
+    for (lower, upper, radix) in [("0x", "0X", 16u32), ("0o", "0O", 8), ("0b", "0B", 2)] {
+        if let Some(digits) = s.strip_prefix(lower).or_else(|| s.strip_prefix(upper)) {
+            if digits.is_empty() {
+                return f64::NAN;
+            }
+            let mut acc = 0f64;
+            for c in digits.chars() {
+                match c.to_digit(radix) {
+                    Some(d) => acc = acc * f64::from(radix) + f64::from(d),
+                    None => return f64::NAN,
+                }
+            }
+            return acc;
+        }
+    }
+
+    // Decimal. Rust accepts `inf`, `infinity` and `nan` in any case; JS
+    // accepts the single exact spelling `Infinity`, optionally signed, and
+    // answers NaN for the rest. Left alone, `Number("inf")` is `Infinity`
+    // here and `NaN` in every browser — a wrong answer, not a refusal.
+    let body = s.strip_prefix(['+', '-']).unwrap_or(&s);
+    if body == "Infinity" {
+        return if s.starts_with('-') {
+            f64::NEG_INFINITY
+        } else {
+            f64::INFINITY
+        };
+    }
+    if body.is_empty()
+        || !body
+            .bytes()
+            .all(|c| c.is_ascii_digit() || matches!(c, b'.' | b'e' | b'E' | b'+' | b'-'))
+    {
+        return f64::NAN;
+    }
     s.parse::<f64>().unwrap_or(f64::NAN)
 }
