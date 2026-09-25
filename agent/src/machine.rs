@@ -29,9 +29,7 @@
 use std::collections::HashMap;
 use std::io;
 
-use interp::{
-    InvokeCall, JsString, PromisePtr, ResumeMode, SettleCall, StepResult, VM, VMError, Value,
-};
+use interp::{InvokeCall, PromisePtr, ResumeMode, SettleCall, StepResult, VM, VMError, Value};
 
 use crate::host::ProgramStatus;
 use crate::report::{Artifact, ArtifactState, arg_preview, preview};
