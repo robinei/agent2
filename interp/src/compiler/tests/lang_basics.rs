@@ -120,14 +120,14 @@ fn bitnot_non_integer_number_explains_the_truncation() {
 #[test]
 fn negative_index_reports_the_index_and_container_type() {
     let err = testutil::run_runtime_err("let a = [1, 2]; return a[-1];");
-    assert_eq!(err.kind, crate::vm::ErrorKind::ValueError);
+    assert_eq!(err.kind, crate::vm::ErrorKind::RangeError);
     assert_eq!(
         err.message,
         "cannot index into array with negative index -1"
     );
 
     let err = testutil::run_runtime_err("let a = [1, 2]; a[-1] = 5;");
-    assert_eq!(err.kind, crate::vm::ErrorKind::ValueError);
+    assert_eq!(err.kind, crate::vm::ErrorKind::RangeError);
     assert_eq!(
         err.message,
         "cannot index into array with negative index -1"
@@ -137,7 +137,7 @@ fn negative_index_reports_the_index_and_container_type() {
 #[test]
 fn shift_out_of_range_reports_the_amount() {
     let err = testutil::run_runtime_err("return 1 << 100;");
-    assert_eq!(err.kind, crate::vm::ErrorKind::ValueError);
+    assert_eq!(err.kind, crate::vm::ErrorKind::RangeError);
     assert_eq!(
         err.message,
         "left shift (<<) amount 100 out of range: must be 0-63"

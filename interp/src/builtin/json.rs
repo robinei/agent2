@@ -37,7 +37,7 @@ pub fn json_parse(vm: &mut VM, args: Args) -> Result<Value, VMError> {
             ""
         };
         vm.fail(
-            ErrorKind::ValueError,
+            ErrorKind::SyntaxError,
             format!("JSON.parse: {e} — the text begins {head:?}{more}").as_str(),
         )
     })?;
@@ -472,7 +472,10 @@ mod tests {
     #[test]
     fn json_parse_says_why_and_shows_what_it_was_given() {
         let err = crate::testutil::run_runtime_err("JSON.parse('not json at all');");
-        assert_eq!(err.kind, crate::ErrorKind::ValueError);
+        // Not a judgement call: the spec names a `JSON.parse` failure a
+        // `SyntaxError`, so a program catching one by the book used to
+        // catch nothing.
+        assert_eq!(err.kind, crate::ErrorKind::SyntaxError);
         assert!(err.message.contains("line 1"), "the place: {}", err.message);
         assert!(
             err.message.contains("not json at all"),

@@ -42,7 +42,7 @@ pub fn number_to_fixed(vm: &mut VM, args: Args) -> Result<Value, VMError> {
             })?;
             if !d.is_finite() || !(0.0..=100.0).contains(&d) {
                 return Err(vm.fail(
-                    crate::vm::ErrorKind::ValueError,
+                    crate::vm::ErrorKind::RangeError,
                     "toFixed: digits argument must be in [0, 100]",
                 ));
             }

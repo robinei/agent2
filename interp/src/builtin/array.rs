@@ -24,8 +24,8 @@ pub fn array_ctor(vm: &mut VM, args: Args) -> Result<Value, VMError> {
         let arr: ThinVec<Value> = std::iter::repeat_n(Value::Undefined, len).collect();
         return Ok(vm.alloc_array(arr));
     }
-    // Negative or non-finite: JS throws RangeError. We surface a
-    // ValueError with a clear message (no RangeError kind yet).
+    // Negative or non-finite: a `RangeError`, the name JS gives it. It was
+    // a `ValueError` only because there was no `RangeError` kind to raise.
     // Non-numeric single arg: fall through to `[arg]` (JS coerces to
     // number and throws on NaN, but the common case is a numeric length;
     // a non-numeric `Array(x)` is `Array(x)` → `[x]` in practice only
@@ -858,7 +858,9 @@ mod tests {
     #[test]
     fn writing_past_length_still_errors_and_says_how_to_grow() {
         let err = testutil::run_runtime_err("const a = []; a[3] = 1;");
-        assert_eq!(err.kind, crate::ErrorKind::ValueError);
+        // An index past the end is out of *range*, which is what a program
+        // branching on `e instanceof RangeError` is asking about.
+        assert_eq!(err.kind, crate::ErrorKind::RangeError);
         assert!(err.message.contains("push()"), "{}", err.message);
     }
 }

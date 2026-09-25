@@ -281,7 +281,7 @@ pub fn str_replace(vm: &mut VM, args: Args) -> Result<Value, VMError> {
             for m in find_all(rx, text) {
                 out.extend_from_slice(&text[last..m.range.start]);
                 if !push_replacement(&mut out, replacement.as_units(), text, &m) {
-                    return Err(vm.fail(ErrorKind::ValueError, TOO_LARGE));
+                    return Err(vm.fail(ErrorKind::RangeError, TOO_LARGE));
                 }
                 last = m.range.end;
             }
@@ -292,7 +292,7 @@ pub fn str_replace(vm: &mut VM, args: Args) -> Result<Value, VMError> {
                 let mut out: Vec<u16> = Vec::with_capacity(text.len());
                 out.extend_from_slice(&text[..m.range.start]);
                 if !push_replacement(&mut out, replacement.as_units(), text, &m) {
-                    return Err(vm.fail(ErrorKind::ValueError, TOO_LARGE));
+                    return Err(vm.fail(ErrorKind::RangeError, TOO_LARGE));
                 }
                 out.extend_from_slice(&text[m.range.end..]);
                 return Ok(Value::String(JsString::from_units(&out)));
@@ -334,7 +334,7 @@ pub fn str_replace_all(vm: &mut VM, args: Args) -> Result<Value, VMError> {
         for m in find_all(rx, text) {
             out.extend_from_slice(&text[last..m.range.start]);
             if !push_replacement(&mut out, replacement.as_units(), text, &m) {
-                return Err(vm.fail(ErrorKind::ValueError, TOO_LARGE));
+                return Err(vm.fail(ErrorKind::RangeError, TOO_LARGE));
             }
             last = m.range.end;
         }
@@ -351,7 +351,7 @@ pub fn str_replace_all(vm: &mut VM, args: Args) -> Result<Value, VMError> {
         // `"".replaceAll("", "x")` is `"x"`; returning the receiver unchanged
         // (which is what a naive "nothing to find" guard does) fails both.
         if repl.len().saturating_mul(text.len() + 1) > MAX_STRING_LEN {
-            return Err(vm.fail(ErrorKind::ValueError, TOO_LARGE));
+            return Err(vm.fail(ErrorKind::RangeError, TOO_LARGE));
         }
         let mut out: Vec<u16> = Vec::with_capacity(text.len() + repl.len() * (text.len() + 1));
         out.extend_from_slice(repl);
@@ -641,7 +641,7 @@ fn pad(vm: &mut VM, args: Args, at_start: bool) -> Result<Value, VMError> {
         return Ok(Value::String(s));
     }
     if target_len > MAX_STRING_LEN as f64 {
-        return Err(vm.fail(ErrorKind::ValueError, TOO_LARGE));
+        return Err(vm.fail(ErrorKind::RangeError, TOO_LARGE));
     }
     let target = target_len as usize;
     let needed = target - text.len();
@@ -658,7 +658,8 @@ fn pad(vm: &mut VM, args: Args, at_start: bool) -> Result<Value, VMError> {
     Ok(Value::String(JsString::from_units(&out)))
 }
 
-/// `s.repeat(count)` → repeated string. Negative counts → ValueError.
+/// `s.repeat(count)` → repeated string. A count outside `[0, REPEAT_MAX]` is
+/// a `RangeError`, the name JS gives it.
 pub fn str_repeat(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let s = args.string_receiver(vm)?;
     let count = args
@@ -666,7 +667,10 @@ pub fn str_repeat(vm: &mut VM, args: Args) -> Result<Value, VMError> {
         .to_number()
         .ok_or_else(|| vm.fail(ErrorKind::TypeError, "type error"))?;
     if count < 0.0 || count.is_infinite() {
-        return Err(vm.fail(ErrorKind::ValueError, "value error"));
+        return Err(vm.fail(
+            ErrorKind::RangeError,
+            format!("repeat count must be a finite number >= 0; got {count}").as_str(),
+        ));
     }
     // Bound the allocation, but raise loudly instead of silently truncating
     // (a silent cap produces a wrong-length string with no signal).
@@ -674,7 +678,7 @@ pub fn str_repeat(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let n = count as usize;
     if n > REPEAT_MAX {
         return Err(vm.fail(
-            ErrorKind::ValueError,
+            ErrorKind::RangeError,
             "repeat count too large (max 1000000)",
         ));
     }
@@ -843,7 +847,11 @@ pub fn str_from_code_point(vm: &mut VM, args: Args) -> Result<Value, VMError> {
             .to_number()
             .ok_or_else(|| vm.fail(ErrorKind::TypeError, "type error"))?;
         if !n.is_finite() || n.trunc() != n || n < 0.0 || n > 0x10FFFF as f64 {
-            return Err(vm.fail(ErrorKind::ValueError, "value error"));
+            return Err(vm.fail(
+                ErrorKind::RangeError,
+                format!("{n} is not a valid code point (want an integer in [0, 0x10FFFF])")
+                    .as_str(),
+            ));
         }
         let code = n as u32;
         if code < 0x10000 {
@@ -1161,15 +1169,16 @@ mod tests {
             testutil::run_ret("return 'ab'.repeat(2);"),
             serde_json::json!("abab")
         );
-        // Negative → ValueError (RangeError in JS).
+        // Negative → `RangeError`, as in JS.
         assert_eq!(
             testutil::run_err_kind("return 'ab'.repeat(-1);"),
-            ErrorKind::ValueError
+            ErrorKind::RangeError
         );
-        // Over the cap → loud ValueError, not a silently-truncated string.
+        // Over the cap → a loud `RangeError`, not a silently-truncated
+        // string.
         assert_eq!(
             testutil::run_err_kind("return 'x'.repeat(2000000);"),
-            ErrorKind::ValueError
+            ErrorKind::RangeError
         );
         // A large-but-allowed count still works.
         assert_eq!(

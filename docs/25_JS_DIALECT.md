@@ -233,15 +233,31 @@ of the pair, because the code that catches one of these is the code
 that reads those fields.
 
 **`ValueError` is in the set, and is not a JS name.** It is this
-dialect's own kind for "right type, impossible value" (`JSON.parse` of a
-truncated document, an out-of-range index), and of the three kinds a
-program can actually catch — `fail()` raises only `TypeError`,
-`ValueError` and `ReferenceError` resumably; everything else ends the
-program — it is the second commonest, 164 raise sites against 243 for
-`TypeError`. Omitting it would have left the error a program is
-likeliest to catch as the one with no class to test for, which is the
+dialect's own kind for "right type, impossible value", one of the five
+kinds a program can actually catch — `fail()` raises `TypeError`,
+`ValueError`, `RangeError`, `SyntaxError` and `ReferenceError`
+resumably; everything else ends the program. Omitting it would have left
+an error a program can catch with no class to test for, which is the
 opposite of the point. It is a deliberate dialect addition, with a
 global constructor like the rest.
+
+**But it was doing four jobs, and two of them have JS names.** Of its
+~145 raise sites, 36 moved: every out-of-range *magnitude* — a negative
+index, an array write past `length`, a shift amount outside `[0, 63]`, a
+radix outside `[2, 36]`, a `toFixed` precision, a `repeat` count, a code
+point, a string length, every typed-array `byteOffset`/`length` bound —
+is a `RangeError`, and `JSON.parse` failures and malformed regexps are
+`SyntaxError`. The first of those is not a judgement call: the spec
+*names* a `JSON.parse` failure a `SyntaxError`, so a program catching
+one by the book caught nothing. The name is what a program branches on,
+and the repair differs — `catch (e) { if (e instanceof RangeError)
+shrinkTheSlice() }` is not what a malformed document calls for.
+
+What kept the name is what the name was for: a value of the right type
+and the right size that this dialect still cannot use — a closure or a
+`RegExp` handed to `JSON.stringify`, a structure nested past the
+serializer's depth limit, the `edit` builtins' ambiguity failures.
+Corrupt-pointer checks kept it too, and should not have; see §25.4c.
 
 `ToolError` deliberately gets no class. It is the harness's concept
 (`agent/src/machine.rs`), and `interp` should not learn the name of

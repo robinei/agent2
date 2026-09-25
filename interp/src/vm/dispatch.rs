@@ -202,7 +202,7 @@ impl VM {
 
             if idx < 0 {
                 return Err(self.fail(
-                    ErrorKind::ValueError,
+                    ErrorKind::RangeError,
                     format!(
                         "cannot index into {} with negative index {idx}",
                         receiver.type_name()
@@ -578,7 +578,7 @@ impl VM {
 
             if idx < 0 {
                 return Err(self.fail(
-                    ErrorKind::ValueError,
+                    ErrorKind::RangeError,
                     format!(
                         "cannot index into {} with negative index {idx}",
                         receiver.type_name()
@@ -617,7 +617,7 @@ impl VM {
                 if idx > arr.len() {
                     let len = arr.len();
                     return Err(self.fail(
-                        ErrorKind::ValueError,
+                        ErrorKind::RangeError,
                         format!(
                             "cannot write array index {idx}: out of bounds (length {len}) — \
                              an array grows by push() or by writing at exactly its length"
@@ -2104,7 +2104,7 @@ impl VM {
                     let a = self.pop_int()?;
                     if !(0..64).contains(&b) {
                         return Err(self.fail(
-                            ErrorKind::ValueError,
+                            ErrorKind::RangeError,
                             format!("left shift (<<) amount {b} out of range: must be 0-63"),
                         ));
                     }
@@ -2116,7 +2116,7 @@ impl VM {
                     let a = self.pop_int()?;
                     if !(0..64).contains(&b) {
                         return Err(self.fail(
-                            ErrorKind::ValueError,
+                            ErrorKind::RangeError,
                             format!("right shift (>>) amount {b} out of range: must be 0-63"),
                         ));
                     }
@@ -2128,7 +2128,7 @@ impl VM {
                     let a = self.pop_int()?;
                     if !(0..64).contains(&b) {
                         return Err(self.fail(
-                            ErrorKind::ValueError,
+                            ErrorKind::RangeError,
                             format!(
                                 "unsigned right shift (>>>) amount {b} out of range: must be 0-63"
                             ),

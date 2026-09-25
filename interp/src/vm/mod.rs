@@ -875,6 +875,27 @@ pub enum ErrorKind {
     /// is not in the builtin registry, not a hardcoded global, and not an
     /// error constructor. Maps to JS's `ReferenceError`.
     ReferenceError,
+    /// A value of the right type whose *magnitude* is out of bounds: a radix
+    /// outside `[2, 36]`, `toFixed` past 100 digits, a negative index, a
+    /// typed-array byteOffset past the end of its buffer, a string longer
+    /// than the representable maximum.
+    ///
+    /// **Split out of `ValueError`, which was doing four jobs.** These sites
+    /// are what a real engine calls a `RangeError`, and the name matters
+    /// because it is what a program branches on: `catch (e) { if (e
+    /// instanceof RangeError) shrinkTheSlice() }` is a different repair from
+    /// the one a genuinely malformed value calls for. While they shared one
+    /// name there was nothing to tell the two apart.
+    RangeError,
+    /// Text that is not well-formed in the grammar it was handed to:
+    /// `JSON.parse` of a truncated document, `new RegExp("(")`, a regexp
+    /// flag string containing `q`.
+    ///
+    /// Also split out of `ValueError`, and not a judgement call for the
+    /// first of those: **the spec says `JSON.parse` failures are
+    /// `SyntaxError`**, so a program that catches one by the book caught
+    /// nothing here.
+    SyntaxError,
 }
 
 /// Whether the host can resume from this error by feeding a value (see

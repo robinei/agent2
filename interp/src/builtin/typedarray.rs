@@ -107,7 +107,7 @@ pub(crate) fn arraybuffer_ctor(vm: &mut VM, args: Args) -> Result<Value, VMError
                 0u32
             } else if f < 0.0 || f.is_infinite() {
                 return Err(vm.fail(
-                    ErrorKind::ValueError,
+                    ErrorKind::RangeError,
                     format!("invalid ArrayBuffer length: {}", vm.preview(raw)),
                 ));
             } else {
@@ -195,13 +195,13 @@ fn typed_array_ctor_impl(vm: &mut VM, args: Args, kind: TypedArrayKind) -> Resul
 
         &Value::PosInt(n) => {
             if n > u32::MAX as u64 {
-                return Err(vm.fail(ErrorKind::ValueError, "typed array length out of range"));
+                return Err(vm.fail(ErrorKind::RangeError, "typed array length out of range"));
             }
             alloc_typed_array(vm, n as usize, kind)
         }
 
         &Value::NegInt(_) => Err(vm.fail(
-            ErrorKind::ValueError,
+            ErrorKind::RangeError,
             "invalid typed array length: negative",
         )),
 
@@ -210,7 +210,7 @@ fn typed_array_ctor_impl(vm: &mut VM, args: Args, kind: TypedArrayKind) -> Resul
                 alloc_typed_array(vm, 0, kind)
             } else if f < 0.0 || f.is_infinite() {
                 Err(vm.fail(
-                    ErrorKind::ValueError,
+                    ErrorKind::RangeError,
                     format!("invalid typed array length: {f}"),
                 ))
             } else {
@@ -308,13 +308,13 @@ fn typed_array_ctor_impl(vm: &mut VM, args: Args, kind: TypedArrayKind) -> Resul
                     let f = v.to_number().unwrap_or(0.0);
                     if f < 0.0 || f.is_nan() || !f.is_finite() || f as usize > buf_len {
                         return Err(
-                            vm.fail(ErrorKind::ValueError, "typed array: invalid byteOffset")
+                            vm.fail(ErrorKind::RangeError, "typed array: invalid byteOffset")
                         );
                     }
                     let off = f as usize;
                     if !off.is_multiple_of(elem_size) {
                         return Err(vm.fail(
-                            ErrorKind::ValueError,
+                            ErrorKind::RangeError,
                             "typed array: byteOffset must be a multiple of element size",
                         ));
                     }
@@ -328,7 +328,7 @@ fn typed_array_ctor_impl(vm: &mut VM, args: Args, kind: TypedArrayKind) -> Resul
                     let remaining = buf_len.saturating_sub(byte_offset);
                     if !remaining.is_multiple_of(elem_size) {
                         return Err(vm.fail(
-                            ErrorKind::ValueError,
+                            ErrorKind::RangeError,
                             "typed array: buffer length - byteOffset must be a multiple of element size",
                         ));
                     }
@@ -337,13 +337,13 @@ fn typed_array_ctor_impl(vm: &mut VM, args: Args, kind: TypedArrayKind) -> Resul
                 v => {
                     let f = v.to_number().unwrap_or(0.0);
                     if f < 0.0 || f.is_nan() || !f.is_finite() {
-                        return Err(vm.fail(ErrorKind::ValueError, "typed array: invalid length"));
+                        return Err(vm.fail(ErrorKind::RangeError, "typed array: invalid length"));
                     }
                     let n = f as usize;
                     let bl = n * elem_size;
                     if byte_offset.saturating_add(bl) > buf_len {
                         return Err(vm.fail(
-                            ErrorKind::ValueError,
+                            ErrorKind::RangeError,
                             "typed array: byte range out of bounds",
                         ));
                     }
@@ -375,7 +375,7 @@ fn typed_array_ctor_impl(vm: &mut VM, args: Args, kind: TypedArrayKind) -> Resul
 fn alloc_typed_array(vm: &mut VM, len: usize, kind: TypedArrayKind) -> Result<Value, VMError> {
     let byte_len = len
         .checked_mul(kind.element_size() as usize)
-        .ok_or_else(|| vm.fail(ErrorKind::ValueError, "typed array byte length overflow"))?;
+        .ok_or_else(|| vm.fail(ErrorKind::RangeError, "typed array byte length overflow"))?;
     let buf_ptr = vm.buffers.len() as BufferPtr;
     vm.buffers.push(vec![0u8; byte_len]);
     let ta_ptr = vm.typed_arrays.len() as TypedArrayPtr;
@@ -450,18 +450,18 @@ pub(crate) fn dataview_ctor(vm: &mut VM, args: Args) -> Result<Value, VMError> {
         }
     };
     if byte_offset > buf_len {
-        return Err(vm.fail(ErrorKind::ValueError, "DataView: byteOffset out of bounds"));
+        return Err(vm.fail(ErrorKind::RangeError, "DataView: byteOffset out of bounds"));
     }
     let byte_length = match args.get(vm, 2) {
         Value::Undefined => buf_len - byte_offset,
         v => {
             let f = v.to_number().unwrap_or(0.0);
             if f < 0.0 || f.is_nan() || !f.is_finite() {
-                return Err(vm.fail(ErrorKind::ValueError, "DataView: invalid byteLength"));
+                return Err(vm.fail(ErrorKind::RangeError, "DataView: invalid byteLength"));
             }
             let bl = f as usize;
             if byte_offset.saturating_add(bl) > buf_len {
-                return Err(vm.fail(ErrorKind::ValueError, "DataView: byteLength out of bounds"));
+                return Err(vm.fail(ErrorKind::RangeError, "DataView: byteLength out of bounds"));
             }
             bl
         }
@@ -500,14 +500,14 @@ fn dv_byte_index(
     let f = offset_val.to_number().unwrap_or(0.0);
     if f < 0.0 || f.is_nan() || !f.is_finite() {
         return Err(vm.fail(
-            ErrorKind::ValueError,
+            ErrorKind::RangeError,
             "DataView offset must be non-negative",
         ));
     }
     let off = f as usize;
     // Use saturating_add to avoid overflow on huge offsets.
     if off.saturating_add(access_size) > view_len {
-        return Err(vm.fail(ErrorKind::ValueError, "DataView access out of bounds"));
+        return Err(vm.fail(ErrorKind::RangeError, "DataView access out of bounds"));
     }
     let _ = buf_ptr;
     Ok(view_off + off)
@@ -823,7 +823,7 @@ pub(crate) fn ta_set(vm: &mut VM, args: Args) -> Result<Value, VMError> {
             0usize
         } else if f < 0.0 {
             return Err(vm.fail(
-                ErrorKind::ValueError,
+                ErrorKind::RangeError,
                 "TypedArray.set: offset is out of bounds (negative)",
             ));
         } else {
@@ -874,7 +874,7 @@ pub(crate) fn ta_set(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     };
     if offset.saturating_add(vals.len()) > length {
         return Err(vm.fail(
-            ErrorKind::ValueError,
+            ErrorKind::RangeError,
             "TypedArray.set: source is too large to fit at the given offset",
         ));
     }
@@ -1542,7 +1542,7 @@ mod tests {
             return 0;
         "#,
         );
-        assert_eq!(kind, crate::vm::ErrorKind::ValueError);
+        assert_eq!(kind, crate::vm::ErrorKind::RangeError);
     }
 
     #[test]
@@ -1554,7 +1554,9 @@ mod tests {
             return 0;
         "#,
         );
-        assert_eq!(kind, crate::vm::ErrorKind::ValueError);
+        // The comment at the raise site already said "JS throws RangeError
+        // for a negative offset"; it now does.
+        assert_eq!(kind, crate::vm::ErrorKind::RangeError);
     }
 
     // ── Step 5: DataView ──────────────────────────────────────────────────

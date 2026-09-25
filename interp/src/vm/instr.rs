@@ -297,7 +297,8 @@ impl TypeTag {
     ///
     /// **The default is not a fallback nobody hits**, though it is a narrower
     /// job than it looks. Of the VM's own kinds only `TypeError`,
-    /// `ValueError` and `ReferenceError` are raised resumably (see
+    /// `ValueError`, `RangeError`, `SyntaxError` and `ReferenceError` are
+    /// raised resumably (see
     /// `VM::fail`'s match on `ResumeMode`) — the rest are invariant
     /// violations that end the program rather than becoming a value, so they
     /// never reach here. What does reach the default is the harness's

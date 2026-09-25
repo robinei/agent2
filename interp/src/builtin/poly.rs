@@ -32,7 +32,7 @@ pub fn value_to_string(vm: &mut VM, args: Args) -> Result<Value, VMError> {
             .to_number()
             .ok_or_else(|| vm.fail(ErrorKind::TypeError, "toString: radix must be a number"))?;
         if !r.is_finite() || !(2.0..=36.0).contains(&r) {
-            return Err(vm.fail(ErrorKind::ValueError, "toString: radix must be in [2, 36]"));
+            return Err(vm.fail(ErrorKind::RangeError, "toString: radix must be in [2, 36]"));
         }
         let radix = r as u32;
         let n = recv.as_f64().unwrap_or(0.0);

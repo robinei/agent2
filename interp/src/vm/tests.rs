@@ -1334,7 +1334,7 @@ fn arr_set_oob() {
         PushFloat(99.0),        // value
         IndexSet(SetMode::New), // pops: value, index, arr_ptr
     ];
-    assert!(matches!(run_err(code).kind, ErrorKind::ValueError));
+    assert!(matches!(run_err(code).kind, ErrorKind::RangeError));
 }
 
 #[test]
@@ -1940,11 +1940,11 @@ fn frame_allocates_multiple_locals() {
 fn bit_shift_rejects_bad_count() {
     assert!(matches!(
         run_err(vec![PushFloat(1.0), PushFloat(64.0), BitLhs]).kind,
-        ErrorKind::ValueError
+        ErrorKind::RangeError
     ));
     assert!(matches!(
         run_err(vec![PushFloat(1.0), PushFloat(-1.0), BitRhs]).kind,
-        ErrorKind::ValueError
+        ErrorKind::RangeError
     ));
     // Valid shifts still work.
     assert_eq!(
@@ -2303,7 +2303,8 @@ fn relational_non_coercion() {
 
 #[test]
 fn arr_index_negative_errors() {
-    // Negative IndexGet on an array is a ValueError.
+    // Negative IndexGet on an array is a RangeError: the index is out of
+    // range, which is the question `e instanceof RangeError` asks.
     let mut vm = VM::new(vec![
         PushPosInt(0),  // dummy array element
         ArrNew(1),      // create array (pops 1 value)
@@ -2311,10 +2312,10 @@ fn arr_index_negative_errors() {
         IndexGet,       // should error
     ]);
     match vm.step(u64::MAX) {
-        Err(e) if e.kind == ErrorKind::ValueError => {} // expected
-        other => panic!("expected ValueError, got {other:?}"),
+        Err(e) if e.kind == ErrorKind::RangeError => {} // expected
+        other => panic!("expected RangeError, got {other:?}"),
     }
-    // Negative IndexSet on an array is also a ValueError.
+    // Negative IndexSet on an array is also a RangeError.
     let mut vm = VM::new(vec![
         PushPosInt(0),  // dummy array element
         ArrNew(1),      // create array (pops 1 value)
@@ -2323,8 +2324,8 @@ fn arr_index_negative_errors() {
         IndexSet(SetMode::New),
     ]);
     match vm.step(u64::MAX) {
-        Err(e) if e.kind == ErrorKind::ValueError => {} // expected
-        other => panic!("expected ValueError, got {other:?}"),
+        Err(e) if e.kind == ErrorKind::RangeError => {} // expected
+        other => panic!("expected RangeError, got {other:?}"),
     }
 }
 
@@ -2877,8 +2878,8 @@ fn message_negative_index_includes_value() {
     vm.arrays.push(vec![].into());
     let err = vm.step(u64::MAX).unwrap_err();
     assert!(
-        err.kind == ErrorKind::ValueError,
-        "expected ValueError, got {:?}: {}",
+        err.kind == ErrorKind::RangeError,
+        "expected RangeError, got {:?}: {}",
         err.kind,
         err.message
     );

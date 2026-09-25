@@ -91,6 +91,19 @@ is still open on its own merits — a `JSON.parse` failure arguably *is*
 a `SyntaxError` — but it is now a question about which name fits each
 site, not about whether the name is usable.
 
+**And then the sites were split too, 2026-09-25.** `ErrorKind` grew
+`RangeError` and `SyntaxError`, and 36 of `ValueError`'s ~145 raise
+sites moved to them: every out-of-range magnitude (negative index,
+out-of-bounds array write, shift amount, radix, `toFixed` precision,
+`repeat` count, code point, string length, every typed-array
+byteOffset/length bound) to `RangeError`, and `JSON.parse` failures and
+malformed regexps to `SyntaxError`. The first of those is not a
+judgement call: the spec *names* a `JSON.parse` failure a `SyntaxError`,
+so a program catching one by the book caught nothing. What stayed
+`ValueError` is what the name was for — a value of the right type and
+the right size that this dialect still cannot use, such as a closure
+handed to `JSON.stringify`.
+
 **Stdlib lang-items: move `Error`/`TypeError`/… into the prelude as classes
 (post-Phase-13).** Once Phase 13's `class` (Step 7) and `instanceof` (Step 8)
 land, the `new Error` compiler special-form (`compile_error_ctor` → bare

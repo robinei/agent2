@@ -157,7 +157,16 @@ impl VM {
             // TypeError / ValueError: most sites pop operands first (macros,
             // take_args, check_arity!). Default to PushValueThenContinue;
             // specific sites that error before popping override below.
-            ErrorKind::TypeError | ErrorKind::ValueError | ErrorKind::ReferenceError => {
+            ErrorKind::TypeError
+            | ErrorKind::ValueError
+            | ErrorKind::ReferenceError
+            // `RangeError`/`SyntaxError` were `ValueError` until they were
+            // split out, and they are raised from the same sites by the
+            // same macros — so they keep the same default. A kind that is
+            // catchable and a kind that is resumable have to be listed
+            // together here while one match answers both questions.
+            | ErrorKind::RangeError
+            | ErrorKind::SyntaxError => {
                 ResumeMode::PushValueThenContinue
             }
             // An escaped program-level throw: the operand was consumed, but
@@ -1231,7 +1240,7 @@ impl VM {
         for c in flags_str.chars() {
             if !matches!(c, 'g' | 'i' | 'm' | 's' | 'u' | 'y' | 'd' | 'v') {
                 return Err(self.fail(
-                    ErrorKind::ValueError,
+                    ErrorKind::SyntaxError,
                     format!("invalid regular expression flags: {flags_str}"),
                 ));
             }
@@ -1241,7 +1250,7 @@ impl VM {
                 Ok(re) => re,
                 Err(e) => {
                     return Err(self.fail(
-                        ErrorKind::ValueError,
+                        ErrorKind::SyntaxError,
                         format!("invalid regular expression: {e}"),
                     ));
                 }
@@ -1294,9 +1303,9 @@ impl VM {
     pub fn alloc_error(&mut self, name: JsString, message: JsString) -> Value {
         // The `name` picks the class, so this one mapping serves all three
         // sources at once: `error_to_thrown`'s `{:?}` of an `ErrorKind`
-        // (only ever `TypeError`/`ValueError`/`ReferenceError` — the other
-        // kinds are not resumable and end the program instead of becoming a
-        // value), the `TypeTag::name()` each constructor handler passes in,
+        // (only ever `TypeError`/`ValueError`/`RangeError`/`SyntaxError`/
+        // `ReferenceError` — the other kinds are not resumable and end the
+        // program instead of becoming a value), the `TypeTag::name()` each constructor handler passes in,
         // and the harness's `"ToolError"`, which has no class and lands on
         // the base.
         let tag = crate::vm::instr::TypeTag::error_tag_for_name(&name);
