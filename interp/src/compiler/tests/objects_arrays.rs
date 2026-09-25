@@ -1417,7 +1417,7 @@ fn bound_function_serialization_rejected() {
     let result = vm.stack_value_to_json(&val, 0);
     assert!(result.is_err());
     let err = result.unwrap_err();
-    assert_eq!(err.kind, ErrorKind::ValueError);
+    assert_eq!(err.kind, ErrorKind::TypeError);
 }
 
 #[test]

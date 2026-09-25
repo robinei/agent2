@@ -2484,8 +2484,8 @@ fn stack_value_to_json_depth_limit() {
     // and the message should say so (Step 4: JSON depth message quality).
     let result = vm.stack_value_to_json(&innermost, 0);
     assert!(
-        matches!(result, Err(ref e) if e.kind == ErrorKind::ValueError),
-        "expected ValueError for depth > 128, got {result:?}"
+        matches!(result, Err(ref e) if e.kind == ErrorKind::TypeError),
+        "expected TypeError for depth > 128, got {result:?}"
     );
     let msg = result.unwrap_err().message;
     assert!(msg.contains("depth"), "got: {msg}");
@@ -2503,8 +2503,8 @@ fn json_to_value_depth_limit() {
     let mut vm = VM::new(vec![]);
     let result = vm.json_to_stack_value(&val, 0);
     assert!(
-        matches!(result, Err(ref e) if e.kind == ErrorKind::ValueError),
-        "expected ValueError for depth > 128, got {result:?}"
+        matches!(result, Err(ref e) if e.kind == ErrorKind::RangeError),
+        "expected RangeError for depth > 128, got {result:?}"
     );
     let msg = result.unwrap_err().message;
     assert!(msg.contains("depth"), "got: {msg}");
@@ -3004,8 +3004,8 @@ fn cyclic_value_serialization_errors() {
     });
     let result = vm.stack_value_to_json(&Value::Object(0), 0);
     assert!(
-        matches!(result, Err(ref e) if e.kind == ErrorKind::ValueError),
-        "expected ValueError for cyclic value, got {result:?}"
+        matches!(result, Err(ref e) if e.kind == ErrorKind::TypeError),
+        "expected TypeError for cyclic value, got {result:?}"
     );
 }
 
@@ -3416,8 +3416,8 @@ fn prototype_has_no_json_form() {
     let proto = vm.prototype_for(TypeTag::Array).unwrap();
     let result = vm.stack_value_to_json(&Value::Object(proto), 0);
     assert!(
-        matches!(result, Err(ref e) if e.kind == ErrorKind::ValueError),
-        "expected ValueError for prototype serialization, got {result:?}"
+        matches!(result, Err(ref e) if e.kind == ErrorKind::TypeError),
+        "expected TypeError for prototype serialization, got {result:?}"
     );
 }
 
@@ -3722,8 +3722,8 @@ fn namespace_has_no_json_form() {
     let p = vm.namespace_for(crate::vm::GlobalId::Math).unwrap();
     let result = vm.stack_value_to_json(&Value::Object(p), 0);
     assert!(
-        matches!(result, Err(ref e) if e.kind == ErrorKind::ValueError),
-        "expected ValueError for namespace serialization, got {result:?}"
+        matches!(result, Err(ref e) if e.kind == ErrorKind::TypeError),
+        "expected TypeError for namespace serialization, got {result:?}"
     );
 }
 

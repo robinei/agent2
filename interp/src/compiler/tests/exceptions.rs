@@ -1474,19 +1474,20 @@ fn an_error_is_an_instance_of_its_own_class_and_of_error() {
         ),
         json!(["SyntaxError", true, true])
     );
-    // `ValueError` is still this dialect's own kind, for the values JS has
-    // no name for: a closure has no JSON form at all.
+    // A value with no JSON form is a `TypeError`, which is what a real
+    // engine says of the one every program meets — `JSON.stringify` of a
+    // structure that refers to itself.
     assert_eq!(
         run_ret(
-            r#"try { JSON.stringify(function () {}); } catch (e) { return [e.name, e instanceof ValueError, e instanceof Error]; }"#
+            r#"try { JSON.stringify(function () {}); } catch (e) { return [e.name, e instanceof TypeError, e instanceof Error]; }"#
         ),
-        json!(["ValueError", true, true])
+        json!(["TypeError", true, true])
     );
     // And a `RangeError` where the value is the right kind and the wrong
-    // size — the other half of what `ValueError` used to cover alone.
+    // size — never a `TypeError`, because the repair is a different one.
     assert_eq!(
         run_ret(
-            r#"try { (1).toString(99); } catch (e) { return [e.name, e instanceof RangeError, e instanceof ValueError]; }"#
+            r#"try { (1).toString(99); } catch (e) { return [e.name, e instanceof RangeError, e instanceof TypeError]; }"#
         ),
         json!(["RangeError", true, false])
     );

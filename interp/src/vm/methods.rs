@@ -2313,8 +2313,15 @@ impl VM {
         depth: usize,
     ) -> Result<serde_json::Value, VMError> {
         if depth > MAX_JSON_DEPTH {
+            // **`TypeError`, because this is the cycle check.** There is no
+            // separate seen-set: a cycle is found only by falling off this
+            // cap, so the commonest value that lands here is `obj.self =
+            // obj`, and the spec answer for that one is `TypeError`
+            // ("Converting circular structure to JSON"). A genuinely deep
+            // 129-level tree gets the same name, which is the price of
+            // detecting cycles by depth.
             return Err(self.fail(
-                ErrorKind::ValueError,
+                ErrorKind::TypeError,
                 format!(
                     "cannot serialize to JSON: nesting exceeds max depth {MAX_JSON_DEPTH} (value is too deeply nested or cyclic)"
                 ),
@@ -2338,7 +2345,7 @@ impl VM {
             | Value::TypedArray(_)
             | Value::DataView(_) => {
                 return Err(self.fail(
-                    ErrorKind::ValueError,
+                    ErrorKind::TypeError,
                     format!("cannot serialize a {} to JSON", val.type_name()),
                 ));
             }
@@ -2347,7 +2354,7 @@ impl VM {
             // missing-`await` mistake, so say so.
             Value::Promise(_) => {
                 return Err(self.fail(
-                    ErrorKind::ValueError,
+                    ErrorKind::TypeError,
                     "cannot serialize a promise to JSON (did you forget `await`?)",
                 ));
             }
@@ -2358,7 +2365,7 @@ impl VM {
             // JSON — so we surface an error rather than inventing one.
             Value::Undefined => {
                 return Err(self.fail(
-                    ErrorKind::ValueError,
+                    ErrorKind::TypeError,
                     "cannot serialize undefined to JSON (it has no JSON form; \
                      JSON.stringify returns undefined for it in JS)",
                 ));
@@ -2412,7 +2419,7 @@ impl VM {
                     ObjKind::BuiltinPrototype | ObjKind::BuiltinNamespace
                 ) {
                     return Err(self.fail(
-                        ErrorKind::ValueError,
+                        ErrorKind::TypeError,
                         "cannot serialize a builtin prototype/namespace to JSON",
                     ));
                 }
@@ -2427,7 +2434,7 @@ impl VM {
                 serde_json::Value::Object(map)
             }
             Value::RegExp(_) => {
-                return Err(self.fail(ErrorKind::ValueError, "cannot serialize a RegExp to JSON"));
+                return Err(self.fail(ErrorKind::TypeError, "cannot serialize a RegExp to JSON"));
             }
             Value::Map(p) => {
                 let map = self
@@ -2468,8 +2475,13 @@ impl VM {
         depth: usize,
     ) -> Result<Value, VMError> {
         if depth > MAX_JSON_DEPTH {
+            // **`RangeError`, unlike its `stack_value_to_json` twin.** JSON
+            // *text* cannot describe a cycle, so nothing but genuine depth
+            // reaches here — a magnitude out of bounds, which is what
+            // `RangeError` is for, and what V8 raises (as a stack overflow)
+            // on the same input.
             return Err(self.fail(
-                ErrorKind::ValueError,
+                ErrorKind::RangeError,
                 format!("cannot parse JSON: nesting exceeds max depth {MAX_JSON_DEPTH}"),
             ));
         }

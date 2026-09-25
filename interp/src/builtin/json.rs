@@ -9,11 +9,21 @@ pub fn json_parse(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     // `JSON.parse(r.body)` on a result with no `body` said `in
     // \`parse\`: type error`, naming neither the value nor that a
     // string was wanted.
+    //
+    // Real JS coerces the argument with ToString and parses *that*, so
+    // `JSON.parse(undefined)` is a `SyntaxError` about the text
+    // "undefined" rather than a complaint about the argument. This
+    // dialect refuses cross-type coercion on purpose (25_JS_DIALECT), and
+    // the refusal is worth more here than spec fidelity: the value is
+    // almost always a missing field, and a `SyntaxError` about the word
+    // "undefined" points at the JSON instead of at the property that was
+    // not there. The kind is `TypeError` because the complaint is about
+    // the argument type.
     let arg = args.get(vm, 0).clone();
     if !matches!(arg, Value::String(_)) {
         let what = vm.describe_operand(&arg);
         return Err(vm.fail(
-            ErrorKind::ValueError,
+            ErrorKind::TypeError,
             format!("JSON.parse needs a string; got {what}").as_str(),
         ));
     }
@@ -602,7 +612,7 @@ mod tests {
         use crate::testutil::run_err_kind;
         assert_eq!(
             run_err_kind("return JSON.stringify(function() {});"),
-            ErrorKind::ValueError
+            ErrorKind::TypeError
         );
     }
 }
